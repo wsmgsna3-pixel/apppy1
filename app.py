@@ -1,63 +1,68 @@
 # -*- coding: utf-8 -*-
 """
-短线王 · v3.5（1-5天短线 专属强化版）
-特性（相较 v3.0 的主要升级）：
-- 更严格的趋势过滤（最近低点抬升 / 不破短均线 / 5/10/20 日结构）
-- 成交额硬过滤（默认日成交额 ≥ 2 亿）
-- 行业主线强制：非强行业将被大幅降权或剔除
-- MACD/RSI 评分体系重写，差异化更明显
-- ATR 波动与波动比率更严格过滤
-- 翻倍排除、连续大幅加速排除
-- 完整容错、缓存与 UI 降级提示
+短线王 · v4.0（盘中实时版）
+说明：
+- 优先使用 tushare 的实时接口： realtime_quote（单只实时快照） 和 rt_min（分钟线）
+- 若实时接口不可用（无权限或异常），自动回退为日线历史并提示
+- 策略：先用“昨收/涨幅榜”做粗筛 → 对候选池请求实时/分钟数据 → 应用更严格的短线过滤并评分
+- 目标：在盘中任意时间点产生不同候选（9:40、10:00、10:05 等）
 """
 import streamlit as st
 import tushare as ts
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
+import time
+import math
 import warnings
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="短线王 · v3.5（Top20）", layout="wide")
-st.title("短线王 · v3.5（1-5 天短线 专属强化）")
+st.set_page_config(page_title="短线王 · v4.0（盘中实时）", layout="wide")
+st.title("短线王 · v4.0（盘中实时） — 任意时刻可变结果")
 
 # ---------------------------
-# Token (manual)
+# User inputs
 # ---------------------------
-TS_TOKEN = st.text_input("请输入 Tushare Token（仅本次会话使用）", type="password")
+TS_TOKEN = st.text_input("请输入你的 Tushare Token（仅本次会话）", type="password")
 if not TS_TOKEN:
-    st.info("请输入 Tushare Token 后运行。")
+    st.info("请输入 Tushare Token 并回车以激活。")
     st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
+st.sidebar.header("快速参数（适合 1-5 天短线）")
+INITIAL_TOP_N = int(st.sidebar.number_input("初筛：涨幅榜取前 N（减少实时请求）", min_value=200, max_value=5000, value=1000, step=100))
+FINAL_POOL = int(st.sidebar.number_input("进入实时评分池数量（最终候选）", min_value=50, max_value=2000, value=500, step=50))
+TOP_K = int(st.sidebar.number_input("展示 Top K", min_value=5, max_value=50, value=20, step=1))
+
+MIN_PRICE = float(st.sidebar.number_input("最低股价（元）", min_value=0.1, max_value=1000.0, value=10.0, step=0.1))
+MAX_PRICE = float(st.sidebar.number_input("最高股价（元）", min_value=1.0, max_value=2000.0, value=200.0, step=1.0))
+MIN_AMOUNT = float(st.sidebar.number_input("最低日成交额（元）", min_value=0.0, max_value=1e11, value=200_000_000.0, step=10_000_000.0))
+MIN_MV = float(st.sidebar.number_input("最小市值（元）", min_value=1e7, max_value=1e12, value=20_0000_0000.0, step=1e7))
+MAX_MV = float(st.sidebar.number_input("最大市值（元）", min_value=1e8, max_value=1e13, value=500_0000_00000.0, step=1e8))
+
+EXCLUDE_DOUBLE_10_20 = st.sidebar.checkbox("排除过去10-20天翻倍", value=True)
+EXCLUDE_IMMEDIATE_CHASE = st.sidebar.checkbox("排除今日短期暴拉（3日内连续大幅）", value=True)
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("实时模式说明：若实时接口不可用，脚本会自动用日线回退并在界面提示（结果会变成日线快照）。")
+
 # ---------------------------
-# Utilities & safety
+# helpers
 # ---------------------------
 def safe_float(x, default=np.nan):
     try:
-        if x is None:
-            return default
+        if x is None: return default
         return float(x)
     except:
         return default
 
 def norm_series(s):
     s = pd.Series(s).astype(float)
-    if s.isnull().all():
-        return pd.Series(np.zeros(len(s)), index=s.index)
-    mn = s.min(); mx = s.max()
-    if abs(mx - mn) < 1e-9:
-        return pd.Series(np.ones(len(s)) * 0.5, index=s.index)
+    if s.isnull().all(): return pd.Series(np.zeros(len(s)), index=s.index)
+    mn, mx = s.min(), s.max()
+    if abs(mx - mn) < 1e-9: return pd.Series(np.ones(len(s))*0.5, index=s.index)
     return (s - mn) / (mx - mn)
-
-def check_and_fill_data(df, required_cols):
-    missing = []
-    for c in required_cols:
-        if c not in df.columns:
-            df[c] = np.nan
-            missing.append(c)
-    return df, missing
 
 def get_last_trade_day(pro_obj, max_days=14):
     today = datetime.now()
@@ -72,87 +77,45 @@ def get_last_trade_day(pro_obj, max_days=14):
             continue
     return None
 
-# Technical indicators
-def calculate_macd(df, close_col='close', short=12, long=26, signal=9):
-    close = df[close_col].astype(float)
-    ema_short = close.ewm(span=short, adjust=False).mean()
-    ema_long = close.ewm(span=long, adjust=False).mean()
-    dif = ema_short - ema_long
-    dea = dif.ewm(span=signal, adjust=False).mean()
-    hist = (dif - dea) * 2
-    res = df.copy()
-    res['DIF'] = dif; res['DEA'] = dea; res['MACD_HIST'] = hist
-    return res
+# try realtime_quote (single snapshot) for a ts_code
+def try_realtime_quote(pro_obj, ts_code, src='sina'):
+    # realtime_quote is a爬虫接口 in tushare; some accounts may not have it or the network may block
+    try:
+        df = pro_obj.realtime_quote(ts_code=ts_code, src=src)
+        # df expected to contain fields like 'price','change','percent','volume','amount' depending on src
+        return df
+    except Exception as e:
+        return None
 
-def calculate_rsi(df, close_col='close', period=6):
-    close = df[close_col].astype(float)
-    delta = close.diff()
-    up = delta.clip(lower=0); down = -1 * delta.clip(upper=0)
-    ma_up = up.ewm(alpha=1/period, adjust=False).mean()
-    ma_down = down.ewm(alpha=1/period, adjust=False).mean()
-    rs = ma_up / (ma_down + 1e-9)
-    rsi = 100 - (100 / (1 + rs))
-    res = df.copy()
-    res[f'RSI_{period}'] = rsi
-    return res
+# try minute bars for multiple codes at once (rt_min)
+def try_rt_min(pro_obj, codes, freq='1MIN'):
+    try:
+        # rt_min may accept comma-separated ts_code; limit may apply
+        df = pro_obj.rt_min(freq=freq, ts_code=",".join(codes))
+        return df
+    except Exception:
+        return None
 
-def calculate_atr(df, period=14):
-    df = df.copy()
-    df['high'] = df['high'].astype(float); df['low'] = df['low'].astype(float); df['close'] = df['close'].astype(float)
-    df['prev_close'] = df['close'].shift(1)
-    tr1 = df['high'] - df['low']
-    tr2 = (df['high'] - df['prev_close']).abs()
-    tr3 = (df['low'] - df['prev_close']).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1/period, adjust=False).mean()
-    df['ATR'] = atr
-    return df
+# fallback to pro.daily for a single code history
+def try_hist_daily(pro_obj, ts_code, start_date, end_date):
+    try:
+        df = pro_obj.daily(ts_code=ts_code, start_date=start_date, end_date=end_date)
+        if df is None or df.empty: return None
+        return df.sort_values('trade_date').reset_index(drop=True)
+    except Exception:
+        return None
 
 # ---------------------------
-# Sidebar (params tuned for 1-5d)
+# Step 0: get last trade day and today's market snapshot (daily)
 # ---------------------------
-st.sidebar.header("筛选参数（短线 1-5 天，v3.5）")
-INITIAL_TOP_N = int(st.sidebar.number_input("初筛：涨幅榜取前 N", min_value=200, max_value=5000, value=1000, step=100))
-FINAL_POOL = int(st.sidebar.number_input("进入评分池数量", min_value=50, max_value=2000, value=500, step=50))
-TOP_K = int(st.sidebar.number_input("界面展示 Top K", min_value=5, max_value=50, value=20, step=1))
-
-MIN_PRICE = float(st.sidebar.number_input("最低股价（元）", min_value=0.1, max_value=1000.0, value=10.0, step=0.1))
-MAX_PRICE = float(st.sidebar.number_input("最高股价（元）", min_value=1.0, max_value=2000.0, value=200.0, step=1.0))
-MIN_AMOUNT = float(st.sidebar.number_input("最低日成交额（元，硬过滤，建议 >= 200,000,000）", min_value=0.0, max_value=1e11, value=200_000_000.0, step=10_000_000.0))
-MIN_MV = float(st.sidebar.number_input("最小市值（元）", min_value=1e7, max_value=1e12, value=20_0000_0000.0, step=1e7))
-MAX_MV = float(st.sidebar.number_input("最大市值（元）", min_value=1e8, max_value=1e13, value=500_0000_00000.0, step=1e8))
-
-EXCLUDE_DOUBLE_10_20 = st.sidebar.checkbox("排除过去10-20天内翻倍", value=True)
-EXCLUDE_HIGH_ACCEL = st.sidebar.checkbox("排除短期连续高加速（3日内连续放量大涨）", value=True)
-
-st.sidebar.markdown("---")
-st.sidebar.header("因子权重（默认强化行业与技术）")
-w_pct = st.sidebar.slider("短期涨幅强度", 0.0, 1.0, 0.16)
-w_volratio = st.sidebar.slider("量比（放量）", 0.0, 1.0, 0.14)
-w_turn = st.sidebar.slider("成交额/活跃度", 0.0, 1.0, 0.12)
-w_money = st.sidebar.slider("主力资金", 0.0, 1.0, 0.10)
-w_ind = st.sidebar.slider("行业强度（提升）", 0.0, 1.0, 0.30)
-w_tech = st.sidebar.slider("技术形态（MACD/RSI/形态）", 0.0, 1.0, 0.18)
-
-total_w = w_pct + w_volratio + w_turn + w_money + w_ind + w_tech
-if total_w == 0:
-    st.sidebar.error("权重总和不可为0")
-    st.stop()
-w_pct /= total_w; w_volratio /= total_w; w_turn /= total_w; w_money /= total_w; w_ind /= total_w; w_tech /= total_w
-
-st.sidebar.markdown("---")
-st.sidebar.markdown("说明：若 moneyflow/daily_basic/stock_basic 某些字段缺失，脚本自动降级并提示。")
-
-# ---------------------------
-# Get last trade day & market
-# ---------------------------
-with st.spinner("获取最近交易日..."):
+with st.spinner("获取最近交易日与当日日线快照（用于粗筛）..."):
     last_trade = get_last_trade_day(pro, max_days=14)
 if not last_trade:
     st.error("无法获取最近交易日，请检查 Token 或网络")
     st.stop()
-st.info(f"参考最近交易日：{last_trade}")
+st.info(f"参考交易日（用于初筛）：{last_trade}")
 
+# load market daily snapshot (this is a single API call)
 @st.cache_data(ttl=60)
 def load_market_daily(trade_date):
     try:
@@ -161,399 +124,340 @@ def load_market_daily(trade_date):
         return pd.DataFrame()
 
 market_df = load_market_daily(last_trade)
-market_df, _ = check_and_fill_data(market_df, ['ts_code','pct_chg','vol','amount','open','high','low','pre_close','close'])
-if market_df.empty:
-    st.error("无法获取当日行情或数据为空")
+if market_df is None or market_df.empty:
+    st.error("读取当日日线失败（可能权限不足）——脚本无法继续")
     st.stop()
-st.write(f"当日记录数：{len(market_df)}（从涨幅榜前 {INITIAL_TOP_N} 初筛）")
+st.write(f"市场日线记录数（参考）：{len(market_df)}，将从涨幅榜前 {INITIAL_TOP_N} 初筛以减少实时请求")
 
 # ---------------------------
-# stock_basic / daily_basic / moneyflow safe
+# Step 1: initial top N from day snapshot (fast)
 # ---------------------------
+initial_pool = market_df.sort_values('pct_chg', ascending=False).head(int(INITIAL_TOP_N)).copy().reset_index(drop=True)
+
+# attach basic info if available (stock_basic)
 def try_get_stock_basic():
     try:
-        return pro.stock_basic(list_status='L', fields='ts_code,symbol,name,market,industry,list_date')
+        df = pro.stock_basic(list_status='L', fields='ts_code,name,market,industry,list_date,total_mv,circ_mv')
+        return df.drop_duplicates(subset=['ts_code'])
     except Exception:
         try:
-            return pro.stock_basic(list_status='L')
+            df = pro.stock_basic(list_status='L')
+            return df.drop_duplicates(subset=['ts_code'])
         except Exception:
             return pd.DataFrame()
 
 stock_basic_df = try_get_stock_basic()
-stock_basic_df, missing_sb = check_and_fill_data(stock_basic_df, ['ts_code','name','industry'])
-if missing_sb:
-    st.warning(f"stock_basic 缺失列：{missing_sb}，行业/名称可能受限，相关因子将自动降级。")
-
-def try_get_daily_basic(trade_date):
-    try:
-        return pro.daily_basic(trade_date=trade_date, fields='ts_code,turnover_rate,amount,total_mv,circ_mv,pe,pb')
-    except Exception:
-        return None
-
-def try_get_moneyflow(trade_date):
-    try:
-        mf = pro.moneyflow(trade_date=trade_date)
-        for col in ['net_mf','net_mf_amount','net_amount']:
-            if col in mf.columns:
-                mf = mf[['ts_code', col]].drop_duplicates(subset=['ts_code']).set_index('ts_code')
-                mf.columns = ['net_mf']
-                return mf
-        return None
-    except Exception:
-        return None
-
-daily_basic_df = try_get_daily_basic(last_trade)
-if daily_basic_df is None:
-    st.warning("daily_basic 不可用，换手/市值/PE 等因子将被降级或用近似替代。")
-
-moneyflow_df = try_get_moneyflow(last_trade)
-if moneyflow_df is None:
-    st.warning("moneyflow 不可用，主力资金因子将被禁用。")
-
-# ---------------------------
-# initial pool
-# ---------------------------
-pool = market_df.sort_values('pct_chg', ascending=False).head(int(INITIAL_TOP_N)).copy().reset_index(drop=True)
-
-# safe merge stock_basic
-need_cols = ['ts_code','name','industry']
-actual_cols = stock_basic_df.columns.tolist() if not stock_basic_df.empty else []
-use_cols = [c for c in need_cols if c in actual_cols]
-if 'ts_code' in use_cols and len(use_cols)>0:
-    pool = pool.merge(stock_basic_df[use_cols], on='ts_code', how='left')
+if not stock_basic_df.empty:
+    # merge safely
+    cols = [c for c in ['ts_code','name','industry','total_mv','circ_mv'] if c in stock_basic_df.columns]
+    initial_pool = initial_pool.merge(stock_basic_df[cols], on='ts_code', how='left')
 else:
-    pool['name'] = pool['ts_code']
-    pool['industry'] = ""
+    initial_pool['name'] = initial_pool['ts_code']
+    initial_pool['industry'] = ""
 
-# join daily_basic if available
-if daily_basic_df is not None:
-    try:
-        db = daily_basic_df.drop_duplicates(subset=['ts_code']).set_index('ts_code')
-        pool = pool.set_index('ts_code').join(db[['turnover_rate','amount','total_mv','circ_mv']].rename(columns={'turnover_rate':'turnover_rate_db','amount':'amount_db'}), how='left').reset_index()
-    except Exception:
-        pool['turnover_rate_db'] = np.nan; pool['amount_db'] = np.nan
-else:
-    pool['turnover_rate_db'] = np.nan; pool['amount_db'] = np.nan
-
-# join moneyflow if available
-if moneyflow_df is not None:
-    try:
-        pool = pool.set_index('ts_code').join(moneyflow_df[['net_mf']], how='left').reset_index()
-    except Exception:
-        pool['net_mf'] = 0.0
-else:
-    pool['net_mf'] = 0.0
-
-pool, _ = check_and_fill_data(pool, ['ts_code','pct_chg','vol','amount','open','high','low','pre_close','close','name','industry','turnover_rate_db','net_mf'])
+# limit to FINAL_POOL by pct_chg to reduce realtime calls further
+initial_pool = initial_pool.sort_values('pct_chg', ascending=False).head(int(FINAL_POOL)).reset_index(drop=True)
+st.write(f"初筛并限制后候选数量（将做实时/分钟更新）：{len(initial_pool)}")
 
 # ---------------------------
-# cleaning with stronger hard filters
+# Step 2: attempt to fetch realtime snapshots for candidates
 # ---------------------------
-cleaned = []
-for idx, r in pool.iterrows():
-    try:
-        vol = safe_float(r.get('vol', 0)); amt = safe_float(r.get('amount', 0))
-        if vol == 0 or (amt == 0 or np.isnan(amt)):
-            continue
-        # amount normalization
-        if amt > 0 and amt < 1e5:
-            amt *= 10000
-        if amt < MIN_AMOUNT:
-            continue
-        price = safe_float(r.get('close', np.nan))
-        if np.isnan(price): continue
-        if price < MIN_PRICE or price > MAX_PRICE: continue
-        # name filter
-        name = r.get('name','')
-        if isinstance(name, str) and name != "":
-            if 'ST' in name.upper() or '退' in name:
-                continue
-        # market cap
-        tv = r.get('total_mv', np.nan)
+use_realtime = True
+realtime_available = True
+realtime_fail_reasons = []
+realtime_records = []
+
+# We'll try two strategies:
+# 1) Use pro.rt_min to fetch 1-minute bars for chunks (preferred for multi-code)
+# 2) If rt_min unavailable, fall back to per-code realtime_quote (slower)
+codes = initial_pool['ts_code'].astype(str).tolist()
+
+st.info("开始获取盘中/分钟级数据（若权限不够将回退到日线）...")
+progress = st.progress(0)
+chunk_size = 80  # rt_min may limit; smaller chunk if errors
+all_minute_frames = {}
+
+try:
+    # first try batch rt_min for all codes (may fail if no permission)
+    # we fetch 1MIN for each code in chunks to avoid too large requests
+    for i in range(0, len(codes), chunk_size):
+        chunk = codes[i:i+chunk_size]
         try:
-            tvf = float(tv)
-            if tvf > 1e6:
-                tv_yuan = tvf * 10000
-            else:
-                tv_yuan = tvf
-            if not np.isnan(tv_yuan):
-                if tv_yuan < MIN_MV or tv_yuan > MAX_MV:
-                    continue
-        except:
-            pass
-        # exclude one-word boards
-        try:
-            if (safe_float(r.get('open',0)) == safe_float(r.get('high',0)) == safe_float(r.get('low',0)) == safe_float(r.get('pre_close',0))):
-                continue
-        except:
-            pass
-        cleaned.append(r)
-    except Exception:
-        continue
+            rt = try_rt_min(pro, chunk, freq='1MIN')
+            if rt is None or rt.empty:
+                raise RuntimeError("rt_min returned empty or None")
+            # rt likely contains multi-code minute lines. Ensure structure.
+            # Save per-code tail minute frame
+            for code in chunk:
+                sub = rt[rt['ts_code'] == code].sort_values('trade_time').reset_index(drop=True) if 'ts_code' in rt.columns else pd.DataFrame()
+                all_minute_frames[code] = sub
+        except Exception:
+            # if any chunk fails, flag and break to fallback
+            realtime_available = False
+            realtime_fail_reasons.append("rt_min 批量请求失败或无权限")
+            break
+except Exception:
+    realtime_available = False
+    realtime_fail_reasons.append("rt_min 全局异常")
 
-cleaned_df = pd.DataFrame(cleaned).reset_index(drop=True)
-st.write(f"清洗后候选：{len(cleaned_df)}（从中取涨幅前 {FINAL_POOL} 进入评分）")
-if cleaned_df.empty:
-    st.error("清洗后无候选，请放宽条件或检查 Token 权限")
-    st.stop()
-
-# reduce to FINAL_POOL
-cleaned_df = cleaned_df.sort_values('pct_chg', ascending=False).head(int(FINAL_POOL)).reset_index(drop=True)
-st.write(f"评分池大小：{len(cleaned_df)}")
-
-# ---------------------------
-# history with caching
-# ---------------------------
-@st.cache_data(ttl=600)
-def get_hist(ts_code, end_date, days=80):
+if not realtime_available:
+    # fallback to per-code realtime_quote (slower, but sometimes available)
+    per_code_frames = {}
     try:
-        start_date = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=days*2)).strftime("%Y%m%d")
-        df = pro.daily(ts_code=ts_code, start_date=start_date, end_date=end_date)
-        if df is None or df.empty: return None
-        df = df.sort_values('trade_date').reset_index(drop=True)
-        return df
+        for idx, code in enumerate(codes):
+            dfrt = try_realtime_quote(pro, code, src='sina')
+            # realtime_quote returns one-row snapshot; we wrap it as a tiny DataFrame with timestamp
+            if dfrt is not None and not dfrt.empty:
+                per_code_frames[code] = dfrt.reset_index(drop=True)
+            # update progress
+            progress.progress((idx+1)/len(codes))
+            time.sleep(0.05)  # small sleep to avoid throttle
+        if len(per_code_frames) == 0:
+            realtime_available = False
+            realtime_fail_reasons.append("realtime_quote 单票接口不可用或返回空")
+        else:
+            realtime_available = True
+            all_minute_frames = {}  # we will rely on per_code_frames
     except Exception:
-        return None
+        realtime_available = False
+        realtime_fail_reasons.append("realtime_quote 逐票请求失败")
+else:
+    progress.progress(1.0)
+
+# If still not realtime_available, we will fall back to daily history per code
+if not realtime_available:
+    st.warning("实时 API 不可用或权限受限： " + "; ".join(realtime_fail_reasons))
+    st.info("脚本将使用日线历史做近似盘中判断（结果会与真实盘中不同）")
 
 # ---------------------------
-# scoring loop v3.5
+# Step 3: build candidate records using best-available data
 # ---------------------------
 records = []
+N = len(initial_pool)
 pbar = st.progress(0)
-N = len(cleaned_df)
-for i, row in enumerate(cleaned_df.itertuples()):
-    try:
-        ts_code = getattr(row,'ts_code'); pct_chg = safe_float(getattr(row,'pct_chg',0))
-        amount_val = safe_float(getattr(row,'amount',0))
-        if amount_val >0 and amount_val < 1e5: amount_val *= 10000
+for i, row in enumerate(initial_pool.itertuples()):
+    ts = getattr(row, 'ts_code')
+    name = getattr(row, 'name', ts)
+    industry = getattr(row, 'industry', '')
+    # base daily fields
+    pct_chg = safe_float(getattr(row, 'pct_chg', 0))
+    amount_day = safe_float(getattr(row, 'amount', 0))
+    if amount_day > 0 and amount_day < 1e5: amount_day *= 10000
 
-        hist = get_hist(ts_code, last_trade, days=80)
-        # initialize defaults
-        vol_ratio = np.nan; ma5 = np.nan; ma10 = np.nan; ten_return = np.nan; twenty_return = np.nan
-        macd_score = 0.5; rsi_score = 0.5; atr_ratio = np.nan; trend_ok = False; exclude_double = False; high_accel = False
+    # try to obtain minute-level info if available
+    vol_ratio = np.nan
+    recent_price = np.nan
+    turnover_now = np.nan
+    atr_ratio = np.nan
+    ma_short = np.nan
+    ma_long = np.nan
+    trend_ok = False
+    ten_return = np.nan
+    net_mf = 0.0
 
-        if hist is None or len(hist) < 15:
-            # fallback neutral (but still keep filtering by amt/price)
-            pass
-        else:
-            hist = hist.reset_index(drop=True)
-            tail = hist.tail(30).reset_index(drop=True)
-            # ATR
-            atr_df = calculate_atr(tail, period=14)
-            atr = atr_df['ATR'].iloc[-1] if 'ATR' in atr_df.columns else np.nan
+    # preferred: minute bars from rt_min
+    if realtime_available and ts in all_minute_frames and not all_minute_frames[ts].empty:
+        mdf = all_minute_frames[ts].copy()
+        # try fields: 'close','vol','amount' or 'trade' names depending on rt_min output
+        # normalize column names
+        if 'close' not in mdf.columns and 'price' in mdf.columns:
+            mdf = mdf.rename(columns={'price':'close'})
+        if 'vol' not in mdf.columns and 'volume' in mdf.columns:
+            mdf = mdf.rename(columns={'volume':'vol'})
+        if 'amount' not in mdf.columns and 'money' in mdf.columns:
+            mdf = mdf.rename(columns={'money':'amount'})
 
-            price_now = safe_float(tail['close'].iloc[-1])
-            atr_ratio = atr / price_now if (not np.isnan(atr) and price_now>0) else np.nan
-
-            # vol ratio (today / prev5 avg)
-            vols = tail['vol'].astype(float).tolist()
-            if len(vols) >= 6:
-                avg5 = np.mean(vols[-6:-1])
-                vol_ratio = vols[-1] / (avg5 + 1e-9)
-            else:
-                vol_ratio = np.nan
-
-            # ma5/ma10 & returns
-            close_series = tail['close'].astype(float)
-            if len(close_series) >=5: ma5 = close_series.rolling(window=5).mean().iloc[-1]
-            if len(close_series) >=10: ma10 = close_series.rolling(window=10).mean().iloc[-1]
-            if len(close_series) >=10: ten_return = float(close_series.iloc[-1]) / float(close_series.iloc[0]) - 1.0
-            if len(close_series) >=20: twenty_return = float(close_series.iloc[-1]) / float(close_series.iloc[0]) - 1.0
-
-            # exclude double
-            if EXCLUDE_DOUBLE_10_20 and ( (not np.isnan(ten_return) and ten_return >= 1.0) or (not np.isnan(twenty_return) and twenty_return >= 1.0) ):
-                exclude_double = True
-
-            # detect high acceleration: last 3 days all big pct_chg > threshold AND vol_ratio > threshold
-            if EXCLUDE_HIGH_ACCEL:
-                tail_pct = tail['close'].pct_change().fillna(0).replace([np.inf,-np.inf],0).tolist()
-                recent_pct3 = tail_pct[-3:] if len(tail_pct) >=3 else []
-                if len(recent_pct3) == 3 and all([p > 0.08 for p in recent_pct3]) and not np.isnan(vol_ratio) and vol_ratio > 3:
-                    high_accel = True
-
-            # trend quality: last5 lows avg > prev5 lows avg
-            lows = tail['low'].astype(float).tolist()
-            trend_ok = False
-            if len(lows) >= 10:
-                prev5 = lows[-10:-5]; last5 = lows[-5:]
-                if np.nanmean(last5) > np.nanmean(prev5):
-                    trend_ok = True
-
-            # MACD/RSI scoring
-            macd_tail = calculate_macd(tail, close_col='close')
-            dif = macd_tail['DIF'].iloc[-1]; dea = macd_tail['DEA'].iloc[-1]; macd_hist = macd_tail['MACD_HIST'].iloc[-1]
-            # MACD rules
-            if dif > dea and macd_hist > 0:
-                macd_score = 1.0
-            elif dif > dea and macd_hist <= 0:
-                macd_score = 0.8
-            elif dif <= dea and macd_hist > 0:
-                macd_score = 0.6
-            else:
-                macd_score = 0.2
-
-            rsi_tail = calculate_rsi(tail, close_col='close', period=6)
-            rsi6 = rsi_tail['RSI_6'].iloc[-1] if 'RSI_6' in rsi_tail.columns else 50.0
-            # RSI rules tuned for short-term
-            if 55 <= rsi6 <= 70:
-                rsi_score = 1.0
-            elif 45 <= rsi6 < 55:
-                rsi_score = 0.75
-            elif 40 <= rsi6 < 45:
-                rsi_score = 0.5
-            elif rsi6 > 70:
-                rsi_score = 0.3
-            else:
-                rsi_score = 0.15
-
-        # hard exclusions post-history
-        if exclude_double:
-            continue
-        if high_accel:
-            # skip immediate chase of extreme加速
-            continue
-        # ATR absolute filtering (exclude extreme vols)
-        if not np.isnan(atr_ratio):
-            if atr_ratio > 0.12:  # >12% daily volatility is too insane
-                continue
-            if atr_ratio < 0.0025:  # <0.25% too sleepy
-                continue
-
-        # compose record
-        net_mf = 0.0
+        if 'close' in mdf.columns and len(mdf) >= 3:
+            recent_price = safe_float(mdf['close'].iloc[-1])
+            # compute simple MA on minute closes (short 5, long 15)
+            closes = mdf['close'].astype(float)
+            if len(closes) >= 5: ma_short = float(closes.rolling(window=5).mean().iloc[-1])
+            if len(closes) >= 15: ma_long = float(closes.rolling(window=15).mean().iloc[-1])
+            # ATR on minute
+            try:
+                highs = mdf['high'].astype(float) if 'high' in mdf.columns else closes
+                lows = mdf['low'].astype(float) if 'low' in mdf.columns else closes
+                prev = closes.shift(1)
+                tr = pd.concat([highs - lows, (highs - prev).abs(), (lows - prev).abs()], axis=1).max(axis=1)
+                atr = tr.ewm(span=14, adjust=False).mean().iloc[-1]
+                if recent_price > 0: atr_ratio = float(atr) / recent_price
+            except Exception:
+                atr_ratio = np.nan
+            # vol ratio: current minute vol vs prev 5-min avg (if vol column exists)
+            if 'vol' in mdf.columns:
+                vols = mdf['vol'].astype(float).tolist()
+                if len(vols) >= 6:
+                    avg5 = np.mean(vols[-6:-1])
+                    vol_ratio = vols[-1] / (avg5 + 1e-9)
+            # trend: last 5 lows vs previous 5 lows
+            if 'low' in mdf.columns:
+                lows = mdf['low'].astype(float).tolist()
+                if len(lows) >= 10:
+                    if np.nanmean(lows[-5:]) > np.nanmean(lows[-10:-5]): trend_ok = True
+        # attempt to get minute-based pct change if available
+        if 'pct_chg' in mdf.columns:
+            pct_chg = safe_float(mdf['pct_chg'].iloc[-1])
+    else:
+        # fallback: try per-code realtime_quote snapshot
         try:
-            if moneyflow_df is not None and ts_code in moneyflow_df.index:
-                net_mf = float(moneyflow_df.loc[ts_code,'net_mf'])
+            r = try_realtime_quote(pro, ts, src='sina')
+            if r is not None and not r.empty:
+                # try to parse price/pct/vol/amount
+                srow = r.iloc[0]
+                # different sources have different field names; try common keys
+                recent_price = safe_float(srow.get('price', srow.get('now', srow.get('last_price', np.nan))))
+                pct_chg = safe_float(srow.get('percent', srow.get('pct_chg', pct_chg)))
+                # volume/amount fields may be named differently
+                vol = safe_float(srow.get('volume', srow.get('vol', np.nan)))
+                amount_now = safe_float(srow.get('amount', srow.get('money', np.nan)))
+                # we can't compute minute ATR/MA from single snapshot; keep as NaN
+            else:
+                # no realtime available at all — use historical daily-derived approximations
+                recent_price = safe_float(getattr(row, 'close', np.nan))
         except Exception:
-            net_mf = 0.0
+            recent_price = safe_float(getattr(row, 'close', np.nan))
 
-        records.append({
-            'ts_code': ts_code,
-            'name': getattr(row,'name',ts_code),
-            'pct_chg': pct_chg,
-            'amount': amount_val,
-            'vol_ratio': vol_ratio if not pd.isna(vol_ratio) else 1.0,
-            'turnover_rate': safe_float(getattr(row,'turnover_rate_db',np.nan)),
-            'net_mf': net_mf,
-            'ten_return': ten_return if not pd.isna(ten_return) else 0.0,
-            'ma5': ma5,
-            'ma10': ma10,
-            'macd_score': macd_score,
-            'rsi_score': rsi_score,
-            'atr_ratio': atr_ratio,
-            'trend_ok': trend_ok,
-            'price': safe_float(getattr(row,'close',np.nan)),
-            'industry': getattr(row,'industry','')
-        })
+    # if we still don't have price, use daily close
+    if math.isnan(recent_price):
+        recent_price = safe_float(getattr(row, 'close', np.nan))
+
+    # compute ten-day return using historical daily if available (best-effort)
+    try:
+        hist = try_hist_daily(pro, ts, (datetime.strptime(last_trade, "%Y%m%d") - timedelta(days=60)).strftime("%Y%m%d"), last_trade)
+        if hist is not None and len(hist) >= 10:
+            hclose = hist.sort_values('trade_date')['close'].astype(float).reset_index(drop=True)
+            ten_return = float(hclose.iloc[-1]) / float(hclose.iloc[-10]) - 1.0
     except Exception:
+        ten_return = np.nan
+
+    # net_mf (moneyflow) if available from daily moneyflow (fallback)
+    try:
+        mf = pro.moneyflow(trade_date=last_trade) if 'pro' in globals() else None
+        if mf is not None and 'net_mf' in mf.columns:
+            mf_sub = mf[mf['ts_code'] == ts]
+            if not mf_sub.empty:
+                net_mf = safe_float(mf_sub.iloc[0]['net_mf'])
+    except Exception:
+        # ignore moneyflow failure (permissions)
+        net_mf = 0.0
+
+    # price bounds and amount/day checks (hard filters)
+    if recent_price < MIN_PRICE or recent_price > MAX_PRICE:
+        pbar.progress((i+1)/N)
         continue
-    pbar.progress((i+1)/N if N>0 else 1.0)
+    if amount_day > 0 and amount_day < MIN_AMOUNT:
+        pbar.progress((i+1)/N)
+        continue
+
+    # exclude 10-20 day doubling if requested
+    if EXCLUDE_DOUBLE_10_20 and not math.isnan(ten_return) and ten_return >= 1.0:
+        pbar.progress((i+1)/N)
+        continue
+
+    # ATR-based filters (if available)
+    if not math.isnan(atr_ratio):
+        if atr_ratio > 0.12 or atr_ratio < 0.0025:
+            pbar.progress((i+1)/N)
+            continue
+
+    # immediate high-accel exclusion: if today's pct_chg > 8% and vol_ratio huge and EXCLUDE_IMMEDIATE_CHASE
+    if EXCLUDE_IMMEDIATE_CHASE and pct_chg is not None and pct_chg > 8 and (not math.isnan(vol_ratio) and vol_ratio > 3):
+        pbar.progress((i+1)/N)
+        continue
+
+    records.append({
+        'ts_code': ts,
+        'name': name,
+        'industry': industry,
+        'price': recent_price,
+        'pct_chg': pct_chg,
+        'vol_ratio': vol_ratio if not math.isnan(vol_ratio) else np.nan,
+        'turnover_rate': turnover_now,
+        'net_mf': net_mf,
+        'amount_day': amount_day,
+        'ma_short': ma_short,
+        'ma_long': ma_long,
+        'atr_ratio': atr_ratio,
+        'ten_return': ten_return,
+        'trend_ok': trend_ok
+    })
+    pbar.progress((i+1)/N)
 
 pbar.progress(1.0)
+if len(records) == 0:
+    st.error("实时/回退筛选后无候选，请放宽条件或确认接口权限")
+    st.stop()
+
 score_df = pd.DataFrame(records)
-if score_df.empty:
-    st.error("评分后无候选（可能被严格过滤或历史数据不足），请放宽条件或检查接口权限。")
-    st.stop()
 
 # ---------------------------
-# industry strength & enforce mainline
+# Step 4: scoring (real-time aware)
 # ---------------------------
-if 'industry' in score_df.columns and score_df['industry'].notnull().any():
-    ind_mean = score_df.groupby('industry')['pct_chg'].transform('mean')
-    score_df['industry_score'] = (ind_mean - ind_mean.min()) / (ind_mean.max() - ind_mean.min() + 1e-9)
-    score_df['industry_score'] = score_df['industry_score'].fillna(0.0)
-    # industry ranking percentile
-    ind_pct = score_df.groupby('industry')['pct_chg'].transform(lambda x: pd.Series(x).rank(pct=True).values)
-    # If industry_score is very low (bottom 50%), treat as weak; we will penalize later
-else:
-    score_df['industry_score'] = 0.0
-    st.warning("行业数据不可用或为空，行业因子将被禁用（降权）")
-
-# ---------------------------
-# normalize & penalties
-# ---------------------------
-score_df['pct_rank'] = norm_series(score_df['pct_chg'])
-score_df['vol_rank'] = norm_series(score_df['vol_ratio'].replace([np.inf,-np.inf],np.nan).fillna(0))
-score_df['turn_rank'] = norm_series(score_df['turnover_rate'].fillna(0))
+# normalize subfactors (fillna with conservative defaults)
+score_df['pct_rank'] = norm_series(score_df['pct_chg'].fillna(0))
+score_df['volrank'] = norm_series(score_df['vol_ratio'].fillna(0))
+score_df['amt_rank'] = norm_series(score_df['amount_day'].fillna(0))
 score_df['money_rank'] = norm_series(score_df['net_mf'].fillna(0))
-score_df['tech_rank'] = norm_series(score_df['macd_score'] * 0.65 + score_df['rsi_score'] * 0.35)
-score_df['industry_rank'] = norm_series(score_df['industry_score'].fillna(0))
+score_df['trend_rank'] = norm_series((score_df['ma_short'].fillna(0) - score_df['ma_long'].fillna(0)).fillna(0))
+score_df['atr_penalty'] = score_df['atr_ratio'].fillna(0).apply(lambda x: 1.0 if 0.0025 <= x <= 0.12 else 0.85)
 
-# trend bonus (must be true or small penalty)
-score_df['trend_bonus'] = score_df['trend_ok'].apply(lambda x: 1.0 if x else 0.6)
+# weights tuned for intraday shortline
+w_pct = 0.20
+w_vol = 0.18
+w_amt = 0.15
+w_money = 0.10
+w_trend = 0.22
+w_extra = 0.15  # safety / atr / trend_ok multiplier
 
-# industry enforcement: if industry's mean is low, apply heavy penalty
-if 'industry' in score_df.columns and score_df['industry'].notnull().any():
-    # compute industry mean pct by group
-    ind_group_mean = score_df.groupby('industry')['pct_chg'].transform('mean')
-    # industry percentile
-    ind_rank = norm_series(ind_group_mean)
-    # if ind_rank < 0.4 penalize heavily
-    score_df['industry_penalty'] = score_df['industry_score'].apply(lambda x: 1.0 if x >= np.nanpercentile(score_df['industry_score'].fillna(0), 40) else 0.6)
-else:
-    score_df['industry_penalty'] = 1.0
-    w_ind = 0.0  # disable industry weight if no data
-
-# disable money factor if no data
-if moneyflow_df is None:
-    w_money = 0.0
-
-# re-normalize weights if any disabled
-total_w = w_pct + w_volratio + w_turn + w_money + w_ind + w_tech
-if total_w == 0:
-    st.error("所有因子被禁用，无法评分")
-    st.stop()
-w_pct /= total_w; w_volratio /= total_w; w_turn /= total_w; w_money /= total_w; w_ind /= total_w; w_tech /= total_w
-
-# compose final score
-score_df['综合评分_raw'] = (
+# compute raw score
+score_df['score_raw'] = (
     score_df['pct_rank'] * w_pct +
-    score_df['vol_rank'] * w_volratio +
-    score_df['turn_rank'] * w_turn +
+    score_df['volrank'] * w_vol +
+    score_df['amt_rank'] * w_amt +
     score_df['money_rank'] * w_money +
-    score_df['industry_rank'] * w_ind +
-    score_df['tech_rank'] * w_tech
+    score_df['trend_rank'] * w_trend
 )
 
-# apply trend & industry multipliers and small ATR smoothing
-score_df['综合评分'] = score_df['综合评分_raw'] * score_df['trend_bonus'] * score_df['industry_penalty']
-score_df['综合评分'] = score_df['综合评分'] * (1 - 0.08 * (1 - np.tanh(10 * (score_df['atr_ratio'].fillna(0.01)-0.01))))
+# apply multipliers
+score_df['trend_mult'] = score_df['trend_ok'].apply(lambda x: 1.0 if x else 0.8)
+score_df['score'] = score_df['score_raw'] * score_df['trend_mult'] * score_df['atr_penalty']
 
-score_df = score_df.sort_values('综合评分', ascending=False).reset_index(drop=True)
+# industry boost: compute industry mean pct in current pool and boost top industries slightly
+ind_mean = score_df.groupby('industry')['pct_chg'].transform('mean').fillna(0)
+score_df['industry_rank'] = norm_series(ind_mean)
+score_df['score'] = score_df['score'] * (1 + 0.15 * score_df['industry_rank'])
+
+# final sort & display
+score_df = score_df.sort_values('score', ascending=False).reset_index(drop=True)
 score_df.index += 1
 
-# ---------------------------
-# Output Top K
-# ---------------------------
-display_cols = ['name','ts_code','综合评分','pct_chg','vol_ratio','turnover_rate','net_mf','amount','price','ma5','ma10','ten_return','atr_ratio','industry','trend_ok']
+st.success(f"实时评分完成（模式：{'实时' if realtime_available else '日线回退'}），候选 {len(score_df)} 支，展示 Top {min(TOP_K, len(score_df))}")
+display_cols = ['name','ts_code','score','pct_chg','vol_ratio','amount_day','price','ma_short','ma_long','atr_ratio','industry','trend_ok']
 for c in display_cols:
     if c not in score_df.columns:
         score_df[c] = np.nan
 
-st.success(f"评分完成，候选 {len(score_df)} 支，展示 Top {min(TOP_K, len(score_df))}（按综合评分降序）")
 st.dataframe(score_df[display_cols].head(int(TOP_K)).reset_index(drop=False), use_container_width=True)
 
-# CSV download
-csv = score_df[display_cols].to_csv(index=True, encoding='utf-8-sig')
-st.download_button("下载全部评分结果 CSV", data=csv, file_name=f"score_result_{last_trade}.csv", mime="text/csv")
-
-# explain top picks
+# Reasons / quick notes for top picks
 st.markdown("### Top 候选说明（示例）")
-top_show = score_df.head(int(TOP_K))
-for idx, r in top_show.reset_index().iterrows():
+for idx, r in score_df.head(int(TOP_K)).reset_index().iterrows():
     reasons = []
-    if r['pct_chg'] > 5: reasons.append("当日强势")
-    if r['vol_ratio'] and r['vol_ratio'] > 1.5: reasons.append("放量")
-    if r['ma5'] and r['price'] > r['ma5']: reasons.append("站上短均")
-    if r['atr_ratio'] and 0.003 <= r['atr_ratio'] <= 0.06: reasons.append("波动适中")
-    if r['net_mf'] and r['net_mf'] > 0: reasons.append("主力净流入")
-    if r['trend_ok']: reasons.append("低点抬升（趋势质量好）")
-    st.write(f"{int(r['index'])}. {r['name']} ({r['ts_code']}) — Score {r['综合评分']:.4f} — {'；'.join(reasons) if reasons else '常规强势'}")
+    if r['pct_chg'] and r['pct_chg'] > 5: reasons.append("当日强势")
+    if not math.isnan(r['vol_ratio']) and r['vol_ratio'] > 1.5: reasons.append("当前分钟放量")
+    if r['ma_short'] and r['price'] > r['ma_short']: reasons.append("站上短均（分钟）")
+    if r['atr_ratio'] and 0.0025 <= r['atr_ratio'] <= 0.06: reasons.append("波动适中")
+    st.write(f"{int(r['index'])}. {r['name']} ({r['ts_code']}) — Score {r['score']:.4f} — {'；'.join(reasons) if reasons else '常规'}")
 
-st.markdown("### 小结与建议")
+# CSV download
+csv = score_df.to_csv(index=True, encoding='utf-8-sig')
+st.download_button("下载全部评分结果 CSV", data=csv, file_name=f"realtime_score_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", mime="text/csv")
+
+# final note
+st.markdown("### 说明与提示")
 st.markdown("""
-- v3.5 为 1–5 天短线做了强过滤：成交额硬过滤、趋势与形态硬要求、行业主线强制、ATR 波动过滤、翻倍/极端加速剔除。  
-- 若某接口缺失（例如 moneyflow/daily_basic），脚本会自动降级并提示；核心仍基于 daily 与历史日线。  
-- 建议每日早盘 9:30-10:15 运行一次；若看到连续高加速的票（被排除），等回调缩量再做观察。  
-- 想微调偏好（更偏保守或更偏激进），告诉我具体指标我直接帮你改。  
+- 本版优先使用实时接口（rt_min / realtime_quote）。若你看到页面顶部警告，说明实时接口不可用并已回退为日线近似。  
+- 实时接口权限受 Tushare 积分/分钟频次限制影响。若频次受限，建议把 INITIAL_TOP_N 减小到 300 或 200，以降低实时请求量。  
+- 推荐场景：**9:40 - 10:10** 之间运行可获得最佳短线候选（既避开开盘噪声，又抓到真实早盘资金方向）。  
+- 若你希望我把结果自动每 X 秒刷新并高亮新入榜票（自动监控模式），告诉我我会给你一个可配置的自动刷新版本（注意频次受限）。  
 """)
