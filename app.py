@@ -1,12 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 短线王 · V5.0 双模型自动切换（Ultimate 满血版，适配 10000 积分）
-目标：面向 1-3 天短线，自动根据盘面切换“右侧趋势模型”与“弱势反转模型”。
-说明：
- - 运行：streamlit run app.py
- - 启动后在界面输入 Tushare Token（仅本次会话使用，不保存）
- - 适配 10000 积分特色接口（moneyflow 可用则启用主力因子；筹码/forecast 若不可用则自动降级）
- - 自动降级、容错、缓存、可设置多次运行（建议每天 4-5 次）
+说明：修复了 Streamlit 缓存相关 UnhashableParamError（不再把 pro 作为缓存参数）。
+运行：streamlit run app.py
 """
 import streamlit as st
 import tushare as ts
@@ -22,7 +18,7 @@ warnings.filterwarnings("ignore")
 # APP CONFIG
 # ---------------------------
 st.set_page_config(page_title="短线王 · V5.0 双模型", layout="wide")
-st.title("短线王 · V5.0 双模型自动切换（Ultmate · 10000积分）")
+st.title("短线王 · V5.0 双模型自动切换（Ultimate · 10000积分）")
 
 # ---------------------------
 # User inputs
@@ -61,7 +57,6 @@ exclude_recent_accel = st.sidebar.checkbox("排除极端短期暴涨（3日>8% �
 
 st.sidebar.markdown("---")
 st.sidebar.header("因子权重（可微调）")
-# Base weights; normalized later
 weights = {
     'pct': st.sidebar.slider("当日涨幅权重", 0.0, 1.0, 0.12),
     'mf': st.sidebar.slider("主力资金权重", 0.0, 1.0, 0.18),
@@ -97,17 +92,21 @@ def norm_series(s):
         return pd.Series(np.ones(len(s))*0.5, index=s.index)
     return (s - mn) / (mx - mn)
 
+# --- IMPORTANT: do NOT pass 'pro' into cached functions (pro is unhashable) ---
 @st.cache_data(ttl=600)
-def get_last_trade_day(pro_obj, max_days=14):
+def get_last_trade_day(max_days=14):
+    """
+    Use global pro inside. Returns a string like 'YYYYMMDD' or None.
+    """
     today = datetime.now()
     for i in range(0, max_days):
         d = today - timedelta(days=i)
         ds = d.strftime("%Y%m%d")
         try:
-            dd = pro_obj.daily(trade_date=ds)
+            dd = pro.daily(trade_date=ds)
             if dd is not None and len(dd) > 0:
                 return ds
-        except:
+        except Exception:
             continue
     return None
 
@@ -115,7 +114,7 @@ def get_last_trade_day(pro_obj, max_days=14):
 def load_market_daily(trade_date):
     try:
         return pro.daily(trade_date=trade_date)
-    except:
+    except Exception:
         return pd.DataFrame()
 
 @st.cache_data(ttl=600)
@@ -123,17 +122,17 @@ def get_stock_basic():
     try:
         df = pro.stock_basic(list_status='L', fields='ts_code,name,market,industry,list_date,total_mv,circ_mv')
         return df.drop_duplicates(subset=['ts_code'])
-    except:
+    except Exception:
         try:
             return pro.stock_basic(list_status='L')
-        except:
+        except Exception:
             return pd.DataFrame()
 
 @st.cache_data(ttl=600)
 def get_daily_basic(trade_date):
     try:
         return pro.daily_basic(trade_date=trade_date, fields='ts_code,turnover_rate,amount,total_mv,circ_mv,pe,pb')
-    except:
+    except Exception:
         return None
 
 @st.cache_data(ttl=600)
@@ -148,16 +147,20 @@ def get_moneyflow(trade_date):
                 tmp.columns = ['net_mf']
                 return tmp
         return None
-    except:
+    except Exception:
         return None
 
-@st.cache_data(ttl=600)
+# remove caching from special api call to avoid hashing kwargs issues
 def try_special_api(api_name, **kwargs):
+    """
+    Try specialty APIs (like chips/distribution/forecast) if available in pro.
+    Returns DataFrame or None.
+    """
     try:
         if hasattr(pro, api_name):
             func = getattr(pro, api_name)
             return func(**kwargs)
-    except:
+    except Exception:
         return None
     return None
 
@@ -173,7 +176,7 @@ def get_hist(ts_code, end_date, days=90):
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors='coerce')
         return df
-    except:
+    except Exception:
         return None
 
 # ---------------------------
@@ -190,7 +193,7 @@ if auto_refresh:
 # ---------------------------
 def run_pipeline():
     # 0. last trade day & market snapshot
-    last_trade = get_last_trade_day(pro, max_days=14)
+    last_trade = get_last_trade_day(max_days=14)
     if not last_trade:
         st.error("无法获取最近交易日，请检查 Token 或网络。")
         return
@@ -203,28 +206,21 @@ def run_pipeline():
     st.write(f"当日市场记录数：{len(market_df)}（将从涨幅榜前 {INITIAL_TOP_N} 进行初筛）")
 
     # 0.5 determine market state (for switching)
-    # use SSE 000001.SH or CSI 000300 as proxy if present in market_df
-    # fallback: use median pct_chg width
     market_index_pct = None
     try:
-        # try index daily
         idx = pro.index_daily(ts_code='000001.SH', trade_date=last_trade)
         if idx is not None and len(idx) > 0:
-            market_index_pct = float(idx.iloc[0]['pct_chg'])
-    except:
+            market_index_pct = float(idx.iloc[0].get('pct_chg', 0.0))
+    except Exception:
         market_index_pct = None
 
-    # fallback measure: market broadness
     try:
         up_count = (market_df['pct_chg'] > 0).sum()
         down_count = (market_df['pct_chg'] < 0).sum()
         breadth = (up_count - down_count) / (up_count + down_count + 1e-9)
-    except:
+    except Exception:
         breadth = 0.0
 
-    # decide mode: right-side (trend) or weak/reversal
-    # threshold logic: if index pct_chg >= -0.3% and breadth > -0.1 -> trend mode
-    # else weak mode
     trend_mode = True
     if market_index_pct is not None:
         if market_index_pct < -0.3 or breadth < -0.15:
@@ -246,7 +242,7 @@ def run_pipeline():
         cols = [c for c in ['ts_code','name','industry','circ_mv','total_mv'] if c in stock_basic.columns]
         try:
             pool = pool.merge(stock_basic[cols], on='ts_code', how='left')
-        except:
+        except Exception:
             pool['name'] = pool['ts_code']; pool['industry'] = ""
     else:
         pool['name'] = pool['ts_code']; pool['industry'] = ""
@@ -255,8 +251,15 @@ def run_pipeline():
     if daily_basic is not None:
         try:
             db = daily_basic.drop_duplicates(subset=['ts_code']).set_index('ts_code')
-            pool = pool.set_index('ts_code').join(db[['turnover_rate','amount','circ_mv']].rename(columns={'turnover_rate':'turnover_rate_db','amount':'amount_db'}), how='left').reset_index()
-        except:
+            join_cols = []
+            if 'turnover_rate' in db.columns: join_cols.append('turnover_rate')
+            if 'amount' in db.columns: join_cols.append('amount')
+            if 'circ_mv' in db.columns: join_cols.append('circ_mv')
+            if join_cols:
+                pool = pool.set_index('ts_code').join(db[join_cols].rename(columns={'turnover_rate':'turnover_rate_db','amount':'amount_db'}), how='left').reset_index()
+            else:
+                pool['turnover_rate_db'] = np.nan; pool['amount_db'] = np.nan
+        except Exception:
             pool['turnover_rate_db'] = np.nan; pool['amount_db'] = np.nan
     else:
         pool['turnover_rate_db'] = np.nan; pool['amount_db'] = np.nan
@@ -269,7 +272,7 @@ def run_pipeline():
     pool = pool.sort_values('pct_chg', ascending=False).head(int(FINAL_POOL)).reset_index(drop=True)
     st.write(f"初筛后候选：{len(pool)}（接下来将为每只请求历史与特色数据并计算因子）")
 
-    # try special APIs once
+    # try special APIs once (best-effort)
     special_chips = try_special_api('daily_chip', trade_date=last_trade) or try_special_api('chips_distribution', trade_date=last_trade) or None
     special_forecast = try_special_api('fina_indicator', start_date=(datetime.strptime(last_trade,"%Y%m%d")-timedelta(days=365)).strftime("%Y%m%d"), end_date=last_trade) or None
 
@@ -283,6 +286,7 @@ def run_pipeline():
         industry = getattr(r, 'industry', '') if 'industry' in pool.columns else ''
         pct_chg = safe_float(getattr(r, 'pct_chg', 0))
         amount_day = safe_float(getattr(r, 'amount_db', getattr(r, 'amount', np.nan)))
+        # normalize amount from 万元 if necessary
         if amount_day > 0 and amount_day < 1e5:
             amount_day *= 10000
         price = safe_float(getattr(r, 'close', np.nan))
@@ -340,11 +344,11 @@ def run_pipeline():
         recent = hist.tail(7).reset_index(drop=True)
         k_health = 1.0
         long_upper = False; consec_down = 0
-        for idx in range(len(recent)):
-            o = safe_float(recent.loc[idx,'open'], np.nan)
-            c = safe_float(recent.loc[idx,'close'], np.nan)
-            h = safe_float(recent.loc[idx,'high'], np.nan)
-            l = safe_float(recent.loc[idx,'low'], np.nan)
+        for idx_r in range(len(recent)):
+            o = safe_float(recent.loc[idx_r,'open'], np.nan)
+            c = safe_float(recent.loc[idx_r,'close'], np.nan)
+            h = safe_float(recent.loc[idx_r,'high'], np.nan)
+            l = safe_float(recent.loc[idx_r,'low'], np.nan)
             if math.isnan(o) or math.isnan(c): continue
             body = abs(c-o)
             upper = h - max(o,c)
@@ -368,9 +372,8 @@ def run_pipeline():
         # chip_score: try special chips else use vol stability
         chip_score = 0.5
         try:
-            if special_chips is not None:
+            if special_chips is not None and isinstance(special_chips, pd.DataFrame):
                 if 'ts_code' in special_chips.columns and ts in special_chips['ts_code'].values:
-                    # guess concentration like 'concentration' or 'chip_ratio'
                     for col in ['concentration','chip_concentration','chipratio','peak_density']:
                         if col in special_chips.columns:
                             val = float(special_chips[special_chips['ts_code']==ts][col].iloc[0])
@@ -383,7 +386,7 @@ def run_pipeline():
                 if len(vv) >= 8:
                     var = vv.std(); mean = vv.mean() + 1e-9
                     chip_score = 1.0 - min(1.0, var/mean) * 0.5
-        except:
+        except Exception:
             chip_score = 0.5
         chip_score = max(0.0, min(1.0, chip_score))
 
@@ -392,7 +395,7 @@ def run_pipeline():
         try:
             if moneyflow_df is not None and ts in moneyflow_df.index:
                 net_mf = float(moneyflow_df.loc[ts,'net_mf'])
-        except:
+        except Exception:
             net_mf = 0.0
 
         # forecast score (if available)
@@ -400,12 +403,11 @@ def run_pipeline():
         try:
             if special_forecast is not None and isinstance(special_forecast, pd.DataFrame):
                 if 'ts_code' in special_forecast.columns and ts in special_forecast['ts_code'].values:
-                    # pick a plausible column
                     for col in ['profit_forecast','inc_netprofit','netprofit_ratio']:
                         if col in special_forecast.columns:
                             forecast_score = safe_float(special_forecast[special_forecast['ts_code']==ts][col].iloc[0], 0.0)
                             break
-        except:
+        except Exception:
             forecast_score = 0.0
 
         records.append({
@@ -442,7 +444,6 @@ def run_pipeline():
 
     # choose scoring template depending on mode
     if trend_mode:
-        # Right-side trend model: emphasize trend, moneyflow, volprice, industry
         df['score_raw'] = (
             df['pct_rank'] * weights['pct'] +
             df['mf_rank'] * weights['mf'] +
@@ -453,7 +454,6 @@ def run_pipeline():
             df['health_rank'] * weights['health']
         )
     else:
-        # Weak/reversal model: emphasize chip stability (低位吸筹), vol spike on low base, lower trend weight
         df['score_raw'] = (
             df['chip_rank'] * (weights['chip'] + 0.12) +
             df['volprice_rank'] * (weights['volprice'] + 0.06) +
@@ -521,11 +521,9 @@ if run_now:
     st.session_state["_v5_last_run"] = time.time()
     run_pipeline()
 else:
-    # run once on first load
     if "_v5_has_run" not in st.session_state:
         st.session_state["_v5_has_run"] = True
         st.session_state["_v5_last_run"] = time.time()
         run_pipeline()
     else:
-        # show run button to refresh
         st.info("点击左侧“立即运行/刷新一次”可强制刷新结果。")
