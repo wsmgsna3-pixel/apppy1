@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 10000 积分旗舰（BC 混合增强版）
+选股王 · 10000 积分旗舰（BC 修正版）
 说明：
 - 目标：短线爆发 (B) + 妖股捕捉 (C)，持股 1-5 天
 - 在界面输入 Tushare Token（仅本次运行使用）
@@ -223,16 +223,19 @@ clean_df = pd.DataFrame([dict(zip(r._fields, r)) for r in clean_list])
 # ---------------------------
 def compute_macd(df):
     """计算 MACD"""
-    if len(df) >= 26:
-        df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
-        df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
-        df['macd'] = df['ema12'] - df['ema26']
-        df['signal'] = df['macd'].ewm(span=9, adjust=False).mean()
-        df['histogram'] = df['macd'] - df['signal']
+    if len(df) < 26:  # 确保数据足够
+        return df
+    df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
+    df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
+    df['macd'] = df['ema12'] - df['ema26']
+    df['signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+    df['histogram'] = df['macd'] - df['signal']
     return df
 
 def compute_rsi(df, period=14):
     """计算 RSI"""
+    if len(df) < period:  # 确保数据足够
+        return df
     delta = df['close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
@@ -254,16 +257,18 @@ for idx, row in clean_df.iterrows():
     ts_code = row['ts_code']
     df = safe_get(pro.daily, ts_code=ts_code, start_date="20230101", end_date=last_trade)
     
-    if df.empty:
+    if df.empty or len(df) < 26:  # 检查数据是否足够
         continue
     
+    # 计算 MACD、RSI 和量价分析
     df = compute_macd(df)
     df = compute_rsi(df)
     df = volume_price_analysis(df)
     
-    clean_df.at[idx, 'macd'] = df['macd'].iloc[-1] if not df['macd'].isnull().all() else np.nan
-    clean_df.at[idx, 'rsi'] = df['rsi'].iloc[-1] if not df['rsi'].isnull().all() else np.nan
-    clean_df.at[idx, 'vol_ratio'] = df['vol_ratio'].iloc[-1] if not df['vol_ratio'].isnull().all() else np.nan
+    # 仅在计算成功后更新数据
+    clean_df.at[idx, 'macd'] = df['macd'].iloc[-1] if 'macd' in df.columns else np.nan
+    clean_df.at[idx, 'rsi'] = df['rsi'].iloc[-1] if 'rsi' in df.columns else np.nan
+    clean_df.at[idx, 'vol_ratio'] = df['vol_ratio'].iloc[-1] if 'vol_ratio' in df.columns else np.nan
 
 # 评分与回馈
 st.write("技术指标计算完成，进行回馈与评分：")
