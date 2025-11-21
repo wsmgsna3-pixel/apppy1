@@ -29,7 +29,7 @@ st.markdown("输入你的 Tushare Token（仅本次运行使用）。若有权�
 with st.sidebar:
     st.header("可调参数（实时）")
     INITIAL_TOP_N = int(st.number_input("初筛：涨幅榜取前 N", value=1000, step=100))
-    FINAL_POOL = int(st.number_input("清洗后取前 M 进入评分", value=500, step=50))
+    FINAL_POOL = int(st.number_input("清洗后取前 M 进入评分", value=300, step=50))
     TOP_DISPLAY = int(st.number_input("界面显示 Top K", value=30, step=5))
     MIN_PRICE = float(st.number_input("最低价格 (元)", value=10.0, step=1.0))
     MAX_PRICE = float(st.number_input("最高价格 (元)", value=200.0, step=10.0))
@@ -206,12 +206,8 @@ clean_list = []
 pbar = st.progress(0)
 for i, r in enumerate(pool_merged.itertuples()):
     ts = getattr(r, 'ts_code')
-    # try volume detection with fallback
-    try:
-        vol_df = safe_get(pro.daily, ts_code=ts, trade_date=last_trade)
-        vol = vol_df.get('vol', pd.Series([0])).iloc[0] if not vol_df.empty else getattr(r, 'vol') if 'vol' in pool_merged.columns else 0
-    except:
-        vol = getattr(r, 'vol') if 'vol' in pool_merged.columns else 0
+    # use volume info from merged pool (avoid per-stock API calls for speed)
+    vol = getattr(r, 'vol', 0)
 
     close = getattr(r, 'close', np.nan)
     open_p = getattr(r, 'open', np.nan)
