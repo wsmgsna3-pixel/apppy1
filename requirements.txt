@@ -3,3 +3,10 @@ tushare
 pandas
 backtrader>=1.9.78.123
 backtrader
+streamlit>=1.30.0
+matplotlib>=3.5.0
+numpy
+plotly
+yfinance
+scipy
+seaborn
