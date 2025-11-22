@@ -6,6 +6,7 @@
   python ycjsb_backtest_addon.py --mode optimize --trials 50
 """
 
+import streamlit as st
 import argparse
 import importlib
 import os
@@ -13,7 +14,24 @@ import sys
 from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
+
+if 'tushare_token' not in st.session_state:
+    st.set_page_config(page_title="盈财金手指-回测增强版", layout="wide")
+    st.title("请先输入 TuShare Pro Token")
+    token = st.text_input("TuShare Token（48位）", type="password", help="从 https://tushare.pro/user/token 获取")
+    if token:
+        token = token.strip()
+        if len(token) == 48:
+            st.session_state.tushare_token = token
+            st.success("Token 已保存")
+            st.rerun()
+        else:
+            st.error("Token 长度必须为 48 位，请检查是否复制完整")
+    st.stop()
+
 import tushare as ts
+ts.set_token(st.session_state.tushare_token)
+
 import backtrader as bt
 import json
 from signal_builder import set_pro, basic_filters, get_hist, get_moneyflow
