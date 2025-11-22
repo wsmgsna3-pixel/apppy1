@@ -18,15 +18,15 @@ import numpy as np
 if 'tushare_token' not in st.session_state:
     st.set_page_config(page_title="盈财金手指-回测增强版", layout="wide")
     st.title("请先输入 TuShare Pro Token")
-    token = st.text_input("TuShare Token（48位）", type="password", help="从 https://tushare.pro/user/token 获取")
+    token = st.text_input("TuShare Token（56位）", type="password", help="从 https://tushare.pro/user/token 获取")
     if token:
         token = token.strip()
-        if len(token) == 48:
+        if len(token) == 56:
             st.session_state.tushare_token = token
             st.success("Token 已保存")
             st.rerun()
         else:
-            st.error("Token 长度必须为 48 位，请检查是否复制完整")
+            st.error("Token 长度必须为 56 位，请检查是否复制完整")
     st.stop()
 
 import tushare as ts
