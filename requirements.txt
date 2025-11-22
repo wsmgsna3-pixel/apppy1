@@ -1,4 +1,5 @@
 streamlit
 tushare
 pandas
-
+backtrader>=1.9.78.123
+backtrader
