@@ -673,21 +673,8 @@ st.markdown("""
 
 st.info("运行出现问题请把 Streamlit 的错误日志或首段报错发给我（截图或文字都行），我会在一次修改内继续帮你调优。")
 # ---------------------------
-# 回测模块与买点卖点设置
+# 更新后的回测展示逻辑
 # ---------------------------
-
-# 设置买点和卖点的规则
-def get_buy_sell_signals(stock_data):
-    """
-    设置买入和卖出的条件：以5日均线突破20日均线作为买入信号，持股满5天后卖出
-    """
-    # 买入信号：5日均线突破20日均线
-    buy_signal = (stock_data['ma5'].iloc[-1] > stock_data['ma20'].iloc[-1]) and                  (stock_data['ma5'].iloc[-2] <= stock_data['ma20'].iloc[-2])
-
-    # 卖出信号：持股5天后卖出
-    sell_signal = stock_data.index[-1] == stock_data.index[4]  # 假设持股期为5天
-
-    return buy_signal, sell_signal
 
 # 回测函数：模拟持股1到5天，并设置买点卖点
 def backtest(pro, start_date, end_date, initial_cash=100000, hold_days=5, fee_rate=0.001):
@@ -738,4 +725,12 @@ def backtest(pro, start_date, end_date, initial_cash=100000, hold_days=5, fee_ra
 
     total_assets = cash
     total_profit = total_assets - initial_cash
+
+    # 显示回测结果和交易历史
+    st.write(f"总资产：{total_assets}")
+    st.write(f"总收益：{total_profit}")
+    st.write("交易历史：")
+    for trade in trade_history:
+        st.write(f"股票：{trade['stock']} - 买入日期：{trade['buy_date']} - 卖出日期：{trade['sell_date']} - 盈利：{trade['profit']}元")
+
     return total_assets, total_profit, trade_history
