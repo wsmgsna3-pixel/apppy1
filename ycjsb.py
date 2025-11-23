@@ -658,7 +658,14 @@ st.dataframe(fdf[display_cols].head(TOP_DISPLAY), use_container_width=True)
 # 下载（仅导出前200避免过大）
 out_csv = fdf[display_cols].head(200).to_csv(index=True, encoding='utf-8-sig')
 st.download_button("下载评分结果（前200）CSV", data=out_csv, file_name=f"score_result_{last_trade}.csv", mime="text/csv")
-
+# ---------------------------
+# 回测按钮 - 触发回测功能
+# ---------------------------
+if st.button("开始回测"):
+    selected_stocks = select_stocks(stock_list, start_date, end_date, pro)  # 确保你定义了股票列表
+    backtest_results = backtest(selected_stocks, start_date, end_date, pro)
+    st.write("回测结果：")
+    st.dataframe(backtest_results)
 # ---------------------------
 # 小结与建议（简洁）
 # ---------------------------
@@ -672,3 +679,62 @@ st.markdown("""
 """)
 
 st.info("运行出现问题请把 Streamlit 的错误日志或首段报错发给我（截图或文字都行），我会在一次修改内继续帮你调优。")
+# ---------------------------
+# 获取股票的日线数据（get_stock_data函数）
+# ---------------------------
+def get_stock_data(stock_code, pro, start_date, end_date):
+    df = pro.daily(ts_code=stock_code, start_date=start_date, end_date=end_date)
+    df['trade_date'] = pd.to_datetime(df['trade_date'])
+    df.set_index('trade_date', inplace=True)
+    return df
+
+# ---------------------------
+# 回测模块 - 逻辑
+# ---------------------------
+def backtest(stock_list, start_date, end_date, pro):
+    results = []
+    
+    for stock in stock_list:
+        df = get_stock_data(stock, pro, start_date, end_date)  # 获取股票数据
+        initial_cash = 100000  # 初始资金
+        cash = initial_cash
+        stock_qty = 0
+        buy_price = 0
+        buy_date = None
+        trades = []
+        
+        # 模拟买卖逻辑
+        for i in range(1, len(df)):
+            # 买入逻辑
+            if stock_qty == 0 and df['close'].iloc[i] > df['close'].iloc[i-1] * 1.1:
+                stock_qty = cash // df['close'].iloc[i]
+                cash -= stock_qty * df['close'].iloc[i]
+                buy_price = df['close'].iloc[i]
+                buy_date = df.index[i]
+                trades.append(('Buy', buy_date, buy_price, stock_qty))
+            
+            # 卖出逻辑
+            if stock_qty > 0 and (df['close'].iloc[i] < buy_price * 0.9 or df['close'].iloc[i] > buy_price * 1.2):
+                cash += stock_qty * df['close'].iloc[i]
+                trades.append(('Sell', df.index[i], df['close'].iloc[i], stock_qty))
+                stock_qty = 0
+        
+        # 最后卖出持仓
+        if stock_qty > 0:
+            cash += stock_qty * df['close'].iloc[-1]
+            trades.append(('Sell', df.index[-1], df['close'].iloc[-1], stock_qty))
+        
+        final_value = cash
+        profit = final_value - initial_cash
+        win_rate = len([t for t in trades if t[0] == 'Sell' and t[2] > buy_price]) / len(trades)
+        
+        results.append({
+            'Stock': stock,
+            'Initial Cash': initial_cash,
+            'Final Value': final_value,
+            'Profit': profit,
+            'Win Rate': win_rate,
+            'Total Trades': len(trades)
+        })
+    
+    return pd.DataFrame(results)
