@@ -717,7 +717,9 @@ def backtest(pro, start_date, end_date, initial_cash=100000, hold_days=5, fee_ra
                 'sell_date': sell_date,
                 'sell_price': sell_price,
                 'quantity': quantity,
-                'profit': quantity * (sell_price - buy_price) - (quantity * buy_price * fee_rate) - (quantity * sell_price * fee_rate)
+                'profit': quantity * (sell_price - buy_price) - (quantity * buy_price * fee_rate) - (quantity * sell_price * fee_rate),
+                'buy_signal': buy_signal,
+                'sell_signal': sell_signal
             })
 
             # 卖出股票，更新资金
@@ -732,5 +734,6 @@ def backtest(pro, start_date, end_date, initial_cash=100000, hold_days=5, fee_ra
     st.write("交易历史：")
     for trade in trade_history:
         st.write(f"股票：{trade['stock']} - 买入日期：{trade['buy_date']} - 卖出日期：{trade['sell_date']} - 盈利：{trade['profit']}元")
+        st.write(f"买入信号：{trade['buy_signal']} - 卖出信号：{trade['sell_signal']}")
 
     return total_assets, total_profit, trade_history
