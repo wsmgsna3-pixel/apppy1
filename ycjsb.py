@@ -7,33 +7,7 @@
 - 尽可能调用 moneyflow / chip / ths_member / chip 等高级接口，若无权限会自动降级
 - 已做大量异常处理与缓存，降低因接口波动导致的报错
 """
-def select_stocks(stock_list, start_date, end_date, pro):
-    """
-    从股票列表中筛选出符合条件的股票
-    参数：
-    - stock_list: 股票代码列表
-    - start_date: 回测开始日期（格式: 'YYYYMMDD'）
-    - end_date: 回测结束日期（格式: 'YYYYMMDD'）
-    - pro: tushare 的 pro_api 对象，用于获取数据
-    
-    返回：
-    - selected: 筛选出的符合条件的股票列表
-    """
-    selected = []
-    
-    for stock in stock_list:
-        # 获取该股票的日线数据
-        df = pro.daily(ts_code=stock, start_date=start_date, end_date=end_date)
-        
-        if df.empty:
-            continue  # 如果没有数据，跳过
 
-        # 示例筛选条件：选取最近涨幅超过 5% 的股票
-        latest_pct_chg = df['pct_chg'].iloc[-1]  # 获取最近一天的涨幅
-        if latest_pct_chg > 5:  # 设定涨幅条件（如 5%）
-            selected.append(stock)
-    
-    return selected
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -684,14 +658,7 @@ st.dataframe(fdf[display_cols].head(TOP_DISPLAY), use_container_width=True)
 # 下载（仅导出前200避免过大）
 out_csv = fdf[display_cols].head(200).to_csv(index=True, encoding='utf-8-sig')
 st.download_button("下载评分结果（前200）CSV", data=out_csv, file_name=f"score_result_{last_trade}.csv", mime="text/csv")
-# ---------------------------
-# 回测按钮 - 触发回测功能
-# ---------------------------
-if st.button("开始回测"):
-    selected_stocks = select_stocks(stock_list, start_date, end_date, pro)  # 确保你定义了股票列表
-    backtest_results = backtest(selected_stocks, start_date, end_date, pro)
-    st.write("回测结果：")
-    st.dataframe(backtest_results)
+
 # ---------------------------
 # 小结与建议（简洁）
 # ---------------------------
@@ -706,7 +673,7 @@ st.markdown("""
 
 st.info("运行出现问题请把 Streamlit 的错误日志或首段报错发给我（截图或文字都行），我会在一次修改内继续帮你调优。")
 # ---------------------------
-# 获取股票的日线数据（get_stock_data函数）
+# Backtest Functionality
 # ---------------------------
 def get_stock_data(stock_code, pro, start_date, end_date):
     df = pro.daily(ts_code=stock_code, start_date=start_date, end_date=end_date)
@@ -714,46 +681,44 @@ def get_stock_data(stock_code, pro, start_date, end_date):
     df.set_index('trade_date', inplace=True)
     return df
 
-# ---------------------------
-# 回测模块 - 逻辑
-# ---------------------------
 def backtest(stock_list, start_date, end_date, pro):
     results = []
-    
+
     for stock in stock_list:
-        df = get_stock_data(stock, pro, start_date, end_date)  # 获取股票数据
-        initial_cash = 100000  # 初始资金
+        # Get stock data
+        df = get_stock_data(stock, pro, start_date, end_date)
+        initial_cash = 100000  # Initial capital
         cash = initial_cash
         stock_qty = 0
         buy_price = 0
         buy_date = None
         trades = []
-        
-        # 模拟买卖逻辑
+
+        # Simulate buying and selling
         for i in range(1, len(df)):
-            # 买入逻辑
+            # Buy logic
             if stock_qty == 0 and df['close'].iloc[i] > df['close'].iloc[i-1] * 1.1:
                 stock_qty = cash // df['close'].iloc[i]
                 cash -= stock_qty * df['close'].iloc[i]
                 buy_price = df['close'].iloc[i]
                 buy_date = df.index[i]
                 trades.append(('Buy', buy_date, buy_price, stock_qty))
-            
-            # 卖出逻辑
+
+            # Sell logic
             if stock_qty > 0 and (df['close'].iloc[i] < buy_price * 0.9 or df['close'].iloc[i] > buy_price * 1.2):
                 cash += stock_qty * df['close'].iloc[i]
                 trades.append(('Sell', df.index[i], df['close'].iloc[i], stock_qty))
                 stock_qty = 0
-        
-        # 最后卖出持仓
+
+        # Final sell
         if stock_qty > 0:
             cash += stock_qty * df['close'].iloc[-1]
             trades.append(('Sell', df.index[-1], df['close'].iloc[-1], stock_qty))
-        
+
         final_value = cash
         profit = final_value - initial_cash
         win_rate = len([t for t in trades if t[0] == 'Sell' and t[2] > buy_price]) / len(trades)
-        
+
         results.append({
             'Stock': stock,
             'Initial Cash': initial_cash,
@@ -762,6 +727,14 @@ def backtest(stock_list, start_date, end_date, pro):
             'Win Rate': win_rate,
             'Total Trades': len(trades)
         })
-    
+
     return pd.DataFrame(results)
-    
+
+# ---------------------------
+# Backtest Button
+# ---------------------------
+if st.button("开始回测"):
+    selected_stocks = select_stocks(stock_list, start_date, end_date, pro)  # Ensure stock_list is defined
+    backtest_results = backtest(selected_stocks, start_date, end_date, pro)
+    st.write("回测结果：")
+    st.dataframe(backtest_results)
