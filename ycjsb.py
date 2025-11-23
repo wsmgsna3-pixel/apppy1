@@ -738,3 +738,4 @@ def backtest(stock_list, start_date, end_date, pro):
         })
     
     return pd.DataFrame(results)
+    
