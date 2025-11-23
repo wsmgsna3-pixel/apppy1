@@ -1,5 +1,17 @@
+import streamlit as st
 import tushare as ts
 import pandas as pd
+
+# 手动输入 Tushare Token
+TUSHARE_TOKEN = st.text_input("请输入 Tushare Token：", type="password")
+
+# 设置 Tushare Token
+if TUSHARE_TOKEN:
+    ts.set_token(TUSHARE_TOKEN)
+    pro = ts.pro_api()
+    st.success("Token 已成功设置！")
+else:
+    st.warning("请先输入 Tushare Token。")
 
 # 获取股票的历史数据
 def get_stock_data(stock_code, start_date, end_date):
@@ -8,6 +20,17 @@ def get_stock_data(stock_code, start_date, end_date):
     """
     df = ts.pro_bar(ts_code=stock_code, start_date=start_date, end_date=end_date, asset='E')
     return df
+
+# 获取选出的股票池（从选股王中获取）
+def get_selected_stocks(TOP_DISPLAY=30):
+    """
+    返回选出的股票池，默认返回 Top K 股票（根据综合评分）
+    """
+    # 假设 fdf 是包含选股数据的 DataFrame
+    selected_stocks = fdf[['ts_code', 'name', '综合评分']].head(TOP_DISPLAY)
+    
+    # 返回股票代码列表
+    return selected_stocks['ts_code'].tolist()
 
 # 执行回测
 def backtest(start_date, end_date, initial_cash=100000, TOP_DISPLAY=30, hold_days=5, fee_rate=0.001):
@@ -55,6 +78,9 @@ def backtest(start_date, end_date, initial_cash=100000, TOP_DISPLAY=30, hold_day
     total_profit = total_assets - initial_cash
     return total_assets, total_profit, trade_history
 
+# 假设你已经在选股王部分得到了 fdf 数据
+# fdf = ...
+
 # 执行回测并输出结果
 start_date = '20210101'
 end_date = '20230101'
@@ -63,11 +89,12 @@ TOP_DISPLAY = 30  # 显示前30只股票
 hold_days = 5  # 持股5天
 fee_rate = 0.001  # 交易费用率（千分之一）
 
+# 执行回测
 final_cash, total_profit, history = backtest(start_date, end_date, initial_cash, TOP_DISPLAY, hold_days, fee_rate)
 
 # 输出回测结果
-print(f"最终资金：{final_cash}")
-print(f"总收益：{total_profit}")
-print("交易历史：")
+st.write(f"最终资金：{final_cash}")
+st.write(f"总收益：{total_profit}")
+st.write("交易历史：")
 for trade in history:
-    print(trade)
+    st.write(trade)
