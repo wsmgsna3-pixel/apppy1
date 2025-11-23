@@ -6,7 +6,7 @@ import pandas as pd
 import numpy as np
 import tushare as ts
 import backtrader as bt
-import streamlit as st # 引入 Streamlit
+import streamlit as st  # 引入 Streamlit
 
 # ------------- 页面基础配置 -------------
 st.set_page_config(page_title="选股回测工具", layout="wide")
@@ -23,6 +23,19 @@ DEFAULTS = {
     "MAX_5D_PCT": 50,  # 提高最大 5 日涨幅限制
     "start_date": (datetime.now() - timedelta(days=365)).strftime("%Y%m%d")
 }
+
+# ------------- 使用 Tushare 获取股票池 -------------
+def build_universe_from_ycjsb(last_trade, params, pro_api):
+    """
+    使用 Tushare 获取股票池，默认选择每日涨幅前 N 名的股票
+    """
+    daily = pro_api.daily(trade_date=last_trade)
+    if daily is None or daily.empty:
+        raise RuntimeError("无法获取每日行情数据 (daily data unavailable).")
+    
+    # 排序，选择涨幅前 N 的股票
+    top = daily.sort_values("pct_chg", ascending=False).head(params.get("INITIAL_TOP_N", 800))
+    return list(top['ts_code'].unique())
 
 # ------------- run a single backtest -------------
 def run_backtest(universe, params, cash=100000.0, commission=0.0003, slippage=0.000, verbose=False):
@@ -156,7 +169,7 @@ def main_gui():
         # 构建股票池
         with st.spinner(f"正在构建股票池 (基准日期: {last_trade})..."):
             try:
-                universe = build_universe_from_ycjsb(ycjsb_mod, last_trade, {"INITIAL_TOP_N": topn}, pro_local)
+                universe = build_universe_from_ycjsb(last_trade, {"INITIAL_TOP_N": topn}, pro_local)
                 st.success(f"股票池构建完成，共包含 {len(universe)} 只股票")
             except Exception as e:
                 st.error(f"构建股票池失败: {e}")
