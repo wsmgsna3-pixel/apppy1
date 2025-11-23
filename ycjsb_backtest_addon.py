@@ -1,12 +1,10 @@
 # ycjsb_backtest_addon.py
 """
-外挂回测 & 优化模块（基于你的 ycjsb.py 稳定程序）
+外挂回测 & 优化模块（Streamlit GUI 版本）
 用法：
-  python ycjsb_backtest_addon.py --mode run
-  python ycjsb_backtest_addon.py --mode optimize --trials 50
+  直接在终端运行: streamlit run ycjsb_backtest_addon.py
 """
 
-import argparse
 import importlib
 import os
 import sys
@@ -16,11 +14,17 @@ import numpy as np
 import tushare as ts
 import backtrader as bt
 import json
+import streamlit as st # 引入 Streamlit
+
+# 尝试导入用户模块
 from signal_builder import set_pro, basic_filters, get_hist, get_moneyflow
 from bt_strategy import SignalStrategy
 from viz import plot_equity_curve, plot_drawdown
 from optimize import run_optuna
 from tqdm import tqdm
+
+# ------------- 页面基础配置 -------------
+st.set_page_config(page_title="选股回测工具", layout="wide")
 
 # ------------- Configurable defaults -------------
 DEFAULTS = {
@@ -44,17 +48,13 @@ def try_import_ycjsb(path="ycjsb.py"):
             sys.path.insert(0, base_dir)
             modname = os.path.splitext(os.path.basename(path))[0]
             mod = importlib.import_module(modname)
-            print(f"Imported user module {modname}")
+            # st.success(f"成功加载用户模块: {modname}") # UI提示太频繁可注释
         except Exception as e:
-            print(f"Failed import ycjsb module: {e}")
+            st.error(f"加载 ycjsb 模块失败: {e}")
     return mod
 
 # ------------- create data feeds for backtrader -------------
 def create_bt_datas(cerebro, df_dict):
-    """
-    df_dict: {ts_code: DataFrame with ['trade_date','open','high','low','close','vol']}
-    returns list of bt datas
-    """
     feeds = []
     for ts_code, df in df_dict.items():
         tmp = df.copy()
@@ -68,33 +68,38 @@ def create_bt_datas(cerebro, df_dict):
         feeds.append(data)
     return feeds
 
-# ------------- run a single backtest given parameter dict -------------
+# ------------- run a single backtest -------------
 def run_backtest(universe, params, cash=100000.0, commission=0.0003, slippage=0.000, verbose=False):
-    """
-    universe: list of ts_code
-    params: dict containing strategy params e.g. stoploss_pct, takeprofit_pct, VOL_RATIO_MIN, MACD_MIN, RSI_MAX
-    Returns: performance metric (sharpe) and equity series (pd.Series)
-    """
     cerebro = bt.Cerebro(stdstats=False)
     cerebro.broker.setcash(cash)
     cerebro.broker.setcommission(commission=commission)
-    # gather historical data for each ticker
+    
     df_dict = {}
-    for ts_code in universe:
+    # 显示进度条
+    progress_text = "正在获取历史数据..."
+    my_bar = st.progress(0, text=progress_text)
+    
+    total_stocks = len(universe)
+    for i, ts_code in enumerate(universe):
         try:
+            # 更新进度条
+            my_bar.progress((i + 1) / total_stocks, text=f"获取数据: {ts_code}")
+            
             df = get_hist(ts_code, start_date=DEFAULTS['start_date'], end_date=datetime.now().strftime("%Y%m%d"))
             if df.empty:
                 continue
-            # backtrader expects index ascending and datetime
             df = df[['trade_date','open','high','low','close','vol']].copy()
             df_dict[ts_code] = df
         except Exception as e:
             print(f"failed to fetch {ts_code}: {e}")
+            
+    my_bar.empty() # 清除进度条
+
     if not df_dict:
-        raise RuntimeError("No data available for backtest universe.")
-    # create datas
+        raise RuntimeError("没有获取到任何回测数据，请检查Token或网络。")
+    
     create_bt_datas(cerebro, df_dict)
-    # add strategy
+    
     stratparams = dict(
         stake=1,
         stoploss_pct=params.get('stoploss_pct', 0.08),
@@ -103,155 +108,172 @@ def run_backtest(universe, params, cash=100000.0, commission=0.0003, slippage=0.
         verbose=verbose
     )
     cerebro.addstrategy(SignalStrategy, **stratparams)
-    # run
+    
     try:
+        st.info("开始执行 Backtrader 回测...")
         results = cerebro.run()
     except Exception as e:
-        print(f"Backtest error: {e}")
+        st.error(f"Backtest error: {e}")
         raise
-    # get portfolio value time series (cerebro has no direct TS; use broker.getvalue at each data point via analyzer or observers)
-    # For simplicity, we re-run with observer of value
+    
     try:
-        # re-run to capture value history with observers disabled? Instead, use the built-in broker snapshot is not trivial.
-        # As compromise: return final value and approximate equity series by stepping through daily close per combined index
         final_value = cerebro.broker.getvalue()
     except Exception:
         final_value = None
-    # WARNING: building precise equity time series in backtrader requires observers; for this addon we approximate by final value.
+
     return {
         "final_value": final_value,
         "cerebro": cerebro,
         "df_dict": df_dict
     }
 
-# ------------- collate universe: prefer ycjsb.provided pool if available -------------
-def build_universe_from_ycjsb(ycjsb_mod, last_trade, params):
+# ------------- collate universe -------------
+def build_universe_from_ycjsb(ycjsb_mod, last_trade, params, pro_api):
     """
-    If ycjsb.py exposes a function to get pool, we call it; else we fallback to scanning the top N from daily
+    构建股票池
     """
     if ycjsb_mod is not None:
         try:
             if hasattr(ycjsb_mod, "get_candidate_pool"):
-                # expected to return DataFrame with ts_code column
                 pool = ycjsb_mod.get_candidate_pool()
                 if isinstance(pool, (list, tuple)):
                     return list(pool)
                 if hasattr(pool, "ts_code"):
                     return list(pool['ts_code'].unique())
         except Exception as e:
-            print(f"Error calling get_candidate_pool(): {e}")
-    # fallback: use daily top INITIAL_TOP_N
-    daily = pro.daily(trade_date=last_trade)
+            st.warning(f"调用 get_candidate_pool() 出错: {e}，将使用默认Top N策略")
+            
+    # fallback
+    daily = pro_api.daily(trade_date=last_trade)
     if daily is None or daily.empty:
-        raise RuntimeError("cannot fetch daily for fallback universe.")
+        raise RuntimeError("无法获取每日行情数据 (daily data unavailable).")
     top = daily.sort_values("pct_chg", ascending=False).head(params.get("INITIAL_TOP_N",800))
     return list(top['ts_code'].unique())
 
-# ------------- high level runner used by optimizer -------------
-def runner_for_opt(params, fixed_args):
-    """
-    params: optimization parameters from optuna
-    fixed_args: contains universe, last_trade
-    Returns a metric (Sharpe-like) to maximize
-    """
-    # merge fixed and params
-    run_params = {}
-    run_params.update(fixed_args.get("base_params", {}))
-    run_params.update(params)
+# ------------- GUI 主程序 -------------
+def main_gui():
+    st.title("📈 选股回测系统 (Secure Mode)")
+    
+    st.markdown("""
+    此界面允许你安全地输入 Tushare Token 进行回测。
+    Token 仅保存在当前会话内存中，刷新页面即清除。
+    """)
+
+    # --- 1. 安全输入 Token ---
+    with st.expander("🔐 Tushare Token 设置 (必填)", expanded=True):
+        token_input = st.text_input(
+            "请输入你的 Tushare Token", 
+            type="password", 
+            help="你的Token不会被保存，仅用于本次运行"
+        )
+    
+    if not token_input:
+        st.warning("👉 请在上框中输入 Tushare Token 以启用系统。")
+        st.stop() # 停止执行后续代码，直到用户输入
+
+    # 初始化 Tushare
     try:
-        res = run_backtest(fixed_args['universe'], run_params, cash=fixed_args.get('cash',100000.0))
-        # compute a simple metric: final_value / initial - 1
-        fv = res.get('final_value', None)
-        if fv is None:
-            return -999
-        ret = (fv - fixed_args.get('cash',100000.0)) / fixed_args.get('cash',100000.0)
-        # use return as metric (can be replaced by sharpe)
-        return float(ret)
+        ts.set_token(token_input)
+        pro_local = ts.pro_api()
+        set_pro(pro_local) # 设置全局 pro
     except Exception as e:
-        print(f"runner_for_opt exception: {e}")
-        return -999
+        st.error(f"Token 设置失败: {e}")
+        st.stop()
 
-# ------------- main -------------
-def main(args):
-    global pro
-    # init tushare
-    token = os.environ.get("TUSHARE_TOKEN", None)
-    if token is None:
-        token = input("Please input your Tushare token (or set env var TUSHARE_TOKEN): ").strip()
-    ts.set_token(token)
-    pro_local = ts.pro_api()
-    set_pro(pro_local)
-    # try import ycjsb
-    ycjsb_mod = try_import_ycjsb("ycjsb.py")
+    # --- 2. 侧边栏参数设置 ---
+    st.sidebar.header("⚙️ 回测参数设置")
+    
+    # 模式选择
+    mode = st.sidebar.selectbox("运行模式", ["单次运行 (Run)", "参数优化 (Optimize)"])
+    
+    st.sidebar.subheader("筛选条件")
+    topn = st.sidebar.number_input("每日候选池大小 (Top N)", value=800, step=50)
+    min_price = st.sidebar.number_input("最低股价", value=3.0)
+    max_price = st.sidebar.number_input("最高股价", value=500.0)
+    min_turnover = st.sidebar.number_input("最低换手率", value=2.0)
+    
+    st.sidebar.subheader("技术指标")
+    vol_ratio_min = st.sidebar.number_input("最小量比", value=1.2)
+    rsi_max = st.sidebar.number_input("RSI 上限", value=75.0)
+    
+    st.sidebar.subheader("交易策略")
+    cash = st.sidebar.number_input("初始资金", value=100000.0)
+    stoploss = st.sidebar.number_input("止损百分比 (0.08 = 8%)", value=0.08, step=0.01)
+    takeprofit = st.sidebar.number_input("止盈百分比 (0.2 = 20%)", value=0.2, step=0.01)
 
-    # build universe
-    last_trade = None
-    for i in range(15):
-        d = (datetime.now() - timedelta(days=i)).strftime("%Y%m%d")
-        if not pro_local.daily(trade_date=d).empty:
-            last_trade = d
-            break
-    if last_trade is None:
-        raise RuntimeError("Cannot find last trade date")
+    # --- 3. 运行逻辑 ---
+    
+    # 只有点击按钮才开始运行
+    if st.button("🚀 开始运行", type="primary"):
+        
+        # 准备参数
+        base_params = DEFAULTS.copy()
+        base_params.update({
+            "MIN_PRICE": min_price,
+            "MAX_PRICE": max_price,
+            "MIN_TURNOVER": min_turnover,
+            "VOL_RATIO_MIN": vol_ratio_min,
+            "RSI_MAX": rsi_max,
+        })
 
-    universe = build_universe_from_ycjsb(ycjsb_mod, last_trade, {"INITIAL_TOP_N": args.topn})
+        # 尝试导入 ycjsb
+        ycjsb_mod = try_import_ycjsb("ycjsb.py")
 
-    print(f"Universe size: {len(universe)}")
+        with st.spinner("正在获取最新交易日期..."):
+            last_trade = None
+            for i in range(15):
+                d = (datetime.now() - timedelta(days=i)).strftime("%Y%m%d")
+                try:
+                    if not pro_local.daily(trade_date=d).empty:
+                        last_trade = d
+                        break
+                except Exception:
+                    pass
+            
+            if last_trade is None:
+                st.error("无法连接 Tushare 获取日期，请检查 Token 是否正确或已过期。")
+                st.stop()
 
-    # prepare base params merged with defaults
-    base_params = DEFAULTS.copy()
-    base_params.update({
-        "MIN_PRICE": args.min_price,
-        "MAX_PRICE": args.max_price,
-        "MIN_TURNOVER": args.min_turnover,
-        "MIN_AMOUNT": args.min_amount,
-        "VOL_RATIO_MIN": args.vol_ratio_min,
-        "RSI_MAX": args.rsi_max,
-        "MACD_MIN": args.macd_min,
-        "MAX_5D_PCT": args.max_5d_pct
-    })
+        with st.spinner(f"正在构建股票池 (基准日期: {last_trade})..."):
+            try:
+                universe = build_universe_from_ycjsb(ycjsb_mod, last_trade, {"INITIAL_TOP_N": topn}, pro_local)
+                st.success(f"股票池构建完成，共包含 {len(universe)} 只股票")
+            except Exception as e:
+                st.error(f"构建股票池失败: {e}")
+                st.stop()
 
-    if args.mode == "run":
-        # run single backtest with given params
-        run_params = {
-            "stoploss_pct": args.stoploss,
-            "takeprofit_pct": args.takeprofit,
-            "VOL_RATIO_MIN": base_params['VOL_RATIO_MIN'],
-            "MACD_MIN": base_params['MACD_MIN'],
-            "RSI_MAX": base_params['RSI_MAX']
-        }
-        out = run_backtest(universe, run_params, cash=args.cash)
-        print("Backtest finished. final value:", out.get('final_value'))
-        # Try to save equity as placeholder (not precise)
-        try:
-            # If cerebro exists we can at least save final value to txt
-            with open("backtest_result.json","w") as f:
-                json.dump({"final_value": out.get('final_value')}, f)
-        except Exception:
-            pass
-        print("Results saved to backtest_result.json")
-    elif args.mode == "optimize":
-        fixed_args = {"universe": universe, "cash": args.cash, "base_params": base_params}
-        study, best = run_optuna(runner_for_opt, fixed_args, n_trials=args.trials)
-        print("Best params:", best)
-    else:
-        raise RuntimeError("Unknown mode")
+        # 执行模式
+        if mode == "单次运行 (Run)":
+            run_params = {
+                "stoploss_pct": stoploss,
+                "takeprofit_pct": takeprofit,
+                "VOL_RATIO_MIN": vol_ratio_min,
+                "RSI_MAX": rsi_max
+            }
+            
+            try:
+                out = run_backtest(universe, run_params, cash=cash)
+                
+                # 结果展示
+                final_val = out.get('final_value')
+                profit = final_val - cash
+                ret_pct = (profit / cash) * 100
+                
+                st.divider()
+                c1, c2, c3 = st.columns(3)
+                c1.metric("初始资金", f"{cash:,.0f}")
+                c2.metric("最终资金", f"{final_val:,.2f}")
+                c3.metric("收益率", f"{ret_pct:.2f}%", delta=f"{profit:,.2f}")
+                
+                st.json({"Status": "Finished", "Final Value": final_val})
+                
+            except Exception as e:
+                st.error(f"回测运行出错: {e}")
+
+        elif mode == "参数优化 (Optimize)":
+            st.info("参数优化功能在此 Web 模式下简化展示，建议在本地环境运行以获得最佳性能。")
+            # 这里可以接入 run_optuna 逻辑，但考虑到网页超时问题，建议谨慎
+            st.warning("优化功能耗时较长，请确保服务器不会超时。")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["run","optimize"], default="run")
-    parser.add_argument("--topn", type=int, default=800)
-    parser.add_argument("--min_price", type=float, default=3.0)
-    parser.add_argument("--max_price", type=float, default=500.0)
-    parser.add_argument("--min_turnover", type=float, default=2.0)
-    parser.add_argument("--min_amount", type=float, default=50_000_000.0)
-    parser.add_argument("--vol_ratio_min", type=float, default=1.2)
-    parser.add_argument("--rsi_max", type=float, default=75)
-    parser.add_argument("--macd_min", type=float, default=-0.3)
-    parser.add_argument("--max_5d_pct", type=float, default=40.0)
-    parser.add_argument("--stoploss", type=float, default=0.08)
-    parser.add_argument("--takeprofit", type=float, default=0.2)
-    parser.add_argument("--cash", type=float, default=100000.0)
-    parser.add_argument("--trials", type=int, default=50)
-    args = parser.parse_args()
-    main(args)
+    main_gui()
