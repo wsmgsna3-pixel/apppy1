@@ -672,3 +672,152 @@ st.markdown("""
 """)
 
 st.info("运行出现问题请把 Streamlit 的错误日志或首段报错发给我（截图或文字都行），我会在一次修改内继续帮你调优。")
+import streamlit as st
+import pandas as pd
+import tushare as ts
+from datetime import datetime, timedelta
+import warnings
+
+# 设置 Tushare Token
+TUSHARE_TOKEN = st.text_input("请输入 Tushare Token：", type="password")
+if TUSHARE_TOKEN:
+    ts.set_token(TUSHARE_TOKEN)
+    pro = ts.pro_api()
+    st.success("Token 已成功设置！")
+else:
+    st.warning("请先输入 Tushare Token。")
+
+warnings.filterwarnings("ignore")
+
+# ---------------------------
+# 页面设置
+# ---------------------------
+st.set_page_config(page_title="选股王 · 10000旗舰（BC增强）", layout="wide")
+st.title("选股王 · 10000 积分旗舰（BC 混合增强版）")
+st.markdown("输入你的 Tushare Token（仅本次运行使用）。若有权限缺失，脚本会自动降级并继续运行。")
+
+# ---------------------------
+# 侧边栏参数（实时可改）
+# ---------------------------
+with st.sidebar:
+    st.header("可调参数（实时）")
+    INITIAL_TOP_N = int(st.number_input("初筛：涨幅榜取前 N", value=1000, step=100))
+    FINAL_POOL = int(st.number_input("清洗后取前 M 进入评分", value=300, step=50))
+    TOP_DISPLAY = int(st.number_input("界面显示 Top K", value=30, step=5))
+
+# ---------------------------
+# 生成选股结果 fdf
+# ---------------------------
+def generate_fdf():
+    """
+    生成选股的 DataFrame fdf，其中包含 ts_code（股票代码）、name（股票名称）和综合评分（score）。
+    """
+    # 获取涨幅榜股票数据（这里使用一个示例数据，实际需要通过 Tushare 获取数据）
+    # 假设这是从 Tushare 或其他方式获取的股票数据
+    stock_data = {
+        'ts_code': ['000001.SZ', '000002.SZ', '000003.SZ'],  # 股票代码示例
+        'name': ['Stock1', 'Stock2', 'Stock3'],  # 股票名称示例
+        '综合评分': [90, 80, 85],  # 综合评分示例
+    }
+    
+    # 将数据转换为 DataFrame
+    fdf = pd.DataFrame(stock_data)
+    return fdf
+
+# 生成 fdf
+fdf = generate_fdf()
+
+# ---------------------------
+# 获取选出的股票池（根据评分）
+# ---------------------------
+def get_selected_stocks(TOP_DISPLAY=30):
+    """
+    返回选出的股票池，默认返回 Top K 股票（根据综合评分）
+    """
+    selected_stocks = fdf[['ts_code', 'name', '综合评分']].head(TOP_DISPLAY)
+    return selected_stocks['ts_code'].tolist()
+
+# ---------------------------
+# 执行选股（假设用的是 fdf）
+# ---------------------------
+selected_stocks = get_selected_stocks(TOP_DISPLAY)
+
+# 显示选出的股票
+st.write(f"选出的前 {TOP_DISPLAY} 只股票：")
+st.write(fdf[['ts_code', 'name', '综合评分']].head(TOP_DISPLAY))
+
+# ---------------------------
+# 获取股票的历史数据
+# ---------------------------
+def get_stock_data(stock_code, start_date, end_date):
+    """
+    获取股票的历史交易数据
+    """
+    df = ts.pro_bar(ts_code=stock_code, start_date=start_date, end_date=end_date, asset='E')
+    return df
+
+# ---------------------------
+# 执行回测
+# ---------------------------
+def backtest(start_date, end_date, initial_cash=100000, TOP_DISPLAY=30, hold_days=5, fee_rate=0.001):
+    """
+    回测选股王选出的股票
+    """
+    selected_stocks = get_selected_stocks(TOP_DISPLAY)  # 获取选出的股票池
+    cash = initial_cash  # 初始资金
+    portfolio = {}  # 当前持仓
+    trade_history = []  # 记录交易历史
+
+    for stock in selected_stocks:
+        stock_data = get_stock_data(stock, start_date, end_date)
+        
+        if stock_data is None or len(stock_data) == 0:
+            continue  # 如果没有历史数据，跳过
+
+        # 设定买入和卖出价格：买入后持有 hold_days 天
+        buy_price = stock_data['close'].iloc[0]  # 第一天的收盘价
+        buy_date = stock_data['trade_date'].iloc[0]
+        sell_price = stock_data['close'].iloc[hold_days-1]  # 持股 hold_days 天后的收盘价
+        sell_date = stock_data['trade_date'].iloc[hold_days-1]
+
+        # 计算买入股票的数量
+        quantity = cash // buy_price  # 用现有资金买入股票
+        cash -= quantity * buy_price  # 扣除资金
+
+        # 记录交易历史
+        trade_history.append({
+            'stock': stock,
+            'buy_date': buy_date,
+            'buy_price': buy_price,
+            'sell_date': sell_date,
+            'sell_price': sell_price,
+            'quantity': quantity,
+            'profit': quantity * (sell_price - buy_price) - (quantity * buy_price * fee_rate) - (quantity * sell_price * fee_rate)
+        })
+
+        # 卖出股票，更新资金
+        cash += quantity * sell_price  # 卖出股票获得现金
+
+    total_assets = cash
+    total_profit = total_assets - initial_cash
+    return total_assets, total_profit, trade_history
+
+# ---------------------------
+# 设置回测日期和参数
+# ---------------------------
+start_date = '20210101'
+end_date = '20230101'
+initial_cash = 100000  # 初始资金
+hold_days = 5  # 持股5天
+fee_rate = 0.001  # 交易费用率（千分之一）
+
+final_cash, total_profit, history = backtest(start_date, end_date, initial_cash, TOP_DISPLAY, hold_days, fee_rate)
+
+# ---------------------------
+# 输出回测结果
+# ---------------------------
+st.write(f"最终资金：{final_cash}")
+st.write(f"总收益：{total_profit}")
+st.write("交易历史：")
+for trade in history:
+    st.write(trade)
