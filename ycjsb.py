@@ -7,7 +7,33 @@
 - 尽可能调用 moneyflow / chip / ths_member / chip 等高级接口，若无权限会自动降级
 - 已做大量异常处理与缓存，降低因接口波动导致的报错
 """
+def select_stocks(stock_list, start_date, end_date, pro):
+    """
+    从股票列表中筛选出符合条件的股票
+    参数：
+    - stock_list: 股票代码列表
+    - start_date: 回测开始日期（格式: 'YYYYMMDD'）
+    - end_date: 回测结束日期（格式: 'YYYYMMDD'）
+    - pro: tushare 的 pro_api 对象，用于获取数据
+    
+    返回：
+    - selected: 筛选出的符合条件的股票列表
+    """
+    selected = []
+    
+    for stock in stock_list:
+        # 获取该股票的日线数据
+        df = pro.daily(ts_code=stock, start_date=start_date, end_date=end_date)
+        
+        if df.empty:
+            continue  # 如果没有数据，跳过
 
+        # 示例筛选条件：选取最近涨幅超过 5% 的股票
+        latest_pct_chg = df['pct_chg'].iloc[-1]  # 获取最近一天的涨幅
+        if latest_pct_chg > 5:  # 设定涨幅条件（如 5%）
+            selected.append(stock)
+    
+    return selected
 import streamlit as st
 import pandas as pd
 import numpy as np
