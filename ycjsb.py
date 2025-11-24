@@ -5,8 +5,7 @@
 - 目标：短线爆发 (B) + 妖股捕捉 (C)，持股 1-5 天
 - 在界面输入 Tushare Token（仅本次运行使用）
 - 尽可能调用 moneyflow / chip / ths_member / chip 等高级接口，若无权限会自动降级
-- 已做大量异常处理与缓存，降低因接口波动导致的报错
-- **新增回测模块：计算持股 1/3/5 天收益（按收盘价买卖）**
+- **已做大量异常处理与缓存，大幅优化回测时的历史数据加载速度**
 """
 
 import streamlit as st
@@ -18,6 +17,17 @@ import warnings
 import time
 
 warnings.filterwarnings("ignore")
+
+# ---------------------------
+# 全局数据缓存（用于性能优化）
+# ---------------------------
+# 存储所有股票的日线数据，key 为 ts_code
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_global_daily_data(ts_code):
+    """用于存储单只股票的历史数据，避免重复加载，但在回测模式下会被 get_bulk_daily_data 代替"""
+    return pd.DataFrame() # 仅用于占位，实际由 bulk load 实现
+
+GLOBAL_KLINE_DATA = {}
 
 # ---------------------------
 # 页面设置
@@ -117,7 +127,8 @@ st.info(f"参考最近交易日：{last_trade}")
 @st.cache_data(ttl=600)
 def get_advanced_data(trade_date):
     """缓存并获取当日所有高级数据"""
-    st.write(f"尝试加载 {trade_date} 的 stock_basic / daily_basic / moneyflow 等高级接口（若权限允许）...")
+    # 此处不需要 st.write，避免回测时打印过多信息
+    # st.write(f"尝试加载 {trade_date} 的 stock_basic / daily_basic / moneyflow 等高级接口（若权限允许）...")
     stock_basic = safe_get(pro.stock_basic, list_status='L', fields='ts_code,name,industry,list_date,total_mv,circ_mv')
     daily_basic = safe_get(pro.daily_basic, trade_date=trade_date, fields='ts_code,turnover_rate,amount,total_mv,circ_mv')
     mf_raw = safe_get(pro.moneyflow, trade_date=trade_date)
@@ -137,12 +148,12 @@ def get_advanced_data(trade_date):
             if col:
                  moneyflow = mf_raw[['ts_code', col]].rename(columns={col:'net_mf'}).fillna(0)
             else:
-                 st.warning(f"moneyflow 未在 {trade_date} 获取到，主力流向因子置为 0。")
-
+                 pass # 流向因子置为 0
+                 
     return stock_basic, daily_basic, moneyflow
 
 # ---------------------------
-# 合并基本信息（safe） - 抽取成函数以便回测调用
+# 合并基本信息 (safe_merge_pool, merge_all_info 保持不变)
 # ---------------------------
 def safe_merge_pool(pool_df, other_df, cols):
     """安全合并辅助函数"""
@@ -205,13 +216,12 @@ def merge_all_info(pool0, stock_basic, daily_basic, moneyflow):
     return pool_merged
 
 # ---------------------------
-# 清洗与过滤（抽取成函数以便回测调用）
+# 清洗与过滤（clean_and_filter 保持不变）
 # ---------------------------
 def clean_and_filter(pool_merged, min_price, max_price, min_turnover, min_amount, min_market_cap, max_market_cap, vol_spike_mult, volatility_max, high_pct_threshold, final_pool):
     """统一清洗和过滤流程"""
     clean_list = []
     
-    # 使用 Progress Bar 占位符，避免回测时实时更新
     st_pbar = None
     if st.session_state.get('mode', 'live') == 'live':
         st_pbar = st.progress(0)
@@ -299,32 +309,56 @@ def clean_and_filter(pool_merged, min_price, max_price, min_turnover, min_amount
     return clean_df
 
 # ---------------------------
-# 辅助：获取单只历史（10/20 日）并缓存（用于量比/10日收益等）
+# 性能优化：K 线批量加载（替换了原来的 get_hist_cached）
 # ---------------------------
-# 调整缓存 key，确保回测和实时调用不冲突
 @st.cache_data(ttl=600, show_spinner=False)
-def get_hist_cached(ts_code, end_date, days=60):
+def get_bulk_daily_data(start_date, end_date):
+    """
+    性能优化核心函数：批量获取全市场在指定时间范围内的日线数据。
+    返回一个字典: {ts_code: DataFrame(kline)}
+    """
+    global GLOBAL_KLINE_DATA
+    st.write(f"📈 正在批量加载全市场 {start_date} 至 {end_date} 的 K 线数据（Tushare调用密集，请耐心等待...）")
+    
+    # 尽可能一次性获取所有股票数据
     try:
-        start = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=days*2)).strftime("%Y%m%d")
-        # 兼容回测时的 pro 调用
-        pro_api = ts.pro_api(TS_TOKEN) if TS_TOKEN else pro
-        
-        df = safe_get(pro_api.daily, ts_code=ts_code, start_date=start, end_date=end_date)
-        if df is None or df.empty:
-            return pd.DataFrame()
-        df = df.sort_values('trade_date').reset_index(drop=True)
-        return df
-    except:
-        return pd.DataFrame()
+        df_all = safe_get(pro.daily, start_date=start_date, end_date=end_date)
+        if df_all.empty:
+            st.error("批量获取 K 线数据失败或返回空，回测无法进行。")
+            return {}
+    except Exception as e:
+        st.error(f"批量获取 K 线数据出错：{e}。回测无法进行。")
+        return {}
+
+    # 按股票代码分组，存入全局字典
+    GLOBAL_KLINE_DATA = {
+        ts_code: group.sort_values('trade_date').reset_index(drop=True)
+        for ts_code, group in df_all.groupby('ts_code')
+    }
+    
+    st.write(f"✅ K 线数据加载完成。共获取 {len(GLOBAL_KLINE_DATA)} 支股票的历史数据。")
+    return GLOBAL_KLINE_DATA
 
 # ---------------------------
-# 评分指标计算（未改变）
+# 评分指标计算（已修改为从全局缓存读取）
 # ---------------------------
-def compute_indicators(df):
-    # ... (与原文件中的 compute_indicators 函数内容完全一致，为保持代码简洁，这里省略)
+def compute_indicators(ts_code, end_date, days=60):
+    """从全局缓存中获取数据并计算指标"""
     res = {}
+    
+    # 从全局缓存中获取 K 线数据
+    if ts_code not in GLOBAL_KLINE_DATA:
+        return res
+        
+    df_full = GLOBAL_KLINE_DATA[ts_code]
+    
+    # 筛选出当前回测日之前的数据（包括 end_date 当天）
+    df = df_full[df_full['trade_date'] <= end_date].tail(days + 26) # 26 for MACD
+    
     if df.empty or len(df) < 3:
         return res
+        
+    # 指标计算逻辑 (与原逻辑保持一致)
     close = df['close'].astype(float)
     high = df['high'].astype(float)
     low = df['low'].astype(float)
@@ -424,7 +458,7 @@ def compute_indicators(df):
     return res
 
 # ---------------------------
-# 评分计算主体（抽取成函数以便回测调用）
+# 评分计算主体（已修改为使用本地缓存）
 # ---------------------------
 def compute_scores(clean_df, last_trade, min_market_cap, max_market_cap, vol_spike_mult, volatility_max, high_pct_threshold):
     """统一评分和风险过滤流程"""
@@ -445,8 +479,8 @@ def compute_scores(clean_df, last_trade, min_market_cap, max_market_cap, vol_spi
         turnover_rate = getattr(row, 'turnover_rate', np.nan)
         net_mf = float(getattr(row, 'net_mf', 0.0))
 
-        hist = get_hist_cached(ts_code, last_trade, days=60)
-        ind = compute_indicators(hist)
+        # *** 性能优化：调用新的指标计算函数 ***
+        ind = compute_indicators(ts_code, last_trade, days=60)
 
         vol_ratio = ind.get('vol_ratio', np.nan)
         ten_return = ind.get('10d_return', np.nan)
@@ -492,7 +526,9 @@ def compute_scores(clean_df, last_trade, min_market_cap, max_market_cap, vol_spi
     fdf = pd.DataFrame(records)
     if fdf.empty: return pd.DataFrame()
 
-    # 风险过滤（与原文件一致）
+    # ... (风险过滤和评分逻辑保持不变)
+    
+    # 风险过滤
     try:
         # A: 高位大阳线 -> last_close > ma20*1.10 且 pct_chg > HIGH_PCT_THRESHOLD
         if all(c in fdf.columns for c in ['ma20','last_close','pct_chg']):
@@ -586,7 +622,7 @@ def compute_scores(clean_df, last_trade, min_market_cap, max_market_cap, vol_spi
     return fdf
 
 # ---------------------------
-# 回测主模块（新增）
+# 回测主模块（已修改为使用本地缓存）
 # ---------------------------
 def run_backtest(trade_dates, hold_days, top_k):
     """
@@ -595,24 +631,46 @@ def run_backtest(trade_dates, hold_days, top_k):
     hold_days: 持有天数列表 [1, 3, 5]
     top_k: 每天选股 Top K
     """
+    global GLOBAL_KLINE_DATA # 声明使用全局变量
+    
+    # 步骤 0：性能优化核心 - 预加载 K 线数据
+    # 计算需要预加载的日期范围
+    if not trade_dates:
+        st.warning("回测日期列表为空，回测终止。")
+        return pd.DataFrame()
+        
+    start_buy_date = trade_dates[0]
+    # 指标计算需要 60 天历史数据，MACD需要 26 天，我们取 60 天 Lookback
+    lookback_days = 60 * 2 # 粗略估计
+    start_kline_date = (datetime.strptime(start_buy_date, "%Y%m%d") - timedelta(days=lookback_days)).strftime("%Y%m%d")
+    
+    # 获取数据，这里是 Streamlit Cache 的功劳，第一次慢，以后快
+    # 这一步将数据填充到 GLOBAL_KLINE_DATA
+    get_bulk_daily_data(start_kline_date, last_trade)
+    
+    if not GLOBAL_KLINE_DATA:
+        return pd.DataFrame()
+
+
     st.info(f"开始回测：{trade_dates[0]} 到 {trade_dates[-1]}，持股 {hold_days} 天，每日选择 Top {top_k}。")
     
     results = {h: {'returns': [], 'wins': 0, 'total': 0} for h in hold_days}
     
     # 获取所有交易日，用于计算卖出日期
-    today_date_str = datetime.now().strftime("%Y%m%d")
-    start_lookback = (datetime.strptime(trade_dates[0], "%Y%m%d") - timedelta(days=20)).strftime("%Y%m%d")
-    all_trade_cals = get_all_trade_cals(start_lookback, today_date_str)
-    
+    today_date_str = datetime.now().strftime("%Y%m%m")
+    max_lookback = BACKTEST_DAYS + max(HOLD_DAYS) + 30
+    start_lookback = (datetime.strptime(trade_dates[0], "%Y%m%d") - timedelta(days=max_lookback)).strftime("%Y%m%d")
+    all_trade_cals = get_all_trade_cals(start_lookback, last_trade) # 仅获取到最近交易日
+
     if len(all_trade_cals) == 0:
-        st.error("无法获取交易日历，回测失败。请检查 Token 权限。")
+        st.error("无法获取交易日历，回测失败。")
         return pd.DataFrame()
 
     pbar = st.progress(0, text=f"回测进度：0 / {len(trade_dates)} 天")
 
     for i, buy_date in enumerate(trade_dates):
         
-        # 1. 获取当日数据
+        # 1. 获取当日数据 (此处仍需 API 调用，因为需要当日的涨幅榜和高级数据)
         try:
             daily_all = safe_get(pro.daily, trade_date=buy_date)
             if daily_all.empty: continue
@@ -622,7 +680,7 @@ def run_backtest(trade_dates, hold_days, top_k):
             
         pool0 = daily_all.head(INITIAL_TOP_N).copy().reset_index(drop=True)
         
-        # 2. 获取高级接口数据
+        # 2. 获取高级接口数据 (已缓存)
         stock_basic, daily_basic, moneyflow = get_advanced_data(buy_date)
         
         # 3. 合并信息
@@ -632,31 +690,38 @@ def run_backtest(trade_dates, hold_days, top_k):
         clean_df = clean_and_filter(pool_merged, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MIN_AMOUNT, MIN_MARKET_CAP, MAX_MARKET_CAP, VOL_SPIKE_MULT, VOLATILITY_MAX, HIGH_PCT_THRESHOLD, FINAL_POOL)
         if clean_df.empty: continue
 
-        # 5. 评分
+        # 5. 评分 (***性能提升点：指标计算现在读取本地缓存***)
         fdf_scored = compute_scores(clean_df, buy_date, MIN_MARKET_CAP, MAX_MARKET_CAP, VOL_SPIKE_MULT, VOLATILITY_MAX, HIGH_PCT_THRESHOLD)
         if fdf_scored.empty: continue
         
         fdf_scored = fdf_scored.sort_values('综合评分', ascending=False).head(top_k)
         
         # 6. 计算收益 (买入价: buy_date 的收盘价)
-        buy_date_cal_idx = all_trade_cals.index(buy_date)
+        try:
+            buy_date_cal_idx = all_trade_cals.index(buy_date)
+        except ValueError:
+            continue
         
         for _, row in fdf_scored.iterrows():
             ts_code = row['ts_code']
-            buy_close = row['last_close'] # last_close 在 compute_indicators 中即为 buy_date 的 close
+            buy_close = row['last_close'] 
 
             for h in hold_days:
                 try:
                     sell_cal_idx = buy_date_cal_idx + h
-                    if sell_cal_idx >= len(all_trade_cals): continue # 无法回测
-
+                    
+                    if sell_cal_idx >= len(all_trade_cals): continue 
+                    
                     sell_date = all_trade_cals[sell_cal_idx]
                     
-                    # 获取卖出日数据
-                    sell_data = safe_get(pro.daily, ts_code=ts_code, trade_date=sell_date)
-                    if sell_data.empty: continue
+                    # 获取卖出日数据 (从预加载的全量 K 线数据中查询，避免 API 调用)
+                    if ts_code not in GLOBAL_KLINE_DATA: continue
                     
-                    sell_close = sell_data['close'].iloc[0]
+                    sell_data_row = GLOBAL_KLINE_DATA[ts_code]
+                    sell_close_df = sell_data_row[sell_data_row['trade_date'] == sell_date]['close']
+                    
+                    if sell_close_df.empty: continue
+                    sell_close = sell_close_df.iloc[0]
                     
                     # 收益率
                     ret = (sell_close / buy_close) - 1.0
@@ -669,7 +734,7 @@ def run_backtest(trade_dates, hold_days, top_k):
         
         pbar.progress((i + 1) / len(trade_dates), text=f"回测进度：{i+1} / {len(trade_dates)} 天")
 
-    pbar.empty() # 清除进度条
+    pbar.empty() 
     
     # 7. 整理结果
     final_results = []
@@ -689,11 +754,15 @@ def run_backtest(trade_dates, hold_days, top_k):
 
 
 # ---------------------------
-# 实时选股主流程
+# 实时选股主流程 
 # ---------------------------
-
 def live_stock_pick():
+    global GLOBAL_KLINE_DATA # 实时选股也利用 K 线缓存
     st.session_state['mode'] = 'live'
+    
+    # 预加载 K 线数据（仅当日选股所需，start_date 可以设置为最近 90 天）
+    start_date_90 = (datetime.strptime(last_trade, "%Y%m%d") - timedelta(days=90)).strftime("%Y%m%d")
+    get_bulk_daily_data(start_date_90, last_trade)
     
     # 1. 拉当日涨幅榜初筛
     st.write("正在拉取当日 daily（涨幅榜）作为初筛...")
@@ -724,7 +793,7 @@ def live_stock_pick():
     st.write(f"用于评分的池子大小：{len(clean_df)}")
     
     # 5. 评分计算
-    st.write("为评分池逐票拉历史并计算指标（此步骤调用历史接口，已缓存）...")
+    st.write("为评分池逐票计算指标（本次已优化：从本地缓存读取 K 线数据）...")
     fdf = compute_scores(clean_df, last_trade, MIN_MARKET_CAP, MAX_MARKET_CAP, VOL_SPIKE_MULT, VOLATILITY_MAX, HIGH_PCT_THRESHOLD)
 
     if fdf.empty:
@@ -762,19 +831,28 @@ if st.button('🟢 **运行当日选股**'):
 # 回测按钮
 if st.button('🟠 **启动回测** (N 天前买入, 持有 H 天, 收盘价计算)'):
     st.session_state['mode'] = 'backtest'
-    with st.spinner(f'正在获取过去 {BACKTEST_DAYS} 个交易日的数据并回测... (可能较慢)'):
+    with st.spinner(f'正在获取过去 {BACKTEST_DAYS} 个交易日的数据并回测... (首次加载全量 K 线会慢)'):
         
         # 1. 获取回测交易日列表 (即买入日)
         today = datetime.strptime(last_trade, "%Y%m%d")
-        start_date = (today - timedelta(days=BACKTEST_DAYS * 2)).strftime("%Y%m%d")
+        start_date = (today - timedelta(days=BACKTEST_DAYS * 3)).strftime("%Y%m%d")
         
         all_trade_cals = get_all_trade_cals(start_date, last_trade)
         
-        if len(all_trade_cals) < BACKTEST_DAYS:
-            st.error(f"Tushare 只返回了 {len(all_trade_cals)} 个交易日，无法满足 {BACKTEST_DAYS} 天的回测需求。请检查 Token 权限或降低回测天数。")
+        if len(all_trade_cals) < BACKTEST_DAYS + 1:
+            st.error(f"交易日历不足 {BACKTEST_DAYS} 天，请检查 Token 权限或降低回测天数。")
         else:
-            # 取最近 N 个交易日作为买入日
-            backtest_dates = all_trade_cals[-BACKTEST_DAYS-1:-1] # 排除当日
+            # 找到最近一个交易日（last_trade）的索引
+            try:
+                last_trade_idx = all_trade_cals.index(last_trade)
+            except ValueError:
+                st.error(f"最近交易日 {last_trade} 不在交易日历中。")
+                st.stop()
+                
+            start_idx = last_trade_idx - BACKTEST_DAYS
+            end_idx = last_trade_idx 
+            
+            backtest_dates = all_trade_cals[start_idx:end_idx]
             
             # 2. 运行回测
             results_df = run_backtest(backtest_dates, HOLD_DAYS, TOP_DISPLAY)
@@ -796,10 +874,5 @@ st.markdown("### 小结与操作提示（简洁）")
 st.markdown("""
 - **当日选股**：点击 **🟢 运行当日选股**，执行原有的选股逻辑。
 - **回测**：点击 **🟠 启动回测**，软件将向后追溯 N 个交易日，每日使用您的选股参数选择 Top K 股票，并计算持有 H 天的平均收益率和胜率（按收盘价买卖）。
-- **回测注意事项**：回测时，`get_hist_cached` 会被大量调用，请耐心等待。如果数据缺失（如停牌），该笔交易将自动跳过。
-- 推荐实战纪律（供参考）：**9:40 前不买 → 观察 9:40-10:05 的量价节奏 → 10:05 后择优介入**。  
-- 若候选普遍翻绿，请保持空仓。  
+- **回测速度**：**本次已进行性能优化**。第一次运行时，`get_bulk_daily_data` 会一次性请求大量数据，**速度依然较慢**。但数据会被 Streamlit 缓存，后续更改参数或再次运行回测时，速度会大幅提升。
 """)
-
-st.info("运行出现问题请把 Streamlit 的错误日志或首段报错发给我（截图或文字都行），我会在一次修改内继续帮你调优。")
-
