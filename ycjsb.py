@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 10000 积分旗舰（终极修复 V5.4）
+选股王 · 10000 积分旗舰（终极修复 V5.5）
 说明：
-- 核心修复：解决了 moneyflow 预处理中的 NameError: mf_cols is not defined。
-- 健壮性增强：确保回测结果计算（V5.2）能处理 NaN 值，避免进度条卡住。
-- 策略同步：确保 run_backtest 逻辑与实时选股策略完全对齐。
+- 核心修复：解决了计算中的 NaN 值导致回测崩溃或卡住的问题。
+- 界面增强：回测主进度条增加文本观察器，显示当前正在处理的回测日，解决“假死”问题。
 """
 
 import streamlit as st
@@ -18,8 +17,8 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · 10000旗舰（终极修复V5.4）", layout="wide")
-st.title("选股王 · 10000 积分旗舰（终极修复版 V5.4）")
+st.set_page_config(page_title="选股王 · 10000旗舰（终极修复V5.5）", layout="wide")
+st.title("选股王 · 10000 积分旗舰（终极修复版 V5.5）")
 st.markdown("输入你的 Tushare Token（仅本次运行使用）。若有权限缺失，脚本会自动降级并继续运行。")
 
 # ---------------------------
@@ -32,22 +31,18 @@ with st.sidebar:
     TOP_DISPLAY = int(st.number_input("界面显示 Top K", value=30, step=5))
     MIN_PRICE = float(st.number_input("最低价格 (元)", value=10.0, step=1.0))
     MAX_PRICE = float(st.number_input("最高价格 (元)", value=200.0, step=10.0))
-    # V5.0 调整：换手率和成交额更激进
     MIN_TURNOVER = float(st.number_input("最低换手率 (%)", value=2.0, step=0.5)) 
-    MIN_AMOUNT = float(st.number_input("最低成交额 (元)", value=150_000_000.0, step=50_000_000.0)) # 默认 1.5亿
+    MIN_AMOUNT = float(st.number_input("最低成交额 (元)", value=150_000_000.0, step=50_000_000.0))
     VOL_SPIKE_MULT = float(st.number_input("放量倍数阈值 (vol_last > vol_ma5 * x)", value=1.7, step=0.1))
-    VOLATILITY_MAX = float(st.number_input("过去10日波动 std 阈值 (%)", value=15.0, step=1.0)) # V5.0 调高，容忍短线高波动
+    VOLATILITY_MAX = float(st.number_input("过去10日波动 std 阈值 (%)", value=15.0, step=1.0))
     HIGH_PCT_THRESHOLD = float(st.number_input("视为大阳线 pct_chg (%)", value=6.0, step=0.5))
-    MIN_MARKET_CAP = float(st.number_input("最低市值 (元)", value=2000000000.0, step=100000000.0))  # 默认 20亿
-    MAX_MARKET_CAP = float(st.number_input("最高市值 (元)", value=50000000000.0, step=1000000000.0))  # 默认 500亿
+    MIN_MARKET_CAP = float(st.number_input("最低市值 (元)", value=2000000000.0, step=100000000.0))
+    MAX_MARKET_CAP = float(st.number_input("最高市值 (元)", value=50000000000.0, step=1000000000.0))
     st.markdown("---")
     # --- 回测参数 ---
     st.header("历史回测参数")
     BACKTEST_DAYS = int(st.number_input("回测交易日天数", value=60, min_value=10, max_value=250))
-    
-    # 根据上次讨论，将 Top K 建议值设为小值
     BACKTEST_TOP_K = int(st.number_input("回测每日最多交易 K 支", value=3, min_value=1, max_value=30)) 
-    
     HOLD_DAYS_OPTIONS = st.multiselect("回测持股天数", options=[1, 3, 5, 10, 20], default=[1, 3, 5])
     st.caption("提示：请确认 **MIN_TURNOVER**、**MIN_AMOUNT** 已调整。")
     st.caption(f"**回测 Top K 建议值：3 - 5 支，当前：{BACKTEST_TOP_K}。**")
@@ -414,7 +409,7 @@ def norm_col(s):
 
 def apply_scoring_and_filtering(fdf, use_hard_filter=True):
     """
-    V5.0 统一的评分和过滤流程。
+    V5.5 统一的评分和过滤流程。
     返回：排序后的 DataFrame
     """
     if fdf.empty:
@@ -575,7 +570,7 @@ if fdf.empty:
     st.stop()
 
 # ---------------------------
-# 最终综合评分（V5.4: 调用统一函数）
+# 最终综合评分（V5.5: 调用统一函数）
 # ---------------------------
 fdf = apply_scoring_and_filtering(fdf, use_hard_filter=False)
 fdf.index = fdf.index + 1
@@ -594,12 +589,12 @@ st.download_button("下载评分结果（前200）CSV", data=out_csv, file_name=
 
 
 # ---------------------------
-# 历史回测部分（V5.4 增强健壮性）
+# 历史回测部分（V5.5 增强健壮性）
 # ---------------------------
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=6000)
 def load_backtest_data(all_trade_dates):
     """
-    V5.0 预加载：同时加载 daily 和 daily_basic，支持回测中进行换手率过滤。
+    预加载：同时加载 daily 和 daily_basic。
     """
     daily_cache = {}
     basic_cache = {}
@@ -650,14 +645,21 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k):
     daily_cache, basic_cache = load_backtest_data(sorted(list(required_dates)))
 
     st.write(f"正在模拟 {len(backtest_dates)} 个交易日的选股回测...")
-    pbar_bt = st.progress(0)
+    # V5.5 改进：主进度条添加文本描述
+    pbar_bt = st.progress(0, text="回测初始化...")
+    
+    total_days = len(backtest_dates)
     
     for i, buy_date in enumerate(backtest_dates):
+        
+        # V5.5 改进：在执行耗时操作前更新进度条文本，让用户知道程序在工作
+        pbar_bt.progress((i)/total_days, text=f"回测进度: 第 {i+1}/{total_days} 天 ({buy_date}) 正在评分...") 
+        
         daily_df_cached = daily_cache.get(buy_date)
         basic_df_cached = basic_cache.get(buy_date)
         
         if daily_df_cached is None or daily_df_cached.empty:
-            pbar_bt.progress((i+1)/len(backtest_dates)); continue
+            pbar_bt.progress((i+1)/total_days); continue
 
         daily_df = daily_df_cached.copy().reset_index() 
         daily_df.rename(columns={'amount': 'amount_daily'}, inplace=True) # daily 里的 amount (千元)
@@ -676,15 +678,15 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k):
             
         # 2. 应用基本过滤（与实时选股同步）
         daily_df = daily_df[
-            (daily_df['close'] >= MIN_PRICE) & 
-            (daily_df['close'] <= MAX_PRICE) &
-            (daily_df['vol'] > 0) & 
-            (daily_df['amount'] > MIN_AMOUNT) & # 成交额过滤
-            (daily_df['pct_chg'] > 0) & # 剔除当日下跌
-            (~((daily_df['open'] == daily_df['high']) & (daily_df['pct_chg'] > 9.5))) # 剔除一字板
+            (daily_df['close'].fillna(0) >= MIN_PRICE) & 
+            (daily_df['close'].fillna(0) <= MAX_PRICE) &
+            (daily_df['vol'].fillna(0) > 0) & 
+            (daily_df['amount'].fillna(0) > MIN_AMOUNT) & # 成交额过滤
+            (daily_df['pct_chg'].fillna(0) > 0) & # 剔除当日下跌
+            (~((daily_df['open'].fillna(0) == daily_df['high'].fillna(0)) & (daily_df['pct_chg'].fillna(0) > 9.5))) # 剔除一字板
         ].copy()
         
-        # 换手率过滤 (V5.0: 现在可以用了)
+        # 换手率过滤 
         if 'turnover_rate' in daily_df.columns:
             daily_df = daily_df[(daily_df['turnover_rate'].fillna(0) >= MIN_TURNOVER)].copy()
         
@@ -693,20 +695,19 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k):
             # 兼容 Tushare daily_basic 的 total_mv (单位为万元，需要转元)
             daily_df['total_mv_yuan'] = daily_df['total_mv'].fillna(0) * 10000.0 
             daily_df = daily_df[
-                (daily_df['total_mv_yuan'] >= MIN_MARKET_CAP) & 
-                (daily_df['total_mv_yuan'] <= MAX_MARKET_CAP)
+                (daily_df['total_mv_yuan'].fillna(0) >= MIN_MARKET_CAP) & 
+                (daily_df['total_mv_yuan'].fillna(0) <= MAX_MARKET_CAP)
             ].copy()
 
         if daily_df.empty:
-            pbar_bt.progress((i+1)/len(backtest_dates)); continue
+            pbar_bt.progress((i+1)/total_days); continue
             
-        # 3. 计算指标并评分 (重现实时评分的复杂逻辑)
+        # 3. 计算指标并评分 (耗时操作)
         score_records = []
         for _, row in daily_df.iterrows():
             ts_code = row['ts_code']
             
-            # ** 性能关键 **：从缓存中拉取历史K线数据，以供计算指标
-            # 注意：回测时需要精确回溯，所以不能用主流程的 get_hist_cached（end_date不对）
+            # ** 性能关键 **：调用缓存函数获取历史K线数据
             hist_df = get_hist_cached(ts_code, buy_date, days=60)
             ind = compute_indicators(hist_df)
             
@@ -716,15 +717,15 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k):
             
             # 资金强度代理 (需在评分前计算)
             pct_chg = rec.get('pct_chg', 0.0)
-            vol_ratio = rec.get('vol_ratio', 0.0)
-            turnover_rate = rec.get('turnover_rate', 0.0)
-            rec['proxy_money'] = (abs(pct_chg) + 1e-9) * (vol_ratio if not pd.isna(vol_ratio) else 0.0) * (turnover_rate if not pd.isna(turnover_rate) else 0.0)
+            vol_ratio = ind.get('vol_ratio', 0.0) # 从指标中获取
+            turnover_rate_val = rec.get('turnover_rate', 0.0) # 从当日基本数据中获取
+            rec['proxy_money'] = (abs(pct_chg) + 1e-9) * (vol_ratio if not pd.isna(vol_ratio) else 0.0) * (turnover_rate_val if not pd.isna(turnover_rate_val) else 0.0)
 
             score_records.append(rec)
 
         scored_df = pd.DataFrame(score_records)
         if scored_df.empty:
-            pbar_bt.progress((i+1)/len(backtest_dates)); continue
+            pbar_bt.progress((i+1)/total_days); continue
 
         # 4. 应用评分和排序
         scored_df = apply_scoring_and_filtering(scored_df, use_hard_filter=False)
@@ -754,7 +755,7 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k):
                 
                 if pd.isna(sell_price) or sell_price <= 0: continue
                 
-                # V5.2 确保 ret 是 float
+                # 确保 ret 是 float
                 ret = (float(sell_price) / float(buy_price)) - 1.0
                 
                 results[h]['total'] += 1
@@ -762,16 +763,16 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k):
                 if ret > 0:
                     results[h]['wins'] += 1
 
-        pbar_bt.progress((i+1)/len(backtest_dates))
+        pbar_bt.progress((i+1)/total_days)
 
-    pbar_bt.progress(1.0)
+    pbar_bt.progress(1.0, text="回测完成!")
     
     final_results = {}
     for h, res in results.items():
         total = res['total']
-        # V5.2 增强健壮性：将 returns 转换为 Series，并移除 NaN 后再计算平均值
+        # 增强健壮性：将 returns 转换为 Series，并移除 NaN/Inf 后再计算平均值
         returns_series = pd.Series(res['returns'])
-        valid_returns = returns_series.dropna()
+        valid_returns = returns_series.replace([np.inf,-np.inf], np.nan).dropna()
         
         if total > 0 and len(valid_returns) > 0:
             avg_return = valid_returns.mean() * 100.0
@@ -802,7 +803,7 @@ if st.checkbox("✅ 运行历史回测", value=False):
         except:
             start_date_for_cal = (datetime.now() - timedelta(days=200)).strftime("%Y%m%d")
             
-        # V5.4 增加 try/except 捕获可能的最终异常
+        # V5.5 确保捕获并提示
         try:
             backtest_result = run_backtest(
                 start_date=start_date_for_cal, 
@@ -821,10 +822,10 @@ if st.checkbox("✅ 运行历史回测", value=False):
             
             export_df = bt_df.copy()
             export_df.columns = ['HoldDays', 'AvgReturn', 'WinRate', 'TotalTrades']
-            out_csv_bt = export_df.to_csv(index=False, encoding='utf-8-sig')
+            out_csv = export_df.to_csv(index=False, encoding='utf-8-sig')
             st.download_button(
                 "下载回测结果 CSV", 
-                data=out_csv_bt, 
+                data=out_csv, 
                 file_name=f"backtest_result_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", 
                 mime="text/csv"
             )
@@ -835,15 +836,9 @@ if st.checkbox("✅ 运行历史回测", value=False):
 # ---------------------------
 # 小结与建议（简洁）
 # ---------------------------
-st.markdown("### 小结与操作提示（终极修复 V5.4）")
+st.markdown("### 小结与操作提示（终极修复 V5.5）")
 st.markdown("""
-- **状态：** **V5.4** 已发布。核心修复已在 V5.2/V5.3 完成。
-- **强制解决方案：** 如果进度条走到 100% 后卡住不显示结果：
-    1.  请确保您已将代码更新为 V5.4。
-    2.  点击 Streamlit 右上角 **三点菜单 (☰)**。
-    3.  选择 **“Clear cache”** 或 **“清除缓存”**。
-    4.  重新勾选 **“✅ 运行历史回测”**。
-- **性能提示：** 1.  第一次运行时，**数据预加载**耗时约 **15-20分钟**。
-    2.  清除缓存后，如果需要重新加载数据，也会耗时较长。
-- **Top K 建议：** 我们已在侧边栏将 **“回测每日最多交易 K 支”** 的默认值设置为 **3**。建议您保持这个较小的 Top K 值来集中策略火力。
+- **状态：** 已更新至 **V5.5**，增强了回测进度条的可见性。
+- **请注意：** 如果第二个进度条仍卡在 **0%**，但文本显示为 **“回测进度: 第 1/60 天 (YYYYMMDD) 正在评分...”**，则意味着您的 Tushare 接口正在进行大量缓存查阅或首次拉取，请等待约 **15-30 分钟**。
+- **重要提醒：** 只有 **“正在预加载回测所需 X 个交易日的 daily 和 daily_basic 数据...”** 的进度条跑完后，回测模拟才开始。如果它卡住，请先清除缓存。
 """)
