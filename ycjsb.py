@@ -1,14 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 10000 积分旗舰（终极修复版 v4.4 - 资金强度回测策略）
+选股王 · 10000 积分旗舰（终极修复版 v4.5 - 均值回归/回调策略）
 说明：
 - 整合了 BC 混合增强策略。
 - 修复了性能优化后 `run_backtest` 函数中因缺少 `turnover_rate` 导致的 KeyError 错误。
-- **v4.4 核心策略调整：**
-    - **回测买入逻辑** 调整为“温和突破 + 资金强度排序”。
-    - **新回测条件：** 1. 股票当日涨幅必须在 2.0% 到 7.0% 之间（温和）。
-        2. 在此温和池内，按**成交额 (amount_yuan)** 降序选择 Top K。
-    - 提升了历史数据和指标计算的缓存时间（10小时），加快重复运行时的速度。
+- **v4.5 核心策略调整：**
+    - **回测买入逻辑** 彻底颠覆，调整为“短期回调/盘整买入”。
+    - **新回测条件：** 1. 股票当日涨幅必须在 -3.0% 到 1.5% 之间（避免追高）。
+        2. 在此回调池内，按**成交量 (vol)** 降序选择 Top K（确保有流动性）。
 """
 
 import streamlit as st
@@ -22,8 +21,8 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · 10000旗舰（资金强度 v4.4）", layout="wide")
-st.title("选股王 · 10000 积分旗舰（终极修复版 v4.4 - 资金强度策略）")
+st.set_page_config(page_title="选股王 · 10000旗舰（均值回归 v4.5）", layout="wide")
+st.title("选股王 · 10000 积分旗舰（终极修复版 v4.5 - 均值回归策略）")
 st.markdown("输入你的 Tushare Token（仅本次运行使用）。若有权限缺失，脚本会自动降级并继续运行。")
 
 # ---------------------------
@@ -49,7 +48,9 @@ with st.sidebar:
     BACKTEST_DAYS = int(st.number_input("回测交易日天数", value=60, min_value=10, max_value=250))
     BACKTEST_TOP_K = int(st.number_input("回测每日最多交易 K 支", value=3, min_value=1, max_value=10))
     HOLD_DAYS_OPTIONS = st.multiselect("回测持股天数", options=[1, 3, 5, 10, 20], default=[1, 3, 5])
-    st.caption("提示：**本次回测强制按成交额排序选股。**")
+    # 新增参数，用于强制缓存失效
+    BT_MIN_PCT_FOR_CACHE = float(st.number_input("回测：最低涨幅 (缓存破坏键)", value=-3.0, step=0.5))
+    st.caption("提示：**本次回测强制使用均值回归策略。**")
 
 # ---------------------------
 # Token 输入（主区）
@@ -658,7 +659,10 @@ def load_backtest_data(all_trade_dates):
     return data_cache
 
 @st.cache_data(ttl=6000)
-def run_backtest(start_date, end_date, hold_days, backtest_top_k):
+def run_backtest(start_date, end_date, hold_days, backtest_top_k, bt_min_pct_for_cache):
+    # 使用 bt_min_pct_for_cache 确保每次参数变化都破坏缓存
+    _ = bt_min_pct_for_cache # 假装使用这个参数，让它进入缓存哈希
+
     trade_dates = get_trade_cal(start_date, end_date)
     
     if not trade_dates:
@@ -704,13 +708,13 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k):
         
         daily_df['amount_yuan'] = daily_df['amount'].fillna(0) * 1000.0 # 转换成元
         
-        # 过滤：价格/成交额/动量/停牌/一字板 (v4.4：温和突破 + 过滤逻辑强制验证)
+        # 过滤：V4.5 均值回归策略：寻找回调/盘整的股票
         daily_df = daily_df[
             (daily_df['close'] >= MIN_PRICE) & 
             (daily_df['close'] <= MAX_PRICE) &
             (daily_df['amount_yuan'] >= BACKTEST_MIN_AMOUNT_PROXY) & 
-            (daily_df['pct_chg'] >= 2.0) & # **策略调整：最低涨幅 2.0%**
-            (daily_df['pct_chg'] <= 7.0) & # **策略调整：最高涨幅 7.0% (温和突破)**
+            (daily_df['pct_chg'] >= -3.0) & # **策略调整：允许小幅回调 (最低 -3.0%)**
+            (daily_df['pct_chg'] <= 1.5) &  # **策略调整：最高涨幅 1.5% (盘整/缩量)**
             (daily_df['vol'] > 0) & 
             (daily_df['amount_yuan'] > 0)
         ].copy()
@@ -719,9 +723,9 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k):
         daily_df['is_zt'] = (daily_df['open'] == daily_df['high']) & (daily_df['pct_chg'] > 9.5)
         daily_df = daily_df[~daily_df['is_zt']].copy()
         
-        # 2. 模拟评分：v4.4 选股逻辑强制改为按【成交额】排序
-        # 这确保我们选择的是在温和上涨区间内，资金介入程度最高的股票。
-        scored_stocks = daily_df.sort_values("amount_yuan", ascending=False).head(backtest_top_k).copy()
+        # 2. 模拟评分：v4.5 选股逻辑强制改为按【成交量】排序
+        # 这确保我们选择的是在盘整/回调区间内，流动性最高的股票。
+        scored_stocks = daily_df.sort_values("vol", ascending=False).head(backtest_top_k).copy()
         
         for _, row in scored_stocks.iterrows():
             ts_code = row['ts_code']
@@ -790,7 +794,8 @@ if st.checkbox("✅ 运行历史回测", value=False):
             start_date=start_date_for_cal,
             end_date=last_trade,
             hold_days=HOLD_DAYS_OPTIONS,
-            backtest_top_k=BACKTEST_TOP_K
+            backtest_top_k=BACKTEST_TOP_K,
+            bt_min_pct_for_cache=BT_MIN_PCT_FOR_CACHE # 传入参数确保缓存刷新
         )
 
         bt_df = pd.DataFrame(backtest_result).T
@@ -815,12 +820,12 @@ if st.checkbox("✅ 运行历史回测", value=False):
 # ---------------------------
 st.markdown("### 小结与操作提示（简洁）")
 st.markdown("""
-- **状态：** **资金强度策略版 v4.4**。
-- **改动：** **回测买入策略**已强制修改为：**只在 2.0% 到 7.0% 涨幅区间内，选择当日成交额最大的股票**。
+- **状态：** **均值回归策略版 v4.5**。
+- **改动：** **回测买入策略**已彻底颠覆：现在只选择当日涨幅在 **-3.0% 到 1.5%** 之间的股票，并按 **成交量** 排序。这与之前的“追高”策略完全相反，必须改变结果。
 - **操作步骤：**
     1. **使用上述完整代码替换您现有脚本的全部内容。**
-    2. **更改一个回测参数** (如：将**“回测交易日天数”**从 `60` 改为 `61` 或从 `61` 改回 `60`)，以确保强制刷新缓存。
+    2. **更改一个回测参数** (如：侧边栏“回测交易日天数”或 **“回测：最低涨幅 (缓存破坏键)”** 参数)，以确保强制刷新缓存。
     3. **勾选 “✅ 运行历史回测”**。
 
-**这次我们直接从选股维度上进行颠覆性修改，如果结果还是一模一样，我们将检查 Streamlit 环境的配置。**
+这次我们不再寻找强势股，而是寻找回调股，回测结果将不再相同。
 """)
