@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 10000 积分旗舰（终极修复版 v4.1 - 性能优化）
+选股王 · 10000 积分旗舰（终极修复版 v4.2 - 清洗逻辑修复）
 说明：
 - 整合了 BC 混合增强策略。
 - 修复了性能优化后 `run_backtest` 函数中因缺少 `turnover_rate` 导致的 KeyError 错误。
 - 回测逻辑强化：使用更高的成交额要求和涨幅要求替代换手率过滤。
-- **v4.1 优化：**
-    1. 使用主运行按钮包裹选股逻辑，避免重复执行。
-    2. 延长历史数据缓存 TTL 至 10 小时，提升重复运行速度。
+- **v4.2 修复：**
+    - 修复了清洗循环中 `continue` 缩进错误，避免了所有股票都被无条件过滤的问题。
+    - 维持了 v4.1 的性能优化（主运行按钮和 10 小时缓存）。
 """
 
 import streamlit as st
@@ -21,8 +21,8 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · 10000旗舰（终极修复 - 性能优化）", layout="wide")
-st.title("选股王 · 10000 积分旗舰（终极修复版 v4.1 - 性能优化）")
+st.set_page_config(page_title="选股王 · 10000旗舰（终极修复 - 清洗修复）", layout="wide")
+st.title("选股王 · 10000 积分旗舰（终极修复版 v4.2 - 清洗逻辑修复）")
 st.markdown("输入你的 Tushare Token（仅本次运行使用）。若有权限缺失，脚本会自动降级并继续运行。")
 
 # ---------------------------
@@ -84,7 +84,7 @@ def get_trade_cal(start_date, end_date):
     except Exception:
         return []
 
-@st.cache_data(ttl=36000) # **优化点 2: 延长历史数据缓存至 10 小时**
+@st.cache_data(ttl=36000) # 延长历史数据缓存至 10 小时
 def find_last_trade_day(max_days=20):
     today = datetime.now().date()
     for i in range(max_days):
@@ -102,7 +102,7 @@ if not last_trade:
 st.info(f"参考最近交易日：{last_trade}")
 
 # ---------------------------
-# **优化点 1: 将选股逻辑包裹在按钮中**
+# 优化点 1: 将选股逻辑包裹在按钮中
 # ---------------------------
 if st.button("🚀 运行当日选股（初次运行可能较久）"):
 
@@ -231,22 +231,24 @@ if st.button("🚀 运行当日选股（初次运行可能较久）"):
     
         # 1. 过滤：停牌/无成交
         if vol == 0 or (isinstance(amount_daily,(int,float)) and amount_daily == 0):
-            pbar.progress((i+1)/len(pool_merged));
+            pbar.progress((i+1)/len(pool_merged))
             continue
 
         # 2. 过滤：价格区间
-        if pd.isna(close): pbar.progress((i+1)/len(pool_merged));
-        continue
-        if (close < MIN_PRICE) or (close > MAX_PRICE): pbar.progress((i+1)/len(pool_merged));
-        continue
+        if pd.isna(close): 
+            pbar.progress((i+1)/len(pool_merged))
+            continue
+        if (close < MIN_PRICE) or (close > MAX_PRICE): 
+            pbar.progress((i+1)/len(pool_merged))
+            continue
 
         # 3. 过滤：ST / 退市 / 北交所
         if isinstance(name, str) and (('ST' in name.upper()) or ('退' in name)):
-            pbar.progress((i+1)/len(pool_merged));
+            pbar.progress((i+1)/len(pool_merged))
             continue
         tsck = getattr(r, 'ts_code', '')
         if isinstance(tsck, str) and (tsck.startswith('4') or tsck.startswith('8')):
-            pbar.progress((i+1)/len(pool_merged));
+            pbar.progress((i+1)/len(pool_merged))
             continue
 
         # 4. 过滤：市值（兼容万元单位）
@@ -259,10 +261,10 @@ if st.button("🚀 运行当日选股（初次运行可能较久）"):
                 else:
                     tv_yuan = tv
                 if tv_yuan < MIN_MARKET_CAP or tv_yuan > MAX_MARKET_CAP:
-                    pbar.progress((i+1)/len(pool_merged));
+                    pbar.progress((i+1)/len(pool_merged))
                     continue
         except:
-            pass
+            pass # 发生异常时不过滤
 
         # 5. 过滤：一字涨停板
         try:
@@ -270,31 +272,34 @@ if st.button("🚀 运行当日选股（初次运行可能较久）"):
             low = getattr(r, 'low', np.nan)
             if (not pd.isna(open_p) and not pd.isna(high) and not pd.isna(low) and not pd.isna(pre_close)):
                 if (open_p == high == low == pre_close) and (pct > 9.5):
-                    pbar.progress((i+1)/len(pool_merged));
+                    pbar.progress((i+1)/len(pool_merged))
                     continue
         except:
-            pass
+            pass # 发生异常时不过滤
 
         # 6. 过滤：换手率
         if not pd.isna(turnover):
             try:
-                if float(turnover) < MIN_TURNOVER: pbar.progress((i+1)/len(pool_merged));
-                continue
+                if float(turnover) < MIN_TURNOVER: 
+                    pbar.progress((i+1)/len(pool_merged))
+                    continue
             except:
-                pass
+                pass # 发生异常时不过滤
 
         # 7. 过滤：成交额（修正单位：daily amount是千元）
         if not pd.isna(amount_daily):
             amt = amount_daily * 1000.0 # 转换成元
-            if amt < MIN_AMOUNT: pbar.progress((i+1)/len(pool_merged));
-            continue
+            if amt < MIN_AMOUNT: 
+                pbar.progress((i+1)/len(pool_merged))
+                continue
 
         # 8. 过滤：剔除昨日收阴股（保留当日上涨的）
         try:
-            if float(pct) < 0: pbar.progress((i+1)/len(pool_merged));
-            continue
+            if float(pct) < 0: 
+                pbar.progress((i+1)/len(pool_merged))
+                continue
         except:
-            pass
+            pass # 发生异常时不过滤
             
         clean_list.append(r)
         pbar.progress((i+1)/len(pool_merged))
@@ -309,7 +314,7 @@ if st.button("🚀 运行当日选股（初次运行可能较久）"):
     # ---------------------------
     # 辅助：获取单只历史（用于量比/10日收益等）
     # ---------------------------
-    @st.cache_data(ttl=36000) # **优化点 2: 延长历史数据缓存至 10 小时**
+    @st.cache_data(ttl=36000) # 延长历史数据缓存至 10 小时
     def get_hist_cached(ts_code, end_date, days=60):
         try:
             start = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=days*2)).strftime("%Y%m%d")
@@ -432,7 +437,7 @@ if st.button("🚀 运行当日选股（初次运行可能较久）"):
     # 评分池逐票计算因子（缓存 get_hist）
     # ---------------------------
     st.write("为评分池逐票拉历史并计算指标（此步骤调用历史接口，已缓存）...")
-    st.warning(f"⚠️ **耗时警告：** 当前有 {len(clean_df)} 支股票需要计算指标。如果太慢，请调整侧边栏 **'清洗后取前 M'** 参数。") # **优化点 3: 增加耗时警告**
+    st.warning(f"⚠️ **耗时警告：** 当前有 {len(clean_df)} 支股票需要计算指标。如果太慢，请调整侧边栏 **'清洗后取前 M'** 参数。") # 增加耗时警告
     records = []
     pbar2 = st.progress(0)
     for idx, row in enumerate(clean_df.itertuples()):
@@ -808,8 +813,8 @@ if st.checkbox("✅ 运行历史回测", value=False):
 # ---------------------------
 st.markdown("### 小结与操作提示（简洁）")
 st.markdown("""
-- **状态：** **性能优化版 v4.1**。
-- **优化：** 选股流程现已封装在 **主运行按钮** 中，避免了在操作回测时重复耗时运行。历史指标缓存延长至 10 小时。
+- **状态：** **清洗逻辑已修复版 v4.2**。
+- **修复：** 清洗循环中 `continue` 语句的缩进错误，现在股票将能够正常通过筛选。
 - **操作步骤：**
     1. **点击 “🚀 运行当日选股”**：完成当日选股和评分（仅需点击一次）。
     2. **勾选 “✅ 运行历史回测”**：开始回测。
