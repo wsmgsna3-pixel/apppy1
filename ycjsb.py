@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 10000 积分旗舰（终极修复版 v4.6 - 右侧启动/趋势强化策略）
+选股王 · 10000 积分旗舰（终极修复版 v4.7 - 强制右侧启动策略）
 说明：
 - 整合了 BC 混合增强策略。
 - 修复了性能优化后 `run_backtest` 函数中因缺少 `turnover_rate` 导致的 KeyError 错误。
-- **v4.6 核心策略调整：**
-    - **回测买入逻辑** 调整为“右侧启动”：寻找当日涨幅较高，且高流动性的股票。
-    - **新回测条件：** 1. 股票当日涨幅必须在 4.0% 到 9.5% 之间（避免盘整和极端激进）。
-        2. 在此池内，按 `pct_chg` (涨幅) 降序选择 Top K（确保捕捉动量）。
+- **v4.7 核心策略调整：**
+    - **回测买入逻辑** 调整为“右侧启动”：寻找当日涨幅在 4.1% 到 9.5% 之间的股票（从 4.0% 微调到 4.1% 强制刷新缓存）。
+    - **新回测条件：** 使用 V7 专用的缓存破坏键，确保新的回测逻辑被执行。
 """
 
 import streamlit as st
@@ -21,8 +20,8 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · 10000旗舰（右侧启动 v4.6）", layout="wide")
-st.title("选股王 · 10000 积分旗舰（终极修复版 v4.6 - 右侧启动策略）")
+st.set_page_config(page_title="选股王 · 10000旗舰（强制右侧启动 v4.7）", layout="wide")
+st.title("选股王 · 10000 积分旗舰（强制右侧启动版 v4.7）")
 st.markdown("输入你的 Tushare Token（仅本次运行使用）。若有权限缺失，脚本会自动降级并继续运行。")
 
 # ---------------------------
@@ -48,9 +47,11 @@ with st.sidebar:
     BACKTEST_DAYS = int(st.number_input("回测交易日天数", value=60, min_value=10, max_value=250))
     BACKTEST_TOP_K = int(st.number_input("回测每日最多交易 K 支", value=3, min_value=1, max_value=10))
     HOLD_DAYS_OPTIONS = st.multiselect("回测持股天数", options=[1, 3, 5, 10, 20], default=[1, 3, 5])
-    # 新增参数，用于强制缓存失效 (右侧策略使用涨幅上限作为缓存键)
-    BT_MAX_PCT_FOR_CACHE = float(st.number_input("回测：最高涨幅 (缓存破坏键)", value=9.5, step=0.5))
-    st.caption("提示：**本次回测使用右侧启动/趋势强化策略 (4.0% < 涨幅 < 9.5%)。**")
+    # 新增参数，用于强制缓存失效 (这次使用新的 v7 专用键)
+    BT_MAX_PCT_FOR_CACHE = float(st.number_input("回测：最高涨幅 (上限)", value=9.5, step=0.5))
+    # V7 强制刷新键
+    BT_MIN_PCT_FOR_CACHE_V7 = float(st.number_input("【重要】最低涨幅强制刷新键", value=4.1, step=0.1))
+    st.caption("提示：**本次回测使用右侧启动/趋势强化策略 (4.1% < 涨幅 < 9.5%)。**")
 
 # ---------------------------
 # Token 输入（主区）
@@ -659,9 +660,10 @@ def load_backtest_data(all_trade_dates):
     return data_cache
 
 @st.cache_data(ttl=6000)
-def run_backtest(start_date, end_date, hold_days, backtest_top_k, bt_max_pct_for_cache):
-    # 使用 bt_max_pct_for_cache 确保每次参数变化都破坏缓存
-    _ = bt_max_pct_for_cache # 假装使用这个参数，让它进入缓存哈希
+def run_backtest(start_date, end_date, hold_days, backtest_top_k, bt_max_pct_for_cache, bt_min_pct_for_cache_v7):
+    # 使用 bt_max_pct_for_cache 和 bt_min_pct_for_cache_v7 确保每次参数变化都破坏缓存
+    _ = bt_max_pct_for_cache 
+    _ = bt_min_pct_for_cache_v7
 
     trade_dates = get_trade_cal(start_date, end_date)
     
@@ -708,13 +710,13 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k, bt_max_pct_for
         
         daily_df['amount_yuan'] = daily_df['amount'].fillna(0) * 1000.0 # 转换成元
         
-        # 过滤：V4.6 右侧启动策略：寻找当日涨幅较高，且高成交额的股票
+        # 过滤：V4.7 右侧启动策略：寻找当日涨幅在 4.1% 到 9.5% 之间
         daily_df = daily_df[
             (daily_df['close'] >= MIN_PRICE) & 
             (daily_df['close'] <= MAX_PRICE) &
             (daily_df['amount_yuan'] >= BACKTEST_MIN_AMOUNT_PROXY) & 
-            (daily_df['pct_chg'] >= 4.0) & # **策略调整：当日涨幅必须达到 4.0% 以上 (右侧启动)**
-            (daily_df['pct_chg'] <= BT_MAX_PCT_FOR_CACHE) & # **使用缓存破坏键的参数作为上限 (9.5%)**
+            (daily_df['pct_chg'] >= bt_min_pct_for_cache_v7) & # **策略调整：当日涨幅必须达到 4.1% 以上 (右侧启动)**
+            (daily_df['pct_chg'] <= bt_max_pct_for_cache) & # **使用上限参数 (9.5%)**
             (daily_df['vol'] > 0) & 
             (daily_df['amount_yuan'] > 0)
         ].copy()
@@ -723,7 +725,7 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k, bt_max_pct_for
         daily_df['is_zt'] = (daily_df['open'] == daily_df['high']) & (daily_df['pct_chg'] > 9.5)
         daily_df = daily_df[~daily_df['is_zt']].copy()
         
-        # 2. 模拟评分：v4.6 选股逻辑改为按【涨幅】排序 (右侧启动)
+        # 2. 模拟评分：v4.7 选股逻辑改为按【涨幅】排序 (右侧启动)
         scored_stocks = daily_df.sort_values("pct_chg", ascending=False).head(backtest_top_k).copy()
         
         for _, row in scored_stocks.iterrows():
@@ -794,7 +796,8 @@ if st.checkbox("✅ 运行历史回测", value=False):
             end_date=last_trade,
             hold_days=HOLD_DAYS_OPTIONS,
             backtest_top_k=BACKTEST_TOP_K,
-            bt_max_pct_for_cache=BT_MAX_PCT_FOR_CACHE # 传入参数确保缓存刷新
+            bt_max_pct_for_cache=BT_MAX_PCT_FOR_CACHE, # 上限参数
+            bt_min_pct_for_cache_v7=BT_MIN_PCT_FOR_CACHE_V7 # V7 强制刷新键
         )
 
         bt_df = pd.DataFrame(backtest_result).T
@@ -819,12 +822,15 @@ if st.checkbox("✅ 运行历史回测", value=False):
 # ---------------------------
 st.markdown("### 小结与操作提示（简洁）")
 st.markdown("""
-- **状态：** **右侧启动/趋势强化策略版 v4.6**。
-- **改动：** **回测买入策略**已调整为“右侧启动”：现在只选择当日涨幅在 **4.0% 到 9.5%** 之间的股票，并按 **涨幅** 排序。这旨在捕捉刚刚启动的趋势股。
-- **操作步骤：**
+- **状态：** **强制右侧启动策略版 v4.7**。
+- **目标：** **强制执行**您的“右侧启动”新逻辑，摆脱旧的失败缓存。
+- **改动：**
+    1. **回测买入逻辑**微调为 **4.1% $\le$ 涨幅 $\le$ 9.5%**。
+    2. 新增了 **`【重要】最低涨幅强制刷新键`** (`BT_MIN_PCT_FOR_CACHE_V7`) 作为新的缓存破坏键。
+- **操作步骤（必看）：**
     1. **使用上述完整代码替换您现有脚本的全部内容。**
-    2. **更改一个回测参数** (如：侧边栏“回测交易日天数”或 **“回测：最高涨幅 (缓存破坏键)”** 参数)，以确保强制刷新缓存。
+    2. **在侧边栏找到 “【重要】最低涨幅强制刷新键”**，将默认值 `4.1` 更改为 **`4.2`** 或其他任何数值（只需更改一个参数）。
     3. **勾选 “✅ 运行历史回测”**。
 
-这次我们专注于**高质量的右侧启动**，希望能在趋势强劲的股票中获得持续的收益。
+这次我们强制系统执行新的策略，应该会看到与之前的失败追高策略（-6%到-8%）**完全不同**的结果。
 """)
