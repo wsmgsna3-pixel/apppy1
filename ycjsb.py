@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 10000 积分旗舰（终极修复 V5.5）
+选股王 · 10000 积分旗舰（终极修复 V5.6）
 说明：
-- 核心修复：解决了计算中的 NaN 值导致回测崩溃或卡住的问题。
-- 界面增强：回测主进度条增加文本观察器，显示当前正在处理的回测日，解决“假死”问题。
+- 核心修复：解决了 Tushare API 频率限制导致的“假死”问题。
+- API 节流：在获取每支股票历史数据时强制休眠 0.5 秒 (time.sleep(0.5))，确保遵守 Tushare 限制。
+- 界面增强：回测主进度条显示当前正在处理的回测日。
 """
 
 import streamlit as st
@@ -12,13 +13,14 @@ import numpy as np
 import tushare as ts
 from datetime import datetime, timedelta
 import warnings
+import time # V5.6 新增: 引入 time 库用于休眠
 warnings.filterwarnings("ignore")
 
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · 10000旗舰（终极修复V5.5）", layout="wide")
-st.title("选股王 · 10000 积分旗舰（终极修复版 V5.5）")
+st.set_page_config(page_title="选股王 · 10000旗舰（终极修复V5.6）", layout="wide")
+st.title("选股王 · 10000 积分旗舰（终极修复版 V5.6）")
 st.markdown("输入你的 Tushare Token（仅本次运行使用）。若有权限缺失，脚本会自动降级并继续运行。")
 
 # ---------------------------
@@ -288,7 +290,12 @@ if len(clean_df) == 0:
 # ---------------------------
 @st.cache_data(ttl=600)
 def get_hist_cached(ts_code, end_date, days=60):
-    """V5.0：精简历史数据获取，专注于 daily 接口"""
+    """V5.6：精简历史数据获取 + 强制 API 节流"""
+    
+    # 强制休眠，防止短时间内大量调用 Tushare 接口
+    # 即使缓存命中，Streamlit 也会很快返回。只有未命中时，此休眠才有效防止 API 限制。
+    time.sleep(0.5) 
+    
     try:
         start = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=days*2)).strftime("%Y%m%d")
         df = safe_get(pro.daily, ts_code=ts_code, start_date=start, end_date=end_date)
@@ -409,7 +416,7 @@ def norm_col(s):
 
 def apply_scoring_and_filtering(fdf, use_hard_filter=True):
     """
-    V5.5 统一的评分和过滤流程。
+    V5.6 统一的评分和过滤流程。
     返回：排序后的 DataFrame
     """
     if fdf.empty:
@@ -523,7 +530,7 @@ for idx, row in enumerate(final_clean_df.itertuples()):
     turnover_rate = getattr(row, 'turnover_rate', np.nan)
     net_mf = float(getattr(row, 'net_mf', 0.0))
 
-    # **性能瓶颈**：调用缓存函数获取历史数据
+    # **性能瓶颈**：调用缓存函数获取历史数据 (V5.6 已在函数内引入休眠)
     hist = get_hist_cached(ts_code, last_trade, days=60)
     ind = compute_indicators(hist)
 
@@ -570,7 +577,7 @@ if fdf.empty:
     st.stop()
 
 # ---------------------------
-# 最终综合评分（V5.5: 调用统一函数）
+# 最终综合评分（V5.6: 调用统一函数）
 # ---------------------------
 fdf = apply_scoring_and_filtering(fdf, use_hard_filter=False)
 fdf.index = fdf.index + 1
@@ -589,7 +596,7 @@ st.download_button("下载评分结果（前200）CSV", data=out_csv, file_name=
 
 
 # ---------------------------
-# 历史回测部分（V5.5 增强健壮性）
+# 历史回测部分（V5.6 增强健壮性）
 # ---------------------------
 @st.cache_data(ttl=6000)
 def load_backtest_data(all_trade_dates):
@@ -645,14 +652,14 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k):
     daily_cache, basic_cache = load_backtest_data(sorted(list(required_dates)))
 
     st.write(f"正在模拟 {len(backtest_dates)} 个交易日的选股回测...")
-    # V5.5 改进：主进度条添加文本描述
+    # V5.5/V5.6 改进：主进度条添加文本描述
     pbar_bt = st.progress(0, text="回测初始化...")
     
     total_days = len(backtest_dates)
     
     for i, buy_date in enumerate(backtest_dates):
         
-        # V5.5 改进：在执行耗时操作前更新进度条文本，让用户知道程序在工作
+        # V5.5/V5.6 改进：在执行耗时操作前更新进度条文本
         pbar_bt.progress((i)/total_days, text=f"回测进度: 第 {i+1}/{total_days} 天 ({buy_date}) 正在评分...") 
         
         daily_df_cached = daily_cache.get(buy_date)
@@ -708,7 +715,8 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k):
             ts_code = row['ts_code']
             
             # ** 性能关键 **：调用缓存函数获取历史K线数据
-            hist_df = get_hist_cached(ts_code, buy_date, days=60)
+            # V5.6 节流机制位于 get_hist_cached 内部
+            hist_df = get_hist_cached(ts_code, buy_date, days=60) 
             ind = compute_indicators(hist_df)
             
             # 合并当日基本数据和计算出的指标
@@ -803,8 +811,11 @@ if st.checkbox("✅ 运行历史回测", value=False):
         except:
             start_date_for_cal = (datetime.now() - timedelta(days=200)).strftime("%Y%m%d")
             
-        # V5.5 确保捕获并提示
+        # V5.6 确保捕获并提示
         try:
+            # **********************************************
+            # 此处会触发回测，现在加入了节流，应会缓慢前进
+            # **********************************************
             backtest_result = run_backtest(
                 start_date=start_date_for_cal, 
                 end_date=last_trade,
@@ -836,9 +847,13 @@ if st.checkbox("✅ 运行历史回测", value=False):
 # ---------------------------
 # 小结与建议（简洁）
 # ---------------------------
-st.markdown("### 小结与操作提示（终极修复 V5.5）")
+st.markdown("### 小结与操作提示（终极修复 V5.6）")
 st.markdown("""
-- **状态：** 已更新至 **V5.5**，增强了回测进度条的可见性。
-- **请注意：** 如果第二个进度条仍卡在 **0%**，但文本显示为 **“回测进度: 第 1/60 天 (YYYYMMDD) 正在评分...”**，则意味着您的 Tushare 接口正在进行大量缓存查阅或首次拉取，请等待约 **15-30 分钟**。
-- **重要提醒：** 只有 **“正在预加载回测所需 X 个交易日的 daily 和 daily_basic 数据...”** 的进度条跑完后，回测模拟才开始。如果它卡住，请先清除缓存。
+- **状态：** 已更新至 **V5.6**，强制引入 **0.5 秒** 节流机制。
+- **运行时间预估：** 在冷启动模式下，假设评分池 **300 支** 股票，每天需要 **300 次** 接口调用：
+    - 300 次调用 * 0.5 秒/次 = **150 秒（2.5 分钟）**。
+    - 60 个交易日回测 ≈ 150 秒/天 * 60 天 = **9000 秒 (约 2.5 小时)**。
+- **预期变化：**
+    - **第一次运行：** 速度会变慢，但进度条会稳定、缓慢地以 **“第 1/60 天” -> “第 2/60 天”** 的速度前进。整个回测可能需要 2-3 小时。
+    - **后续运行：** 数据一旦缓存，回测将在 **几分钟内** 完成（恢复到您之前的速度）。
 """)
