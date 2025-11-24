@@ -707,7 +707,7 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k):
         daily_df = daily_df[
             (daily_df['close'] >= MIN_PRICE) & 
             (daily_df['close'] <= MAX_PRICE) &
-            (daily_df['amount_yuan'] >= BACKTEST_MIN_AMOUNT_PROXY) & # 使用更高的成交额要求替代换手率
+            (daily_df['amount_yuan'] >= BACKTEST_MIN_AMOUNT_PROXY) & # **使用更高的成交额要求替代换手率**
             (daily_df['pct_chg'] >= 2.0) & # **策略调整：最低涨幅降至 2.0%**
             (daily_df['pct_chg'] <= 7.0) & # **策略调整：增加最高涨幅限制 (温和突破)**
             (daily_df['vol'] > 0) & 
