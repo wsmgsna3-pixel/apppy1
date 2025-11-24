@@ -5,7 +5,7 @@
 - 目标：短线爆发 (B) + 妖股捕捉 (C)，持股 1-5 天
 - 在界面输入 Tushare Token（仅本次运行使用）
 - 尽可能调用 moneyflow / chip / ths_member / chip 等高级接口，若无权限会自动降级
-- **已做大量异常处理与缓存，大幅优化回测时的历史数据加载速度**
+- **已做大量异常处理与缓存，大幅优化回测时的历史数据加载速度，并新增了网络重试机制**
 """
 
 import streamlit as st
@@ -14,7 +14,7 @@ import numpy as np
 import tushare as ts
 from datetime import datetime, timedelta
 import warnings
-import time
+import time # 确保引入 time 模块
 
 warnings.filterwarnings("ignore")
 
@@ -127,8 +127,6 @@ st.info(f"参考最近交易日：{last_trade}")
 @st.cache_data(ttl=600)
 def get_advanced_data(trade_date):
     """缓存并获取当日所有高级数据"""
-    # 此处不需要 st.write，避免回测时打印过多信息
-    # st.write(f"尝试加载 {trade_date} 的 stock_basic / daily_basic / moneyflow 等高级接口（若权限允许）...")
     stock_basic = safe_get(pro.stock_basic, list_status='L', fields='ts_code,name,industry,list_date,total_mv,circ_mv')
     daily_basic = safe_get(pro.daily_basic, trade_date=trade_date, fields='ts_code,turnover_rate,amount,total_mv,circ_mv')
     mf_raw = safe_get(pro.moneyflow, trade_date=trade_date)
@@ -309,10 +307,10 @@ def clean_and_filter(pool_merged, min_price, max_price, min_turnover, min_amount
     return clean_df
 
 # ---------------------------
-# 性能优化：K 线批量加载（替换了原来的 get_hist_cached）
+# 性能优化：K 线批量加载（**新增重试机制**）
 # ---------------------------
 @st.cache_data(ttl=600, show_spinner=False)
-def get_bulk_daily_data(start_date, end_date):
+def get_bulk_daily_data(start_date, end_date, max_retries=3):
     """
     性能优化核心函数：批量获取全市场在指定时间范围内的日线数据。
     返回一个字典: {ts_code: DataFrame(kline)}
@@ -320,24 +318,36 @@ def get_bulk_daily_data(start_date, end_date):
     global GLOBAL_KLINE_DATA
     st.write(f"📈 正在批量加载全市场 {start_date} 至 {end_date} 的 K 线数据（Tushare调用密集，请耐心等待...）")
     
-    # 尽可能一次性获取所有股票数据
-    try:
-        df_all = safe_get(pro.daily, start_date=start_date, end_date=end_date)
-        if df_all.empty:
-            st.error("批量获取 K 线数据失败或返回空，回测无法进行。")
-            return {}
-    except Exception as e:
-        st.error(f"批量获取 K 线数据出错：{e}。回测无法进行。")
-        return {}
-
-    # 按股票代码分组，存入全局字典
-    GLOBAL_KLINE_DATA = {
-        ts_code: group.sort_values('trade_date').reset_index(drop=True)
-        for ts_code, group in df_all.groupby('ts_code')
-    }
+    for attempt in range(max_retries):
+        try:
+            df_all = safe_get(pro.daily, start_date=start_date, end_date=end_date)
+            
+            if df_all.empty:
+                if attempt < max_retries - 1:
+                    st.warning(f"第 {attempt + 1}/{max_retries} 次尝试：批量获取 K 线数据返回空，正在重试（等待 5 秒）...")
+                    time.sleep(5)
+                    continue
+                else:
+                    st.error("批量获取 K 线数据最终失败或返回空，回测无法进行。")
+                    return {}
+            
+            # 如果成功，则处理数据并跳出循环
+            GLOBAL_KLINE_DATA = {
+                ts_code: group.sort_values('trade_date').reset_index(drop=True)
+                for ts_code, group in df_all.groupby('ts_code')
+            }
+            st.write(f"✅ K 线数据加载完成（第 {attempt + 1} 次尝试）。共获取 {len(GLOBAL_KLINE_DATA)} 支股票的历史数据。")
+            return GLOBAL_KLINE_DATA
+            
+        except Exception as e:
+            if attempt < max_retries - 1:
+                st.warning(f"第 {attempt + 1}/{max_retries} 次尝试：批量获取 K 线数据出错：{e}。正在重试（等待 5 秒）...")
+                time.sleep(5)
+            else:
+                st.error(f"批量获取 K 线数据最终失败，请检查网络或 Token 权限。错误：{e}")
+                return {}
     
-    st.write(f"✅ K 线数据加载完成。共获取 {len(GLOBAL_KLINE_DATA)} 支股票的历史数据。")
-    return GLOBAL_KLINE_DATA
+    return {} # 理论上不应到达
 
 # ---------------------------
 # 评分指标计算（已修改为从全局缓存读取）
@@ -379,7 +389,7 @@ def compute_indicators(ts_code, end_date, days=60):
         ema12 = close.ewm(span=12, adjust=False).mean()
         ema26 = close.ewm(span=26, adjust=False).mean()
         diff = ema12 - ema26
-        dea = diff.ewm(span=9, adjust=False).mean()
+        dea = diff.ewm(span=9, adjust=false).mean()
         macd_val = (diff - dea) * 2
         res['macd'] = macd_val.iloc[-1]; res['diff'] = diff.iloc[-1]; res['dea'] = dea.iloc[-1]
     else:
@@ -644,7 +654,7 @@ def run_backtest(trade_dates, hold_days, top_k):
     lookback_days = 60 * 2 # 粗略估计
     start_kline_date = (datetime.strptime(start_buy_date, "%Y%m%d") - timedelta(days=lookback_days)).strftime("%Y%m%d")
     
-    # 获取数据，这里是 Streamlit Cache 的功劳，第一次慢，以后快
+    # 获取数据，这一步调用了带重试机制的函数
     # 这一步将数据填充到 GLOBAL_KLINE_DATA
     get_bulk_daily_data(start_kline_date, last_trade)
     
@@ -831,7 +841,7 @@ if st.button('🟢 **运行当日选股**'):
 # 回测按钮
 if st.button('🟠 **启动回测** (N 天前买入, 持有 H 天, 收盘价计算)'):
     st.session_state['mode'] = 'backtest'
-    with st.spinner(f'正在获取过去 {BACKTEST_DAYS} 个交易日的数据并回测... (首次加载全量 K 线会慢)'):
+    with st.spinner(f'正在获取过去 {BACKTEST_DAYS} 个交易日的数据并回测... (已启用网络重试)'):
         
         # 1. 获取回测交易日列表 (即买入日)
         today = datetime.strptime(last_trade, "%Y%m%d")
@@ -874,5 +884,5 @@ st.markdown("### 小结与操作提示（简洁）")
 st.markdown("""
 - **当日选股**：点击 **🟢 运行当日选股**，执行原有的选股逻辑。
 - **回测**：点击 **🟠 启动回测**，软件将向后追溯 N 个交易日，每日使用您的选股参数选择 Top K 股票，并计算持有 H 天的平均收益率和胜率（按收盘价买卖）。
-- **回测速度**：**本次已进行性能优化**。第一次运行时，`get_bulk_daily_data` 会一次性请求大量数据，**速度依然较慢**。但数据会被 Streamlit 缓存，后续更改参数或再次运行回测时，速度会大幅提升。
+- **回测速度/稳定性**：**本次已加入网络重试机制**。如果第一次加载全量 K 线失败，程序会等待 5 秒并自动重试 2 次。一旦数据缓存成功，后续运行速度会大幅提升。
 """)
