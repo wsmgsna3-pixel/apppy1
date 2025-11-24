@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 10000 积分旗舰（终极修复版 v4.9 - 强制禁用回测缓存 + 验证标记）
+选股王 · 10000 积分旗舰（终极修复版 v5.0 - 彻底禁用回测数据和结果缓存）
 说明：
 - 整合了 BC 混合增强策略。
-- **v4.9 核心策略：** 右侧启动 (4.1% < 涨幅 < 9.5%)。
-- **缓存修复：** 彻底移除了 `run_backtest` 函数上的 `@st.cache_data` 装饰器。
-- **验证标记：** 增加双重可见标记，确保函数执行。
+- **v5.0 核心改动：** 彻底移除了 `load_backtest_data` 和 `run_backtest` 函数上的所有缓存。
+- **回测运行时间将回到 3 分钟**，但结果准确性得到最高保证。
 """
 
 import streamlit as st
@@ -25,8 +24,8 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · 10000旗舰（强制执行 v4.9）", layout="wide")
-st.title("选股王 · 10000 积分旗舰（强制执行版 v4.9）")
+st.set_page_config(page_title="选股王 · 10000旗舰（强制执行 v5.0）", layout="wide")
+st.title("选股王 · 10000 积分旗舰（强制执行版 v5.0）")
 st.markdown("输入你的 Tushare Token（仅本次运行使用）。若有权限缺失，脚本会自动降级并继续运行。")
 
 # ---------------------------
@@ -50,12 +49,12 @@ with st.sidebar:
     # --- 新增回测参数 ---
     st.header("历史回测参数")
     BACKTEST_DAYS = int(st.number_input("回测交易日天数", value=60, min_value=10, max_value=250))
-    BACKTEST_TOP_K = int(st.number_input("回测每日最多交易 K 支", value=3, min_value=1, max_value=10))
+    BACKTEST_TOP_K = int(st.number_input("回测每日最多交易 K 支", value=3, min_value=1, max_value=10)) # 默认 K=3
     HOLD_DAYS_OPTIONS = st.multiselect("回测持股天数", options=[1, 3, 5, 10, 20], default=[1, 3, 5])
     # 策略参数 (用于回测逻辑)
-    BT_MAX_PCT = float(st.number_input("回测：最高涨幅 (上限)", value=9.5, step=0.5))
-    BT_MIN_PCT = float(st.number_input("回测：最低涨幅 (下限)", value=4.1, step=0.1))
-    st.caption("提示：**本次回测强制运行右侧启动策略 (4.1% < 涨幅 < 9.5%)。**")
+    BT_MAX_PCT = float(st.number_input("回测：最高涨幅 (上限)", value=9.9, step=0.5)) # 默认 9.9
+    BT_MIN_PCT = float(st.number_input("回测：最低涨幅 (下限)", value=3.0, step=0.1)) # 默认 3.0
+    st.caption("提示：**当前回测使用默认的涨幅区间 (3.0% < 涨幅 < 9.9%)。**")
 
 # ---------------------------
 # Token 输入（主区）
@@ -109,10 +108,11 @@ if not last_trade:
 st.info(f"参考最近交易日：{last_trade}")
 
 # ---------------------------
-# 优化点 1: 将选股逻辑包裹在按钮中
+# 优化点 1: 将选股逻辑包裹在按钮中 (此处逻辑不变)
 # ---------------------------
 if st.button("🚀 运行当日选股（初次运行可能较久）"):
-
+    # ... (当日选股逻辑保持不变)
+    
     # ---------------------------
     # 拉当日涨幅榜初筛
     # ---------------------------
@@ -441,6 +441,8 @@ if st.button("🚀 运行当日选股（初次运行可能较久）"):
 
         return res
 
+    # ... (评分逻辑保持不变)
+
     # ---------------------------
     # 评分池逐票计算因子（缓存 get_hist）
     # ---------------------------
@@ -650,11 +652,12 @@ if st.button("🚀 运行当日选股（初次运行可能较久）"):
 # ---------------------------
 # 历史回测部分（数据性能优化与逻辑强化）
 # ---------------------------
-@st.cache_data(ttl=3600)
+# ⚠️ V5.0 核心改动：彻底移除 @st.cache_data 装饰器
 def load_backtest_data(all_trade_dates):
-    """预加载所有回测日期的 daily 数据，以字典 {trade_date: DataFrame} 缓存。"""
+    """预加载所有回测日期的 daily 数据，不进行缓存。"""
     data_cache = {}
     st.write(f"正在预加载回测所需 {len(all_trade_dates)} 个交易日的全部 daily 数据 (约 {len(all_trade_dates)} 次 API 调用)...")
+    st.error("⚠️ 注意：每次运行都将重新下载数据，耗时约 3 分钟。")
     pbar = st.progress(0)
     for i, date in enumerate(all_trade_dates):
         daily_df = safe_get(pro.daily, trade_date=date)
@@ -664,12 +667,10 @@ def load_backtest_data(all_trade_dates):
     pbar.progress(1.0)
     return data_cache
 
-# ----------------------------------------------------
-# ⚠️ V4.9 强制禁用缓存：已移除 @st.cache_data 装饰器 ⚠️
-# ----------------------------------------------------
+# ⚠️ V5.0 核心改动：彻底移除 @st.cache_data 装饰器
 def run_backtest(start_date, end_date, hold_days, backtest_top_k, bt_max_pct, bt_min_pct):
     # 【标记 2：执行确认】如果看到了这段文字，说明 run_backtest 函数正在执行
-    st.text(f"🚀 V4.9 回测逻辑强制激活中...日期范围 {start_date} 到 {end_date}。")
+    st.text(f"🚀 V5.0 回测逻辑强制激活中...日期范围 {start_date} 到 {end_date}。")
     
     trade_dates = get_trade_cal(start_date, end_date)
     
@@ -695,6 +696,7 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k, bt_max_pct, bt
         except (ValueError, IndexError):
             continue
             
+    # ** V5.0：每次都重新加载数据 **
     data_cache = load_backtest_data(sorted(list(required_dates)))
 
     st.write(f"正在模拟 {len(backtest_dates)} 个交易日的选股回测...")
@@ -712,17 +714,18 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k, bt_max_pct, bt
         # 1. 应用基本过滤 (价格/成交额/动量/停牌/一字板)
         
         # amount 字段在 daily 接口中，单位是千元，我们要求的是元。
+        # ⚠️ 注意：这里使用侧边栏的 MIN_AMOUNT * 2.0 作为回测过滤的门槛（V4.0的逻辑）
         BACKTEST_MIN_AMOUNT_PROXY = MIN_AMOUNT * 2.0 
         
         daily_df['amount_yuan'] = daily_df['amount'].fillna(0) * 1000.0 # 转换成元
         
-        # 过滤：V4.9 右侧启动策略：寻找当日涨幅在 BT_MIN_PCT (4.1%) 到 BT_MAX_PCT (9.5%) 之间
+        # 过滤：V5.0 策略：寻找当日涨幅在 BT_MIN_PCT 到 BT_MAX_PCT 之间
         daily_df = daily_df[
             (daily_df['close'] >= MIN_PRICE) & 
             (daily_df['close'] <= MAX_PRICE) &
             (daily_df['amount_yuan'] >= BACKTEST_MIN_AMOUNT_PROXY) & 
-            (daily_df['pct_chg'] >= bt_min_pct) & # **策略调整：当日涨幅下限 (4.1%)**
-            (daily_df['pct_chg'] <= bt_max_pct) & # **当日涨幅上限 (9.5%)**
+            (daily_df['pct_chg'] >= bt_min_pct) & # **策略调整：当日涨幅下限**
+            (daily_df['pct_chg'] <= bt_max_pct) & # **当日涨幅上限**
             (daily_df['vol'] > 0) & 
             (daily_df['amount_yuan'] > 0)
         ].copy()
@@ -731,7 +734,7 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k, bt_max_pct, bt
         daily_df['is_zt'] = (daily_df['open'] == daily_df['high']) & (daily_df['pct_chg'] > 9.5)
         daily_df = daily_df[~daily_df['is_zt']].copy()
         
-        # 2. 模拟评分：v4.9 选股逻辑改为按【涨幅】排序 (右侧启动)
+        # 2. 模拟评分：v5.0 选股逻辑改为按【涨幅】排序 (右侧启动)
         scored_stocks = daily_df.sort_values("pct_chg", ascending=False).head(backtest_top_k).copy()
         
         for _, row in scored_stocks.iterrows():
@@ -793,13 +796,14 @@ if st.checkbox("✅ 运行历史回测", value=False):
         st.header("📈 历史回测结果（买入收盘价 / 卖出收盘价）")
         
         # 【标记 1：运行确认】如果看到了这段文字，说明回测脚本正在运行
-        st.warning("✅ V4.9 确认回测正在执行中...这次预计耗时约 3 分钟！")
+        st.warning("✅ V5.0 终极修复：回测正在执行中...这次预计耗时约 3 分钟！")
         
         try:
             start_date_for_cal = (datetime.strptime(last_trade, "%Y%m%d") - timedelta(days=200)).strftime("%Y%m%d")
         except:
             start_date_for_cal = (datetime.now() - timedelta(days=200)).strftime("%Y%m%d")
             
+        # 强制运行回测
         backtest_result = run_backtest(
             start_date=start_date_for_cal,
             end_date=last_trade,
@@ -831,12 +835,13 @@ if st.checkbox("✅ 运行历史回测", value=False):
 # ---------------------------
 st.markdown("### 小结与操作提示（简洁）")
 st.markdown("""
-- **状态：** **V4.9 强制执行验证版**。
-- **目标：** 彻底绕过缓存，强制运行 **4.1% $\le$ 涨幅 $\le$ 9.5%** 的新策略。
+- **状态：** **V5.0 终极缓存禁用版**。
+- **目标：** 彻底绕过所有 Streamlit 缓存，强制进行计算和结果更新。
 - **操作步骤：**
     1. **使用上述完整代码替换您现有脚本的全部内容。**
     2. 勾选 **“✅ 运行历史回测”**。
 - **关键检查点：**
-    - **如果成功：** 您应该看到 **`✅ V4.9 确认回测正在执行中...`** 和 **`🚀 V4.9 回测逻辑强制激活中...`** 这两行信息，并且运行时间将回到 **3 分钟左右**。
-    - **如果失败：** 如果再次 3 秒完成，说明您替换代码未成功，或者您使用的运行环境（例如 Colab/Streamlit）正在从更高的层级进行缓存。
+    - **运行时间：** 每次运行都将耗时 **3 分钟左右**（因为要重新下载所有数据）。
+    - **如果成功：** 您将看到 **`✅ V5.0 终极修复：回测正在执行中...`** 提示，并且**结果将随参数调整而变化**。
+
 """)
