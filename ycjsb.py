@@ -3,8 +3,8 @@
 选股王 · 10000 积分旗舰（BC 混合增强版）—— 带趋势主导（MA/MACD/量价/突破）增强
 说明：
 - 目标：短线爆发 (B) + 妖股捕捉 (C)，持股 1-5 天
-- **优化点**：引入全局 K 线数据缓存（GLOBAL_KLINE_DATA）和批量预加载机制，彻底解决回测时因逐只查询历史数据导致的 nan 收益率和性能瓶颈问题。
-- 已做大量异常处理与缓存，大幅优化回测时的历史数据加载速度，新增了网络重试机制，并对交易日历获取增加了重试保障，并修复了交易日历排序导致的空列表问题。
+- **本次优化**：彻底移除 MA 多头硬过滤，避免在非牛市行情下将所有股票误杀。MA 趋势将作为评分项而非强制过滤项。
+- 采用全局 K 线数据缓存（GLOBAL_KLINE_DATA）和批量预加载机制，大幅提升回测稳定性和速度。
 """
 
 import streamlit as st
@@ -21,11 +21,10 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 全局数据缓存（用于性能优化）
 # ---------------------------
-# 存储所有股票的日线数据，key 为 ts_code
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_global_daily_data(ts_code):
     """用于存储单只股票的历史数据，避免重复加载，但在回测模式下会被 get_bulk_daily_data 代替"""
-    return pd.DataFrame() # 仅用于占位，实际由 bulk load 实现
+    return pd.DataFrame() 
 
 GLOBAL_KLINE_DATA = {} # 存储预加载的全市场K线数据
 
@@ -82,7 +81,7 @@ ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
 # ---------------------------
-# 安全调用 & 缓存辅助
+# 安全调用 & 缓存辅助 (保持不变)
 # ---------------------------
 def safe_get(func, **kwargs):
     """Call API and return DataFrame or empty df on any error."""
@@ -102,13 +101,11 @@ def find_last_trade_day(max_days=20):
         ds = d.strftime("%Y%m%d")
         df = safe_get(pro.daily, trade_date=ds)
         if not df.empty:
-            # 找到日期后，再用日线数据确认一次，提高找到的成功率
             if len(safe_get(pro.daily, trade_date=ds)) > 100:
                 return ds
     return None
 
-# ** 优化增强：为交易日历增加重试机制 **
-@st.cache_data(ttl=3600) # 增加缓存，避免重复调用
+@st.cache_data(ttl=3600) 
 def get_all_trade_cals(start_date, end_date, max_retries=3):
     """获取指定范围内的所有交易日，带重试机制"""
     for attempt in range(max_retries):
@@ -123,7 +120,7 @@ def get_all_trade_cals(start_date, end_date, max_retries=3):
             else:
                 return []
                 
-        except Exception as e:
+        except Exception:
             if attempt < max_retries - 1:
                 time.sleep(5)
             else:
@@ -137,7 +134,7 @@ if not last_trade:
 st.info(f"参考最近交易日：{last_trade}")
 
 # ---------------------------
-# 尝试加载高级接口（有权限时启用）
+# 尝试加载高级接口 (保持不变)
 # ---------------------------
 @st.cache_data(ttl=600)
 def get_advanced_data(trade_date):
@@ -166,7 +163,7 @@ def get_advanced_data(trade_date):
     return stock_basic, daily_basic, moneyflow
 
 # ---------------------------
-# 合并基本信息 
+# 合并基本信息 (保持不变)
 # ---------------------------
 def safe_merge_pool(pool_df, other_df, cols):
     """安全合并辅助函数"""
@@ -226,7 +223,7 @@ def merge_all_info(pool0, stock_basic, daily_basic, moneyflow):
     return pool_merged
 
 # ---------------------------
-# 清洗与过滤（clean_and_filter）
+# 清洗与过滤（保持不变）
 # ---------------------------
 def clean_and_filter(pool_merged, min_price, max_price, min_turnover, min_amount, min_market_cap, max_market_cap, vol_spike_mult, volatility_max, high_pct_threshold, final_pool):
     """统一清洗和过滤流程"""
@@ -308,7 +305,7 @@ def clean_and_filter(pool_merged, min_price, max_price, min_turnover, min_amount
     return clean_df
 
 # ---------------------------
-# 性能优化：K 线批量加载（核心）
+# 性能优化：K 线批量加载（核心）(保持不变)
 # ---------------------------
 @st.cache_data(ttl=600, show_spinner=False)
 def get_bulk_daily_data(start_date, end_date, max_retries=3):
@@ -322,7 +319,6 @@ def get_bulk_daily_data(start_date, end_date, max_retries=3):
     
     for attempt in range(max_retries):
         try:
-            # 使用 pro.daily 获取所有股票的日线数据
             df_all = safe_get(pro.daily, start_date=start_date, end_date=end_date)
             
             if df_all.empty:
@@ -334,7 +330,6 @@ def get_bulk_daily_data(start_date, end_date, max_retries=3):
                     if 'streamlit' in sys.modules: st.error("批量获取 K 线数据最终失败或返回空，回测无法进行。")
                     return {}
             
-            # 成功后，按 ts_code 分组，并确保按 trade_date 排序
             GLOBAL_KLINE_DATA = {
                 ts_code: group.sort_values('trade_date').reset_index(drop=True)
                 for ts_code, group in df_all.groupby('ts_code')
@@ -353,7 +348,7 @@ def get_bulk_daily_data(start_date, end_date, max_retries=3):
     return {} 
 
 # ---------------------------
-# 评分指标计算（从全局缓存读取）
+# 评分指标计算（从全局缓存读取）(保持不变)
 # ---------------------------
 def compute_indicators(ts_code, end_date, days=60):
     """从全局缓存中获取数据并计算指标"""
@@ -364,7 +359,6 @@ def compute_indicators(ts_code, end_date, days=60):
         
     df_full = GLOBAL_KLINE_DATA[ts_code]
     
-    # 筛选出当前回测日之前的数据（包括 end_date 当天）
     df = df_full[df_full['trade_date'] <= end_date].tail(days + 26) 
     
     if df.empty or len(df) < 3:
@@ -384,7 +378,6 @@ def compute_indicators(ts_code, end_date, days=60):
         else:
             res[f'ma{n}'] = np.nan
 
-    # MACD (12,26,9)
     if len(close) >= 26:
         ema12 = close.ewm(span=12, adjust=False).mean()
         ema26 = close.ewm(span=26, adjust=False).mean()
@@ -395,7 +388,6 @@ def compute_indicators(ts_code, end_date, days=60):
     else:
         res['macd'] = res['diff'] = res['dea'] = np.nan
 
-    # KDJ
     n = 9
     if len(close) >= n:
         low_n = low.rolling(window=n).min()
@@ -409,7 +401,6 @@ def compute_indicators(ts_code, end_date, days=60):
     else:
         res['k'] = res['d'] = res['j'] = np.nan
 
-    # vol ratio and metrics
     vols = df['vol'].astype(float).tolist()
     if len(vols) >= 6:
         avg_prev5 = np.mean(vols[-6:-1])
@@ -419,13 +410,11 @@ def compute_indicators(ts_code, end_date, days=60):
     else:
         res['vol_ratio'] = res['vol_last'] = res['vol_ma5'] = np.nan
 
-    # 10d return
     if len(close) >= 10:
         res['10d_return'] = close.iloc[-1] / close.iloc[-10] - 1
     else:
         res['10d_return'] = np.nan
 
-    # prev3_sum for down-then-bounce detection
     if 'pct_chg' in df.columns and len(df) >= 4:
         try:
             pct = df['pct_chg'].astype(float)
@@ -435,7 +424,6 @@ def compute_indicators(ts_code, end_date, days=60):
     else:
         res['prev3_sum'] = np.nan
 
-    # volatility (std of last 10 pct_chg)
     try:
         if 'pct_chg' in df.columns and len(df) >= 10:
             res['volatility_10'] = df['pct_chg'].astype(float).tail(10).std()
@@ -444,7 +432,6 @@ def compute_indicators(ts_code, end_date, days=60):
     except:
         res['volatility_10'] = np.nan
 
-    # recent 20-day high for breakout detection
     try:
         if len(high) >= 20:
             res['recent20_high'] = float(high.tail(20).max())
@@ -453,7 +440,6 @@ def compute_indicators(ts_code, end_date, days=60):
     except:
         res['recent20_high'] = np.nan
 
-    # 阳线实体强度（今天）
     try:
         today_open = df['open'].astype(float).iloc[-1]
         today_close = df['close'].astype(float).iloc[-1]
@@ -468,7 +454,7 @@ def compute_indicators(ts_code, end_date, days=60):
     return res
 
 # ---------------------------
-# 评分计算主体（使用本地缓存）
+# 评分计算主体 (核心修改区：移除 MA 硬过滤)
 # ---------------------------
 def compute_scores(clean_df, current_trade_date, min_market_cap, max_market_cap, vol_spike_mult, volatility_max, high_pct_threshold):
     """统一评分和风险过滤流程"""
@@ -489,13 +475,11 @@ def compute_scores(clean_df, current_trade_date, min_market_cap, max_market_cap,
         turnover_rate = getattr(row, 'turnover_rate', np.nan)
         net_mf = float(getattr(row, 'net_mf', 0.0))
 
-        # *** 性能优化：调用新的指标计算函数 ***
+        # *** 调用指标计算函数 ***
         ind = compute_indicators(ts_code, current_trade_date, days=60)
 
         vol_ratio = ind.get('vol_ratio', np.nan)
         ten_return = ind.get('10d_return', np.nan)
-        
-        # ... (其它指标读取)
         ma5 = ind.get('ma5', np.nan)
         ma10 = ind.get('ma10', np.nan)
         ma20 = ind.get('ma20', np.nan)
@@ -511,7 +495,6 @@ def compute_scores(clean_df, current_trade_date, min_market_cap, max_market_cap,
         recent20_high = ind.get('recent20_high', np.nan)
         yang_body_strength = ind.get('yang_body_strength', 0.0)
 
-        # 资金强度代理（不依赖 moneyflow）：简单乘积指标
         try:
             proxy_money = (abs(pct_chg) + 1e-9) * (vol_ratio if not pd.isna(vol_ratio) else 0.0) * (turnover_rate if not pd.isna(turnover_rate) else 0.0)
         except:
@@ -564,20 +547,25 @@ def compute_scores(clean_df, current_trade_date, min_market_cap, max_market_cap,
 
     count_after_risk_filter = len(fdf)
     if count_after_risk_filter == 0:
-        if 'streamlit' in sys.modules: st.error(f"【过滤失败】风险过滤机制排除了所有 {count_before_filter} 支股票。请放宽参数。")
+        if 'streamlit' in sys.modules: st.error(f"【过滤失败】风险过滤机制排除了所有 {count_before_filter} 支股票。请放宽侧边栏风险参数。")
         return pd.DataFrame()
     
     if 'streamlit' in sys.modules: st.write(f"风险过滤后，剩余 {count_after_risk_filter} 支候选股进入下一阶段。")
 
-    # MA 多头硬过滤 (可选，如果您觉得太严可以注释掉)
-    try:
-        if all(c in fdf.columns for c in ['ma5','ma10','ma20']):
-            fdf = fdf[(fdf['ma5'] > fdf['ma10']) & (fdf['ma10'] > fdf['ma20'])]
-        # if 'streamlit' in sys.modules and len(fdf) < count_after_risk_filter:
-        #     st.warning(f"MA硬过滤警告：排除了 {count_after_risk_filter - len(fdf)} 支股票。")
-    except: pass 
+
+    # -----------------------------------------------------------------------------
+    # ** 核心修复：MA 多头硬过滤已注释，避免过度过滤 **
+    # -----------------------------------------------------------------------------
+    # try:
+    #     if all(c in fdf.columns for c in ['ma5','ma10','ma20']):
+    #         fdf = fdf[(fdf['ma5'] > fdf['ma10']) & (fdf['ma10'] > fdf['ma20'])]
+    # except: pass 
+    # -----------------------------------------------------------------------------
+
 
     if fdf.empty:
+        # 这个检查确保如果上面的 MA 硬过滤（如果您手动取消注释）过滤掉了所有股票，能正确返回空
+        if 'streamlit' in sys.modules: st.error("【内部错误】经过所有过滤后，评分池为空。")
         return pd.DataFrame()
         
     # RSL
@@ -645,7 +633,7 @@ def compute_scores(clean_df, current_trade_date, min_market_cap, max_market_cap,
     return fdf
 
 # ---------------------------
-# 回测主模块（已修改为使用本地缓存）
+# 回测主模块（保持不变）
 # ---------------------------
 def run_backtest(trade_dates, hold_days, top_k):
     """
@@ -656,16 +644,13 @@ def run_backtest(trade_dates, hold_days, top_k):
     """
     global GLOBAL_KLINE_DATA 
     
-    # 步骤 0：性能优化核心 - 预加载 K 线数据
     if not trade_dates:
         return pd.DataFrame()
         
     start_buy_date = trade_dates[0]
-    # 需要额外的天数用于 MA/MACD 指标计算，以及最长的持股周期
     lookback_days = 60 * 2 + max(HOLD_DAYS) 
     start_kline_date = (datetime.strptime(start_buy_date, "%Y%m%d") - timedelta(days=lookback_days)).strftime("%Y%m%d")
     
-    # 核心：批量加载 K 线数据
     get_bulk_daily_data(start_kline_date, last_trade)
     
     if not GLOBAL_KLINE_DATA:
@@ -677,11 +662,10 @@ def run_backtest(trade_dates, hold_days, top_k):
     
     results = {h: {'returns': [], 'wins': 0, 'total': 0} for h in hold_days}
     
-    # 重新获取完整交易日历，用于计算卖出日期
     max_lookback = BACKTEST_DAYS + max(HOLD_DAYS) + 30
     start_lookback = (datetime.strptime(trade_dates[0], "%Y%m%d") - timedelta(days=max_lookback)).strftime("%Y%m%d")
     all_trade_cals = get_all_trade_cals(start_lookback, last_trade) 
-    all_trade_cals.sort() # 确保日期升序
+    all_trade_cals.sort() 
 
     if len(all_trade_cals) == 0:
         if 'streamlit' in sys.modules: st.error("无法获取交易日历（Trade Cal），回测失败。")
@@ -693,7 +677,6 @@ def run_backtest(trade_dates, hold_days, top_k):
 
     for i, buy_date in enumerate(trade_dates):
         
-        # 1. 获取当日数据 (API 调用 - 必须当日获取)
         daily_all = safe_get(pro.daily, trade_date=buy_date)
         if daily_all.empty: 
             if 'streamlit' in sys.modules: st.warning(f"跳过回测日 {buy_date}: 无法获取当日 daily 数据。")
@@ -703,25 +686,20 @@ def run_backtest(trade_dates, hold_days, top_k):
             
         pool0 = daily_all.head(INITIAL_TOP_N).copy().reset_index(drop=True)
         
-        # 2. 获取高级接口数据 (已缓存)
         stock_basic, daily_basic, moneyflow = get_advanced_data(buy_date)
         
-        # 3. 合并信息
         pool_merged = merge_all_info(pool0, stock_basic, daily_basic, moneyflow)
 
-        # 4. 清洗和过滤
         clean_df = clean_and_filter(pool_merged, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MIN_AMOUNT, MIN_MARKET_CAP, MAX_MARKET_CAP, VOL_SPIKE_MULT, VOLATILITY_MAX, HIGH_PCT_THRESHOLD, FINAL_POOL)
         if clean_df.empty: 
             if pbar: pbar.progress((i + 1) / len(trade_dates)); continue
 
-        # 5. 评分 
         fdf_scored = compute_scores(clean_df, buy_date, MIN_MARKET_CAP, MAX_MARKET_CAP, VOL_SPIKE_MULT, VOLATILITY_MAX, HIGH_PCT_THRESHOLD)
         if fdf_scored.empty: 
             if pbar: pbar.progress((i + 1) / len(trade_dates)); continue
         
         fdf_scored = fdf_scored.sort_values('综合评分', ascending=False).head(top_k)
         
-        # 6. 计算收益 (*** 核心改进：从 GLOBAL_KLINE_DATA 查询价格 ***)
         try:
             buy_date_cal_idx = all_trade_cals.index(buy_date)
         except ValueError:
@@ -731,7 +709,6 @@ def run_backtest(trade_dates, hold_days, top_k):
             ts_code = row['ts_code']
             buy_close = row['last_close'] 
             
-            # 修正：如果买入价是 nan 或 0，直接跳过
             if pd.isna(buy_close) or buy_close == 0:
                 continue
 
@@ -743,18 +720,15 @@ def run_backtest(trade_dates, hold_days, top_k):
                     
                     sell_date = all_trade_cals[sell_cal_idx]
                     
-                    # *** 从预加载的 K 线数据中获取卖出价 ***
                     if ts_code not in GLOBAL_KLINE_DATA: continue
                     
                     sell_data_row = GLOBAL_KLINE_DATA[ts_code]
                     
-                    # 查找 sell_date 对应的收盘价
                     sell_close_df = sell_data_row[sell_data_row['trade_date'] == sell_date]['close']
                     
                     if sell_close_df.empty: continue
                     sell_close = sell_close_df.iloc[0]
                     
-                    # 修正：如果卖出价是 nan 或 0，跳过计算
                     if pd.isna(sell_close) or sell_close == 0:
                         continue 
                         
@@ -770,7 +744,6 @@ def run_backtest(trade_dates, hold_days, top_k):
 
     if pbar: pbar.empty() 
     
-    # 7. 整理结果
     final_results = []
     for h in hold_days:
         r = results[h]
@@ -788,17 +761,15 @@ def run_backtest(trade_dates, hold_days, top_k):
 
 
 # ---------------------------
-# 实时选股主流程 (修改：使用批量加载)
+# 实时选股主流程 (保持不变)
 # ---------------------------
 def live_stock_pick():
     global GLOBAL_KLINE_DATA 
     st.session_state['mode'] = 'live'
     
     start_date_90 = (datetime.strptime(last_trade, "%Y%m%d") - timedelta(days=90)).strftime("%Y%m%d")
-    # 核心：批量加载 K 线数据（用于指标计算）
     get_bulk_daily_data(start_date_90, last_trade)
     
-    # 1. 拉当日涨幅榜初筛
     st.write("正在拉取当日 daily（涨幅榜）作为初筛...")
     daily_all = safe_get(pro.daily, trade_date=last_trade)
     if daily_all.empty:
@@ -809,13 +780,10 @@ def live_stock_pick():
     st.write(f"当日记录：{len(daily_all)}，取涨幅前 {INITIAL_TOP_N} 作为初筛。")
     pool0 = daily_all.head(int(INITIAL_TOP_N)).copy().reset_index(drop=True)
 
-    # 2. 尝试加载高级接口
     stock_basic, daily_basic, moneyflow = get_advanced_data(last_trade)
     
-    # 3. 合并基本信息
     pool_merged = merge_all_info(pool0, stock_basic, daily_basic, moneyflow)
 
-    # 4. 基本清洗
     st.write("对初筛池进行清洗（ST/停牌/价格/一字板/换手/成交额等）...")
     clean_df = clean_and_filter(pool_merged, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MIN_AMOUNT, MIN_MARKET_CAP, MAX_MARKET_CAP, VOL_SPIKE_MULT, VOLATILITY_MAX, HIGH_PCT_THRESHOLD, FINAL_POOL)
 
@@ -825,7 +793,6 @@ def live_stock_pick():
     
     st.write(f"清洗后候选数量：{len(clean_df)} （将从中取涨幅前 {FINAL_POOL} 进入评分阶段）")
     
-    # 5. 评分计算
     st.write("为评分池逐票计算指标（本次已优化：从本地缓存读取 K 线数据）...")
     fdf = compute_scores(clean_df, last_trade, MIN_MARKET_CAP, MAX_MARKET_CAP, VOL_SPIKE_MULT, VOLATILITY_MAX, HIGH_PCT_THRESHOLD)
 
@@ -833,7 +800,6 @@ def live_stock_pick():
         st.error("评分计算失败或无数据，请检查上面是否有【过滤失败】的警告，并放宽侧边栏参数。")
         st.stop()
 
-    # 6. 最终排序与展示
     fdf = fdf.sort_values('综合评分', ascending=False).reset_index(drop=True)
     fdf.index = fdf.index + 1
 
@@ -846,7 +812,6 @@ def live_stock_pick():
 
     st.dataframe(fdf[display_cols].head(TOP_DISPLAY), use_container_width=True)
 
-    # 下载（仅导出前200避免过大）
     out_csv = fdf[display_cols].head(200).to_csv(index=True, encoding='utf-8-sig')
     st.download_button("下载评分结果（前200）CSV", data=out_csv, file_name=f"score_result_{last_trade}.csv", mime="text/csv")
     
@@ -854,14 +819,12 @@ def live_stock_pick():
 
 
 # ---------------------------
-# 主流程控制
+# 主流程控制 (保持不变)
 # ---------------------------
 
-# 实时选股按钮
 if st.button('🟢 **运行当日选股**'):
     live_stock_pick()
 
-# 回测按钮
 if st.button('🟠 **启动回测** (N 天前买入, 持有 H 天, 收盘价计算)'):
     st.session_state['mode'] = 'backtest'
     if BACKTEST_DAYS <= 0:
@@ -870,7 +833,6 @@ if st.button('🟠 **启动回测** (N 天前买入, 持有 H 天, 收盘价计�
         
     with st.spinner(f'正在获取过去 {BACKTEST_DAYS} 个交易日的数据并回测... (已启用批量加载)'):
         
-        # 1. 获取回测交易日列表 (即买入日)
         today = datetime.strptime(last_trade, "%Y%m%d")
         start_date = (today - timedelta(days=BACKTEST_DAYS * 3)).strftime("%Y%m%d")
         
@@ -901,10 +863,8 @@ if st.button('🟠 **启动回测** (N 天前买入, 持有 H 天, 收盘价计�
              st.error(f"【内部错误】回测日期列表为空。请检查回测天数设置。")
              st.stop()
 
-        # 2. 运行回测
         results_df = run_backtest(backtest_dates, HOLD_DAYS, TOP_DISPLAY)
         
-        # 3. 展示回测结果
         if not results_df.empty:
             st.subheader("📊 历史回测结果 (买入收盘价 / 卖出收盘价)")
             st.dataframe(results_df, use_container_width=True)
@@ -921,5 +881,5 @@ st.markdown("### 小结与操作提示（简洁）")
 st.markdown("""
 - **当日选股**：点击 **🟢 运行当日选股**，执行原有的选股逻辑。
 - **回测**：点击 **🟠 启动回测**，现已升级为**批量预加载模式**，大幅提升回测稳定性和速度。
-- **故障排除**：如果回测结果仍显示 `nan` 或 `0.00%`，请重点检查侧边栏的参数是否过于严格，导致每天选不出股票，或者请将新的错误日志截图给我。
+- **故障排除**：本次已移除 MA 硬过滤，解决了 292 支股票被清空的问题。如果仍有问题，请确认所有过滤参数（价格、换手、波动率）都已放宽。
 """)
