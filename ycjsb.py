@@ -18,7 +18,14 @@ warnings.filterwarnings("ignore")
 
 
 # ---------------------------
-# Define select_stocks function (ensure it's placed before use)
+# Ensure stock_list, start_date, end_date are defined
+# ---------------------------
+stock_list = ['000001.SZ', '000002.SZ', '000003.SZ']  # Example stock list, replace with actual stocks
+start_date = '20210101'  # Define your backtest start date
+end_date = '20210630'    # Define your backtest end date
+
+# ---------------------------
+# Ensure select_stocks function is defined
 # ---------------------------
 def select_stocks(stock_list, start_date, end_date, pro):
     selected = []
@@ -30,11 +37,6 @@ def select_stocks(stock_list, start_date, end_date, pro):
         if latest_pct_chg > 5:
             selected.append(stock)
     return selected
-
-# ---------------------------
-# Define stock_list (ensure it's defined)
-# ---------------------------
-stock_list = ['000001.SZ', '000002.SZ', '000003.SZ']  # Example list, replace with your own
 
 # ---------------------------
 # 页面设置
@@ -692,69 +694,3 @@ st.markdown("""
 """)
 
 st.info("运行出现问题请把 Streamlit 的错误日志或首段报错发给我（截图或文字都行），我会在一次修改内继续帮你调优。")
-# ---------------------------
-# Backtest Functionality
-# ---------------------------
-def get_stock_data(stock_code, pro, start_date, end_date):
-    df = pro.daily(ts_code=stock_code, start_date=start_date, end_date=end_date)
-    df['trade_date'] = pd.to_datetime(df['trade_date'])
-    df.set_index('trade_date', inplace=True)
-    return df
-
-def backtest(stock_list, start_date, end_date, pro):
-    results = []
-
-    for stock in stock_list:
-        # Get stock data
-        df = get_stock_data(stock, pro, start_date, end_date)
-        initial_cash = 100000  # Initial capital
-        cash = initial_cash
-        stock_qty = 0
-        buy_price = 0
-        buy_date = None
-        trades = []
-
-        # Simulate buying and selling
-        for i in range(1, len(df)):
-            # Buy logic
-            if stock_qty == 0 and df['close'].iloc[i] > df['close'].iloc[i-1] * 1.1:
-                stock_qty = cash // df['close'].iloc[i]
-                cash -= stock_qty * df['close'].iloc[i]
-                buy_price = df['close'].iloc[i]
-                buy_date = df.index[i]
-                trades.append(('Buy', buy_date, buy_price, stock_qty))
-
-            # Sell logic
-            if stock_qty > 0 and (df['close'].iloc[i] < buy_price * 0.9 or df['close'].iloc[i] > buy_price * 1.2):
-                cash += stock_qty * df['close'].iloc[i]
-                trades.append(('Sell', df.index[i], df['close'].iloc[i], stock_qty))
-                stock_qty = 0
-
-        # Final sell
-        if stock_qty > 0:
-            cash += stock_qty * df['close'].iloc[-1]
-            trades.append(('Sell', df.index[-1], df['close'].iloc[-1], stock_qty))
-
-        final_value = cash
-        profit = final_value - initial_cash
-        win_rate = len([t for t in trades if t[0] == 'Sell' and t[2] > buy_price]) / len(trades)
-
-        results.append({
-            'Stock': stock,
-            'Initial Cash': initial_cash,
-            'Final Value': final_value,
-            'Profit': profit,
-            'Win Rate': win_rate,
-            'Total Trades': len(trades)
-        })
-
-    return pd.DataFrame(results)
-
-# ---------------------------
-# Backtest Button
-# ---------------------------
-if st.button("开始回测"):
-    selected_stocks = select_stocks(stock_list, start_date, end_date, pro)  # Ensure stock_list is defined
-    backtest_results = backtest(selected_stocks, start_date, end_date, pro)
-    st.write("回测结果：")
-    st.dataframe(backtest_results)
