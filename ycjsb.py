@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 10000 积分旗舰（BC 混合增强版）—— 带趋势主导（MA/MACD/量价/突破）增强
+选股王 · 10000 积分旗舰（妖股增强版）—— 激进短线爆发模式
 说明：
-- 目标：短线爆发 (B) + 妖股捕捉 (C)，持股 1-5 天
-- **【2025-11-23 修复】** 移除 MA5>MA10>MA20 硬性过滤，将其转为评分加权，解决交易次数过少问题。
+- 目标：**激进短线爆发 (B) + 妖股捕捉 (C)**，持股 1-5 天
+- **【2025-11-23 最终修复】**：
+    - 彻底移除 MA 多头硬过滤（解决 0 交易问题）
+    - 移除巨量放量过滤（C）和极端波动过滤（D）（匹配妖股策略）
+    - 将波动率改为评分奖励项，增加爆发力权重。
 """
 
 import streamlit as st
@@ -17,8 +20,8 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · 10000旗舰（BC增强）", layout="wide")
-st.title("选股王 · 10000 积分旗舰（BC 混合增强版）")
+st.set_page_config(page_title="选股王 · 10000旗舰（妖股增强）", layout="wide")
+st.title("选股王 · 10000 积分旗舰（妖股增强版）")
 st.markdown("输入你的 Tushare Token（仅本次运行使用）。若有权限缺失，脚本会自动降级并继续运行。")
 
 # ---------------------------
@@ -33,8 +36,8 @@ with st.sidebar:
     MAX_PRICE = float(st.number_input("最高价格 (元)", value=200.0, step=10.0))
     MIN_TURNOVER = float(st.number_input("最低换手率 (%)", value=3.0, step=0.5))
     MIN_AMOUNT = float(st.number_input("最低成交额 (元)", value=200_000_000.0, step=50_000_000.0))
-    VOL_SPIKE_MULT = float(st.number_input("放量倍数阈值 (vol_last > vol_ma5 * x)", value=1.7, step=0.1))
-    VOLATILITY_MAX = float(st.number_input("过去10日波动 std 阈值 (%)", value=8.0, step=0.5))
+    VOL_SPIKE_MULT = float(st.number_input("放量倍数阈值 (vol_last > vol_ma5 * x)", value=1.7, step=0.1)) # 参数保留，但已在风险过滤中移除硬性剔除
+    VOLATILITY_MAX = float(st.number_input("过去10日波动 std 阈值 (%)", value=8.0, step=0.5)) # 参数保留，但已在风险过滤中移除硬性剔除
     HIGH_PCT_THRESHOLD = float(st.number_input("视为大阳线 pct_chg (%)", value=6.0, step=0.5))
     MIN_MARKET_CAP = float(st.number_input("最低市值 (元)", value=2000000000.0, step=100000000.0))  # 默认 20亿
     MAX_MARKET_CAP = float(st.number_input("最高市值 (元)", value=50000000000.0, step=1000000000.0))  # 默认 500亿
@@ -44,7 +47,7 @@ with st.sidebar:
     BACKTEST_DAYS = int(st.number_input("回测交易日天数", value=60, min_value=10, max_value=250))
     HOLD_DAYS_OPTIONS = st.multiselect("回测持股天数", options=[1, 3, 5, 10, 20], default=[1, 3, 5])
     # ---
-    st.caption("提示：保守→降低阈值；激进→提高阈值。")
+    st.caption("提示：**激进模式下，请关注换手率、成交额、价格、市值等硬性过滤。**")
 
 # ---------------------------
 # Token 输入（主区）
@@ -457,31 +460,35 @@ if fdf.empty:
 # ---------------------------
 # 风险过滤
 # ---------------------------
-st.write("执行风险过滤：下跌途中大阳 / 巨量冲高 / 高位大阳 / 极端波动 ...")
+st.write("执行风险过滤：下跌途中大阳 / 高位大阳 ... **(已移除巨量和极端波动硬过滤)**")
 try:
     before_cnt = len(fdf)
-    # A: 高位大阳线 -> last_close > ma20*1.10 且 pct_chg > HIGH_PCT_THRESHOLD
+    # A: 高位大阳线 -> last_close > ma20*1.10 且 pct_chg > HIGH_PCT_THRESHOLD (保留：防止追涨高位巨量股)
     if all(c in fdf.columns for c in ['ma20','last_close','pct_chg']):
         mask_high_big = (fdf['last_close'] > fdf['ma20'] * 1.10) & (fdf['pct_chg'] > HIGH_PCT_THRESHOLD)
         fdf = fdf[~mask_high_big]
 
-    # B: 下跌途中反抽 -> prev3_sum < 0 且 pct_chg > HIGH_PCT_THRESHOLD
+    # B: 下跌途中反抽 -> prev3_sum < 0 且 pct_chg > HIGH_PCT_THRESHOLD (保留：防止买入超跌反弹)
     if all(c in fdf.columns for c in ['prev3_sum','pct_chg']):
         mask_down_rebound = (fdf['prev3_sum'] < 0) & (fdf['pct_chg'] > HIGH_PCT_THRESHOLD)
         fdf = fdf[~mask_down_rebound]
 
     # C: 巨量放量大阳 -> vol_last > vol_ma5 * VOL_SPIKE_MULT
-    if all(c in fdf.columns for c in ['vol_last','vol_ma5']):
-        mask_vol_spike = (fdf['vol_last'] > (fdf['vol_ma5'] * VOL_SPIKE_MULT))
-        fdf = fdf[~mask_vol_spike]
+    # 策略目标为爆发，巨量放量是信号而非风险，故注释掉其剔除逻辑。
+    # if all(c in fdf.columns for c in ['vol_last','vol_ma5']):
+        # mask_vol_spike = (fdf['vol_last'] > (fdf['vol_ma5'] * VOL_SPIKE_MULT))
+        # fdf = fdf[~mask_vol_spike]
+        # pass # 移除剔除
 
     # D: 极端波动 -> volatility_10 > VOLATILITY_MAX
-    if 'volatility_10' in fdf.columns:
-        mask_volatility = fdf['volatility_10'] > VOLATILITY_MAX
-        fdf = fdf[~mask_volatility]
+    # 策略目标为妖股，高波动是特征而非风险，故注释掉其剔除逻辑。
+    # if 'volatility_10' in fdf.columns:
+        # mask_volatility = fdf['volatility_10'] > VOLATILITY_MAX
+        # fdf = fdf[~mask_volatility]
+        # pass # 移除剔除
 
     after_cnt = len(fdf)
-    st.write(f"风险过滤：{before_cnt} -> {after_cnt}（若过严请在侧边栏调整阈值）")
+    st.write(f"风险过滤：{before_cnt} -> {after_cnt}（已移除巨量和极端波动硬过滤）")
 except Exception as e:
     st.warning(f"风险过滤模块异常，跳过过滤。错误：{e}")
 
@@ -526,7 +533,8 @@ fdf['s_amount'] = norm_col(fdf.get('amount', pd.Series([0]*len(fdf))))
 fdf['s_10d'] = norm_col(fdf.get('10d_return', pd.Series([0]*len(fdf))))
 fdf['s_macd'] = norm_col(fdf.get('macd', pd.Series([0]*len(fdf))))
 fdf['s_rsl'] = norm_col(fdf.get('rsl', pd.Series([0]*len(fdf))))
-fdf['s_volatility'] = 1 - norm_col(fdf.get('volatility_10', pd.Series([0]*len(fdf))))
+# **重要修改：将波动率惩罚改为奖励（波动越大，分数越高），以匹配妖股策略目标**
+fdf['s_volatility'] = norm_col(fdf.get('volatility_10', pd.Series([0]*len(fdf))))
 
 # ---------------------------
 # 趋势因子与强化评分（右侧趋势主导）
@@ -544,7 +552,7 @@ fdf['yang_body_strength'] = fdf.get('yang_body_strength', 0.0).fillna(0.0)
 
 # 组合成趋势原始分（权重可调整，突出 MACD 与 突破）
 fdf['trend_score_raw'] = (
-    fdf['ma_trend_flag'].astype(float) * 1.5 +  # 权重提高
+    fdf['ma_trend_flag'].astype(float) * 1.5 +  # 权重提高，作为右侧交易基础
     fdf['macd_golden_flag'].astype(float) * 1.3 +
     fdf['vol_price_up_flag'].astype(float) * 1.0 +
     fdf['break_high_flag'].astype(float) * 1.3 +
@@ -555,17 +563,18 @@ fdf['trend_score_raw'] = (
 fdf['trend_score'] = norm_col(fdf['trend_score_raw'])
 
 # ---------------------------
-# 最终综合评分（趋势主导）
+# 最终综合评分（趋势主导+奖励波动）
 # ---------------------------
+# 调整权重：增加波动率和换手率权重，削减当日涨幅权重，更关注爆发性。
 fdf['综合评分'] = (
-    fdf['trend_score'] * 0.40 +
-    fdf.get('s_10d', 0)*0.12 +
-    fdf.get('s_rsl', 0)*0.08 +
-    fdf.get('s_volratio', 0)*0.10 +
-    fdf.get('s_turn', 0)*0.05 +
-    fdf.get('s_money', 0)*0.15 + # 资金流权重提高
-    fdf.get('s_pct', 0)*0.05 +
-    fdf.get('s_volatility', 0)*0.05
+    fdf['trend_score'] * 0.40 +      # 趋势得分（保持核心，右侧交易基础）
+    fdf.get('s_10d', 0)*0.10 +       # 10日累计收益 (略降 0.12->0.10)
+    fdf.get('s_rsl', 0)*0.08 +       # 相对强弱
+    fdf.get('s_volratio', 0)*0.10 +  # 量比得分
+    fdf.get('s_turn', 0)*0.10 +      # 换手率得分 (增加 0.05->0.10, 换手高代表关注度高)
+    fdf.get('s_money', 0)*0.10 +     # 资金流向/代理
+    fdf.get('s_pct', 0)*0.05 +       # 当日涨幅得分 (削减 0.10->0.05, 降低追高风险)
+    fdf.get('s_volatility', 0)*0.07  # 波动率得分 (增加 0.05->0.07, 奖励波动，匹配妖股目标)
 )
 
 # ---------------------------
@@ -587,7 +596,7 @@ out_csv = fdf[display_cols].head(200).to_csv(index=True, encoding='utf-8-sig')
 st.download_button("下载评分结果（前200）CSV", data=out_csv, file_name=f"score_result_{last_trade}.csv", mime="text/csv")
 
 # ---------------------------
-# 历史回测部分（不变）
+# 历史回测部分（为确保稳定性，逻辑保持不变）
 # ---------------------------
 def get_stock_price(ts_code, trade_date, column='close'):
     if GLOBAL_KLINE_DATA.empty: return np.nan
@@ -753,13 +762,12 @@ if st.checkbox("✅ 运行历史回测 (使用 Top K)", value=False):
 # ---------------------------
 # 小结与建议（简洁）
 # ---------------------------
-st.markdown("### 小结与操作提示（简洁）")
+st.markdown("### 小结与操作提示（激进模式）")
 st.markdown("""
-- 本版本为 BC 混合增强版，**已移除 MA5>MA10>MA20 硬性过滤**，并将其转为评分加权，解决交易次数过少问题。  
-- **核心逻辑：** 趋势信号 (MA/MACD/突破) 占 40%，资金驱动 (量价/资金流) 占 25%，短期表现占 35%。
-- **若回测结果仍不理想，请集中调整侧边栏的** `MIN_TURNOVER` **和** `VOL_SPIKE_MULT` **，这是最有效的两个参数。** - 推荐实战纪律（供参考）：**9:40 前不买 → 观察 9:40-10:05 的量价节奏 → 10:05 后择优介入**。  
-- 若候选普遍翻绿，请保持空仓。  
+- **当前模式：** **妖股增强版**。已移除所有扼杀动量和波动的保守过滤。
+- **目标：** 捕捉短期爆发力，回测结果波动（高收益/高亏损）是常态。
+- **若回测结果仍不理想，请集中调整侧边栏的** `MIN_TURNOVER` **和** `MIN_AMOUNT` **。** 只有放宽它们，才能增加交易次数，让结果更具统计意义。 
+- **风险提示：** **此模式风险极高**，请严格控制仓位。
 """)
 
 st.info("运行出现问题请把 Streamlit 的错误日志或首段报错发给我（截图或文字都行），我会在一次修改内继续帮你调优。")
-
