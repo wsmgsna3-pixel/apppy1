@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 10000 积分旗舰（回测数据鲁棒版）
+选股王 · 10000 积分旗舰（回测日期修正终极版）
 说明：
 - 目标：**激进短线爆发 (B) + 妖股捕捉 (C)**
 - 【2025-11-23 最终修复】：
     - 修复成交额单位（已解决选股成功）
-    - **增强回测模块数据鲁棒性，彻底解决“交易次数0”问题**
+    - 增强回测数据鲁棒性（已解决数据碎片化）
+    - **修复回测日期起始点错误，解决“回测仅覆盖 1 天”和“交易次数 0”的问题。**
 """
 
 import streamlit as st
@@ -19,8 +20,8 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · 10000旗舰（回测鲁棒）", layout="wide")
-st.title("选股王 · 10000 积分旗舰（回测数据鲁棒版）")
+st.set_page_config(page_title="选股王 · 10000旗舰（日期修正）", layout="wide")
+st.title("选股王 · 10000 积分旗舰（回测日期修正终极版）")
 st.markdown("输入你的 Tushare Token（仅本次运行使用）。若有权限缺失，脚本会自动降级并继续运行。")
 
 # ---------------------------
@@ -47,7 +48,7 @@ with st.sidebar:
     BACKTEST_DAYS = int(st.number_input("回测交易日天数", value=60, min_value=10, max_value=250))
     HOLD_DAYS_OPTIONS = st.multiselect("回测持股天数", options=[1, 3, 5, 10, 20], default=[1, 3, 5])
     # ---
-    st.caption("提示：**回测已增强数据鲁棒性，以解决交易次数为 0 的问题。**")
+    st.caption("提示：**回测日期已修正，应能覆盖足够的天数。**")
 
 # ---------------------------
 # Token 输入（主区）
@@ -83,15 +84,13 @@ def get_trade_cal(start_date, end_date):
     except Exception:
         return []
 
-# 【核心改变】这个函数现在只在实时评分中使用，回测中不再使用，以提高鲁棒性
 @st.cache_data(ttl=6000)
 def get_bulk_daily_data(ts_codes, start_date, end_date):
-    """批量获取指定股票和日期的 daily 数据"""
+    """批量获取指定股票和日期的 daily 数据 (仅用于实时评分)"""
     all_data = []
     trade_dates = get_trade_cal(start_date, end_date)
     
-    st.write(f"正在批量加载 {len(trade_dates)} 个交易日的 daily 数据...")
-    # NOTE: 这里可能会因频率限制导致数据不全，但这是实时评分所需要的历史数据
+    st.write(f"正在批量加载 {len(trade_dates)} 个交易日的 daily 数据 (用于指标计算)...")
     pbar = st.progress(0)
     for i, date in enumerate(trade_dates):
         daily_df = safe_get(pro.daily, trade_date=date)
@@ -284,7 +283,6 @@ def get_hist_cached_bulk(ts_code, end_date, days=60):
 # 指标计算（使用 bulk 缓存）
 # ---------------------------
 def compute_indicators(df):
-    # （指标计算函数保持不变，因为它只依赖于实时选股池的历史数据）
     res = {}
     if df.empty or len(df) < 3: return res
     close = df['close'].astype(float)
@@ -384,12 +382,11 @@ def compute_indicators(df):
 
     return res
 
-# 评分计算（略）
+# 评分计算
 st.write("为评分池逐票计算指标...")
 records = []
 pbar2 = st.progress(0)
 for idx, row in enumerate(clean_df.itertuples()):
-    # ... (计算指标和评分，保持不变) ...
     ts_code = getattr(row, 'ts_code')
     name = getattr(row, 'name', ts_code)
     pct_chg = getattr(row, 'pct_chg', 0.0)
@@ -446,8 +443,6 @@ if fdf.empty:
     st.error("评分计算失败或无数据，请检查 Token 权限与接口。")
     st.stop()
 
-
-# ... (风险过滤、RSL、归一化、趋势因子与评分逻辑，保持不变) ...
 
 # ---------------------------
 # 风险过滤
@@ -562,12 +557,11 @@ out_csv = fdf[display_cols].head(200).to_csv(index=True, encoding='utf-8-sig')
 st.download_button("下载评分结果（前200）CSV", data=out_csv, file_name=f"score_result_{last_trade}.csv", mime="text/csv")
 
 # ---------------------------
-# 历史回测部分（数据鲁棒性增强）
+# 历史回测部分（数据鲁棒性增强 & 日期修正）
 # ---------------------------
-# 【移除】 get_stock_price，改为直接调用 safe_get
-
 @st.cache_data(ttl=6000)
 def run_backtest(start_date, end_date, hold_days, top_k):
+    # start_date 和 end_date 之间应该有足够多的交易日
     trade_dates = get_trade_cal(start_date, end_date)
     
     if not trade_dates:
@@ -575,18 +569,20 @@ def run_backtest(start_date, end_date, hold_days, top_k):
 
     results = {h: {'returns': [], 'wins': 0, 'total': 0, 'win_rate': 0.0, 'avg_return': 0.0} for h in hold_days}
     
+    # 确定回测实际的起始日（回溯 x 天）
     bt_start = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=BACKTEST_DAYS * 1.5)).strftime("%Y%m%d")
     
     # 确保只回测 BACKTEST_DAYS 个交易日
     backtest_dates = [d for d in trade_dates if d >= bt_start and d <= end_date]
     if len(backtest_dates) < BACKTEST_DAYS:
         st.warning(f"由于数据或交易日限制，回测仅能覆盖 {len(backtest_dates)} 天。")
+    
+    # 取最近的 BACKTEST_DAYS 个交易日作为买入日期池
     backtest_dates = backtest_dates[-BACKTEST_DAYS:]
     
     st.write(f"正在模拟 {len(backtest_dates)} 个交易日的选股回测...")
     pbar_bt = st.progress(0)
     
-    # 【核心改变】：不再尝试一次性加载所有历史数据
     for i, buy_date in enumerate(backtest_dates):
         # 模拟当日选股：直接调用 API 获取当日数据，更稳定
         daily_df = safe_get(pro.daily, trade_date=buy_date)
@@ -620,12 +616,13 @@ def run_backtest(start_date, end_date, hold_days, top_k):
 
             for h in hold_days:
                 try:
-                    # 确定卖出日期
-                    sell_date = trade_dates[trade_dates.index(buy_date) + h]
+                    # 确定卖出日期在 trade_dates 中的位置
+                    current_index = trade_dates.index(buy_date)
+                    sell_date = trade_dates[current_index + h]
                 except (ValueError, IndexError):
                     continue
                 
-                # 【核心改变】：获取卖出价格 - 直接调用 API，增加鲁棒性
+                # 获取卖出价格 - 直接调用 API，增加鲁棒性
                 sell_price_df = safe_get(pro.daily, trade_date=sell_date, ts_code=ts_code)
                 sell_price = sell_price_df['close'].iloc[0] if not sell_price_df.empty else np.nan
                 
@@ -668,8 +665,15 @@ if st.checkbox("✅ 运行历史回测 (使用 Top K)", value=False):
     else:
         st.header("📈 历史回测结果（买入收盘价 / 卖出收盘价）")
         
+        # 【核心修复】：计算一个足够远的起始日期
+        try:
+            # 往回推 200 个日历日，确保有足够的交易日被包含
+            start_date_for_cal = (datetime.strptime(last_trade, "%Y%m%d") - timedelta(days=200)).strftime("%Y%m%d")
+        except:
+            start_date_for_cal = (datetime.now() - timedelta(days=200)).strftime("%Y%m%d")
+            
         backtest_result = run_backtest(
-            start_date=find_last_trade_day(max_days=300), 
+            start_date=start_date_for_cal, # 传入一个足够早的日期
             end_date=last_trade,
             hold_days=HOLD_DAYS_OPTIONS,
             top_k=TOP_DISPLAY
@@ -697,8 +701,8 @@ if st.checkbox("✅ 运行历史回测 (使用 Top K)", value=False):
 # ---------------------------
 # 小结与建议（简洁）
 # ---------------------------
-st.markdown("### 小结与操作提示（回测鲁棒版）")
+st.markdown("### 小结与操作提示（回测日期修正版）")
 st.markdown("""
-- **当前代码：** **回测数据鲁棒版**，彻底优化了回测数据获取方式，以解决 Tushare 频率限制导致的**交易次数为 0** 的问题。
+- **当前代码：** **回测日期修正终极版**，已修复回测起始日期错误。
 - **操作：** 请重新运行脚本，并勾选底部的 **“✅ 运行历史回测”** 选项。
 """)
