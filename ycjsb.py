@@ -3,7 +3,7 @@
 选股王 · 10000 积分旗舰（BC 混合增强版）—— 带趋势主导（MA/MACD/量价/突破）增强
 说明：
 - 目标：短线爆发 (B) + 妖股捕捉 (C)，持股 1-5 天
-- **本次优化**：在回测收益计算环节，增加对买入价和卖出价的严格检查，确保 nan 或 0 值的交易不会导致整个交易次数统计失败，并修复了交易次数为 0 的问题。
+- **本次优化**：精简回测进度条，只保留一个总进度条；修复收益显示 nan 的问题，确保价格类型和计算的稳定性。
 - 采用全局 K 线数据缓存（GLOBAL_KLINE_DATA）和批量预加载机制，大幅提升回测稳定性和速度。
 """
 
@@ -21,12 +21,8 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 全局数据缓存（用于性能优化）
 # ---------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_global_daily_data(ts_code):
-    """用于存储单只股票的历史数据，避免重复加载，但在回测模式下会被 get_bulk_daily_data 代替"""
-    return pd.DataFrame() 
-
-GLOBAL_KLINE_DATA = {} # 存储预加载的全市场K线数据
+# GLOBAL_KLINE_DATA 存储预加载的全市场K线数据
+GLOBAL_KLINE_DATA = {} 
 
 # ---------------------------
 # 页面设置
@@ -230,10 +226,7 @@ def clean_and_filter(pool_merged, min_price, max_price, min_turnover, min_amount
     """统一清洗和过滤流程"""
     clean_list = []
     
-    # 根据运行模式决定是否显示进度条
-    st_pbar = None
-    if 'streamlit' in sys.modules: 
-        st_pbar = st.progress(0)
+    # 移除内层进度条，只保留日志
     
     for i, r in enumerate(pool_merged.itertuples()):
         ts = getattr(r, 'ts_code')
@@ -248,17 +241,17 @@ def clean_and_filter(pool_merged, min_price, max_price, min_turnover, min_amount
         name = getattr(r, 'name', ts)
         
         if vol == 0 or (isinstance(amount,(int,float)) and amount == 0):
-            if st_pbar: st_pbar.progress((i+1)/len(pool_merged)); continue
+            continue
 
         if pd.isna(close) or (close < min_price) or (close > max_price): 
-            if st_pbar: st_pbar.progress((i+1)/len(pool_merged)); continue
+            continue
 
         if isinstance(name, str) and (('ST' in name.upper()) or ('退' in name)):
-            if st_pbar: st_pbar.progress((i+1)/len(pool_merged)); continue
+            continue
 
         tsck = getattr(r, 'ts_code', '')
         if isinstance(tsck, str) and (tsck.startswith('4') or tsck.startswith('8')):
-            if st_pbar: st_pbar.progress((i+1)/len(pool_merged)); continue
+            continue
 
         try:
             tv = getattr(r, 'total_mv', np.nan)
@@ -266,37 +259,35 @@ def clean_and_filter(pool_merged, min_price, max_price, min_turnover, min_amount
                 tv = float(tv)
                 tv_yuan = tv * 10000.0 if tv > 1e6 else tv
                 if tv_yuan < min_market_cap or tv_yuan > max_market_cap:
-                    if st_pbar: st_pbar.progress((i+1)/len(pool_merged)); continue
+                    continue
         except: pass
 
         try:
             high = getattr(r, 'high', np.nan); low = getattr(r, 'low', np.nan)
             if (not pd.isna(open_p) and not pd.isna(high) and not pd.isna(low) and not pd.isna(pre_close)):
                 if (open_p == high == low == pre_close):
-                    if st_pbar: st_pbar.progress((i+1)/len(pool_merged)); continue
+                    continue
         except: pass
 
         if not pd.isna(turnover):
             try:
                 if float(turnover) < min_turnover: 
-                    if st_pbar: st_pbar.progress((i+1)/len(pool_merged)); continue
+                    continue
             except: pass
 
         if not pd.isna(amount):
             amt = amount
             amt = amt * 10000.0 if amt > 0 and amt < 1e5 else amt
             if amt < min_amount: 
-                if st_pbar: st_pbar.progress((i+1)/len(pool_merged)); continue
+                continue
 
         try:
             if float(pct) < 0: 
-                if st_pbar: st_pbar.progress((i+1)/len(pool_merged)); continue
+                continue
         except: pass
 
         clean_list.append(r)
-        if st_pbar: st_pbar.progress((i+1)/len(pool_merged))
 
-    if st_pbar: st_pbar.progress(1.0)
     clean_df = pd.DataFrame([dict(zip(r._fields, r)) for r in clean_list])
     
     if len(clean_df) == 0:
@@ -484,7 +475,8 @@ def compute_scores(clean_df, current_trade_date, min_market_cap, max_market_cap,
     
     st_pbar = None
     if 'streamlit' in sys.modules:
-        st_pbar = st.progress(0, text="正在计算指标和分数...")
+        # ** 移除进度条，避免重复出现 **
+        pass 
         
     for idx, row in enumerate(clean_df.itertuples()):
         ts_code = getattr(row, 'ts_code')
@@ -536,9 +528,7 @@ def compute_scores(clean_df, current_trade_date, min_market_cap, max_market_cap,
         }
 
         records.append(rec)
-        if st_pbar: st_pbar.progress((idx+1)/len(clean_df))
 
-    if st_pbar: st_pbar.progress(1.0)
     fdf = pd.DataFrame(records)
     
     if fdf.empty: 
@@ -573,7 +563,15 @@ def compute_scores(clean_df, current_trade_date, min_market_cap, max_market_cap,
     
     if 'streamlit' in sys.modules: st.write(f"风险过滤后，剩余 {count_after_risk_filter} 支候选股进入下一阶段。")
 
-    # MA 多头硬过滤已注释 
+    # MA 多头硬过滤
+    try:
+        if all(c in fdf.columns for c in ['ma5','ma10','ma20']):
+            before_ma = len(fdf)
+            fdf = fdf[(fdf['ma5'] > fdf['ma10']) & (fdf['ma10'] > fdf['ma20'])]
+            after_ma = len(fdf)
+            if 'streamlit' in sys.modules and before_ma != after_ma:
+                st.write(f"MA 多头过滤：{before_ma} -> {after_ma}（保留 MA5>MA10>MA20）")
+    except Exception: pass
 
     if fdf.empty:
         if 'streamlit' in sys.modules: st.error("【内部错误】经过所有过滤后，评分池为空。")
@@ -644,7 +642,7 @@ def compute_scores(clean_df, current_trade_date, min_market_cap, max_market_cap,
     return fdf
 
 # ---------------------------
-# 回测主模块（核心修改区：交易次数计数修复）
+# 回测主模块
 # ---------------------------
 def run_backtest(trade_dates, hold_days, top_k):
     """
@@ -691,38 +689,46 @@ def run_backtest(trade_dates, hold_days, top_k):
         daily_all = safe_get(pro.daily, trade_date=buy_date)
         if daily_all.empty: 
             if 'streamlit' in sys.modules: st.warning(f"跳过回测日 {buy_date}: 无法获取当日 daily 数据。")
-            if pbar: pbar.progress((i + 1) / len(trade_dates)); continue
+            if pbar: pbar.progress((i + 1) / len(trade_dates), text=f"回测进度：{i+1} / {len(trade_dates)} 天"); continue
             
         daily_all = daily_all.sort_values("pct_chg", ascending=False).reset_index(drop=True)
             
         pool0 = daily_all.head(INITIAL_TOP_N).copy().reset_index(drop=True)
         
+        # 使用缓存的 get_advanced_data 
         stock_basic, daily_basic, moneyflow = get_advanced_data(buy_date)
         
         pool_merged = merge_all_info(pool0, stock_basic, daily_basic, moneyflow)
 
+        # 清洗/过滤
         clean_df = clean_and_filter(pool_merged, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MIN_AMOUNT, MIN_MARKET_CAP, MAX_MARKET_CAP, VOL_SPIKE_MULT, VOLATILITY_MAX, HIGH_PCT_THRESHOLD, FINAL_POOL)
         if clean_df.empty: 
-            if pbar: pbar.progress((i + 1) / len(trade_dates)); continue
+            if pbar: pbar.progress((i + 1) / len(trade_dates), text=f"回测进度：{i+1} / {len(trade_dates)} 天"); continue
 
+        # 评分/再次过滤
         fdf_scored = compute_scores(clean_df, buy_date, MIN_MARKET_CAP, MAX_MARKET_CAP, VOL_SPIKE_MULT, VOLATILITY_MAX, HIGH_PCT_THRESHOLD)
         if fdf_scored.empty: 
-            if pbar: pbar.progress((i + 1) / len(trade_dates)); continue
+            if pbar: pbar.progress((i + 1) / len(trade_dates), text=f"回测进度：{i+1} / {len(trade_dates)} 天"); continue
         
         fdf_scored = fdf_scored.sort_values('综合评分', ascending=False).head(top_k)
         
         try:
             buy_date_cal_idx = all_trade_cals.index(buy_date)
         except ValueError:
-            if pbar: pbar.progress((i + 1) / len(trade_dates)); continue
+            if pbar: pbar.progress((i + 1) / len(trade_dates), text=f"回测进度：{i+1} / {len(trade_dates)} 天"); continue
         
-        # *** 核心修复循环开始 ***
+        # 核心收益计算循环
         for _, row in fdf_scored.iterrows():
             ts_code = row['ts_code']
-            buy_close = row['last_close'] 
             
-            # 1. 严格检查买入价
-            if pd.isna(buy_close) or float(buy_close) == 0: 
+            try:
+                # 尝试安全转换买入价
+                buy_close = float(row['last_close']) 
+            except (ValueError, TypeError):
+                buy_close = np.nan
+            
+            # 严格检查买入价
+            if pd.isna(buy_close) or buy_close <= 0: 
                 continue
 
             for h in hold_days:
@@ -741,24 +747,28 @@ def run_backtest(trade_dates, hold_days, top_k):
                     sell_close_df = sell_data_row[sell_data_row['trade_date'] == sell_date]['close']
                     
                     if sell_close_df.empty: continue
-                    sell_close = sell_close_df.iloc[0]
                     
-                    # 2. 严格检查卖出价
-                    if pd.isna(sell_close) or float(sell_close) == 0:
+                    # 尝试安全转换卖出价
+                    try:
+                        sell_close = float(sell_close_df.iloc[0])
+                    except (ValueError, TypeError):
+                        sell_close = np.nan
+                    
+                    # 严格检查卖出价
+                    if pd.isna(sell_close) or sell_close <= 0:
                         continue 
                         
-                    # 3. 统计交易次数 (只有通过了买入和卖出价格检查，才算一次有效交易)
-                    results[h]['total'] += 1 # <-- 交易次数在此处累加
+                    # 统计交易次数 (通过价格检查才算有效交易)
+                    results[h]['total'] += 1 
 
-                    # 4. 计算收益
-                    ret = (float(sell_close) / float(buy_close)) - 1.0
+                    # 计算收益
+                    ret = (sell_close / buy_close) - 1.0
                     results[h]['returns'].append(ret)
                     if ret > 0:
                         results[h]['wins'] += 1
                 except Exception:
                     continue # 忽略任何其他计算错误
 
-        # *** 核心修复循环结束 ***
         
         if pbar: pbar.progress((i + 1) / len(trade_dates), text=f"回测进度：{i+1} / {len(trade_dates)} 天")
 
@@ -767,7 +777,9 @@ def run_backtest(trade_dates, hold_days, top_k):
     final_results = []
     for h in hold_days:
         r = results[h]
-        avg_ret = np.mean(r['returns']) * 100 if r['returns'] else 0.0
+        # ** 修复：使用 np.nanmean 确保 nan 不影响有效交易的平均值 **
+        avg_ret = np.nanmean(r['returns']) * 100 if r['returns'] else 0.0
+        
         # 修复：防止 total 为 0 时计算胜率报错
         win_rate = (r['wins'] / r['total']) * 100 if r['total'] > 0 else 0.0
         
@@ -786,7 +798,6 @@ def run_backtest(trade_dates, hold_days, top_k):
 # ---------------------------
 def live_stock_pick():
     global GLOBAL_KLINE_DATA 
-    st.session_state['mode'] = 'live'
     
     start_date_90 = (datetime.strptime(last_trade, "%Y%m%d") - timedelta(days=90)).strftime("%Y%m%d")
     get_bulk_daily_data(start_date_90, last_trade)
@@ -806,6 +817,7 @@ def live_stock_pick():
     pool_merged = merge_all_info(pool0, stock_basic, daily_basic, moneyflow)
 
     st.write("对初筛池进行清洗（ST/停牌/价格/一字板/换手/成交额等）...")
+    # 移除内层进度条，现在 clean_and_filter 已经不显示进度条
     clean_df = clean_and_filter(pool_merged, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MIN_AMOUNT, MIN_MARKET_CAP, MAX_MARKET_CAP, VOL_SPIKE_MULT, VOLATILITY_MAX, HIGH_PCT_THRESHOLD, FINAL_POOL)
 
     if clean_df.empty:
@@ -815,6 +827,7 @@ def live_stock_pick():
     st.write(f"清洗后候选数量：{len(clean_df)} （将从中取涨幅前 {FINAL_POOL} 进入评分阶段）")
     
     st.write("为评分池逐票计算指标（本次已优化：从本地缓存读取 K 线数据）...")
+    # 移除内层进度条，现在 compute_scores 已经不显示进度条
     fdf = compute_scores(clean_df, last_trade, MIN_MARKET_CAP, MAX_MARKET_CAP, VOL_SPIKE_MULT, VOLATILITY_MAX, HIGH_PCT_THRESHOLD)
 
     if fdf.empty:
@@ -901,8 +914,7 @@ st.markdown("---")
 st.markdown("### 小结与操作提示（简洁）")
 st.markdown("""
 - **当日选股**：点击 **🟢 运行当日选股**。
-- **回测**：点击 **🟠 启动回测**，本次修复了交易次数为 0 的问题。
-- **故障排除**：如果回测结果仍为 0 次交易，请：
-    1. 检查侧边栏 **`TOP_DISPLAY`** 是否为 0（应大于 0）。
-    2. 检查**最低价格、最低换手率**等过滤参数是否过于严苛。
+- **回测**：点击 **🟠 启动回测**。
+- **本次优化**：已精简回测进度条，同时修复了收益显示 `nan` 的问题。
+- **故障排除**：如果回测结果的平均收益仍为 **0.00%**，请考虑放宽**MA多头硬过滤**（即 `MA5>MA10>MA20`）或者放宽**风险过滤**参数，因为这可能导致选出的股票数量过少，无法产生足够的正向收益。
 """)
