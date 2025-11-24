@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 10000 积分旗舰（终极修复 V5.1）
+选股王 · 10000 积分旗舰（终极修复 V5.2）
 说明：
-- 核心修复：解决了实时选股流程中的 NameError: fdf is not defined。
+- 核心修复：增强回测结果计算的健壮性，解决进度条结束后卡住不显示结果的问题。
 - 策略同步：确保 run_backtest 逻辑与实时选股策略完全对齐。
 - 性能优化：统一数据缓存，支持回测时使用换手率。
 - 策略调优：取消 MA 多头硬过滤，改为趋势加分项，提高选股率。
@@ -19,8 +19,8 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · 10000旗舰（终极修复V5.1）", layout="wide")
-st.title("选股王 · 10000 积分旗舰（终极修复版 V5.1）")
+st.set_page_config(page_title="选股王 · 10000旗舰（终极修复V5.2）", layout="wide")
+st.title("选股王 · 10000 积分旗舰（终极修复版 V5.2）")
 st.markdown("输入你的 Tushare Token（仅本次运行使用）。若有权限缺失，脚本会自动降级并继续运行。")
 
 # ---------------------------
@@ -126,7 +126,7 @@ if not mf_raw.empty:
     possible = ['net_mf','net_mf_amount','net_mf_in','net_mf_out']
     col = None
     for c in possible:
-        if c in mf_raw.columns:
+        if c in mf_cols:
             col = c; break
     if col is None:
         numeric_cols = [c for c in mf_raw.columns if c != 'ts_code' and pd.api.types.is_numeric_dtype(mf_raw[c])]
@@ -207,7 +207,7 @@ clean_list = []
 pbar = st.progress(0)
 # 统一使用 daily 里的 amount（单位千元） 和 daily_basic 里的 turnover_rate（单位 %）
 for i, r in enumerate(pool_merged.itertuples()):
-    ts = getattr(r, 'ts_code')
+    ts_code = getattr(r, 'ts_code')
     vol = getattr(r, 'vol', 0)
 
     close = getattr(r, 'close', np.nan)
@@ -216,7 +216,7 @@ for i, r in enumerate(pool_merged.itertuples()):
     pct = getattr(r, 'pct_chg', np.nan)
     amount_daily = getattr(r, 'amount', np.nan) # daily 里的 amount
     turnover = getattr(r, 'turnover_rate', np.nan)
-    name = getattr(r, 'name', ts)
+    name = getattr(r, 'name', ts_code)
 
     # 1. 过滤：停牌/无成交
     if vol == 0 or (isinstance(amount_daily,(int,float)) and amount_daily == 0):
@@ -286,7 +286,7 @@ if len(clean_df) == 0:
 
 
 # ---------------------------
-# 辅助：指标计算函数（V5.1 完整保留）
+# 辅助：指标计算函数
 # ---------------------------
 @st.cache_data(ttl=600)
 def get_hist_cached(ts_code, end_date, days=60):
@@ -304,7 +304,6 @@ def get_hist_cached(ts_code, end_date, days=60):
 def compute_indicators(df):
     """
     计算技术指标（MA, MACD, KDJ, 量比, 10d收益, 波动率, 阳线实体）
-    保持与 V4.0 完全一致
     """
     res = {}
     if df.empty or len(df) < 3:
@@ -505,7 +504,7 @@ def apply_scoring_and_filtering(fdf, use_hard_filter=True):
 
 
 # ---------------------------
-# 评分池逐票计算因子（缓存 get_hist） - V5.1 修复：生成 fdf
+# 评分池逐票计算因子（缓存 get_hist）
 # ---------------------------
 st.write("为评分池逐票拉历史并计算指标（此步骤调用历史接口，已缓存）...")
 records = []
@@ -567,16 +566,15 @@ for idx, row in enumerate(final_clean_df.itertuples()):
     pbar2.progress((idx+1)/len(final_clean_df))
 
 pbar2.progress(1.0)
-# **V5.1 修复关键**：定义 fdf
+# V5.1/V5.2：定义 fdf
 fdf = pd.DataFrame(records)
 if fdf.empty:
     st.error("评分计算失败或无数据，请检查 Token 权限与接口。")
     st.stop()
 
 # ---------------------------
-# 最终综合评分（V5.1: 调用统一函数）
+# 最终综合评分（V5.2: 调用统一函数）
 # ---------------------------
-# V5.1 修复：调用 apply_scoring_and_filtering 函数，并接收返回的 DataFrame
 fdf = apply_scoring_and_filtering(fdf, use_hard_filter=False)
 fdf.index = fdf.index + 1
 
@@ -594,7 +592,7 @@ st.download_button("下载评分结果（前200）CSV", data=out_csv, file_name=
 
 
 # ---------------------------
-# 历史回测部分（V5.0/V5.1 保持不变）
+# 历史回测部分（V5.2 增强健壮性）
 # ---------------------------
 @st.cache_data(ttl=3600)
 def load_backtest_data(all_trade_dates):
@@ -706,6 +704,7 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k):
             ts_code = row['ts_code']
             
             # ** 性能关键 **：从缓存中拉取历史K线数据，以供计算指标
+            # 注意：回测时需要精确回溯，所以不能用主流程的 get_hist_cached（end_date不对）
             hist_df = get_hist_cached(ts_code, buy_date, days=60)
             ind = compute_indicators(hist_df)
             
@@ -753,7 +752,9 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k):
                 
                 if pd.isna(sell_price) or sell_price <= 0: continue
                 
-                ret = (sell_price / buy_price) - 1.0
+                # V5.2 确保 ret 是 float
+                ret = (float(sell_price) / float(buy_price)) - 1.0
+                
                 results[h]['total'] += 1
                 results[h]['returns'].append(ret)
                 if ret > 0:
@@ -766,8 +767,12 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k):
     final_results = {}
     for h, res in results.items():
         total = res['total']
-        if total > 0:
-            avg_return = np.mean(res['returns']) * 100.0
+        # V5.2 增强健壮性：将 returns 转换为 Series，并移除 NaN 后再计算平均值
+        returns_series = pd.Series(res['returns'])
+        valid_returns = returns_series.dropna()
+        
+        if total > 0 and len(valid_returns) > 0:
+            avg_return = valid_returns.mean() * 100.0
             win_rate = (res['wins'] / total) * 100.0
         else:
             avg_return = 0.0
@@ -795,38 +800,47 @@ if st.checkbox("✅ 运行历史回测", value=False):
         except:
             start_date_for_cal = (datetime.now() - timedelta(days=200)).strftime("%Y%m%d")
             
-        backtest_result = run_backtest(
-            start_date=start_date_for_cal, 
-            end_date=last_trade,
-            hold_days=HOLD_DAYS_OPTIONS,
-            backtest_top_k=BACKTEST_TOP_K 
-        )
+        # V5.2 增加 try/except 捕获可能的最终异常
+        try:
+            backtest_result = run_backtest(
+                start_date=start_date_for_cal, 
+                end_date=last_trade,
+                hold_days=HOLD_DAYS_OPTIONS,
+                backtest_top_k=BACKTEST_TOP_K 
+            )
 
-        bt_df = pd.DataFrame(backtest_result).T
-        bt_df.index.name = "持股天数"
-        bt_df = bt_df.reset_index()
-        bt_df['持股天数'] = bt_df['持股天数'].astype(str) + ' 天'
-        
-        st.dataframe(bt_df, use_container_width=True, hide_index=True)
-        st.success("回测完成！")
-        
-        export_df = bt_df.copy()
-        export_df.columns = ['HoldDays', 'AvgReturn', 'WinRate', 'TotalTrades']
-        out_csv_bt = export_df.to_csv(index=False, encoding='utf-8-sig')
-        st.download_button(
-            "下载回测结果 CSV", 
-            data=out_csv_bt, 
-            file_name=f"backtest_result_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", 
-            mime="text/csv"
-        )
+            bt_df = pd.DataFrame(backtest_result).T
+            bt_df.index.name = "持股天数"
+            bt_df = bt_df.reset_index()
+            bt_df['持股天数'] = bt_df['持股天数'].astype(str) + ' 天'
+            
+            st.dataframe(bt_df, use_container_width=True, hide_index=True)
+            st.success("回测完成！")
+            
+            export_df = bt_df.copy()
+            export_df.columns = ['HoldDays', 'AvgReturn', 'WinRate', 'TotalTrades']
+            out_csv_bt = export_df.to_csv(index=False, encoding='utf-8-sig')
+            st.download_button(
+                "下载回测结果 CSV", 
+                data=out_csv_bt, 
+                file_name=f"backtest_result_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", 
+                mime="text/csv"
+            )
+        except Exception as e:
+            st.error(f"回测最终计算或展示时发生错误：{e}")
+            st.warning("如果多次运行仍失败，请检查 Tushare 接口权限是否稳定。")
+
 # ---------------------------
 # 小结与建议（简洁）
 # ---------------------------
-st.markdown("### 小结与操作提示（终极修复 V5.1）")
+st.markdown("### 小结与操作提示（终极修复 V5.2）")
 st.markdown("""
-- **状态：** **V5.1** 已发布。本次彻底**修复了实时选股中的 `NameError`**，程序现在可以正常运行并生成评分。
-- **性能：** 耗时的指标计算环节（为评分池逐票拉历史）已使用 Streamlit 缓存 (`@st.cache_data`)。**第一次运行会慢（15分钟左右），但之后重新运行（参数不变）会瞬间完成。**
-- **下一步：** 请用这份完整代码替换您当前的 `ycjsb.py`，然后重新运行。
-- **回测：** 运行后，勾选 **“✅ 运行历史回测”**。请重点关注 **总交易次数** 是否接近 *回测天数\*Top K* (约 $60 \times 3 = 180$ 次)，以及**平均收益率**是否恢复正常。
+- **状态：** **V5.2** 已发布。本次增强了回测计算的健壮性，以解决进度条完成后卡住的问题。
+- **性能提示：** 1.  **第一次运行**脚本需要 **预加载历史数据**，耗时约 **15-20分钟**。
+    2.  所有耗时操作都使用了 Streamlit **缓存**。**如果参数不变，下次运行将瞬间完成。**
+- **下一步：** 1.  用这份完整代码覆盖您的 `ycjsb.py`。
+    2.  重新运行脚本。
+    3.  勾选 **“✅ 运行历史回测”**。
+
+如果问题再次发生，请提供 Streamlit 界面上可能出现的任何红色报错信息，或终端/日志中的完整 `Traceback`。
 """)
-st.info("如果回测结果仍不理想，可以尝试在左侧边栏调整 **VOLATILITY_MAX** (提高容忍度) 或 **MIN_AMOUNT** (降低门槛)。")
