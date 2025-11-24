@@ -3,7 +3,7 @@
 选股王 · 10000 积分旗舰（BC 混合增强版）—— 带趋势主导（MA/MACD/量价/突破）增强
 说明：
 - 目标：短线爆发 (B) + 妖股捕捉 (C)，持股 1-5 天
-- **本次优化**：精简回测进度条，只保留一个总进度条；修复收益显示 nan 的问题，确保价格类型和计算的稳定性。
+- **本次优化**：移除过于严格的 MA 多头硬过滤 (MA5>MA10>MA20)，解决“评分池为空”的问题，提升选股成功率。
 - 采用全局 K 线数据缓存（GLOBAL_KLINE_DATA）和批量预加载机制，大幅提升回测稳定性和速度。
 """
 
@@ -473,10 +473,7 @@ def compute_scores(clean_df, current_trade_date, min_market_cap, max_market_cap,
     """统一评分和风险过滤流程"""
     records = []
     
-    st_pbar = None
-    if 'streamlit' in sys.modules:
-        # ** 移除进度条，避免重复出现 **
-        pass 
+    # ** 进度条已在回测主模块中移除，这里不再有进度条 **
         
     for idx, row in enumerate(clean_df.itertuples()):
         ts_code = getattr(row, 'ts_code')
@@ -539,18 +536,22 @@ def compute_scores(clean_df, current_trade_date, min_market_cap, max_market_cap,
     
     # 风险过滤
     try:
+        # 1. 远离 MA20 且大阳线
         if all(c in fdf.columns for c in ['ma20','last_close','pct_chg']):
             mask_high_big = (fdf['last_close'] > fdf['ma20'] * 1.10) & (fdf['pct_chg'] > high_pct_threshold)
             fdf = fdf[~mask_high_big]
 
+        # 2. 连续下跌后大阳线
         if all(c in fdf.columns for c in ['prev3_sum','pct_chg']):
             mask_down_rebound = (fdf['prev3_sum'] < 0) & (fdf['pct_chg'] > high_pct_threshold)
-            fdf = fdf[~mask_down_rebound]
+            fdf = fdf[~mask_down_rebound] # 保留，因为我们要做反向过滤
 
+        # 3. 巨量放量
         if all(c in fdf.columns for c in ['vol_last','vol_ma5']):
             mask_vol_spike = (fdf['vol_last'] > (fdf['vol_ma5'] * vol_spike_mult))
             fdf = fdf[~mask_vol_spike]
 
+        # 4. 波动率过大
         if 'volatility_10' in fdf.columns:
             mask_volatility = fdf['volatility_10'] > volatility_max
             fdf = fdf[~mask_volatility]
@@ -558,20 +559,17 @@ def compute_scores(clean_df, current_trade_date, min_market_cap, max_market_cap,
 
     count_after_risk_filter = len(fdf)
     if count_after_risk_filter == 0:
-        if 'streamlit' in sys.modules: st.error(f"【过滤失败】风险过滤机制排除了所有 {count_before_filter} 支股票。请放宽侧边栏风险参数。")
+        if 'streamlit' in sys.modules: 
+            st.error(f"【过滤失败】风险过滤机制排除了所有 {count_before_filter} 支股票。请放宽侧边栏风险参数（例如降低**放量倍数阈值**、提高**波动 std 阈值**等）。")
         return pd.DataFrame()
     
-    if 'streamlit' in sys.modules: st.write(f"风险过滤后，剩余 {count_after_risk_filter} 支候选股进入下一阶段。")
+    if 'streamlit' in sys.modules: 
+        st.write(f"风险过滤后，剩余 {count_after_risk_filter} 支候选股进入下一阶段。")
 
-    # MA 多头硬过滤
-    try:
-        if all(c in fdf.columns for c in ['ma5','ma10','ma20']):
-            before_ma = len(fdf)
-            fdf = fdf[(fdf['ma5'] > fdf['ma10']) & (fdf['ma10'] > fdf['ma20'])]
-            after_ma = len(fdf)
-            if 'streamlit' in sys.modules and before_ma != after_ma:
-                st.write(f"MA 多头过滤：{before_ma} -> {after_ma}（保留 MA5>MA10>MA20）")
-    except Exception: pass
+
+    # ** 移除 MA 多头硬过滤，改为只靠评分来决定权重 ** # if all(c in fdf.columns for c in ['ma5','ma10','ma20']):
+    #     fdf = fdf[(fdf['ma5'] > fdf['ma10']) & (fdf['ma10'] > fdf['ma20'])]
+    # 此段已移除，现在完全依赖趋势评分
 
     if fdf.empty:
         if 'streamlit' in sys.modules: st.error("【内部错误】经过所有过滤后，评分池为空。")
@@ -610,7 +608,7 @@ def compute_scores(clean_df, current_trade_date, min_market_cap, max_market_cap,
     fdf['s_rsl'] = norm_col(fdf.get('rsl', pd.Series([0]*len(fdf))))
     fdf['s_volatility'] = 1 - norm_col(fdf.get('volatility_10', pd.Series([0]*len(fdf))))
 
-    # 趋势因子与强化评分
+    # 趋势因子与强化评分 (这里保留了 MA 多头排列的加分项)
     fdf['ma_trend_flag'] = ((fdf.get('ma5', pd.Series([])) > fdf.get('ma10', pd.Series([]))) & (fdf.get('ma10', pd.Series([])) > fdf.get('ma20', pd.Series([])))).fillna(False)
     fdf['macd_golden_flag'] = (fdf.get('diff', 0) > fdf.get('dea', 0)).fillna(False)
     fdf['vol_price_up_flag'] = (fdf.get('vol_last', 0) > fdf.get('vol_ma5', 0)).fillna(False)
@@ -777,10 +775,10 @@ def run_backtest(trade_dates, hold_days, top_k):
     final_results = []
     for h in hold_days:
         r = results[h]
-        # ** 修复：使用 np.nanmean 确保 nan 不影响有效交易的平均值 **
+        # 使用 np.nanmean 确保 nan 不影响有效交易的平均值
         avg_ret = np.nanmean(r['returns']) * 100 if r['returns'] else 0.0
         
-        # 修复：防止 total 为 0 时计算胜率报错
+        # 防止 total 为 0 时计算胜率报错
         win_rate = (r['wins'] / r['total']) * 100 if r['total'] > 0 else 0.0
         
         final_results.append({
@@ -817,7 +815,7 @@ def live_stock_pick():
     pool_merged = merge_all_info(pool0, stock_basic, daily_basic, moneyflow)
 
     st.write("对初筛池进行清洗（ST/停牌/价格/一字板/换手/成交额等）...")
-    # 移除内层进度条，现在 clean_and_filter 已经不显示进度条
+    # clean_and_filter 内部不显示进度条
     clean_df = clean_and_filter(pool_merged, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MIN_AMOUNT, MIN_MARKET_CAP, MAX_MARKET_CAP, VOL_SPIKE_MULT, VOLATILITY_MAX, HIGH_PCT_THRESHOLD, FINAL_POOL)
 
     if clean_df.empty:
@@ -827,7 +825,7 @@ def live_stock_pick():
     st.write(f"清洗后候选数量：{len(clean_df)} （将从中取涨幅前 {FINAL_POOL} 进入评分阶段）")
     
     st.write("为评分池逐票计算指标（本次已优化：从本地缓存读取 K 线数据）...")
-    # 移除内层进度条，现在 compute_scores 已经不显示进度条
+    # compute_scores 内部不显示进度条
     fdf = compute_scores(clean_df, last_trade, MIN_MARKET_CAP, MAX_MARKET_CAP, VOL_SPIKE_MULT, VOLATILITY_MAX, HIGH_PCT_THRESHOLD)
 
     if fdf.empty:
@@ -860,7 +858,6 @@ if st.button('🟢 **运行当日选股**'):
     live_stock_pick()
 
 if st.button('🟠 **启动回测** (N 天前买入, 持有 H 天, 收盘价计算)'):
-    st.session_state['mode'] = 'backtest'
     if BACKTEST_DAYS <= 0:
         st.error("回测天数必须大于 0。")
         st.stop()
@@ -915,6 +912,9 @@ st.markdown("### 小结与操作提示（简洁）")
 st.markdown("""
 - **当日选股**：点击 **🟢 运行当日选股**。
 - **回测**：点击 **🟠 启动回测**。
-- **本次优化**：已精简回测进度条，同时修复了收益显示 `nan` 的问题。
-- **故障排除**：如果回测结果的平均收益仍为 **0.00%**，请考虑放宽**MA多头硬过滤**（即 `MA5>MA10>MA20`）或者放宽**风险过滤**参数，因为这可能导致选出的股票数量过少，无法产生足够的正向收益。
+- **本次优化**：已移除 MA 多头硬过滤，大大增加股票进入评分池的概率。
+- **故障排除**：如果仍出现**【过滤失败】**警告，请重点调整侧边栏中的以下参数：
+    - **最低换手率 (%)**：适当降低
+    - **放量倍数阈值 (vol_last > vol_ma5 * x)**：适当提高（即容忍更高的放量）
+    - **过去10日波动 std 阈值 (%)**：适当提高（即容忍更高的波动率）
 """)
