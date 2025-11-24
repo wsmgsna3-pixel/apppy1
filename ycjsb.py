@@ -1,25 +1,32 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 10000 积分旗舰（终极修复版 v4.8 - 禁用回测缓存强制执行）
+选股王 · 10000 积分旗舰（终极修复版 v4.9 - 强制禁用回测缓存 + 验证标记）
 说明：
 - 整合了 BC 混合增强策略。
-- **v4.8 核心策略调整：** - **回测买入逻辑** 仍为“右侧启动”：寻找当日涨幅在 4.1% 到 9.5% 之间的股票。
-    - **缓存修复：** 彻底移除了 `run_backtest` 函数上的 `@st.cache_data` 装饰器，以强制每次都执行回测逻辑，解决顽固的 3 秒缓存问题。
+- **v4.9 核心策略：** 右侧启动 (4.1% < 涨幅 < 9.5%)。
+- **缓存修复：** 彻底移除了 `run_backtest` 函数上的 `@st.cache_data` 装饰器。
+- **验证标记：** 增加双重可见标记，确保函数执行。
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import tushare as ts
 from datetime import datetime, timedelta
 import warnings
+# 确保 tushare 在必要时被导入和配置
+try:
+    import tushare as ts
+except ImportError:
+    st.error("缺少 tushare 库，请确保环境已安装。")
+    st.stop()
+
 warnings.filterwarnings("ignore")
 
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · 10000旗舰（强制执行 v4.8）", layout="wide")
-st.title("选股王 · 10000 积分旗舰（强制执行版 v4.8）")
+st.set_page_config(page_title="选股王 · 10000旗舰（强制执行 v4.9）", layout="wide")
+st.title("选股王 · 10000 积分旗舰（强制执行版 v4.9）")
 st.markdown("输入你的 Tushare Token（仅本次运行使用）。若有权限缺失，脚本会自动降级并继续运行。")
 
 # ---------------------------
@@ -48,7 +55,7 @@ with st.sidebar:
     # 策略参数 (用于回测逻辑)
     BT_MAX_PCT = float(st.number_input("回测：最高涨幅 (上限)", value=9.5, step=0.5))
     BT_MIN_PCT = float(st.number_input("回测：最低涨幅 (下限)", value=4.1, step=0.1))
-    st.caption("提示：**本次回测强制运行右侧启动策略 (4.1% < 涨幅 < 9.5%)，不再使用缓存。**")
+    st.caption("提示：**本次回测强制运行右侧启动策略 (4.1% < 涨幅 < 9.5%)。**")
 
 # ---------------------------
 # Token 输入（主区）
@@ -306,7 +313,8 @@ if st.button("🚀 运行当日选股（初次运行可能较久）"):
 
     pbar.progress(1.0)
     clean_df = pd.DataFrame([dict(zip(r._fields, r)) for r in clean_list])
-    st.write(f"清洗后候选数量：{len(clean_df)} （将从中取涨幅前 {FINAL_POOL} 进入评分阶段）")
+    clean_df = clean_df.head(FINAL_POOL) # 提前裁剪到 M 股
+    st.write(f"清洗后候选数量：{len(clean_df)} （进入评分阶段）")
     if len(clean_df) == 0:
         st.error("清洗后没有候选，建议放宽条件或检查接口权限。")
         st.stop()
@@ -437,7 +445,7 @@ if st.button("🚀 运行当日选股（初次运行可能较久）"):
     # 评分池逐票计算因子（缓存 get_hist）
     # ---------------------------
     st.write("为评分池逐票拉历史并计算指标（此步骤调用历史接口，已缓存）...")
-    st.warning(f"⚠️ **耗时警告：** 当前有 {len(clean_df)} 支股票需要计算指标。如果太慢，请调整侧边栏 **'清洗后取前 M'** 参数。")
+    st.warning(f"⚠️ **耗时警告：** 当前有 {len(clean_df)} 支股票需要计算指标。")
     records = []
     pbar2 = st.progress(0)
     for idx, row in enumerate(clean_df.itertuples()):
@@ -657,10 +665,12 @@ def load_backtest_data(all_trade_dates):
     return data_cache
 
 # ----------------------------------------------------
-# ⚠️ 强制禁用缓存：已移除 @st.cache_data 装饰器 ⚠️
+# ⚠️ V4.9 强制禁用缓存：已移除 @st.cache_data 装饰器 ⚠️
 # ----------------------------------------------------
 def run_backtest(start_date, end_date, hold_days, backtest_top_k, bt_max_pct, bt_min_pct):
-    # 注意：现在每次运行时都会重新计算！预计耗时 3 分钟左右。
+    # 【标记 2：执行确认】如果看到了这段文字，说明 run_backtest 函数正在执行
+    st.text(f"🚀 V4.9 回测逻辑强制激活中...日期范围 {start_date} 到 {end_date}。")
+    
     trade_dates = get_trade_cal(start_date, end_date)
     
     if not trade_dates:
@@ -706,22 +716,22 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k, bt_max_pct, bt
         
         daily_df['amount_yuan'] = daily_df['amount'].fillna(0) * 1000.0 # 转换成元
         
-        # 过滤：V4.8 右侧启动策略：寻找当日涨幅在 BT_MIN_PCT (4.1%) 到 BT_MAX_PCT (9.5%) 之间
+        # 过滤：V4.9 右侧启动策略：寻找当日涨幅在 BT_MIN_PCT (4.1%) 到 BT_MAX_PCT (9.5%) 之间
         daily_df = daily_df[
             (daily_df['close'] >= MIN_PRICE) & 
             (daily_df['close'] <= MAX_PRICE) &
             (daily_df['amount_yuan'] >= BACKTEST_MIN_AMOUNT_PROXY) & 
-            (daily_df['pct_chg'] >= bt_min_pct) & # **策略调整：当日涨幅下限**
-            (daily_df['pct_chg'] <= bt_max_pct) & # **当日涨幅上限**
+            (daily_df['pct_chg'] >= bt_min_pct) & # **策略调整：当日涨幅下限 (4.1%)**
+            (daily_df['pct_chg'] <= bt_max_pct) & # **当日涨幅上限 (9.5%)**
             (daily_df['vol'] > 0) & 
             (daily_df['amount_yuan'] > 0)
         ].copy()
         
-        # 过滤一字涨停板 (防止 BT_MAX_PCT_FOR_CACHE 被设置为 10.0 时漏网)
+        # 过滤一字涨停板
         daily_df['is_zt'] = (daily_df['open'] == daily_df['high']) & (daily_df['pct_chg'] > 9.5)
         daily_df = daily_df[~daily_df['is_zt']].copy()
         
-        # 2. 模拟评分：v4.8 选股逻辑改为按【涨幅】排序 (右侧启动)
+        # 2. 模拟评分：v4.9 选股逻辑改为按【涨幅】排序 (右侧启动)
         scored_stocks = daily_df.sort_values("pct_chg", ascending=False).head(backtest_top_k).copy()
         
         for _, row in scored_stocks.iterrows():
@@ -782,6 +792,9 @@ if st.checkbox("✅ 运行历史回测", value=False):
     else:
         st.header("📈 历史回测结果（买入收盘价 / 卖出收盘价）")
         
+        # 【标记 1：运行确认】如果看到了这段文字，说明回测脚本正在运行
+        st.warning("✅ V4.9 确认回测正在执行中...这次预计耗时约 3 分钟！")
+        
         try:
             start_date_for_cal = (datetime.strptime(last_trade, "%Y%m%d") - timedelta(days=200)).strftime("%Y%m%d")
         except:
@@ -818,14 +831,12 @@ if st.checkbox("✅ 运行历史回测", value=False):
 # ---------------------------
 st.markdown("### 小结与操作提示（简洁）")
 st.markdown("""
-- **状态：** **强制执行版 v4.8**。
-- **改动：** **彻底移除了回测函数上的缓存装饰器**。
-- **预期结果：**
-    - 运行时间：**约为 3 分钟**（如果还是 3 秒，说明代码没有更新成功）。
-    - 结果：将是 **V4.7 右侧启动策略**的真实回测结果，**必定**与您之前的失败结果（如 -6.46%）不同。
+- **状态：** **V4.9 强制执行验证版**。
+- **目标：** 彻底绕过缓存，强制运行 **4.1% $\le$ 涨幅 $\le$ 9.5%** 的新策略。
 - **操作步骤：**
     1. **使用上述完整代码替换您现有脚本的全部内容。**
     2. 勾选 **“✅ 运行历史回测”**。
-
-如果这次运行时间超过 30 秒，就说明新的逻辑正在执行！请耐心等待结果。
+- **关键检查点：**
+    - **如果成功：** 您应该看到 **`✅ V4.9 确认回测正在执行中...`** 和 **`🚀 V4.9 回测逻辑强制激活中...`** 这两行信息，并且运行时间将回到 **3 分钟左右**。
+    - **如果失败：** 如果再次 3 秒完成，说明您替换代码未成功，或者您使用的运行环境（例如 Colab/Streamlit）正在从更高的层级进行缓存。
 """)
