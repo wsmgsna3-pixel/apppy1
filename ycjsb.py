@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 10000 积分旗舰（参数超低 + 涨幅解放版）
+选股王 · 10000 积分旗舰（单位修正终极版）
 说明：
 - 目标：**激进短线爆发 (B) + 妖股捕捉 (C)**
 - 【2025-11-23 最终修复】：
+    - 修复 Tushare daily API 'amount' 单位 (千元) 导致清空选股池的致命错误。
     - 移除所有技术指标硬过滤
-    - 将最低流动性参数默认值调至**极低**
-    - 移除当日涨跌幅 >= 0 的硬性过滤（涨幅解放）
+    - 移除当日涨跌幅 >= 0 的硬性过滤
+    - 调整参数默认值至极低
 """
 
 import streamlit as st
@@ -20,8 +21,8 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · 10000旗舰（涨幅解放）", layout="wide")
-st.title("选股王 · 10000 积分旗舰（参数超低 + 涨幅解放版）")
+st.set_page_config(page_title="选股王 · 10000旗舰（单位修正）", layout="wide")
+st.title("选股王 · 10000 积分旗舰（单位修正终极版）")
 st.markdown("输入你的 Tushare Token（仅本次运行使用）。若有权限缺失，脚本会自动降级并继续运行。")
 
 # ---------------------------
@@ -32,11 +33,11 @@ with st.sidebar:
     INITIAL_TOP_N = int(st.number_input("初筛：涨幅榜取前 N", value=1000, step=100))
     FINAL_POOL = int(st.number_input("清洗后取前 M 进入评分", value=300, step=50))
     TOP_DISPLAY = int(st.number_input("界面显示 Top K", value=30, step=5))
-    # **参数默认值：调至极低，确保通过**
+    # 参数默认值：调至极低，确保通过
     MIN_PRICE = float(st.number_input("最低价格 (元)", value=3.0, step=0.5)) 
     MAX_PRICE = float(st.number_input("最高价格 (元)", value=200.0, step=10.0))
-    MIN_TURNOVER = float(st.number_input("最低换手率 (%)", value=0.5, step=0.5)) # 调至 0.5%
-    MIN_AMOUNT = float(st.number_input("最低成交额 (元)", value=20_000_000.0, step=10_000_000.0)) # 调至 2000 万
+    MIN_TURNOVER = float(st.number_input("最低换手率 (%)", value=0.5, step=0.5)) 
+    MIN_AMOUNT = float(st.number_input("最低成交额 (元)", value=20_000_000.0, step=10_000_000.0)) # 2000 万
     VOL_SPIKE_MULT = float(st.number_input("放量倍数阈值 (vol_last > vol_ma5 * x)", value=1.7, step=0.1))
     VOLATILITY_MAX = float(st.number_input("过去10日波动 std 阈值 (%)", value=8.0, step=0.5))
     HIGH_PCT_THRESHOLD = float(st.number_input("视为大阳线 pct_chg (%)", value=6.0, step=0.5))
@@ -48,7 +49,7 @@ with st.sidebar:
     BACKTEST_DAYS = int(st.number_input("回测交易日天数", value=60, min_value=10, max_value=250))
     HOLD_DAYS_OPTIONS = st.multiselect("回测持股天数", options=[1, 3, 5, 10, 20], default=[1, 3, 5])
     # ---
-    st.caption("提示：**流动性参数已调至极低，以确保有候选。**")
+    st.caption("提示：**流动性参数默认值已调至极低，以确保有候选。**")
 
 # ---------------------------
 # Token 输入（主区）
@@ -221,14 +222,24 @@ clean_df = clean_df[(clean_df['close'] >= MIN_PRICE) & (clean_df['close'] <= MAX
 clean_df = clean_df[(clean_df['total_mv_yuan'] >= MIN_MARKET_CAP) & (clean_df['total_mv_yuan'] <= MAX_MARKET_CAP)]
 
 # 4. 换手率过滤
-clean_df = clean_df[clean_df['turnover_rate'] >= MIN_TURNOVER]
+# 换手率来自 daily_basic，如果接口失败，则为 NaN。这里对 NaN 填充 0，但由于 MIN_TURNOVER=0.5，仍能达到过滤低换手率的效果。
+if 'turnover_rate' in clean_df.columns:
+    clean_df['turnover_rate'] = clean_df['turnover_rate'].fillna(0)
+    clean_df = clean_df[clean_df['turnover_rate'] >= MIN_TURNOVER]
+else:
+    st.warning("daily_basic 接口缺失，跳过换手率过滤。")
 
-# 5. 成交额过滤
-clean_df = clean_df.merge(daily_all[['ts_code', 'amount']].rename(columns={'amount': 'amount_actual_yuan'}), on='ts_code', how='left')
+# 5. **【关键修正：成交额单位转换】** # Tushare daily API 'amount' 是千元 (Kilo Yuan)。需要 * 1000 转换为元 (User setting)。
+daily_amount = daily_all[['ts_code', 'amount']].copy()
+daily_amount['amount_actual_yuan'] = daily_amount['amount'].astype(float) * 1000.0 
+
+clean_df = clean_df.merge(daily_amount[['ts_code', 'amount_actual_yuan']], on='ts_code', how='left')
+clean_df['amount_actual_yuan'] = clean_df['amount_actual_yuan'].fillna(0) # 确保 NaN 不会影响比较
+
+# 过滤：成交额(元) >= 最低成交额(元)
 clean_df = clean_df[clean_df['amount_actual_yuan'] >= MIN_AMOUNT]
 
-# 6. **【重要修改】** 过滤昨日下跌 (已移除此行硬过滤：clean_df = clean_df[clean_df['pct_chg'] >= 0])
-# 策略改为：允许负涨幅进入评分池，由评分项（s_pct）来决定权重。
+# 6. 过滤昨日下跌 (已移除此行硬过滤)
 
 # 7. 过滤停牌/无成交
 clean_df = clean_df[(clean_df['vol'] > 0) & (clean_df['amount_actual_yuan'] > 0)]
@@ -240,7 +251,7 @@ clean_df = clean_df[~clean_df['is_zt']]
 
 st.write(f"清洗后候选数量：{len(clean_df)} （将从中取涨幅前 {FINAL_POOL} 进入评分阶段）")
 if len(clean_df) == 0:
-    st.error("清洗后没有候选，建议放宽条件（尤其是左侧的成交额/换手率/价格），或检查 Tushare 接口权限。")
+    st.error("清洗后没有候选，这通常是 Tushare Token 接口权限缺失，无法获取到基本的 daily/daily_basic 数据导致。")
     st.stop()
 
 # ---------------------------
@@ -275,6 +286,12 @@ def get_hist_cached_bulk(ts_code, end_date, days=60):
 # ---------------------------
 # 指标计算（使用 bulk 缓存）
 # ---------------------------
+st.write("为评分池逐票计算指标（利用批量加载的 K 线数据加速）...")
+records = []
+pbar2 = st.progress(0)
+
+# (Indicator computation function is lengthy and unchanged, omitted here for brevity)
+# Re-define compute_indicators function here
 def compute_indicators(df):
     res = {}
     if df.empty or len(df) < 3: return res
@@ -318,7 +335,7 @@ def compute_indicators(df):
         res['k'] = res['d'] = res['j'] = np.nan
 
     # vol ratio and metrics
-    vols = df['vol'].astype(float).tolist()
+    vols = GLOBAL_KLINE_DATA[GLOBAL_KLINE_DATA['ts_code'] == df['ts_code'].iloc[0]]['vol'].astype(float).tolist() if not df.empty and 'ts_code' in df.columns else df['vol'].astype(float).tolist()
     if len(vols) >= 6:
         avg_prev5 = np.mean(vols[-6:-1])
         res['vol_ratio'] = vols[-1] / (avg_prev5 + 1e-9)
@@ -374,13 +391,8 @@ def compute_indicators(df):
         res['yang_body_strength'] = 0.0
 
     return res
+# End of compute_indicators
 
-# ---------------------------
-# 评分计算（使用 bulk 缓存）
-# ---------------------------
-st.write("为评分池逐票计算指标（利用批量加载的 K 线数据加速）...")
-records = []
-pbar2 = st.progress(0)
 for idx, row in enumerate(clean_df.itertuples()):
     ts_code = getattr(row, 'ts_code')
     name = getattr(row, 'name', ts_code)
@@ -437,6 +449,7 @@ fdf = pd.DataFrame(records)
 if fdf.empty:
     st.error("评分计算失败或无数据，请检查 Token 权限与接口。")
     st.stop()
+# ... (rest of the code for risk filter, RSL, normalization, scoring, display, and backtesting is unchanged from the "涨幅解放版")
 
 # ---------------------------
 # 风险过滤
@@ -483,7 +496,6 @@ def norm_col(s):
     mn = s.min(); mx = s.max()
     if mx - mn < 1e-9:
         return pd.Series([0.5]*len(s), index=s.index)
-    # **【重要修改】**：s_pct 归一化时，要确保即使是负数也能正常归一化
     return (s - mn) / (mx - mn)
 
 fdf['s_pct'] = norm_col(fdf.get('pct_chg', pd.Series([0]*len(fdf))))
@@ -553,7 +565,7 @@ out_csv = fdf[display_cols].head(200).to_csv(index=True, encoding='utf-8-sig')
 st.download_button("下载评分结果（前200）CSV", data=out_csv, file_name=f"score_result_{last_trade}.csv", mime="text/csv")
 
 # ---------------------------
-# 历史回测部分（逻辑保持不变）
+# 历史回测部分（为确保稳定性，逻辑保持不变）
 # ---------------------------
 def get_stock_price(ts_code, trade_date, column='close'):
     if GLOBAL_KLINE_DATA.empty: return np.nan
@@ -595,12 +607,12 @@ def run_backtest(start_date, end_date, fdf_scored, hold_days, top_k):
         # 模拟当日的筛选逻辑 (简化版)
         daily_df = daily_df.sort_values("pct_chg", ascending=False).head(INITIAL_TOP_N).copy()
         
-        # 1. 价格、成交额过滤
-        daily_df['amount_yuan'] = daily_df['amount'].fillna(0) 
+        # 1. 价格、成交额过滤 (回测中也要进行单位修正)
+        daily_df['amount_yuan'] = daily_df['amount'].fillna(0) * 1000.0 # **回测中修正单位**
         daily_df = daily_df[(daily_df['close'] >= MIN_PRICE) & (daily_df['close'] <= MAX_PRICE)]
         daily_df = daily_df[daily_df['amount_yuan'] >= MIN_AMOUNT]
         
-        # 2. **（回测逻辑中移除涨幅 >= 0 的过滤）**
+        # 2. 过滤昨日下跌 (已移除此行硬过滤)
         
         # 3. 过滤停牌/无成交
         daily_df = daily_df[(daily_df['vol'] > 0) & (daily_df['amount_yuan'] > 0)]
@@ -695,10 +707,9 @@ if st.checkbox("✅ 运行历史回测 (使用 Top K)", value=False):
 # ---------------------------
 # 小结与建议（简洁）
 # ---------------------------
-st.markdown("### 小结与操作提示（终极解放版）")
+st.markdown("### 小结与操作提示（终极修正版）")
 st.markdown("""
-- **当前代码：** **涨幅解放版**，已将所有硬过滤调至最低，并移除了当日涨幅 >= 0 的限制。
-- **如果仍然失败：** 这表明 Tushare Token 权限缺失，或当日无法通过 `pro.daily` 获取到任何有效的 K 线数据。请确认您的 Tushare 账户是否能正常使用 `pro.daily` 接口。
+- **当前代码：** **单位修正终极版**，已修复成交额单位（千元 vs 元）不匹配的致命错误。
+- **参数建议：** 请确认侧边栏的 **`最低成交额` 保持在 20,000,000.0 (2000 万)** 或更低，这是最低流动性要求。
+- **如果仍然失败：** 如果此版本仍返回 0 候选，请务必检查您的 **Tushare Token 权限**是否完整，因为这意味着无法获取到任何满足基本流动性要求的股票数据。
 """)
-
-st.info("请使用此代码运行，如果问题依旧，则需要排查您的 Tushare 接口权限。")
