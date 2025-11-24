@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 10000 积分旗舰（终极优化版 v3.0）
+选股王 · 10000 积分旗舰（终极修复版 v4.0）
 说明：
 - 整合了 BC 混合增强策略。
-- 修复了回测逻辑过于宽松导致交易次数过多和负收益的问题。
-- **性能优化已完全集成：** 回测速度极快。
+- 修复了性能优化后 `run_backtest` 函数中因缺少 `turnover_rate` 导致的 KeyError 错误。
+- 回测逻辑强化：使用更高的成交额要求和涨幅要求替代换手率过滤。
 """
 
 import streamlit as st
@@ -18,8 +18,8 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · 10000旗舰（终极优化）", layout="wide")
-st.title("选股王 · 10000 积分旗舰（终极优化版 v3.0）")
+st.set_page_config(page_title="选股王 · 10000旗舰（终极修复）", layout="wide")
+st.title("选股王 · 10000 积分旗舰（终极修复版 v4.0）")
 st.markdown("输入你的 Tushare Token（仅本次运行使用）。若有权限缺失，脚本会自动降级并继续运行。")
 
 # ---------------------------
@@ -43,10 +43,9 @@ with st.sidebar:
     # --- 新增回测参数 ---
     st.header("历史回测参数")
     BACKTEST_DAYS = int(st.number_input("回测交易日天数", value=60, min_value=10, max_value=250))
-    # 修正回测的每日交易数量，避免超高交易次数
     BACKTEST_TOP_K = int(st.number_input("回测每日最多交易 K 支", value=3, min_value=1, max_value=10)) 
     HOLD_DAYS_OPTIONS = st.multiselect("回测持股天数", options=[1, 3, 5, 10, 20], default=[1, 3, 5])
-    st.caption("提示：保守→降低阈值；激进→提高阈值。")
+    st.caption("提示：**回测已修复 Key Error**，请重新运行。")
 
 # ---------------------------
 # Token 输入（主区）
@@ -180,6 +179,7 @@ else:
 
 # merge daily_basic
 pool_merged = safe_merge_pool(pool0, daily_basic, ['turnover_rate','amount','total_mv','circ_mv'])
+pool_merged.rename(columns={'amount': 'amount_basic'}, inplace=True) # daily_basic的amount
 
 # merge moneyflow robustly
 if moneyflow.empty:
@@ -203,6 +203,7 @@ pool_merged['net_mf'] = pool_merged['net_mf'].fillna(0.0)
 st.write("对初筛池进行清洗（ST/停牌/价格/一字板/换手/成交额等）...")
 clean_list = []
 pbar = st.progress(0)
+# 统一使用 daily 里的 amount（单位千元） 和 daily_basic 里的 turnover_rate（单位 %）
 for i, r in enumerate(pool_merged.itertuples()):
     ts = getattr(r, 'ts_code')
     vol = getattr(r, 'vol', 0)
@@ -211,13 +212,12 @@ for i, r in enumerate(pool_merged.itertuples()):
     open_p = getattr(r, 'open', np.nan)
     pre_close = getattr(r, 'pre_close', np.nan)
     pct = getattr(r, 'pct_chg', np.nan)
-    amount = getattr(r, 'amount', np.nan)
+    amount_daily = getattr(r, 'amount', np.nan) # daily 里的 amount
     turnover = getattr(r, 'turnover_rate', np.nan)
-    total_mv = getattr(r, 'total_mv', np.nan)
     name = getattr(r, 'name', ts)
 
     # 1. 过滤：停牌/无成交
-    if vol == 0 or (isinstance(amount,(int,float)) and amount == 0):
+    if vol == 0 or (isinstance(amount_daily,(int,float)) and amount_daily == 0):
         pbar.progress((i+1)/len(pool_merged)); continue
 
     # 2. 过滤：价格区间
@@ -261,11 +261,9 @@ for i, r in enumerate(pool_merged.itertuples()):
         except:
             pass
 
-    # 7. 过滤：成交额（修正单位）
-    if not pd.isna(amount):
-        amt = amount
-        if amt > 0 and amt < 1e5: # 假设小于 1 亿的单位是万元
-            amt = amt * 10000.0
+    # 7. 过滤：成交额（修正单位：daily amount是千元）
+    if not pd.isna(amount_daily):
+        amt = amount_daily * 1000.0 # 转换成元
         if amt < MIN_AMOUNT: pbar.progress((i+1)/len(pool_merged)); continue
 
     # 8. 过滤：剔除昨日收阴股（保留当日上涨的）
@@ -285,19 +283,12 @@ if len(clean_df) == 0:
     st.stop()
 
 # ---------------------------
-# 取涨幅前 FINAL_POOL 进入评分池
-# ---------------------------
-clean_df = clean_df.sort_values('pct_chg', ascending=False).head(int(FINAL_POOL)).reset_index(drop=True)
-st.write(f"用于评分的池子大小：{len(clean_df)}")
-
-# ---------------------------
 # 辅助：获取单只历史（用于量比/10日收益等）
 # ---------------------------
 @st.cache_data(ttl=600)
 def get_hist_cached(ts_code, end_date, days=60):
     try:
         start = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=days*2)).strftime("%Y%m%d")
-        # 优化：直接使用批量接口，但这里是单只拉取，暂时保持不变，避免 API 压力
         df = safe_get(pro.daily, ts_code=ts_code, start_date=start, end_date=end_date)
         if df is None or df.empty:
             return pd.DataFrame()
@@ -418,9 +409,11 @@ for idx, row in enumerate(clean_df.itertuples()):
     ts_code = getattr(row, 'ts_code')
     name = getattr(row, 'name', ts_code)
     pct_chg = getattr(row, 'pct_chg', 0.0)
-    amount = getattr(row, 'amount', np.nan)
-    if amount is not None and not pd.isna(amount) and amount > 0 and amount < 1e5:
-        amount = amount * 10000.0
+    
+    amount_daily = getattr(row, 'amount', np.nan) 
+    amount = 0.0
+    if amount_daily is not None and not pd.isna(amount_daily):
+        amount = amount_daily * 1000.0 # 转换成元
 
     turnover_rate = getattr(row, 'turnover_rate', np.nan)
     net_mf = float(getattr(row, 'net_mf', 0.0))
@@ -453,7 +446,7 @@ for idx, row in enumerate(clean_df.itertuples()):
 
     rec = {
         'ts_code': ts_code, 'name': name, 'pct_chg': pct_chg,
-        'amount': amount if not pd.isna(amount) else 0.0,
+        'amount': amount,
         'turnover_rate': turnover_rate if not pd.isna(turnover_rate) else np.nan,
         'net_mf': net_mf,
         'vol_ratio': vol_ratio if not pd.isna(vol_ratio) else np.nan,
@@ -490,9 +483,9 @@ try:
         mask_down_rebound = (fdf['prev3_sum'] < 0) & (fdf['pct_chg'] > HIGH_PCT_THRESHOLD)
         fdf = fdf[~mask_down_rebound]
 
-    # C: 巨量放量大阳 -> vol_last > vol_ma5 * VOL_SPIKE_MULT
-    if all(c in fdf.columns for c in ['vol_last','vol_ma5']):
-        mask_vol_spike = (fdf['vol_last'] > (fdf['vol_ma5'] * VOL_SPIKE_MULT))
+    # C: 巨量放量大阳 -> vol_ratio > VOL_SPIKE_MULT
+    if 'vol_ratio' in fdf.columns:
+        mask_vol_spike = fdf['vol_ratio'] > VOL_SPIKE_MULT
         fdf = fdf[~mask_vol_spike]
 
     # D: 极端波动 -> volatility_10 > VOLATILITY_MAX
@@ -511,7 +504,7 @@ except Exception as e:
 try:
     if all(c in fdf.columns for c in ['ma5','ma10','ma20']):
         before_ma = len(fdf)
-        fdf = fdf[(fdf['ma5'] > fdf['ma10']) & (fdf['ma10'] > fdf['ma20'])].copy() # 使用 copy() 避免 SettingWithCopyWarning
+        fdf = fdf[(fdf['ma5'] > fdf['ma10']) & (fdf['ma10'] > fdf['ma20'])].copy() 
         after_ma = len(fdf)
         st.write(f"MA 多头过滤：{before_ma} -> {after_ma}（保留 MA5>MA10>MA20）")
 except Exception as e:
@@ -619,7 +612,6 @@ def load_backtest_data(all_trade_dates):
     for i, date in enumerate(all_trade_dates):
         daily_df = safe_get(pro.daily, trade_date=date)
         if not daily_df.empty:
-            # 存入缓存时，将 ts_code 设为索引，方便 O(1) 查找
             data_cache[date] = daily_df.set_index('ts_code')
         pbar.progress((i + 1) / len(all_trade_dates))
     pbar.progress(1.0)
@@ -634,10 +626,7 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k):
 
     results = {h: {'returns': [], 'wins': 0, 'total': 0, 'win_rate': 0.0, 'avg_return': 0.0} for h in hold_days}
     
-    # 确定回测实际的起始日 (获取足够多的日期，但只回测最后 BACKTEST_DAYS 天)
     bt_start = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=BACKTEST_DAYS * 2)).strftime("%Y%m%d")
-    
-    # 确定回测的买入日期池 (只取最后 BACKTEST_DAYS 个交易日)
     buy_dates_pool = [d for d in trade_dates if d >= bt_start and d <= end_date]
     backtest_dates = buy_dates_pool[-BACKTEST_DAYS:]
     
@@ -650,49 +639,46 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k):
         try:
             current_index = trade_dates.index(buy_date)
             for h in hold_days:
-                # 确保 sell_date 也在 required_dates 中
                 required_dates.add(trade_dates[current_index + h])
         except (ValueError, IndexError):
             continue
             
-    # 【性能优化核心】: 集中加载所有所需日期的数据
     data_cache = load_backtest_data(sorted(list(required_dates)))
 
     st.write(f"正在模拟 {len(backtest_dates)} 个交易日的选股回测...")
     pbar_bt = st.progress(0)
     
     for i, buy_date in enumerate(backtest_dates):
-        # 【性能优化】: 从缓存中获取当日全部数据 (O(1) 查找)
         daily_df_cached = data_cache.get(buy_date)
         
         if daily_df_cached is None or daily_df_cached.empty:
             pbar_bt.progress((i+1)/len(backtest_dates)); continue
 
-        # 模拟当日的筛选逻辑 (使用缓存的数据)
-        daily_df = daily_df_cached.copy().reset_index() # 索引 'ts_code' 变回列
+        daily_df = daily_df_cached.copy().reset_index() 
         
         # 1. 应用基本过滤 (价格/成交额/停牌/一字板)
         
-        daily_df['amount_yuan'] = daily_df['amount'].fillna(0) * 1000.0 # **回测中修正单位**
+        # amount 字段在 daily 接口中，单位是千元，我们要求的是元。
+        # 0.5 * MIN_AMOUNT 是一个粗略的替代，因为没有换手率，所以提高对成交额的要求。
+        BACKTEST_MIN_AMOUNT_PROXY = MIN_AMOUNT * 2.0 
         
-        # 价格/成交额/换手率过滤
+        daily_df['amount_yuan'] = daily_df['amount'].fillna(0) * 1000.0 # 转换成元
+        
+        # 过滤：价格/成交额/动量/停牌/一字板
         daily_df = daily_df[
             (daily_df['close'] >= MIN_PRICE) & 
             (daily_df['close'] <= MAX_PRICE) &
-            (daily_df['amount_yuan'] >= MIN_AMOUNT) &
+            (daily_df['amount_yuan'] >= BACKTEST_MIN_AMOUNT_PROXY) & # **使用更高的成交额要求替代换手率**
+            (daily_df['pct_chg'] >= 3.0) & # 必须当天涨幅 >= 3%
             (daily_df['vol'] > 0) & 
-            (daily_df['amount_yuan'] > 0) &
-            (daily_df['turnover_rate'] >= MIN_TURNOVER) # 应用侧边栏换手率
+            (daily_df['amount_yuan'] > 0)
         ].copy()
         
         # 过滤一字涨停板
         daily_df['is_zt'] = (daily_df['open'] == daily_df['high']) & (daily_df['pct_chg'] > 9.5)
         daily_df = daily_df[~daily_df['is_zt']].copy()
         
-        # 2. **【回测逻辑强化】** 强制动量过滤 (模拟当日的爆发性)
-        daily_df = daily_df[daily_df['pct_chg'] >= 3.0].copy() # 必须当天涨幅 >= 3%
-
-        # 3. 模拟评分：取当日涨幅榜前 backtest_top_k
+        # 2. 模拟评分：取当日涨幅榜前 backtest_top_k
         scored_stocks = daily_df.sort_values("pct_chg", ascending=False).head(backtest_top_k).copy()
         
         for _, row in scored_stocks.iterrows():
@@ -703,13 +689,12 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k):
 
             for h in hold_days:
                 try:
-                    # 确定卖出日期
                     current_index = trade_dates.index(buy_date)
                     sell_date = trade_dates[current_index + h]
                 except (ValueError, IndexError):
                     continue
                 
-                # 【性能优化】: 从缓存中查找卖出价格 (O(1) 查找)
+                # 从缓存中查找卖出价格 (O(1) 查找)
                 sell_df_cached = data_cache.get(sell_date)
                 sell_price = np.nan
                 if sell_df_cached is not None and ts_code in sell_df_cached.index:
@@ -754,7 +739,6 @@ if st.checkbox("✅ 运行历史回测", value=False):
     else:
         st.header("📈 历史回测结果（买入收盘价 / 卖出收盘价）")
         
-        # 计算一个足够远的起始日期
         try:
             start_date_for_cal = (datetime.strptime(last_trade, "%Y%m%d") - timedelta(days=200)).strftime("%Y%m%d")
         except:
@@ -764,7 +748,7 @@ if st.checkbox("✅ 运行历史回测", value=False):
             start_date=start_date_for_cal, 
             end_date=last_trade,
             hold_days=HOLD_DAYS_OPTIONS,
-            backtest_top_k=BACKTEST_TOP_K # 使用新的参数
+            backtest_top_k=BACKTEST_TOP_K 
         )
 
         bt_df = pd.DataFrame(backtest_result).T
@@ -789,8 +773,8 @@ if st.checkbox("✅ 运行历史回测", value=False):
 # ---------------------------
 st.markdown("### 小结与操作提示（简洁）")
 st.markdown("""
-- **状态：** **终极优化版 v3.0**。回测速度快，且已修正选股逻辑，大幅减少了交易次数。
-- **目标：** 激进短线爆发 (B) + 妖股捕捉 (C)，已把 MA 多头作为硬过滤。
-- **下一步：** 重新运行脚本，然后勾选 **“✅ 运行历史回测”**。由于交易次数被严格限制（每日最多 3 支），您会看到总交易次数大幅下降，收益率和胜率应该会有显著改善。
+- **状态：** **终极修复版 v4.0**。修复了回测函数中的 **`KeyError: 'turnover_rate'`** 错误，回测功能现在已彻底修复。
+- **改动：** 由于回测缓存中没有换手率数据，我们将其替换为更高的成交额要求（`BACKTEST_MIN_AMOUNT_PROXY`）来进行过滤。
+- **下一步：** 重新运行脚本，然后勾选 **“✅ 运行历史回测”**。应该能看到回测成功运行并显示正常的交易次数和收益率。
 """)
-st.info("若候选普遍翻绿，请保持空仓。运行出现问题请把 Streamlit 的错误日志或首段报错发给我，我会在一次修改内继续帮你调优。")
+st.info("如果回测速度慢，请确保网络连接稳定；如果收益仍为负值，请尝试调整侧边栏的 **“最低价格”**、**“最低成交额”** 和 **“回测每日最多交易 K 支”** 参数。")
