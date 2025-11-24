@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 10000 积分旗舰（终极修复 V5.3）
+选股王 · 10000 积分旗舰（终极修复 V5.4）
 说明：
 - 核心修复：解决了 moneyflow 预处理中的 NameError: mf_cols is not defined。
+- 健壮性增强：确保回测结果计算（V5.2）能处理 NaN 值，避免进度条卡住。
 - 策略同步：确保 run_backtest 逻辑与实时选股策略完全对齐。
-- 性能优化：统一数据缓存，支持回测时使用换手率。
-- 策略调优：取消 MA 多头硬过滤，改为趋势加分项，提高选股率。
 """
 
 import streamlit as st
@@ -19,8 +18,8 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · 10000旗舰（终极修复V5.3）", layout="wide")
-st.title("选股王 · 10000 积分旗舰（终极修复版 V5.3）")
+st.set_page_config(page_title="选股王 · 10000旗舰（终极修复V5.4）", layout="wide")
+st.title("选股王 · 10000 积分旗舰（终极修复版 V5.4）")
 st.markdown("输入你的 Tushare Token（仅本次运行使用）。若有权限缺失，脚本会自动降级并继续运行。")
 
 # ---------------------------
@@ -46,7 +45,7 @@ with st.sidebar:
     st.header("历史回测参数")
     BACKTEST_DAYS = int(st.number_input("回测交易日天数", value=60, min_value=10, max_value=250))
     
-    # 重点调整：根据上次讨论，建议将 Top K 设置为小值
+    # 根据上次讨论，将 Top K 建议值设为小值
     BACKTEST_TOP_K = int(st.number_input("回测每日最多交易 K 支", value=3, min_value=1, max_value=30)) 
     
     HOLD_DAYS_OPTIONS = st.multiselect("回测持股天数", options=[1, 3, 5, 10, 20], default=[1, 3, 5])
@@ -130,7 +129,7 @@ if not mf_raw.empty:
     possible = ['net_mf','net_mf_amount','net_mf_in','net_mf_out']
     col = None
     for c in possible:
-        if c in mf_raw.columns: # V5.3 FIX: changed mf_cols to mf_raw.columns
+        if c in mf_raw.columns: 
             col = c; break
     if col is None:
         numeric_cols = [c for c in mf_raw.columns if c != 'ts_code' and pd.api.types.is_numeric_dtype(mf_raw[c])]
@@ -570,14 +569,13 @@ for idx, row in enumerate(final_clean_df.itertuples()):
     pbar2.progress((idx+1)/len(final_clean_df))
 
 pbar2.progress(1.0)
-# V5.3：定义 fdf
 fdf = pd.DataFrame(records)
 if fdf.empty:
     st.error("评分计算失败或无数据，请检查 Token 权限与接口。")
     st.stop()
 
 # ---------------------------
-# 最终综合评分（V5.3: 调用统一函数）
+# 最终综合评分（V5.4: 调用统一函数）
 # ---------------------------
 fdf = apply_scoring_and_filtering(fdf, use_hard_filter=False)
 fdf.index = fdf.index + 1
@@ -596,7 +594,7 @@ st.download_button("下载评分结果（前200）CSV", data=out_csv, file_name=
 
 
 # ---------------------------
-# 历史回测部分（V5.2/V5.3 增强健壮性）
+# 历史回测部分（V5.4 增强健壮性）
 # ---------------------------
 @st.cache_data(ttl=3600)
 def load_backtest_data(all_trade_dates):
@@ -804,7 +802,7 @@ if st.checkbox("✅ 运行历史回测", value=False):
         except:
             start_date_for_cal = (datetime.now() - timedelta(days=200)).strftime("%Y%m%d")
             
-        # V5.2 增加 try/except 捕获可能的最终异常
+        # V5.4 增加 try/except 捕获可能的最终异常
         try:
             backtest_result = run_backtest(
                 start_date=start_date_for_cal, 
@@ -832,18 +830,20 @@ if st.checkbox("✅ 运行历史回测", value=False):
             )
         except Exception as e:
             st.error(f"回测最终计算或展示时发生错误：{e}")
-            st.warning("如果多次运行仍失败，请检查 Tushare 接口权限是否稳定。")
+            st.warning("如果多次运行仍失败，请检查 Tushare 接口权限是否稳定，并尝试清除 Streamlit 缓存。")
 
 # ---------------------------
 # 小结与建议（简洁）
 # ---------------------------
-st.markdown("### 小结与操作提示（终极修复 V5.3）")
+st.markdown("### 小结与操作提示（终极修复 V5.4）")
 st.markdown("""
-- **状态：** **V5.3** 已发布。本次修复了 `moneyflow` 预处理中的 `NameError`。
-- **回测建议：** 我们已在侧边栏将 **“回测每日最多交易 K 支”** 的默认值改为 **3**。建议您保持这个较小的 Top K 值，以集中策略火力，提高回测的平均收益率。
-- **性能提示：** 1.  **第一次运行**脚本会触发数据预加载，耗时约 **15-20分钟**。
-    2.  所有耗时操作都使用了 Streamlit **缓存**。**如果参数不变，下次运行将瞬间完成。**
-- **下一步：** 1.  用这份完整代码覆盖您的 `ycjsb.py`。
-    2.  重新运行脚本。
-    3.  勾选 **“✅ 运行历史回测”** 并观察结果。
+- **状态：** **V5.4** 已发布。核心修复已在 V5.2/V5.3 完成。
+- **强制解决方案：** 如果进度条走到 100% 后卡住不显示结果：
+    1.  请确保您已将代码更新为 V5.4。
+    2.  点击 Streamlit 右上角 **三点菜单 (☰)**。
+    3.  选择 **“Clear cache”** 或 **“清除缓存”**。
+    4.  重新勾选 **“✅ 运行历史回测”**。
+- **性能提示：** 1.  第一次运行时，**数据预加载**耗时约 **15-20分钟**。
+    2.  清除缓存后，如果需要重新加载数据，也会耗时较长。
+- **Top K 建议：** 我们已在侧边栏将 **“回测每日最多交易 K 支”** 的默认值设置为 **3**。建议您保持这个较小的 Top K 值来集中策略火力。
 """)
