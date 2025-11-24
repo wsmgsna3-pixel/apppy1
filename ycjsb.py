@@ -3,7 +3,9 @@
 选股王 · 10000 积分旗舰（BC 混合增强版）—— 带趋势主导（MA/MACD/量价/突破）增强
 说明：
 - 目标：短线爆发 (B) + 妖股捕捉 (C)，持股 1-5 天
-- **本次优化**：移除过于严格的 MA 多头硬过滤 (MA5>MA10>MA20)，解决“评分池为空”的问题，提升选股成功率。
+- **本次优化**：
+    1. 移除回测中“风险过滤后，剩余 XX 支”的重复提示。
+    2. 增强回测买入价的获取鲁棒性，修复“交易次数0”的问题。
 - 采用全局 K 线数据缓存（GLOBAL_KLINE_DATA）和批量预加载机制，大幅提升回测稳定性和速度。
 """
 
@@ -472,8 +474,6 @@ def compute_indicators(ts_code, end_date, days=60):
 def compute_scores(clean_df, current_trade_date, min_market_cap, max_market_cap, vol_spike_mult, volatility_max, high_pct_threshold):
     """统一评分和风险过滤流程"""
     records = []
-    
-    # ** 进度条已在回测主模块中移除，这里不再有进度条 **
         
     for idx, row in enumerate(clean_df.itertuples()):
         ts_code = getattr(row, 'ts_code')
@@ -485,6 +485,8 @@ def compute_scores(clean_df, current_trade_date, min_market_cap, max_market_cap,
 
         turnover_rate = getattr(row, 'turnover_rate', np.nan)
         net_mf = float(getattr(row, 'net_mf', 0.0))
+        # 修复2：获取原始 close 价格作为回测买入价的鲁棒来源
+        buy_price = getattr(row, 'close', np.nan)
 
         ind = compute_indicators(ts_code, current_trade_date, days=60)
 
@@ -519,7 +521,9 @@ def compute_scores(clean_df, current_trade_date, min_market_cap, max_market_cap,
             '10d_return': ten_return if not pd.isna(ten_return) else np.nan,
             'ma5': ma5, 'ma10': ma10, 'ma20': ma20,
             'macd': macd, 'diff': diff, 'dea': dea, 'k': k, 'd': d, 'j': j,
-            'last_close': last_close, 'vol_last': vol_last, 'vol_ma5': vol_ma5, 'recent20_high': recent20_high, 'yang_body_strength': yang_body_strength,
+            'last_close': last_close, # K线计算的收盘价
+            'buy_price': buy_price, # 修复2：原始 daily 接口的收盘价，作为回测的鲁棒买入价
+            'vol_last': vol_last, 'vol_ma5': vol_ma5, 'recent20_high': recent20_high, 'yang_body_strength': yang_body_strength,
             'prev3_sum': prev3_sum, 'volatility_10': volatility_10,
             'proxy_money': proxy_money
         }
@@ -563,15 +567,12 @@ def compute_scores(clean_df, current_trade_date, min_market_cap, max_market_cap,
             st.error(f"【过滤失败】风险过滤机制排除了所有 {count_before_filter} 支股票。请放宽侧边栏风险参数（例如降低**放量倍数阈值**、提高**波动 std 阈值**等）。")
         return pd.DataFrame()
     
-    if 'streamlit' in sys.modules: 
-        st.write(f"风险过滤后，剩余 {count_after_risk_filter} 支候选股进入下一阶段。")
+    # 修复1：移除重复的 st.write 提示
+    # if 'streamlit' in sys.modules: 
+    #     st.write(f"风险过滤后，剩余 {count_after_risk_filter} 支候选股进入下一阶段。")
 
 
-    # ** 移除 MA 多头硬过滤，改为只靠评分来决定权重 ** # if all(c in fdf.columns for c in ['ma5','ma10','ma20']):
-    #     fdf = fdf[(fdf['ma5'] > fdf['ma10']) & (fdf['ma10'] > fdf['ma20'])]
-    # 此段已移除，现在完全依赖趋势评分
-
-    if fdf.empty:
+    # ** 移除 MA 多头硬过滤，改为只靠评分来决定权重 ** if fdf.empty:
         if 'streamlit' in sys.modules: st.error("【内部错误】经过所有过滤后，评分池为空。")
         return pd.DataFrame()
         
@@ -719,9 +720,11 @@ def run_backtest(trade_dates, hold_days, top_k):
         for _, row in fdf_scored.iterrows():
             ts_code = row['ts_code']
             
+            # 修复2：更鲁棒的买入价获取
+            buy_close = np.nan
             try:
-                # 尝试安全转换买入价
-                buy_close = float(row['last_close']) 
+                # 优先使用 compute_scores 中存储的原始 daily close 价格
+                buy_close = float(row.get('buy_price', row.get('last_close', np.nan)))
             except (ValueError, TypeError):
                 buy_close = np.nan
             
@@ -912,9 +915,8 @@ st.markdown("### 小结与操作提示（简洁）")
 st.markdown("""
 - **当日选股**：点击 **🟢 运行当日选股**。
 - **回测**：点击 **🟠 启动回测**。
-- **本次优化**：已移除 MA 多头硬过滤，大大增加股票进入评分池的概率。
-- **故障排除**：如果仍出现**【过滤失败】**警告，请重点调整侧边栏中的以下参数：
-    - **最低换手率 (%)**：适当降低
-    - **放量倍数阈值 (vol_last > vol_ma5 * x)**：适当提高（即容忍更高的放量）
-    - **过去10日波动 std 阈值 (%)**：适当提高（即容忍更高的波动率）
+- **本次优化**：
+    - 移除了回测过程中重复打印的“风险过滤后，剩余 XX 支”提示。
+    - 增强了回测中买入价的获取逻辑，以解决“交易次数0”的问题。
+- **故障排除**：如果仍出现**【过滤失败】**警告，请重点调整侧边栏中的参数，例如降低**放量倍数阈值**（如改为 1.3）或提高**波动 std 阈值**（如改为 10.0）。
 """)
