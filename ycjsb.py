@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 10000 积分旗舰（终极修复版 v4.3 - 温和突破回测策略）
+选股王 · 10000 积分旗舰（终极修复版 v4.4 - 资金强度回测策略）
 说明：
 - 整合了 BC 混合增强策略。
 - 修复了性能优化后 `run_backtest` 函数中因缺少 `turnover_rate` 导致的 KeyError 错误。
-- **v4.3 核心策略调整：**
-    - **回测买入逻辑** 从“激进追高”调整为“温和突破”。
-    - **新回测条件：** 股票当日涨幅必须在 2.0% 到 7.0% 之间，以规避次日抛压。
+- **v4.4 核心策略调整：**
+    - **回测买入逻辑** 调整为“温和突破 + 资金强度排序”。
+    - **新回测条件：** 1. 股票当日涨幅必须在 2.0% 到 7.0% 之间（温和）。
+        2. 在此温和池内，按**成交额 (amount_yuan)** 降序选择 Top K。
     - 提升了历史数据和指标计算的缓存时间（10小时），加快重复运行时的速度。
 """
 
@@ -21,8 +22,8 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · 10000旗舰（温和突破 v4.3）", layout="wide")
-st.title("选股王 · 10000 积分旗舰（终极修复版 v4.3 - 温和突破策略）")
+st.set_page_config(page_title="选股王 · 10000旗舰（资金强度 v4.4）", layout="wide")
+st.title("选股王 · 10000 积分旗舰（终极修复版 v4.4 - 资金强度策略）")
 st.markdown("输入你的 Tushare Token（仅本次运行使用）。若有权限缺失，脚本会自动降级并继续运行。")
 
 # ---------------------------
@@ -48,7 +49,7 @@ with st.sidebar:
     BACKTEST_DAYS = int(st.number_input("回测交易日天数", value=60, min_value=10, max_value=250))
     BACKTEST_TOP_K = int(st.number_input("回测每日最多交易 K 支", value=3, min_value=1, max_value=10))
     HOLD_DAYS_OPTIONS = st.multiselect("回测持股天数", options=[1, 3, 5, 10, 20], default=[1, 3, 5])
-    st.caption("提示：**本次回测使用温和突破策略。**")
+    st.caption("提示：**本次回测强制按成交额排序选股。**")
 
 # ---------------------------
 # Token 输入（主区）
@@ -703,13 +704,13 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k):
         
         daily_df['amount_yuan'] = daily_df['amount'].fillna(0) * 1000.0 # 转换成元
         
-        # 过滤：价格/成交额/动量/停牌/一字板 (新的温和突破策略，避免追高)
+        # 过滤：价格/成交额/动量/停牌/一字板 (v4.4：温和突破 + 过滤逻辑强制验证)
         daily_df = daily_df[
             (daily_df['close'] >= MIN_PRICE) & 
             (daily_df['close'] <= MAX_PRICE) &
-            (daily_df['amount_yuan'] >= BACKTEST_MIN_AMOUNT_PROXY) & # **使用更高的成交额要求替代换手率**
-            (daily_df['pct_chg'] >= 2.0) & # **策略调整：最低涨幅降至 2.0%**
-            (daily_df['pct_chg'] <= 7.0) & # **策略调整：增加最高涨幅限制 (温和突破)**
+            (daily_df['amount_yuan'] >= BACKTEST_MIN_AMOUNT_PROXY) & 
+            (daily_df['pct_chg'] >= 2.0) & # **策略调整：最低涨幅 2.0%**
+            (daily_df['pct_chg'] <= 7.0) & # **策略调整：最高涨幅 7.0% (温和突破)**
             (daily_df['vol'] > 0) & 
             (daily_df['amount_yuan'] > 0)
         ].copy()
@@ -718,8 +719,9 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k):
         daily_df['is_zt'] = (daily_df['open'] == daily_df['high']) & (daily_df['pct_chg'] > 9.5)
         daily_df = daily_df[~daily_df['is_zt']].copy()
         
-        # 2. 模拟评分：取当日涨幅榜前 backtest_top_k (在温和涨幅范围内排序)
-        scored_stocks = daily_df.sort_values("pct_chg", ascending=False).head(backtest_top_k).copy()
+        # 2. 模拟评分：v4.4 选股逻辑强制改为按【成交额】排序
+        # 这确保我们选择的是在温和上涨区间内，资金介入程度最高的股票。
+        scored_stocks = daily_df.sort_values("amount_yuan", ascending=False).head(backtest_top_k).copy()
         
         for _, row in scored_stocks.iterrows():
             ts_code = row['ts_code']
@@ -813,10 +815,12 @@ if st.checkbox("✅ 运行历史回测", value=False):
 # ---------------------------
 st.markdown("### 小结与操作提示（简洁）")
 st.markdown("""
-- **状态：** **温和突破策略版 v4.3**。
-- **改动：** **回测买入策略**已修改为**温和突破**。现在回测只会选择当天涨幅在 **2.0% 到 7.0%** 之间的股票，以捕捉启动信号并规避极度追高风险。
+- **状态：** **资金强度策略版 v4.4**。
+- **改动：** **回测买入策略**已强制修改为：**只在 2.0% 到 7.0% 涨幅区间内，选择当日成交额最大的股票**。
 - **操作步骤：**
-    1. **点击 “🚀 运行当日选股”**：完成当日选股和评分。
-    2. **勾选 “✅ 运行历史回测”**：**重新运行**回测，检查新策略下的收益率和胜率是否得到改善。
-- **调整建议：** 如果新的回测结果仍不理想，请尝试调整侧边栏的 **“最低成交额”** 和 **“回测每日最多交易 K 支”** 参数。
+    1. **使用上述完整代码替换您现有脚本的全部内容。**
+    2. **更改一个回测参数** (如：将**“回测交易日天数”**从 `60` 改为 `61` 或从 `61` 改回 `60`)，以确保强制刷新缓存。
+    3. **勾选 “✅ 运行历史回测”**。
+
+**这次我们直接从选股维度上进行颠覆性修改，如果结果还是一模一样，我们将检查 Streamlit 环境的配置。**
 """)
