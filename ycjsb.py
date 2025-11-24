@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 10000 积分旗舰（终极修复版 v4.2 - 清洗逻辑修复）
+选股王 · 10000 积分旗舰（终极修复版 v4.3 - 温和突破回测策略）
 说明：
 - 整合了 BC 混合增强策略。
 - 修复了性能优化后 `run_backtest` 函数中因缺少 `turnover_rate` 导致的 KeyError 错误。
-- 回测逻辑强化：使用更高的成交额要求和涨幅要求替代换手率过滤。
-- **v4.2 修复：**
-    - 修复了清洗循环中 `continue` 缩进错误，避免了所有股票都被无条件过滤的问题。
-    - 维持了 v4.1 的性能优化（主运行按钮和 10 小时缓存）。
+- **v4.3 核心策略调整：**
+    - **回测买入逻辑** 从“激进追高”调整为“温和突破”。
+    - **新回测条件：** 股票当日涨幅必须在 2.0% 到 7.0% 之间，以规避次日抛压。
+    - 提升了历史数据和指标计算的缓存时间（10小时），加快重复运行时的速度。
 """
 
 import streamlit as st
@@ -21,8 +21,8 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · 10000旗舰（终极修复 - 清洗修复）", layout="wide")
-st.title("选股王 · 10000 积分旗舰（终极修复版 v4.2 - 清洗逻辑修复）")
+st.set_page_config(page_title="选股王 · 10000旗舰（温和突破 v4.3）", layout="wide")
+st.title("选股王 · 10000 积分旗舰（终极修复版 v4.3 - 温和突破策略）")
 st.markdown("输入你的 Tushare Token（仅本次运行使用）。若有权限缺失，脚本会自动降级并继续运行。")
 
 # ---------------------------
@@ -48,7 +48,7 @@ with st.sidebar:
     BACKTEST_DAYS = int(st.number_input("回测交易日天数", value=60, min_value=10, max_value=250))
     BACKTEST_TOP_K = int(st.number_input("回测每日最多交易 K 支", value=3, min_value=1, max_value=10))
     HOLD_DAYS_OPTIONS = st.multiselect("回测持股天数", options=[1, 3, 5, 10, 20], default=[1, 3, 5])
-    st.caption("提示：**回测已修复 Key Error**，请重新运行。")
+    st.caption("提示：**本次回测使用温和突破策略。**")
 
 # ---------------------------
 # Token 输入（主区）
@@ -437,7 +437,7 @@ if st.button("🚀 运行当日选股（初次运行可能较久）"):
     # 评分池逐票计算因子（缓存 get_hist）
     # ---------------------------
     st.write("为评分池逐票拉历史并计算指标（此步骤调用历史接口，已缓存）...")
-    st.warning(f"⚠️ **耗时警告：** 当前有 {len(clean_df)} 支股票需要计算指标。如果太慢，请调整侧边栏 **'清洗后取前 M'** 参数。") # 增加耗时警告
+    st.warning(f"⚠️ **耗时警告：** 当前有 {len(clean_df)} 支股票需要计算指标。如果太慢，请调整侧边栏 **'清洗后取前 M'** 参数。")
     records = []
     pbar2 = st.progress(0)
     for idx, row in enumerate(clean_df.itertuples()):
@@ -699,18 +699,18 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k):
         # 1. 应用基本过滤 (价格/成交额/停牌/一字板)
         
         # amount 字段在 daily 接口中，单位是千元，我们要求的是元。
-        # 0.5 * MIN_AMOUNT 是一个粗略的替代，因为没有换手率，所以提高对成交额的要求。
-        BACKTEST_MIN_AMOUNT_PROXY = MIN_AMOUNT * 2.0
+        BACKTEST_MIN_AMOUNT_PROXY = MIN_AMOUNT * 2.0 
         
         daily_df['amount_yuan'] = daily_df['amount'].fillna(0) * 1000.0 # 转换成元
         
-        # 过滤：价格/成交额/动量/停牌/一字板
+        # 过滤：价格/成交额/动量/停牌/一字板 (新的温和突破策略，避免追高)
         daily_df = daily_df[
-            (daily_df['close'] >= MIN_PRICE) &
+            (daily_df['close'] >= MIN_PRICE) & 
             (daily_df['close'] <= MAX_PRICE) &
-            (daily_df['amount_yuan'] >= BACKTEST_MIN_AMOUNT_PROXY) & # **使用更高的成交额要求替代换手率**
-            (daily_df['pct_chg'] >= 3.0) & # 必须当天涨幅 >= 3%
-            (daily_df['vol'] > 0) &
+            (daily_df['amount_yuan'] >= BACKTEST_MIN_AMOUNT_PROXY) & # 使用更高的成交额要求替代换手率
+            (daily_df['pct_chg'] >= 2.0) & # **策略调整：最低涨幅降至 2.0%**
+            (daily_df['pct_chg'] <= 7.0) & # **策略调整：增加最高涨幅限制 (温和突破)**
+            (daily_df['vol'] > 0) & 
             (daily_df['amount_yuan'] > 0)
         ].copy()
         
@@ -718,7 +718,7 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k):
         daily_df['is_zt'] = (daily_df['open'] == daily_df['high']) & (daily_df['pct_chg'] > 9.5)
         daily_df = daily_df[~daily_df['is_zt']].copy()
         
-        # 2. 模拟评分：取当日涨幅榜前 backtest_top_k
+        # 2. 模拟评分：取当日涨幅榜前 backtest_top_k (在温和涨幅范围内排序)
         scored_stocks = daily_df.sort_values("pct_chg", ascending=False).head(backtest_top_k).copy()
         
         for _, row in scored_stocks.iterrows():
@@ -813,10 +813,10 @@ if st.checkbox("✅ 运行历史回测", value=False):
 # ---------------------------
 st.markdown("### 小结与操作提示（简洁）")
 st.markdown("""
-- **状态：** **清洗逻辑已修复版 v4.2**。
-- **修复：** 清洗循环中 `continue` 语句的缩进错误，现在股票将能够正常通过筛选。
+- **状态：** **温和突破策略版 v4.3**。
+- **改动：** **回测买入策略**已修改为**温和突破**。现在回测只会选择当天涨幅在 **2.0% 到 7.0%** 之间的股票，以捕捉启动信号并规避极度追高风险。
 - **操作步骤：**
-    1. **点击 “🚀 运行当日选股”**：完成当日选股和评分（仅需点击一次）。
-    2. **勾选 “✅ 运行历史回测”**：开始回测。
-- **提速建议：** 如果选股（步骤 1）仍然太慢，请尝试减小侧边栏的 **“清洗后取前 M 进入评分”** 参数。
+    1. **点击 “🚀 运行当日选股”**：完成当日选股和评分。
+    2. **勾选 “✅ 运行历史回测”**：**重新运行**回测，检查新策略下的收益率和胜率是否得到改善。
+- **调整建议：** 如果新的回测结果仍不理想，请尝试调整侧边栏的 **“最低成交额”** 和 **“回测每日最多交易 K 支”** 参数。
 """)
