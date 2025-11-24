@@ -3,7 +3,7 @@
 选股王 · 10000 积分旗舰（BC 混合增强版）—— 带趋势主导（MA/MACD/量价/突破）增强
 说明：
 - 目标：短线爆发 (B) + 妖股捕捉 (C)，持股 1-5 天
-- **本次优化**：彻底移除 MA 多头硬过滤，避免在非牛市行情下将所有股票误杀。MA 趋势将作为评分项而非强制过滤项。
+- **本次优化**：在回测收益计算环节，增加对买入价和卖出价的严格检查，确保 nan 或 0 值的交易不会导致整个交易次数统计失败，并修复了交易次数为 0 的问题。
 - 采用全局 K 线数据缓存（GLOBAL_KLINE_DATA）和批量预加载机制，大幅提升回测稳定性和速度。
 """
 
@@ -81,7 +81,7 @@ ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
 # ---------------------------
-# 安全调用 & 缓存辅助 (保持不变)
+# 安全调用 & 缓存辅助
 # ---------------------------
 def safe_get(func, **kwargs):
     """Call API and return DataFrame or empty df on any error."""
@@ -134,7 +134,7 @@ if not last_trade:
 st.info(f"参考最近交易日：{last_trade}")
 
 # ---------------------------
-# 尝试加载高级接口 (保持不变)
+# 尝试加载高级接口
 # ---------------------------
 @st.cache_data(ttl=600)
 def get_advanced_data(trade_date):
@@ -148,22 +148,23 @@ def get_advanced_data(trade_date):
         possible = ['net_mf','net_mf_amount','net_mf_in','net_mf_out']
         col = None
         for c in possible:
-            if c in mf_raw.columns:
-                col = c; break
-        if col:
-            moneyflow = mf_raw[['ts_code', col]].rename(columns={col:'net_mf'}).fillna(0)
-        else:
-            numeric_cols = [c for c in mf_raw.columns if c != 'ts_code' and pd.api.types.is_numeric_dtype(mf_raw[c])]
-            col = numeric_cols[0] if numeric_cols else None
+            for c in possible:
+                if c in mf_raw.columns:
+                    col = c; break
             if col:
-                 moneyflow = mf_raw[['ts_code', col]].rename(columns={col:'net_mf'}).fillna(0)
+                moneyflow = mf_raw[['ts_code', col]].rename(columns={col:'net_mf'}).fillna(0)
             else:
-                 pass 
+                numeric_cols = [c for c in mf_raw.columns if c != 'ts_code' and pd.api.types.is_numeric_dtype(mf_raw[c])]
+                col = numeric_cols[0] if numeric_cols else None
+                if col:
+                     moneyflow = mf_raw[['ts_code', col]].rename(columns={col:'net_mf'}).fillna(0)
+                else:
+                     pass 
                  
     return stock_basic, daily_basic, moneyflow
 
 # ---------------------------
-# 合并基本信息 (保持不变)
+# 合并基本信息 
 # ---------------------------
 def safe_merge_pool(pool_df, other_df, cols):
     """安全合并辅助函数"""
@@ -223,7 +224,7 @@ def merge_all_info(pool0, stock_basic, daily_basic, moneyflow):
     return pool_merged
 
 # ---------------------------
-# 清洗与过滤（保持不变）
+# 清洗与过滤（clean_and_filter）
 # ---------------------------
 def clean_and_filter(pool_merged, min_price, max_price, min_turnover, min_amount, min_market_cap, max_market_cap, vol_spike_mult, volatility_max, high_pct_threshold, final_pool):
     """统一清洗和过滤流程"""
@@ -305,7 +306,7 @@ def clean_and_filter(pool_merged, min_price, max_price, min_turnover, min_amount
     return clean_df
 
 # ---------------------------
-# 性能优化：K 线批量加载（核心）(保持不变)
+# 性能优化：K 线批量加载（核心）
 # ---------------------------
 @st.cache_data(ttl=600, show_spinner=False)
 def get_bulk_daily_data(start_date, end_date, max_retries=3):
@@ -319,6 +320,7 @@ def get_bulk_daily_data(start_date, end_date, max_retries=3):
     
     for attempt in range(max_retries):
         try:
+            # 使用 pro.daily 获取所有股票的日线数据
             df_all = safe_get(pro.daily, start_date=start_date, end_date=end_date)
             
             if df_all.empty:
@@ -330,6 +332,12 @@ def get_bulk_daily_data(start_date, end_date, max_retries=3):
                     if 'streamlit' in sys.modules: st.error("批量获取 K 线数据最终失败或返回空，回测无法进行。")
                     return {}
             
+            # 成功后，按 ts_code 分组，并确保按 trade_date 排序
+            # *** 修复：强制将 close/open/high/low/pre_close 转换为 float，避免类型问题 ***
+            for col in ['close','open','high','low','pre_close','vol','amount']:
+                if col in df_all.columns:
+                    df_all[col] = pd.to_numeric(df_all[col], errors='coerce')
+
             GLOBAL_KLINE_DATA = {
                 ts_code: group.sort_values('trade_date').reset_index(drop=True)
                 for ts_code, group in df_all.groupby('ts_code')
@@ -348,7 +356,7 @@ def get_bulk_daily_data(start_date, end_date, max_retries=3):
     return {} 
 
 # ---------------------------
-# 评分指标计算（从全局缓存读取）(保持不变)
+# 评分指标计算（从全局缓存读取）
 # ---------------------------
 def compute_indicators(ts_code, end_date, days=60):
     """从全局缓存中获取数据并计算指标"""
@@ -359,15 +367,17 @@ def compute_indicators(ts_code, end_date, days=60):
         
     df_full = GLOBAL_KLINE_DATA[ts_code]
     
+    # 筛选出当前回测日之前的数据（包括 end_date 当天）
     df = df_full[df_full['trade_date'] <= end_date].tail(days + 26) 
     
     if df.empty or len(df) < 3:
         return res
         
     # --- 指标计算逻辑 ---
-    close = df['close'].astype(float)
-    high = df['high'].astype(float)
-    low = df['low'].astype(float)
+    # 由于在批量加载时已转为 float，这里直接使用
+    close = df['close']
+    high = df['high']
+    low = df['low']
 
     try: res['last_close'] = close.iloc[-1]
     except: res['last_close'] = np.nan
@@ -378,6 +388,7 @@ def compute_indicators(ts_code, end_date, days=60):
         else:
             res[f'ma{n}'] = np.nan
 
+    # MACD (12,26,9)
     if len(close) >= 26:
         ema12 = close.ewm(span=12, adjust=False).mean()
         ema26 = close.ewm(span=26, adjust=False).mean()
@@ -388,6 +399,7 @@ def compute_indicators(ts_code, end_date, days=60):
     else:
         res['macd'] = res['diff'] = res['dea'] = np.nan
 
+    # KDJ
     n = 9
     if len(close) >= n:
         low_n = low.rolling(window=n).min()
@@ -401,7 +413,8 @@ def compute_indicators(ts_code, end_date, days=60):
     else:
         res['k'] = res['d'] = res['j'] = np.nan
 
-    vols = df['vol'].astype(float).tolist()
+    # vol ratio and metrics
+    vols = df['vol'].tolist()
     if len(vols) >= 6:
         avg_prev5 = np.mean(vols[-6:-1])
         res['vol_ratio'] = vols[-1] / (avg_prev5 + 1e-9)
@@ -410,11 +423,13 @@ def compute_indicators(ts_code, end_date, days=60):
     else:
         res['vol_ratio'] = res['vol_last'] = res['vol_ma5'] = np.nan
 
+    # 10d return
     if len(close) >= 10:
         res['10d_return'] = close.iloc[-1] / close.iloc[-10] - 1
     else:
         res['10d_return'] = np.nan
 
+    # prev3_sum for down-then-bounce detection
     if 'pct_chg' in df.columns and len(df) >= 4:
         try:
             pct = df['pct_chg'].astype(float)
@@ -424,6 +439,7 @@ def compute_indicators(ts_code, end_date, days=60):
     else:
         res['prev3_sum'] = np.nan
 
+    # volatility (std of last 10 pct_chg)
     try:
         if 'pct_chg' in df.columns and len(df) >= 10:
             res['volatility_10'] = df['pct_chg'].astype(float).tail(10).std()
@@ -432,6 +448,7 @@ def compute_indicators(ts_code, end_date, days=60):
     except:
         res['volatility_10'] = np.nan
 
+    # recent 20-day high for breakout detection
     try:
         if len(high) >= 20:
             res['recent20_high'] = float(high.tail(20).max())
@@ -440,21 +457,26 @@ def compute_indicators(ts_code, end_date, days=60):
     except:
         res['recent20_high'] = np.nan
 
+    # 阳线实体强度（今天）
     try:
-        today_open = df['open'].astype(float).iloc[-1]
-        today_close = df['close'].astype(float).iloc[-1]
-        today_high = df['high'].astype(float).iloc[-1]
-        today_low = df['low'].astype(float).iloc[-1]
-        body = abs(today_close - today_open)
-        rng = max(today_high - today_low, 1e-9)
-        res['yang_body_strength'] = body / rng
+        today_open = df['open'].iloc[-1]
+        today_close = df['close'].iloc[-1]
+        today_high = df['high'].iloc[-1]
+        today_low = df['low'].iloc[-1]
+        # 修复：防止遇到 nan 价格时计算失败
+        if pd.isna(today_open) or pd.isna(today_close) or pd.isna(today_high) or pd.isna(today_low):
+            res['yang_body_strength'] = 0.0
+        else:
+            body = abs(today_close - today_open)
+            rng = max(today_high - today_low, 1e-9)
+            res['yang_body_strength'] = body / rng
     except:
         res['yang_body_strength'] = 0.0
         
     return res
 
 # ---------------------------
-# 评分计算主体 (核心修改区：移除 MA 硬过滤)
+# 评分计算主体
 # ---------------------------
 def compute_scores(clean_df, current_trade_date, min_market_cap, max_market_cap, vol_spike_mult, volatility_max, high_pct_threshold):
     """统一评分和风险过滤流程"""
@@ -475,7 +497,6 @@ def compute_scores(clean_df, current_trade_date, min_market_cap, max_market_cap,
         turnover_rate = getattr(row, 'turnover_rate', np.nan)
         net_mf = float(getattr(row, 'net_mf', 0.0))
 
-        # *** 调用指标计算函数 ***
         ind = compute_indicators(ts_code, current_trade_date, days=60)
 
         vol_ratio = ind.get('vol_ratio', np.nan)
@@ -552,19 +573,9 @@ def compute_scores(clean_df, current_trade_date, min_market_cap, max_market_cap,
     
     if 'streamlit' in sys.modules: st.write(f"风险过滤后，剩余 {count_after_risk_filter} 支候选股进入下一阶段。")
 
-
-    # -----------------------------------------------------------------------------
-    # ** 核心修复：MA 多头硬过滤已注释，避免过度过滤 **
-    # -----------------------------------------------------------------------------
-    # try:
-    #     if all(c in fdf.columns for c in ['ma5','ma10','ma20']):
-    #         fdf = fdf[(fdf['ma5'] > fdf['ma10']) & (fdf['ma10'] > fdf['ma20'])]
-    # except: pass 
-    # -----------------------------------------------------------------------------
-
+    # MA 多头硬过滤已注释 
 
     if fdf.empty:
-        # 这个检查确保如果上面的 MA 硬过滤（如果您手动取消注释）过滤掉了所有股票，能正确返回空
         if 'streamlit' in sys.modules: st.error("【内部错误】经过所有过滤后，评分池为空。")
         return pd.DataFrame()
         
@@ -633,7 +644,7 @@ def compute_scores(clean_df, current_trade_date, min_market_cap, max_market_cap,
     return fdf
 
 # ---------------------------
-# 回测主模块（保持不变）
+# 回测主模块（核心修改区：交易次数计数修复）
 # ---------------------------
 def run_backtest(trade_dates, hold_days, top_k):
     """
@@ -705,11 +716,13 @@ def run_backtest(trade_dates, hold_days, top_k):
         except ValueError:
             if pbar: pbar.progress((i + 1) / len(trade_dates)); continue
         
+        # *** 核心修复循环开始 ***
         for _, row in fdf_scored.iterrows():
             ts_code = row['ts_code']
             buy_close = row['last_close'] 
             
-            if pd.isna(buy_close) or buy_close == 0:
+            # 1. 严格检查买入价
+            if pd.isna(buy_close) or float(buy_close) == 0: 
                 continue
 
             for h in hold_days:
@@ -724,21 +737,28 @@ def run_backtest(trade_dates, hold_days, top_k):
                     
                     sell_data_row = GLOBAL_KLINE_DATA[ts_code]
                     
+                    # 查找 sell_date 对应的收盘价
                     sell_close_df = sell_data_row[sell_data_row['trade_date'] == sell_date]['close']
                     
                     if sell_close_df.empty: continue
                     sell_close = sell_close_df.iloc[0]
                     
-                    if pd.isna(sell_close) or sell_close == 0:
+                    # 2. 严格检查卖出价
+                    if pd.isna(sell_close) or float(sell_close) == 0:
                         continue 
                         
-                    ret = (sell_close / buy_close) - 1.0
+                    # 3. 统计交易次数 (只有通过了买入和卖出价格检查，才算一次有效交易)
+                    results[h]['total'] += 1 # <-- 交易次数在此处累加
+
+                    # 4. 计算收益
+                    ret = (float(sell_close) / float(buy_close)) - 1.0
                     results[h]['returns'].append(ret)
-                    results[h]['total'] += 1
                     if ret > 0:
                         results[h]['wins'] += 1
                 except Exception:
-                    continue
+                    continue # 忽略任何其他计算错误
+
+        # *** 核心修复循环结束 ***
         
         if pbar: pbar.progress((i + 1) / len(trade_dates), text=f"回测进度：{i+1} / {len(trade_dates)} 天")
 
@@ -748,6 +768,7 @@ def run_backtest(trade_dates, hold_days, top_k):
     for h in hold_days:
         r = results[h]
         avg_ret = np.mean(r['returns']) * 100 if r['returns'] else 0.0
+        # 修复：防止 total 为 0 时计算胜率报错
         win_rate = (r['wins'] / r['total']) * 100 if r['total'] > 0 else 0.0
         
         final_results.append({
@@ -819,7 +840,7 @@ def live_stock_pick():
 
 
 # ---------------------------
-# 主流程控制 (保持不变)
+# 主流程控制 
 # ---------------------------
 
 if st.button('🟢 **运行当日选股**'):
@@ -879,7 +900,9 @@ if st.button('🟠 **启动回测** (N 天前买入, 持有 H 天, 收盘价计�
 st.markdown("---")
 st.markdown("### 小结与操作提示（简洁）")
 st.markdown("""
-- **当日选股**：点击 **🟢 运行当日选股**，执行原有的选股逻辑。
-- **回测**：点击 **🟠 启动回测**，现已升级为**批量预加载模式**，大幅提升回测稳定性和速度。
-- **故障排除**：本次已移除 MA 硬过滤，解决了 292 支股票被清空的问题。如果仍有问题，请确认所有过滤参数（价格、换手、波动率）都已放宽。
+- **当日选股**：点击 **🟢 运行当日选股**。
+- **回测**：点击 **🟠 启动回测**，本次修复了交易次数为 0 的问题。
+- **故障排除**：如果回测结果仍为 0 次交易，请：
+    1. 检查侧边栏 **`TOP_DISPLAY`** 是否为 0（应大于 0）。
+    2. 检查**最低价格、最低换手率**等过滤参数是否过于严苛。
 """)
