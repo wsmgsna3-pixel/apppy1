@@ -5,7 +5,7 @@
 - 目标：短线爆发 (B) + 妖股捕捉 (C)，持股 1-5 天
 - 在界面输入 Tushare Token（仅本次运行使用）
 - 尽可能调用 moneyflow / chip / ths_member / chip 等高级接口，若无权限会自动降级
-- **已做大量异常处理与缓存，大幅优化回测时的历史数据加载速度，新增了网络重试机制，并优化了评分失败的调试信息。**
+- **已做大量异常处理与缓存，大幅优化回测时的历史数据加载速度，新增了网络重试机制，并对交易日历获取增加了重试保障。**
 """
 
 import streamlit as st
@@ -56,7 +56,7 @@ with st.sidebar:
     st.markdown("---")
     # --- 回测新增参数 ---
     st.header("回测参数（新增）")
-    BACKTEST_DAYS = int(st.number_input("回测交易日天数 (N)", value=20, step=5))
+    BACKTEST_DAYS = int(st.number_input("回测交易日天数 (N)", value=60, step=5)) # 默认为 60
     HOLD_DAYS_LIST = st.text_input("回测持股天数（逗号分隔）", value="1, 3, 5")
     try:
         HOLD_DAYS = [int(x.strip()) for x in HOLD_DAYS_LIST.split(',') if x.strip().isdigit()]
@@ -105,15 +105,33 @@ def find_last_trade_day(max_days=20):
             return ds
     return None
 
-@st.cache_data(ttl=3600)
-def get_all_trade_cals(start_date, end_date):
-    """获取指定范围内的所有交易日"""
-    try:
-        df = safe_get(pro.trade_cal, start_date=start_date, end_date=end_date)
-        if df.empty: return []
-        return df[df['is_open']==1]['cal_date'].tolist()
-    except:
-        return []
+# ** 优化增强：为交易日历增加重试机制 **
+def get_all_trade_cals(start_date, end_date, max_retries=3):
+    """获取指定范围内的所有交易日，带重试机制"""
+    for attempt in range(max_retries):
+        try:
+            df = safe_get(pro.trade_cal, start_date=start_date, end_date=end_date)
+            
+            if not df.empty:
+                # 交易日历获取成功
+                return df[df['is_open']==1]['cal_date'].tolist()
+            
+            # 如果返回空且不是最后一次尝试，则重试
+            if attempt < max_retries - 1:
+                st.warning(f"第 {attempt + 1}/{max_retries} 次尝试：交易日历返回空，正在重试（等待 5 秒）...")
+                time.sleep(5)
+            else:
+                st.error("交易日历获取最终失败或返回空。")
+                return []
+                
+        except Exception as e:
+            if attempt < max_retries - 1:
+                st.warning(f"第 {attempt + 1}/{max_retries} 次尝试：交易日历获取出错：{e}。正在重试（等待 5 秒）...")
+                time.sleep(5)
+            else:
+                st.error(f"交易日历获取最终失败，请检查网络或 Token 权限。错误：{e}")
+                return []
+    return []
 
 last_trade = find_last_trade_day()
 if not last_trade:
@@ -694,13 +712,14 @@ def run_backtest(trade_dates, hold_days, top_k):
     results = {h: {'returns': [], 'wins': 0, 'total': 0} for h in hold_days}
     
     # 获取所有交易日，用于计算卖出日期
+    # 注意：此处再次调用 get_all_trade_cals，但它在主流程中已经被调用过一次
     today_date_str = datetime.now().strftime("%Y%m%m")
     max_lookback = BACKTEST_DAYS + max(HOLD_DAYS) + 30
     start_lookback = (datetime.strptime(trade_dates[0], "%Y%m%d") - timedelta(days=max_lookback)).strftime("%Y%m%d")
-    all_trade_cals = get_all_trade_cals(start_lookback, last_trade) # 仅获取到最近交易日
+    all_trade_cals = get_all_trade_cals(start_lookback, last_trade) # **这里使用了新的带重试的函数**
 
     if len(all_trade_cals) == 0:
-        st.error("无法获取交易日历，回测失败。")
+        st.error("无法获取交易日历（Trade Cal），回测失败。请检查 Tushare Token 权限。")
         return pd.DataFrame()
 
     pbar = st.progress(0, text=f"回测进度：0 / {len(trade_dates)} 天")
@@ -875,33 +894,39 @@ if st.button('🟠 **启动回测** (N 天前买入, 持有 H 天, 收盘价计�
         today = datetime.strptime(last_trade, "%Y%m%d")
         start_date = (today - timedelta(days=BACKTEST_DAYS * 3)).strftime("%Y%m%d")
         
+        # **使用新的带重试机制的函数获取交易日历**
         all_trade_cals = get_all_trade_cals(start_date, last_trade)
         
         if len(all_trade_cals) < BACKTEST_DAYS + 1:
-            st.error(f"交易日历不足 {BACKTEST_DAYS} 天，请检查 Token 权限或降低回测天数。")
+            st.error(f"【日历缺失】交易日历不足 {BACKTEST_DAYS} 天，或获取失败。请检查 Token 权限或降低回测天数。")
+            st.stop() # 如果日历获取失败，直接停止
+        
+        # 正常获取到交易日历后继续执行
+        try:
+            last_trade_idx = all_trade_cals.index(last_trade)
+        except ValueError:
+            st.error(f"最近交易日 {last_trade} 不在交易日历中。")
+            st.stop()
+            
+        start_idx = last_trade_idx - BACKTEST_DAYS
+        end_idx = last_trade_idx 
+        
+        backtest_dates = all_trade_cals[start_idx:end_idx]
+        
+        if not backtest_dates:
+             st.error("【内部错误】回测日期列表为空。请检查回测天数和交易日历获取情况。")
+             st.stop()
+
+        # 2. 运行回测
+        results_df = run_backtest(backtest_dates, HOLD_DAYS, TOP_DISPLAY)
+        
+        # 3. 展示回测结果
+        if not results_df.empty:
+            st.subheader("📊 历史回测结果 (买入收盘价 / 卖出收盘价)")
+            st.dataframe(results_df, use_container_width=True)
+            st.success("回测完成！")
         else:
-            # 找到最近一个交易日（last_trade）的索引
-            try:
-                last_trade_idx = all_trade_cals.index(last_trade)
-            except ValueError:
-                st.error(f"最近交易日 {last_trade} 不在交易日历中。")
-                st.stop()
-                
-            start_idx = last_trade_idx - BACKTEST_DAYS
-            end_idx = last_trade_idx 
-            
-            backtest_dates = all_trade_cals[start_idx:end_idx]
-            
-            # 2. 运行回测
-            results_df = run_backtest(backtest_dates, HOLD_DAYS, TOP_DISPLAY)
-            
-            # 3. 展示回测结果
-            if not results_df.empty:
-                st.subheader("📊 历史回测结果 (买入收盘价 / 卖出收盘价)")
-                st.dataframe(results_df, use_container_width=True)
-                st.success("回测完成！")
-            else:
-                st.warning("回测未产生有效结果，可能是数据缺失或筛选过于严格。")
+            st.warning("回测未产生有效结果，**极可能是每日选股过滤过于严格**。请检查上方是否有**【过滤失败】**警告，并放宽价格、换手率、波动率等参数。")
 
 
 # ---------------------------
@@ -912,6 +937,8 @@ st.markdown("### 小结与操作提示（简洁）")
 st.markdown("""
 - **当日选股**：点击 **🟢 运行当日选股**，执行原有的选股逻辑。
 - **回测**：点击 **🟠 启动回测**，软件将向后追溯 N 个交易日，每日使用您的选股参数选择 Top K 股票，并计算持有 H 天的平均收益率和胜率（按收盘价买卖）。
-- **回测速度/稳定性**：**本次已加入网络重试机制**。如果第一次加载全量 K 线失败，程序会等待 5 秒并自动重试 2 次。一旦数据缓存成功，后续运行速度会大幅提升。
-- **故障排除**：如果再次失败，请观察是否有**【过滤失败】**的红色警告。若有，请尝试放宽侧边栏的参数，例如：**`放量倍数阈值`** 或 **`过去10日波动 std 阈值 (%)`**。
+- **健壮性提示**：**本次已对“全量 K 线数据”和“交易日历”这两项重要数据的获取都增加了网络重试保障**，极大地提高了回测启动的成功率。
+- **故障排除**：如果回测仍然失败，请重点检查日志中是否有以下警告，并根据建议调整侧边栏参数：
+    1.  **【日历缺失】**：Tushare `trade_cal` 接口权限问题或网络持续断开。
+    2.  **【过滤失败】**：某个回测日，您的筛选条件（价格、市值、换手率、波动率等）将所有股票都排除了。
 """)
