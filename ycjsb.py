@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 10000 积分旗舰（终极修复版 v4.5 - 均值回归/回调策略）
+选股王 · 10000 积分旗舰（终极修复版 v4.6 - 右侧启动/趋势强化策略）
 说明：
 - 整合了 BC 混合增强策略。
 - 修复了性能优化后 `run_backtest` 函数中因缺少 `turnover_rate` 导致的 KeyError 错误。
-- **v4.5 核心策略调整：**
-    - **回测买入逻辑** 彻底颠覆，调整为“短期回调/盘整买入”。
-    - **新回测条件：** 1. 股票当日涨幅必须在 -3.0% 到 1.5% 之间（避免追高）。
-        2. 在此回调池内，按**成交量 (vol)** 降序选择 Top K（确保有流动性）。
+- **v4.6 核心策略调整：**
+    - **回测买入逻辑** 调整为“右侧启动”：寻找当日涨幅较高，且高流动性的股票。
+    - **新回测条件：** 1. 股票当日涨幅必须在 4.0% 到 9.5% 之间（避免盘整和极端激进）。
+        2. 在此池内，按 `pct_chg` (涨幅) 降序选择 Top K（确保捕捉动量）。
 """
 
 import streamlit as st
@@ -21,8 +21,8 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · 10000旗舰（均值回归 v4.5）", layout="wide")
-st.title("选股王 · 10000 积分旗舰（终极修复版 v4.5 - 均值回归策略）")
+st.set_page_config(page_title="选股王 · 10000旗舰（右侧启动 v4.6）", layout="wide")
+st.title("选股王 · 10000 积分旗舰（终极修复版 v4.6 - 右侧启动策略）")
 st.markdown("输入你的 Tushare Token（仅本次运行使用）。若有权限缺失，脚本会自动降级并继续运行。")
 
 # ---------------------------
@@ -48,9 +48,9 @@ with st.sidebar:
     BACKTEST_DAYS = int(st.number_input("回测交易日天数", value=60, min_value=10, max_value=250))
     BACKTEST_TOP_K = int(st.number_input("回测每日最多交易 K 支", value=3, min_value=1, max_value=10))
     HOLD_DAYS_OPTIONS = st.multiselect("回测持股天数", options=[1, 3, 5, 10, 20], default=[1, 3, 5])
-    # 新增参数，用于强制缓存失效
-    BT_MIN_PCT_FOR_CACHE = float(st.number_input("回测：最低涨幅 (缓存破坏键)", value=-3.0, step=0.5))
-    st.caption("提示：**本次回测强制使用均值回归策略。**")
+    # 新增参数，用于强制缓存失效 (右侧策略使用涨幅上限作为缓存键)
+    BT_MAX_PCT_FOR_CACHE = float(st.number_input("回测：最高涨幅 (缓存破坏键)", value=9.5, step=0.5))
+    st.caption("提示：**本次回测使用右侧启动/趋势强化策略 (4.0% < 涨幅 < 9.5%)。**")
 
 # ---------------------------
 # Token 输入（主区）
@@ -295,7 +295,7 @@ if st.button("🚀 运行当日选股（初次运行可能较久）"):
                 pbar.progress((i+1)/len(pool_merged))
                 continue
 
-        # 8. 过滤：剔除昨日收阴股（保留当日上涨的）
+        # 8. 过滤：剔除当日下跌的股（只保留当日上涨的）
         try:
             if float(pct) < 0: 
                 pbar.progress((i+1)/len(pool_merged))
@@ -545,7 +545,7 @@ if st.button("🚀 运行当日选股（初次运行可能较久）"):
             before_ma = len(fdf)
             fdf = fdf[(fdf['ma5'] > fdf['ma10']) & (fdf['ma10'] > fdf['ma20'])].copy() 
             after_ma = len(fdf)
-            st.write(f"MA 多头过滤：{before_ma} -> {after_ma}（保留 MA5>MA10>MA20）")
+            st.write(f"MA 多头过滤：{before_ma} -> {after_ma}（保留 MA5>MA10>MA20，强化趋势）")
     except Exception as e:
         st.warning(f"MA 过滤异常，跳过。错误：{e}")
 
@@ -659,9 +659,9 @@ def load_backtest_data(all_trade_dates):
     return data_cache
 
 @st.cache_data(ttl=6000)
-def run_backtest(start_date, end_date, hold_days, backtest_top_k, bt_min_pct_for_cache):
-    # 使用 bt_min_pct_for_cache 确保每次参数变化都破坏缓存
-    _ = bt_min_pct_for_cache # 假装使用这个参数，让它进入缓存哈希
+def run_backtest(start_date, end_date, hold_days, backtest_top_k, bt_max_pct_for_cache):
+    # 使用 bt_max_pct_for_cache 确保每次参数变化都破坏缓存
+    _ = bt_max_pct_for_cache # 假装使用这个参数，让它进入缓存哈希
 
     trade_dates = get_trade_cal(start_date, end_date)
     
@@ -701,31 +701,30 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k, bt_min_pct_for
 
         daily_df = daily_df_cached.copy().reset_index()
         
-        # 1. 应用基本过滤 (价格/成交额/停牌/一字板)
+        # 1. 应用基本过滤 (价格/成交额/动量/停牌/一字板)
         
         # amount 字段在 daily 接口中，单位是千元，我们要求的是元。
         BACKTEST_MIN_AMOUNT_PROXY = MIN_AMOUNT * 2.0 
         
         daily_df['amount_yuan'] = daily_df['amount'].fillna(0) * 1000.0 # 转换成元
         
-        # 过滤：V4.5 均值回归策略：寻找回调/盘整的股票
+        # 过滤：V4.6 右侧启动策略：寻找当日涨幅较高，且高成交额的股票
         daily_df = daily_df[
             (daily_df['close'] >= MIN_PRICE) & 
             (daily_df['close'] <= MAX_PRICE) &
             (daily_df['amount_yuan'] >= BACKTEST_MIN_AMOUNT_PROXY) & 
-            (daily_df['pct_chg'] >= -3.0) & # **策略调整：允许小幅回调 (最低 -3.0%)**
-            (daily_df['pct_chg'] <= 1.5) &  # **策略调整：最高涨幅 1.5% (盘整/缩量)**
+            (daily_df['pct_chg'] >= 4.0) & # **策略调整：当日涨幅必须达到 4.0% 以上 (右侧启动)**
+            (daily_df['pct_chg'] <= BT_MAX_PCT_FOR_CACHE) & # **使用缓存破坏键的参数作为上限 (9.5%)**
             (daily_df['vol'] > 0) & 
             (daily_df['amount_yuan'] > 0)
         ].copy()
         
-        # 过滤一字涨停板
+        # 过滤一字涨停板 (防止 BT_MAX_PCT_FOR_CACHE 被设置为 10.0 时漏网)
         daily_df['is_zt'] = (daily_df['open'] == daily_df['high']) & (daily_df['pct_chg'] > 9.5)
         daily_df = daily_df[~daily_df['is_zt']].copy()
         
-        # 2. 模拟评分：v4.5 选股逻辑强制改为按【成交量】排序
-        # 这确保我们选择的是在盘整/回调区间内，流动性最高的股票。
-        scored_stocks = daily_df.sort_values("vol", ascending=False).head(backtest_top_k).copy()
+        # 2. 模拟评分：v4.6 选股逻辑改为按【涨幅】排序 (右侧启动)
+        scored_stocks = daily_df.sort_values("pct_chg", ascending=False).head(backtest_top_k).copy()
         
         for _, row in scored_stocks.iterrows():
             ts_code = row['ts_code']
@@ -795,7 +794,7 @@ if st.checkbox("✅ 运行历史回测", value=False):
             end_date=last_trade,
             hold_days=HOLD_DAYS_OPTIONS,
             backtest_top_k=BACKTEST_TOP_K,
-            bt_min_pct_for_cache=BT_MIN_PCT_FOR_CACHE # 传入参数确保缓存刷新
+            bt_max_pct_for_cache=BT_MAX_PCT_FOR_CACHE # 传入参数确保缓存刷新
         )
 
         bt_df = pd.DataFrame(backtest_result).T
@@ -820,12 +819,12 @@ if st.checkbox("✅ 运行历史回测", value=False):
 # ---------------------------
 st.markdown("### 小结与操作提示（简洁）")
 st.markdown("""
-- **状态：** **均值回归策略版 v4.5**。
-- **改动：** **回测买入策略**已彻底颠覆：现在只选择当日涨幅在 **-3.0% 到 1.5%** 之间的股票，并按 **成交量** 排序。这与之前的“追高”策略完全相反，必须改变结果。
+- **状态：** **右侧启动/趋势强化策略版 v4.6**。
+- **改动：** **回测买入策略**已调整为“右侧启动”：现在只选择当日涨幅在 **4.0% 到 9.5%** 之间的股票，并按 **涨幅** 排序。这旨在捕捉刚刚启动的趋势股。
 - **操作步骤：**
     1. **使用上述完整代码替换您现有脚本的全部内容。**
-    2. **更改一个回测参数** (如：侧边栏“回测交易日天数”或 **“回测：最低涨幅 (缓存破坏键)”** 参数)，以确保强制刷新缓存。
+    2. **更改一个回测参数** (如：侧边栏“回测交易日天数”或 **“回测：最高涨幅 (缓存破坏键)”** 参数)，以确保强制刷新缓存。
     3. **勾选 “✅ 运行历史回测”**。
 
-这次我们不再寻找强势股，而是寻找回调股，回测结果将不再相同。
+这次我们专注于**高质量的右侧启动**，希望能在趋势强劲的股票中获得持续的收益。
 """)
