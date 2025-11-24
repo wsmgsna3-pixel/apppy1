@@ -106,6 +106,7 @@ def find_last_trade_day(max_days=20):
     return None
 
 # ** 优化增强：为交易日历增加重试机制 **
+@st.cache_data(ttl=3600) # 增加缓存，避免重复调用
 def get_all_trade_cals(start_date, end_date, max_retries=3):
     """获取指定范围内的所有交易日，带重试机制"""
     for attempt in range(max_retries):
@@ -597,7 +598,6 @@ def compute_scores(clean_df, last_trade, min_market_cap, max_market_cap, vol_spi
     # -----------------------------------------------------------------------------
     # MA 多头硬过滤（必须满足 MA5 > MA10 > MA20）
     # ATTENTION: 此处暂时注释掉，避免在当前市场行情下将所有股票过滤。
-    # 如果您需要严格的 MA 多头过滤，请取消注释。
     # -----------------------------------------------------------------------------
     # try:
     #     count_before_ma_hard = len(fdf)
@@ -686,21 +686,17 @@ def run_backtest(trade_dates, hold_days, top_k):
     hold_days: 持有天数列表 [1, 3, 5]
     top_k: 每天选股 Top K
     """
-    global GLOBAL_KLINE_DATA # 声明使用全局变量
+    global GLOBAL_KLINE_DATA 
     
     # 步骤 0：性能优化核心 - 预加载 K 线数据
-    # 计算需要预加载的日期范围
     if not trade_dates:
-        st.warning("回测日期列表为空，回测终止。")
+        # 这个检查在调用 run_backtest 之前已经做过，但作为保障保留
         return pd.DataFrame()
         
     start_buy_date = trade_dates[0]
-    # 指标计算需要 60 天历史数据，MACD需要 26 天，我们取 60 天 Lookback
-    lookback_days = 60 * 2 # 粗略估计
+    lookback_days = 60 * 2 
     start_kline_date = (datetime.strptime(start_buy_date, "%Y%m%d") - timedelta(days=lookback_days)).strftime("%Y%m%d")
     
-    # 获取数据，这一步调用了带重试机制的函数
-    # 这一步将数据填充到 GLOBAL_KLINE_DATA
     get_bulk_daily_data(start_kline_date, last_trade)
     
     if not GLOBAL_KLINE_DATA:
@@ -711,12 +707,10 @@ def run_backtest(trade_dates, hold_days, top_k):
     
     results = {h: {'returns': [], 'wins': 0, 'total': 0} for h in hold_days}
     
-    # 获取所有交易日，用于计算卖出日期
-    # 注意：此处再次调用 get_all_trade_cals，但它在主流程中已经被调用过一次
-    today_date_str = datetime.now().strftime("%Y%m%m")
+    # 重新获取完整交易日历，用于计算卖出日期
     max_lookback = BACKTEST_DAYS + max(HOLD_DAYS) + 30
     start_lookback = (datetime.strptime(trade_dates[0], "%Y%m%d") - timedelta(days=max_lookback)).strftime("%Y%m%d")
-    all_trade_cals = get_all_trade_cals(start_lookback, last_trade) # **这里使用了新的带重试的函数**
+    all_trade_cals = get_all_trade_cals(start_lookback, last_trade) # 使用带重试的函数
 
     if len(all_trade_cals) == 0:
         st.error("无法获取交易日历（Trade Cal），回测失败。请检查 Tushare Token 权限。")
@@ -726,7 +720,7 @@ def run_backtest(trade_dates, hold_days, top_k):
 
     for i, buy_date in enumerate(trade_dates):
         
-        # 1. 获取当日数据 (此处仍需 API 调用，因为需要当日的涨幅榜和高级数据)
+        # 1. 获取当日数据 (API 调用)
         try:
             daily_all = safe_get(pro.daily, trade_date=buy_date)
             if daily_all.empty: continue
@@ -746,13 +740,13 @@ def run_backtest(trade_dates, hold_days, top_k):
         clean_df = clean_and_filter(pool_merged, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MIN_AMOUNT, MIN_MARKET_CAP, MAX_MARKET_CAP, VOL_SPIKE_MULT, VOLATILITY_MAX, HIGH_PCT_THRESHOLD, FINAL_POOL)
         if clean_df.empty: continue
 
-        # 5. 评分 (***性能提升点：指标计算现在读取本地缓存***)
+        # 5. 评分 
         fdf_scored = compute_scores(clean_df, buy_date, MIN_MARKET_CAP, MAX_MARKET_CAP, VOL_SPIKE_MULT, VOLATILITY_MAX, HIGH_PCT_THRESHOLD)
         if fdf_scored.empty: continue
         
         fdf_scored = fdf_scored.sort_values('综合评分', ascending=False).head(top_k)
         
-        # 6. 计算收益 (买入价: buy_date 的收盘价)
+        # 6. 计算收益
         try:
             buy_date_cal_idx = all_trade_cals.index(buy_date)
         except ValueError:
@@ -770,7 +764,7 @@ def run_backtest(trade_dates, hold_days, top_k):
                     
                     sell_date = all_trade_cals[sell_cal_idx]
                     
-                    # 获取卖出日数据 (从预加载的全量 K 线数据中查询，避免 API 调用)
+                    # 获取卖出日数据 (从预加载的 K 线数据中查询)
                     if ts_code not in GLOBAL_KLINE_DATA: continue
                     
                     sell_data_row = GLOBAL_KLINE_DATA[ts_code]
@@ -779,7 +773,6 @@ def run_backtest(trade_dates, hold_days, top_k):
                     if sell_close_df.empty: continue
                     sell_close = sell_close_df.iloc[0]
                     
-                    # 收益率
                     ret = (sell_close / buy_close) - 1.0
                     results[h]['returns'].append(ret)
                     results[h]['total'] += 1
@@ -810,13 +803,12 @@ def run_backtest(trade_dates, hold_days, top_k):
 
 
 # ---------------------------
-# 实时选股主流程 
+# 实时选股主流程 (保持不变)
 # ---------------------------
 def live_stock_pick():
-    global GLOBAL_KLINE_DATA # 实时选股也利用 K 线缓存
+    global GLOBAL_KLINE_DATA 
     st.session_state['mode'] = 'live'
     
-    # 预加载 K 线数据（仅当日选股所需，start_date 可以设置为最近 90 天）
     start_date_90 = (datetime.strptime(last_trade, "%Y%m%d") - timedelta(days=90)).strftime("%Y%m%d")
     get_bulk_daily_data(start_date_90, last_trade)
     
@@ -888,18 +880,23 @@ if st.button('🟢 **运行当日选股**'):
 # 回测按钮
 if st.button('🟠 **启动回测** (N 天前买入, 持有 H 天, 收盘价计算)'):
     st.session_state['mode'] = 'backtest'
+    # 确保 BACKTEST_DAYS 是正数
+    if BACKTEST_DAYS <= 0:
+        st.error("回测天数必须大于 0。")
+        st.stop()
+        
     with st.spinner(f'正在获取过去 {BACKTEST_DAYS} 个交易日的数据并回测... (已启用网络重试)'):
         
         # 1. 获取回测交易日列表 (即买入日)
         today = datetime.strptime(last_trade, "%Y%m%d")
         start_date = (today - timedelta(days=BACKTEST_DAYS * 3)).strftime("%Y%m%d")
         
-        # **使用新的带重试机制的函数获取交易日历**
+        # **使用带重试机制的函数获取交易日历**
         all_trade_cals = get_all_trade_cals(start_date, last_trade)
         
         if len(all_trade_cals) < BACKTEST_DAYS + 1:
             st.error(f"【日历缺失】交易日历不足 {BACKTEST_DAYS} 天，或获取失败。请检查 Token 权限或降低回测天数。")
-            st.stop() # 如果日历获取失败，直接停止
+            st.stop() 
         
         # 正常获取到交易日历后继续执行
         try:
@@ -913,8 +910,13 @@ if st.button('🟠 **启动回测** (N 天前买入, 持有 H 天, 收盘价计�
         
         backtest_dates = all_trade_cals[start_idx:end_idx]
         
+        # *** 新增的 DEBUG 信息 ***
+        st.warning(f"DEBUG INFO: Trade Cal Length: {len(all_trade_cals)}, Last Trade Index: {last_trade_idx}, Start Index: {start_idx}, End Index: {end_idx}, Sliced Length: {len(backtest_dates)}")
+        # **************************
+
         if not backtest_dates:
-             st.error("【内部错误】回测日期列表为空。请检查回测天数和交易日历获取情况。")
+             # 修改错误信息，以便用户能区分问题
+             st.error(f"【内部错误】回测日期列表为空。计算索引：[{start_idx}:{end_idx}]，但列表长度为 {len(all_trade_cals)}。请检查回测天数和交易日历获取情况。")
              st.stop()
 
         # 2. 运行回测
@@ -937,8 +939,8 @@ st.markdown("### 小结与操作提示（简洁）")
 st.markdown("""
 - **当日选股**：点击 **🟢 运行当日选股**，执行原有的选股逻辑。
 - **回测**：点击 **🟠 启动回测**，软件将向后追溯 N 个交易日，每日使用您的选股参数选择 Top K 股票，并计算持有 H 天的平均收益率和胜率（按收盘价买卖）。
-- **健壮性提示**：**本次已对“全量 K 线数据”和“交易日历”这两项重要数据的获取都增加了网络重试保障**，极大地提高了回测启动的成功率。
-- **故障排除**：如果回测仍然失败，请重点检查日志中是否有以下警告，并根据建议调整侧边栏参数：
-    1.  **【日历缺失】**：Tushare `trade_cal` 接口权限问题或网络持续断开。
-    2.  **【过滤失败】**：某个回测日，您的筛选条件（价格、市值、换手率、波动率等）将所有股票都排除了。
+- **健壮性提示**：本次已对**“全量 K 线数据”**和**“交易日历”**这两项重要数据的获取都增加了网络重试保障。
+- **故障排除**：
+    - **请运行回测并将 `DEBUG INFO` 一行贴给我**。
+    - 如果日历获取成功但回测结果为空，请重点检查侧边栏的参数是否过于严格，导致每天选不出股票（例如：`最低换手率`、`最低成交额`、`最低价格`）。
 """)
