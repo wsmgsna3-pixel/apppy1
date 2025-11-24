@@ -16,6 +16,26 @@ from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings("ignore")
 
+
+# ---------------------------
+# Define select_stocks function (ensure it's placed before use)
+# ---------------------------
+def select_stocks(stock_list, start_date, end_date, pro):
+    selected = []
+    for stock in stock_list:
+        df = pro.daily(ts_code=stock, start_date=start_date, end_date=end_date)
+        if df.empty:
+            continue
+        latest_pct_chg = df['pct_chg'].iloc[-1]
+        if latest_pct_chg > 5:
+            selected.append(stock)
+    return selected
+
+# ---------------------------
+# Define stock_list (ensure it's defined)
+# ---------------------------
+stock_list = ['000001.SZ', '000002.SZ', '000003.SZ']  # Example list, replace with your own
+
 # ---------------------------
 # 页面设置
 # ---------------------------
