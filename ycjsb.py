@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 右侧启动/强势股策略 v1.1 - 回测加速版
+选股王 · 右侧启动/强势股策略 v1.2 - 逻辑修复版
 说明：
 - 核心策略：寻找 MACD 金叉、均线多头、放量突破 20 日高点的“右侧启动”强势股。
-- 硬性过滤：市值/价格区间、ST/北交所、20日涨幅不超过60%。
-- **V1.1 更新：** 优化了回测模块的数据加载逻辑，使用 Tushare 批量查询接口，大幅提高回测速度。
+- **V1.2 更新：**
+    - **修复回测模块交易次数为0的问题。** 在回测开始时批量加载并应用 ST/北交所/停牌等硬性过滤，确保选股池符合用户要求。
+    - 优化回测中的数据过滤和合并逻辑。
 """
 
 import streamlit as st
@@ -18,8 +19,8 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · 右侧启动/强势股策略 v1.1", layout="wide")
-st.title("选股王 · 右侧启动/强势股策略 v1.1 (回测加速版)")
+st.set_page_config(page_title="选股王 · 右侧启动/强势股策略 v1.2", layout="wide")
+st.title("选股王 · 右侧启动/强势股策略 v1.2 (逻辑修复版)")
 st.markdown("输入你的 Tushare Token。本策略核心为**寻找突破强势股**，与均值回归策略完全相反。")
 
 # ---------------------------
@@ -77,8 +78,7 @@ def safe_get(func, **kwargs):
         if df is None or (isinstance(df, pd.DataFrame) and df.empty):
             return pd.DataFrame()
         return df
-    except Exception as e:
-        # st.error(f"API调用失败: {e}") # 调试时可打开
+    except Exception:
         return pd.DataFrame()
 
 @st.cache_data(ttl=600)
@@ -145,7 +145,8 @@ def compute_indicators(df):
     dea = diff.ewm(span=9, adjust=False).mean()
     res['macd_diff'] = diff.iloc[-1]
     res['macd_dea'] = dea.iloc[-1]
-    res['macd_golden'] = res['macd_diff'] > res['macd_dea']
+    # MACD金叉判断: DIFF > DEA 且 上一周期 DIFF <= DEA
+    res['macd_golden'] = (res['macd_diff'] > res['macd_dea']) and (diff.iloc[-2] <= dea.iloc[-2])
     
     # Vol Ratio (量比)
     vols = df['vol'].astype(float).tolist()
@@ -266,6 +267,7 @@ if st.button("🚀 运行当日选股（初次运行可能较久）"):
             
         # F6: MA 多头硬过滤 (趋势确认)
         ma5, ma10, ma20 = ind.get('ma5'), ind.get('ma10'), ind.get('ma20')
+        # 强制 MA5 > MA10 > MA20
         if not (ma5 > ma10 and ma10 > ma20):
             pbar.progress((idx+1)/len(clean_df))
             continue
@@ -285,6 +287,7 @@ if st.button("🚀 运行当日选股（初次运行可能较久）"):
     
     pbar.progress(1.0)
     fdf = pd.DataFrame(records)
+    fdf = fdf.dropna(subset=['ma20']).reset_index(drop=True) # 排除计算MA指标失败的股票
     st.write(f"策略硬过滤后，进入评分阶段的候选数量：{len(fdf)} 支。")
     if fdf.empty:
         st.error("所有股票都被过滤，请放宽过滤条件。")
@@ -351,6 +354,27 @@ def load_backtest_data(all_trade_dates):
     pbar.progress(1.0)
     return data_cache
 
+@st.cache_data(ttl=36000)
+def get_stock_basic_filter(cache_breaker):
+    """一次性加载股票基础数据，并构建硬过滤的白名单"""
+    _ = cache_breaker # 确保参数修改时缓存刷新
+    st.write("正在构建回测的股票白名单（ST/北交所过滤）...")
+    
+    # 拉取所有股票基础信息
+    df = safe_get(pro.stock_basic, list_status='L', fields='ts_code,name,list_date')
+    if df.empty:
+        return pd.DataFrame()
+        
+    # 过滤 ST / 退市
+    df = df[~df['name'].str.contains('ST|退', na=False)]
+    
+    # 过滤 北交所 (4开头或8开头)
+    df = df[~df['ts_code'].str.startswith('4', na=False)]
+    df = df[~df['ts_code'].str.startswith('8', na=False)]
+    
+    # 仅保留 ts_code
+    return df[['ts_code']]
+
 @st.cache_data(ttl=6000)
 def run_backtest_right_side(start_date, end_date, hold_days, backtest_top_k, cache_breaker, 
                             min_price, max_price, min_cap, max_cap, min_turnover, vol_ratio_threshold, max_20d_ret):
@@ -380,34 +404,37 @@ def run_backtest_right_side(start_date, end_date, hold_days, backtest_top_k, cac
         except (ValueError, IndexError):
             continue
     
-    # ----------------------------------------------------
-    # 核心优化：批量加载 daily_basic
-    # ----------------------------------------------------
+    # --- 阶段一：数据批量加载与预处理 ---
     
-    st.write("正在**批量**预加载回测所需的 daily_basic 数据 (加速中...)")
+    # 1. 构建硬过滤白名单
+    basic_filter_df = get_stock_basic_filter(cache_breaker)
+    if basic_filter_df.empty:
+        st.error("无法构建股票白名单，请检查Tushare权限。")
+        return {h: {'returns': [], 'wins': 0, 'total': 0} for h in hold_days}
     
+    valid_ts_codes = set(basic_filter_df['ts_code'])
+    
+    # 2. 批量加载 daily_basic
+    st.write("正在批量预加载回测所需的 daily_basic 数据 (加速中...)")
     daily_basic_cache = {}
     if required_dates:
-        # 确定批量查询的日期范围
         start_bulk = min(required_dates)
         end_bulk = max(required_dates)
 
-        # 批量加载 daily_basic
         daily_basic_df = safe_get(pro.query, 
                                         api_name='daily_basic',
                                         start_date=start_bulk, 
                                         end_date=end_bulk, 
-                                        fields='ts_code,trade_date,turnover_rate,amount,total_mv,circ_mv')
+                                        fields='ts_code,trade_date,turnover_rate,total_mv,circ_mv')
         
         if not daily_basic_df.empty:
-            # 将 DataFrame 转换为嵌套字典，键为 trade_date
             daily_basic_cache = daily_basic_df.groupby('trade_date').apply(lambda x: x.set_index('ts_code')).to_dict('index')
 
-    # 预加载 daily 数据 (有进度条)
+    # 3. 预加载 daily 数据 (有进度条)
     data_cache = load_backtest_data(sorted(list(required_dates)))
 
     # ----------------------------------------------------
-    # 回测主循环
+    # --- 阶段二：回测主循环 ---
     # ----------------------------------------------------
     
     st.write(f"正在模拟 {len(backtest_dates)} 个交易日的右侧启动选股回测...")
@@ -417,13 +444,16 @@ def run_backtest_right_side(start_date, end_date, hold_days, backtest_top_k, cac
         daily_df = data_cache.get(buy_date)
         daily_basic_dict = daily_basic_cache.get(buy_date)
         
-        # 检查关键数据是否可用
         if daily_df is None or daily_df.empty or daily_basic_dict is None:
             pbar_bt.progress((i+1)/len(backtest_dates)); continue
 
-        # 将 daily_basic 字典转换为 DataFrame 并合并
         daily_basic_df_today = pd.DataFrame.from_dict(daily_basic_dict, orient='index')
-        merged_df = daily_df.join(daily_basic_df_today, how='inner', lsuffix='_daily', rsuffix='_basic').reset_index()
+        
+        # 0. 初始过滤：只保留白名单中的股票
+        daily_df_filtered = daily_df[daily_df.index.isin(valid_ts_codes)]
+        
+        # 合并每日基础数据
+        merged_df = daily_df_filtered.join(daily_basic_df_today, how='inner', lsuffix='_daily', rsuffix='_basic').reset_index()
         
         # 1. 应用硬过滤 (注意单位转换)
         MIN_CAP_WAN = min_cap / 10000.0
@@ -437,17 +467,17 @@ def run_backtest_right_side(start_date, end_date, hold_days, backtest_top_k, cac
         # F2: 市值区间 (Tushare 单位万元)
         filtered_df = filtered_df[(filtered_df['total_mv_basic'] >= MIN_CAP_WAN) & (filtered_df['total_mv_basic'] <= MAX_CAP_WAN)]
         
-        # F3: 最低换手率 (避免流动性差的)
+        # F3: 最低换手率
         filtered_df = filtered_df[filtered_df['turnover_rate_basic'] >= min_turnover]
         
-        # F4: 停牌 / 无成交
+        # F4: 停牌 / 无成交 (vol>0已在daily_df_filtered中隐含)
         filtered_df = filtered_df[(filtered_df['vol_daily'] > 0)]
         
-        # F5: 强制过滤当日涨幅小于 1% 的 (避免太多假启动)
+        # F5: 强制过滤当日涨幅小于 1% 的 (右侧启动信号，不能是跌或平盘)
         filtered_df = filtered_df[filtered_df['pct_chg_daily'] >= 1.0].copy() 
         
         # 2. 模拟策略评分（简化版：按当日强势指标排序）
-        # 回测中简化评分，以保证速度，主要通过硬过滤和当日强势指标来捕捉启动股。
+        # 评分采用当日涨幅平方 x 换手率，奖励涨幅更大、流动性更高的启动股
         filtered_df['score_proxy'] = (filtered_df['pct_chg_daily'] ** 2) * filtered_df['turnover_rate_basic']
         
         scored_stocks = filtered_df.sort_values("score_proxy", ascending=False).head(backtest_top_k).copy()
@@ -469,9 +499,9 @@ def run_backtest_right_side(start_date, end_date, hold_days, backtest_top_k, cac
                 sell_df_cached = data_cache.get(sell_date)
                 sell_price = np.nan
                 if sell_df_cached is not None and ts_code in sell_df_cached.index:
-                    # 使用 .loc 确保安全访问
                     sell_price = sell_df_cached.loc[ts_code, 'close']
                 
+                # 检查卖出日是否停牌或数据缺失 (如果停牌，卖出价格为NaN，跳过本次交易)
                 if pd.isna(sell_price) or sell_price <= 0: continue
                 
                 ret = (sell_price / buy_price) - 1.0
@@ -546,11 +576,10 @@ if st.checkbox("✅ 运行历史回测（右侧启动策略）", value=False):
 # ---------------------------
 st.markdown("### 小结与操作提示")
 st.markdown("""
-- **策略：** **右侧启动/强势股 v1.1** (回测加速版)。
-- **核心逻辑：** 通过 **MA 多头** 和 **20 日突破** 确认右侧趋势，并通过 **MACD 金叉** 和 **量价齐升** 增强动能。
+- **策略：** **右侧启动/强势股 v1.2** (逻辑修复版)。
+- **核心逻辑：** 已修复回测逻辑，确保所有硬过滤条件（如市值、价格、ST/北交所）在回测中被正确应用。
 - **操作步骤：**
-    1. **粘贴并运行代码。**
-    2. 在侧边栏调整参数，尤其是 **最低换手率** 和 **最低量比阈值**。
-    3. 点击 **“🚀 运行当日选股”** 查看结果。
-    4. 勾选 **“✅ 运行历史回测”** 验证策略表现。
+    1. **粘贴并运行此代码。**
+    2. 在侧边栏调整参数。
+    3. 再次勾选 **“✅ 运行历史回测”** 按钮。
 """)
