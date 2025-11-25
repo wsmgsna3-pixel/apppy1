@@ -36,11 +36,26 @@ def calculate_rsi(df, period=14):
     df['RSI'] = rsi
     return df
 
+# 筛选股票：根据成交量倍数、换手率、成交额等参数
+def filter_stocks(df, vol_ratio, min_turnover_rate, min_turnover, min_price, max_price):
+    # 成交量倍数过滤
+    df['vol_ratio'] = df['vol'] / df['vol'].rolling(window=5).mean()
+    df = df[df['vol_ratio'] > vol_ratio]  # 满足成交量倍数条件
+    
+    # 换手率和成交额过滤
+    df = df[df['turnover_rate'] >= min_turnover_rate]  # 满足最低换手率
+    df = df[df['turnover'] >= min_turnover]  # 满足最低成交额
+    
+    # 股价范围过滤
+    df = df[(df['close'] >= min_price) & (df['close'] <= max_price)]  # 股价在指定区间内
+    
+    return df
+
 # 评分系统
 def score_stock(df):
     score = 0
     
-    # 突破强度评分
+    # 评分：加入突破强度、RSI等
     df['breakout'] = df['close'] > df['close'].shift(5)  # 突破前期5天的最高价
     score += df['breakout'].sum()  # 如果突破，则给分数
     
@@ -53,22 +68,7 @@ def score_stock(df):
     df['RSI_signal'] = df['RSI'] < 30  # RSI小于30为买入信号
     score += df['RSI_signal'].sum()  # 如果RSI为买入信号，则加分
     
-    # 均线交叉评分：5日均线穿越20日均线
-    df['MA_cross'] = df['MA_5'] > df['MA_20']
-    score += df['MA_cross'].sum()  # 如果均线交叉为买入信号，则加分
-    
     return score
-
-# 筛选股票：右侧刚启动或者20日涨幅不超过60%
-def filter_stocks(df):
-    # 条件1：价格突破前期高点
-    df['breakout'] = df['close'] > df['close'].shift(5)  # 假设前期高点为5日前的最高点
-    # 条件2：过去20个交易日涨幅不超过60%
-    df['within_60'] = df['20d_return'] <= 60
-    
-    # 筛选符合两个条件的股票
-    df = df[(df['breakout'] == True) & (df['within_60'] == True)]
-    return df
 
 # 回测逻辑
 def backtest(df):
@@ -93,34 +93,46 @@ def main():
     # 手动输入Tushare token
     token = st.text_input("请输入Tushare API Token：")
     
-    if token:
-        stock_code = st.text_input("股票代码", "000001.SZ")
-        start_date = st.date_input("开始日期", pd.to_datetime("2022-01-01"))
-        end_date = st.date_input("结束日期", pd.to_datetime("2023-01-01"))
+    # 使用侧边栏来调整参数
+    stock_code = st.sidebar.text_input("股票代码", "000001.SZ")
+    start_date = st.sidebar.date_input("开始日期", pd.to_datetime("2022-01-01"))
+    end_date = st.sidebar.date_input("结束日期", pd.to_datetime("2023-01-01"))
+    
+    # 添加侧边栏参数
+    vol_ratio = st.sidebar.slider("放量倍数阈值 (vol_last > vol_ma5 * x)", 1.0, 3.0, 1.7)
+    min_turnover_rate = st.sidebar.slider("最低换手率 (%)", 0.0, 10.0, 2.5)
+    min_turnover = st.sidebar.number_input("最低成交额 (元)", 10000000, 1000000000, 20000000)
+    min_price = st.sidebar.number_input("最低价格 (元)", 0.0, 200.0, 10.0)
+    max_price = st.sidebar.number_input("最高价格 (元)", 0.0, 200.0, 200.0)
+    
+    # 清洗后取前M进评分
+    top_k = st.sidebar.number_input("界面显示 Top K", 1, 100, 20)
+    
+    if token and stock_code:
+        df = get_stock_data(stock_code, start_date.strftime("%Y%m%d"), end_date.strftime("%Y%m%d"), token)
+        df = calculate_ma(df, 5)
+        df = calculate_ma(df, 20)  # 添加20日均线
+        df = calculate_20d_return(df)
         
-        if stock_code:
-            df = get_stock_data(stock_code, start_date.strftime("%Y%m%d"), end_date.strftime("%Y%m%d"), token)
-            df = calculate_ma(df, 5)
-            df = calculate_ma(df, 20)  # 添加20日均线
-            df = calculate_20d_return(df)
-            df = filter_stocks(df)
-            
-            # 显示选股结果
-            st.write("筛选出的股票：")
-            st.write(df[['trade_date', 'close', 'MA_5', 'MA_20', '20d_return']])
+        # 筛选股票
+        df = filter_stocks(df, vol_ratio, min_turnover_rate, min_turnover, min_price, max_price)
+        
+        # 显示选股结果
+        st.write("筛选出的股票：")
+        st.write(df[['trade_date', 'close', 'MA_5', 'MA_20', '20d_return', 'vol_ratio']])
 
-            # 显示评分
-            score = score_stock(df)
-            st.write(f"股票评分: {score}")
+        # 显示评分
+        score = score_stock(df)
+        st.write(f"股票评分: {score}")
 
-            # 添加回测按钮
-            if st.button('开始回测'):
-                final_capital = backtest(df)
-                st.write(f"回测后资金: {final_capital:.2f} 元")
+        # 添加回测按钮
+        if st.button('开始回测'):
+            final_capital = backtest(df)
+            st.write(f"回测后资金: {final_capital:.2f} 元")
 
-                # 绘制回测图表
-                st.write("股票数据与均线：")
-                st.line_chart(df[['close', 'MA_5', 'MA_20']])
+            # 绘制回测图表
+            st.write("股票数据与均线：")
+            st.line_chart(df[['close', 'MA_5', 'MA_20']])
 
 # 启动Streamlit
 if __name__ == "__main__":
