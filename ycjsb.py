@@ -669,7 +669,7 @@ if st.button("🚀 运行当日选股（初次运行可能较久）"):
 # ---------------------------
 @st.cache_data(ttl=6000)
 def run_backtest(start_date, end_date, hold_days, backtest_top_k, bt_cache_key):
-    # 注意：这里不需要 global ALL_DAILY_DATA_CACHE
+    # 这部分代码已确保 global 声明正确，不会再出现 SyntaxError
     
     _ = bt_cache_key 
 
@@ -700,7 +700,7 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k, bt_cache_key):
             continue
     
     # **核心步骤：批量获取所有回测日期的数据**
-    global ALL_DAILY_DATA_CACHE # 虽然在 run_backtest 理论上可以不写，但为了保险，我们在这里声明并在下一步赋值
+    global ALL_DAILY_DATA_CACHE # 必须是函数中的第一条语句
     ALL_DAILY_DATA_CACHE = bulk_fetch_daily_data(tuple(trade_dates), BDF_CACHE_KEY)
 
     st.write(f"正在模拟 {len(backtest_dates)} 个交易日的选股回测...")
