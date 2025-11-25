@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 右侧启动/强势股策略 v1.0
+选股王 · 右侧启动/强势股策略 v1.1 - 回测加速版
 说明：
 - 核心策略：寻找 MACD 金叉、均线多头、放量突破 20 日高点的“右侧启动”强势股。
 - 硬性过滤：市值/价格区间、ST/北交所、20日涨幅不超过60%。
-- 回测模块：加入 1/3/5 天持股回测，以验证短期表现。
+- **V1.1 更新：** 优化了回测模块的数据加载逻辑，使用 Tushare 批量查询接口，大幅提高回测速度。
 """
 
 import streamlit as st
@@ -18,8 +18,8 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · 右侧启动/强势股策略 v1.0", layout="wide")
-st.title("选股王 · 右侧启动/强势股策略 v1.0")
+st.set_page_config(page_title="选股王 · 右侧启动/强势股策略 v1.1", layout="wide")
+st.title("选股王 · 右侧启动/强势股策略 v1.1 (回测加速版)")
 st.markdown("输入你的 Tushare Token。本策略核心为**寻找突破强势股**，与均值回归策略完全相反。")
 
 # ---------------------------
@@ -68,11 +68,17 @@ pro = ts.pro_api()
 def safe_get(func, **kwargs):
     """安全调用 API，若失败则返回空 DataFrame。"""
     try:
-        df = func(**kwargs)
+        # 使用 pro.query() 进行批量查询
+        if func == pro.query:
+             df = pro.query(kwargs.pop('api_name'), **kwargs)
+        else:
+            df = func(**kwargs)
+            
         if df is None or (isinstance(df, pd.DataFrame) and df.empty):
             return pd.DataFrame()
         return df
-    except Exception:
+    except Exception as e:
+        # st.error(f"API调用失败: {e}") # 调试时可打开
         return pd.DataFrame()
 
 @st.cache_data(ttl=600)
@@ -145,7 +151,8 @@ def compute_indicators(df):
     vols = df['vol'].astype(float).tolist()
     if len(vols) >= 6:
         avg_prev5 = np.mean(vols[-6:-1])
-        res['vol_ratio'] = vols[-1] / (avg_prev5 + 1e-9)
+        # 防止除以零
+        res['vol_ratio'] = vols[-1] / (avg_prev5 + 1e-9) if avg_prev5 > 0 else 1.0
     else:
         res['vol_ratio'] = np.nan
         
@@ -219,9 +226,7 @@ if st.button("🚀 运行当日选股（初次运行可能较久）"):
     # F1: 价格区间
     clean_df = clean_df[(clean_df['close'] >= MIN_PRICE) & (clean_df['close'] <= MAX_PRICE)]
     
-    # F2: 市值区间 (兼容万元/元单位，这里统一按 Tushare 接口返回的单位，通常是万元)
-    # Tushare 的 total_mv/circ_mv 默认单位是万元
-    # 将 MIN_MARKET_CAP 和 MAX_MARKET_CAP 转换为万元
+    # F2: 市值区间 (Tushare 的 total_mv/circ_mv 默认单位是万元)
     MIN_CAP_WAN = MIN_MARKET_CAP / 10000.0
     MAX_CAP_WAN = MAX_MARKET_CAP / 10000.0
     clean_df = clean_df[(clean_df['total_mv_basic'] >= MIN_CAP_WAN) & (clean_df['total_mv_basic'] <= MAX_CAP_WAN)]
@@ -247,7 +252,6 @@ if st.button("🚀 运行当日选股（初次运行可能较久）"):
     
     for idx, row in clean_df.iterrows():
         ts_code = row['ts_code']
-        name = row['name']
         
         hist = get_hist_cached(ts_code, last_trade, days=60) # 60日历史数据足够
         ind = compute_indicators(hist)
@@ -366,7 +370,7 @@ def run_backtest_right_side(start_date, end_date, hold_days, backtest_top_k, cac
     buy_dates_pool = [d for d in trade_dates if d >= bt_start and d <= end_date]
     backtest_dates = buy_dates_pool[-BACKTEST_DAYS:]
     
-    # 确定回测所需的全部交易日，并预加载数据
+    # 确定回测所需的全部交易日
     required_dates = set(backtest_dates)
     for buy_date in backtest_dates:
         try:
@@ -375,34 +379,51 @@ def run_backtest_right_side(start_date, end_date, hold_days, backtest_top_k, cac
                 required_dates.add(trade_dates[current_index + h])
         except (ValueError, IndexError):
             continue
-            
+    
+    # ----------------------------------------------------
+    # 核心优化：批量加载 daily_basic
+    # ----------------------------------------------------
+    
+    st.write("正在**批量**预加载回测所需的 daily_basic 数据 (加速中...)")
+    
+    daily_basic_cache = {}
+    if required_dates:
+        # 确定批量查询的日期范围
+        start_bulk = min(required_dates)
+        end_bulk = max(required_dates)
+
+        # 批量加载 daily_basic
+        daily_basic_df = safe_get(pro.query, 
+                                        api_name='daily_basic',
+                                        start_date=start_bulk, 
+                                        end_date=end_bulk, 
+                                        fields='ts_code,trade_date,turnover_rate,amount,total_mv,circ_mv')
+        
+        if not daily_basic_df.empty:
+            # 将 DataFrame 转换为嵌套字典，键为 trade_date
+            daily_basic_cache = daily_basic_df.groupby('trade_date').apply(lambda x: x.set_index('ts_code')).to_dict('index')
+
+    # 预加载 daily 数据 (有进度条)
     data_cache = load_backtest_data(sorted(list(required_dates)))
 
-    # 预加载 daily_basic, moneyflow 等用于回测硬过滤
-    st.write("正在预加载回测所需的 daily_basic/moneyflow 数据...")
-    daily_basic_cache = {}
-    moneyflow_cache = {}
-    for date in required_dates:
-        daily_basic_cache[date] = safe_get(pro.daily_basic, trade_date=date).set_index('ts_code')
-        mf_raw = safe_get(pro.moneyflow, trade_date=date)
-        if not mf_raw.empty:
-            col = next((c for c in ['net_mf','net_mf_amount'] if c in mf_raw.columns), None)
-            if col:
-                 moneyflow_cache[date] = mf_raw[['ts_code', col]].rename(columns={col:'net_mf'}).set_index('ts_code')
-
+    # ----------------------------------------------------
+    # 回测主循环
+    # ----------------------------------------------------
     
     st.write(f"正在模拟 {len(backtest_dates)} 个交易日的右侧启动选股回测...")
     pbar_bt = st.progress(0)
     
     for i, buy_date in enumerate(backtest_dates):
         daily_df = data_cache.get(buy_date)
-        daily_basic_df = daily_basic_cache.get(buy_date)
+        daily_basic_dict = daily_basic_cache.get(buy_date)
         
-        if daily_df is None or daily_df.empty or daily_basic_df is None or daily_basic_df.empty:
+        # 检查关键数据是否可用
+        if daily_df is None or daily_df.empty or daily_basic_dict is None:
             pbar_bt.progress((i+1)/len(backtest_dates)); continue
 
-        # 合并每日基础数据
-        merged_df = daily_df.join(daily_basic_df, how='inner', lsuffix='_daily', rsuffix='_basic').reset_index()
+        # 将 daily_basic 字典转换为 DataFrame 并合并
+        daily_basic_df_today = pd.DataFrame.from_dict(daily_basic_dict, orient='index')
+        merged_df = daily_df.join(daily_basic_df_today, how='inner', lsuffix='_daily', rsuffix='_basic').reset_index()
         
         # 1. 应用硬过滤 (注意单位转换)
         MIN_CAP_WAN = min_cap / 10000.0
@@ -422,14 +443,12 @@ def run_backtest_right_side(start_date, end_date, hold_days, backtest_top_k, cac
         # F4: 停牌 / 无成交
         filtered_df = filtered_df[(filtered_df['vol_daily'] > 0)]
         
-        # 2. 模拟策略评分（简化版：按 MACD 金叉 + 量比 + 涨幅综合排序）
-        # 此处无法在回测中逐日计算 MACD/20日突破，简化为按当日强势指标排序
-        
-        # 简化版评分逻辑: 涨幅 * 量比 * 换手率
-        filtered_df['score_proxy'] = filtered_df['pct_chg_daily'] * filtered_df['turnover_rate_basic']
-        
-        # 强制过滤当日涨幅小于 1% 的 (避免太多假突破被选入，提高启动质量)
+        # F5: 强制过滤当日涨幅小于 1% 的 (避免太多假启动)
         filtered_df = filtered_df[filtered_df['pct_chg_daily'] >= 1.0].copy() 
+        
+        # 2. 模拟策略评分（简化版：按当日强势指标排序）
+        # 回测中简化评分，以保证速度，主要通过硬过滤和当日强势指标来捕捉启动股。
+        filtered_df['score_proxy'] = (filtered_df['pct_chg_daily'] ** 2) * filtered_df['turnover_rate_basic']
         
         scored_stocks = filtered_df.sort_values("score_proxy", ascending=False).head(backtest_top_k).copy()
         
@@ -450,6 +469,7 @@ def run_backtest_right_side(start_date, end_date, hold_days, backtest_top_k, cac
                 sell_df_cached = data_cache.get(sell_date)
                 sell_price = np.nan
                 if sell_df_cached is not None and ts_code in sell_df_cached.index:
+                    # 使用 .loc 确保安全访问
                     sell_price = sell_df_cached.loc[ts_code, 'close']
                 
                 if pd.isna(sell_price) or sell_price <= 0: continue
@@ -497,6 +517,7 @@ if st.checkbox("✅ 运行历史回测（右侧启动策略）", value=False):
         except:
             start_date_for_cal = (datetime.now() - timedelta(days=200)).strftime("%Y%m%d")
             
+        # 运行回测函数
         backtest_result = run_backtest_right_side(
             start_date=start_date_for_cal,
             end_date=last_trade,
@@ -525,7 +546,7 @@ if st.checkbox("✅ 运行历史回测（右侧启动策略）", value=False):
 # ---------------------------
 st.markdown("### 小结与操作提示")
 st.markdown("""
-- **策略：** **右侧启动/强势股 v1.0**。
+- **策略：** **右侧启动/强势股 v1.1** (回测加速版)。
 - **核心逻辑：** 通过 **MA 多头** 和 **20 日突破** 确认右侧趋势，并通过 **MACD 金叉** 和 **量价齐升** 增强动能。
 - **操作步骤：**
     1. **粘贴并运行代码。**
