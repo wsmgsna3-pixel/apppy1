@@ -6,6 +6,8 @@
 - **语法修复：** 强制将 run_backtest 函数中的 global 声明提前到函数开头。
 """
 
+# V5.0S Fix Attempt 7: TUESDAY NOV 25 - Final Confirmed Code
+
 import streamlit as st
 import pandas as pd
 import numpy as np
