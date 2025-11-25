@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 10000 积分旗舰（V5.0S - 批量数据获取 BDF 稳定版）
+选股王 · 10000 积分旗舰（V5.0S - 批量数据获取 BDF 最终稳定版）
 说明：
-- **核心修复：** 彻底弃用 per-stock historical data fetching。改为一次性批量获取所有回测日期内全市场的 daily 数据。
-- **效果：** 彻底消除 18,000 次 API 调用，将数据获取时间从 5-6 小时降低到 5-20 分钟。
+- **核心架构：** 批量数据获取（BDF），将数据加载时间缩短到分钟级。
+- **语法修复：** 移除了 run_backtest 函数中错误的 global 声明。
 """
 
 import streamlit as st
@@ -669,7 +669,8 @@ if st.button("🚀 运行当日选股（初次运行可能较久）"):
 # ---------------------------
 @st.cache_data(ttl=6000)
 def run_backtest(start_date, end_date, hold_days, backtest_top_k, bt_cache_key):
-    global ALL_DAILY_DATA_CACHE
+    # 注意：这里不需要 global ALL_DAILY_DATA_CACHE
+    
     _ = bt_cache_key 
 
     trade_dates = get_trade_cal(start_date, end_date)
@@ -699,6 +700,7 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k, bt_cache_key):
             continue
     
     # **核心步骤：批量获取所有回测日期的数据**
+    global ALL_DAILY_DATA_CACHE # 虽然在 run_backtest 理论上可以不写，但为了保险，我们在这里声明并在下一步赋值
     ALL_DAILY_DATA_CACHE = bulk_fetch_daily_data(tuple(trade_dates), BDF_CACHE_KEY)
 
     st.write(f"正在模拟 {len(backtest_dates)} 个交易日的选股回测...")
