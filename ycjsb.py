@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 10000 积分旗舰（V5.0S - 批量数据获取 BDF 最终稳定版 - 解决 global 错误）
+选股王 · 10000 积分旗舰（V5.0T - 缓存传递版 - 彻底消除 global 错误）
 说明：
-- **核心架构：** 批量数据获取（BDF），将数据加载时间缩短到分钟级。
-- **语法修复：** 强制将 run_backtest 函数中的 global 声明提前到函数开头。
+- **核心架构：** 缓存传递 (CT)，取代 global 变量来传递批量数据。
+- **语法修复：** 彻底移除 global 关键字，保证兼容性。
 """
 
-# V5.0S Fix Attempt 7: TUESDAY NOV 25 - Final Confirmed Code
+# V5.0T Final Code: Eliminate global keyword by passing cache via function argument
 
 import streamlit as st
 import pandas as pd
@@ -18,7 +18,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # ---------------------------
-# V5.0S BDF 配置
+# V5.0T CT 配置
 # ---------------------------
 # 数据加载缓存键（用于 Streamlit 缓存批量数据）
 BDF_CACHE_KEY = 2.0 
@@ -26,9 +26,9 @@ BDF_CACHE_KEY = 2.0
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · 10000旗舰（V5.0S-BDF 稳定版）", layout="wide")
-st.title("选股王 · 10000 积分旗舰（V5.0S - 批量数据获取 BDF）")
-st.markdown("### 🚀 终极稳定版：数据获取速度提升至分钟级")
+st.set_page_config(page_title="选股王 · 10000旗舰（V5.0T-缓存传递版）", layout="wide")
+st.title("选股王 · 10000 积分旗舰（V5.0T - 缓存传递版）")
+st.markdown("### 🚀 终极稳定版：彻底消除 global 语法错误")
 st.markdown("输入你的 Tushare Token（仅本次运行使用）。")
 
 # ---------------------------
@@ -119,6 +119,7 @@ st.info(f"参考最近交易日：{last_trade}")
 def bulk_fetch_daily_data(trade_dates_tuple, bdf_key):
     """
     一次性批量获取所有回测日期内的全市场 daily 数据。
+    返回：数据缓存字典 data_cache
     """
     _ = bdf_key # 用于手动刷新数据缓存
     data_cache = {}
@@ -137,23 +138,22 @@ def bulk_fetch_daily_data(trade_dates_tuple, bdf_key):
     return data_cache
 
 # ---------------------------
-# **核心修改：历史数据提取 (使用 BDF 缓存)**
+# **核心修改：历史数据提取 (使用缓存字典)**
 # ---------------------------
 
-# 全局变量，用于存储批量数据
-ALL_DAILY_DATA_CACHE = None 
-
-def get_hist_from_bulk(ts_code, end_date, days=60, trade_dates_list=None):
+def get_hist_from_bulk(ts_code, end_date, data_cache, trade_dates_list, days=60):
     """
-    从全局的 ALL_DAILY_DATA_CACHE 中提取单票历史数据。
+    从传入的 data_cache 中提取单票历史数据。
     """
-    global ALL_DAILY_DATA_CACHE
-    
-    if ALL_DAILY_DATA_CACHE is None or not trade_dates_list:
+    if data_cache is None or not trade_dates_list:
         return pd.DataFrame()
     
     # 找到所有需要的日期
-    end_date_index = trade_dates_list.index(end_date)
+    try:
+        end_date_index = trade_dates_list.index(end_date)
+    except ValueError:
+        return pd.DataFrame()
+        
     # 留足冗余，确保能覆盖 days 参数所需
     start_index = max(0, end_date_index - days * 2) 
     
@@ -162,7 +162,7 @@ def get_hist_from_bulk(ts_code, end_date, days=60, trade_dates_list=None):
     history_list = []
     
     for date in required_dates:
-        daily_df = ALL_DAILY_DATA_CACHE.get(date)
+        daily_df = data_cache.get(date)
         if daily_df is not None:
             # 在全市场数据中查找这只股票
             stock_data = daily_df[daily_df['ts_code'] == ts_code]
@@ -321,18 +321,18 @@ def norm_col(s):
     return (s - mn) / (mx - mn)
 
 # ---------------------------
-# 选股逻辑主函数 (使用 BDF)
+# 选股逻辑主函数 (使用缓存字典)
 # ---------------------------
-def compute_scores(trade_date, trade_dates_list):
+def compute_scores(trade_date, trade_dates_list, data_cache):
     """
     运行 T 日的选股、清洗和评分逻辑，获取综合评分。
+    接受 data_cache 字典作为参数。
     """
-    global ALL_DAILY_DATA_CACHE
     
     # ---------------------------
     # 1. 拉当日涨幅榜初筛（使用 BDF 缓存）
     # ---------------------------
-    daily_all_raw = ALL_DAILY_DATA_CACHE.get(trade_date)
+    daily_all_raw = data_cache.get(trade_date)
     if daily_all_raw is None or daily_all_raw.empty:
         # 如果当日数据缓存缺失，尝试直接从 Tushare 获取（仅在实时选股时有用）
         daily_all = safe_get(pro.daily, trade_date=trade_date)
@@ -498,8 +498,8 @@ def compute_scores(trade_date, trade_dates_list):
         turnover_rate = getattr(row, 'turnover_rate', np.nan)
         net_mf = float(getattr(row, 'net_mf', 0.0))
         
-        # 核心：调用 BDF 版本的历史数据提取函数
-        hist = get_hist_from_bulk(ts_code, trade_date, days=60, trade_dates_list=trade_dates_list)
+        # 核心：调用 缓存传递 版本的历史数据提取函数
+        hist = get_hist_from_bulk(ts_code, trade_date, data_cache, trade_dates_list, days=60)
         ind = compute_indicators(hist)
 
         vol_ratio = ind.get('vol_ratio', np.nan)
@@ -639,12 +639,13 @@ if st.button("🚀 运行当日选股（初次运行可能较久）"):
     # 实时选股也需要历史数据，预加载 120 天日历
     temp_start = (datetime.strptime(last_trade, "%Y%m%d") - timedelta(days=120)).strftime("%Y%m%d")
     temp_trade_dates = get_trade_cal(temp_start, last_trade)
-    global ALL_DAILY_DATA_CACHE
-    # 实时选股依赖 BDF，但只加载近期的
+    
+    # 1. 获取 BDF 缓存数据
     ALL_DAILY_DATA_CACHE = bulk_fetch_daily_data(tuple(temp_trade_dates), BDF_CACHE_KEY) 
     
     st.write("正在拉取当日 daily 数据并计算评分...")
-    fdf = compute_scores(last_trade, temp_trade_dates)
+    # 2. 传入缓存数据
+    fdf = compute_scores(last_trade, temp_trade_dates, ALL_DAILY_DATA_CACHE)
 
     if fdf.empty:
         st.error("评分计算失败或无数据，请检查 Token 权限与接口。")
@@ -667,11 +668,11 @@ if st.button("🚀 运行当日选股（初次运行可能较久）"):
 
 
 # ---------------------------
-# 历史回测部分（BDF 稳定版）
+# 历史回测部分（缓存传递稳定版）
 # ---------------------------
 @st.cache_data(ttl=6000)
 def run_backtest(start_date, end_date, hold_days, backtest_top_k, bt_cache_key):
-    global ALL_DAILY_DATA_CACHE # <--- 修复后的位置！
+    # 彻底移除 global ALL_DAILY_DATA_CACHE
     
     _ = bt_cache_key 
 
@@ -701,7 +702,7 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k, bt_cache_key):
         except (ValueError, IndexError):
             continue
     
-    # **核心步骤：批量获取所有回测日期的数据**
+    # **核心步骤：批量获取所有回测日期的数据（缓存在本地字典中）**
     ALL_DAILY_DATA_CACHE = bulk_fetch_daily_data(tuple(trade_dates), BDF_CACHE_KEY)
 
     st.write(f"正在模拟 {len(backtest_dates)} 个交易日的选股回测...")
@@ -709,8 +710,8 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k, bt_cache_key):
     
     for i, t_day in enumerate(backtest_dates): # T 日 (选股日)
         
-        # 1. 运行 T 日选股与评分逻辑 (现在 get_hist_from_bulk 是瞬时完成的)
-        t_scores = compute_scores(t_day, trade_dates) 
+        # 1. 运行 T 日选股与评分逻辑，传入缓存字典
+        t_scores = compute_scores(t_day, trade_dates, ALL_DAILY_DATA_CACHE) 
         
         if t_scores.empty:
             pbar_bt.progress((i+1)/len(backtest_dates)); continue
@@ -792,7 +793,7 @@ if st.checkbox("✅ 运行历史回测", value=False):
     if not HOLD_DAYS_OPTIONS:
         st.warning("请至少选择一个回测持股天数。")
     else:
-        st.header("📈 历史回测结果（V5.0S-BDF 稳定版 / 趋势策略）")
+        st.header("📈 历史回测结果（V5.0T-缓存传递版 / 趋势策略）")
         
         try:
             start_date_for_cal = (datetime.strptime(last_trade, "%Y%m%d") - timedelta(days=200)).strftime("%Y%m%d")
