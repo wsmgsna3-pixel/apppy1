@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 10000 积分旗舰（V4.7 最终优化版 - 均值回归/回调策略）
+选股王 · 10000 积分旗舰（V4.9 最终版 - T+1 开盘买入修复）
 说明：
-- **V4.7 核心优化：** 解除回测中当日涨幅 1.5% 的硬编码限制，放宽至 3.0%，允许策略买入“小幅强势”的股票，以改善纯回调策略的持续亏损问题。
-- **参数定制：** 默认参数已调整为用户定制的股票池（价格/市值过滤）。
+- **V4.9 核心修复：** 修复回测买入逻辑，改为 **T+1 日开盘价买入**，以完全贴合用户“夜间选股，次日开盘买入”的实盘操作。
+- **回测买入价：** T+1 日的开盘价 (open)。
+- **回测卖出价：** 持股期结束当天的收盘价 (close)。
+- **选股逻辑：** 强制筛选当日收阴的股票（回调低吸）。
 """
 
 import streamlit as st
@@ -17,8 +19,8 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · 10000旗舰（均值回归 V4.7）", layout="wide")
-st.title("选股王 · 10000 积分旗舰（V4.7 最终优化版 - 均值回归策略）")
+st.set_page_config(page_title="选股王 · 10000旗舰（均值回归 V4.9 - T+1 开盘买入）", layout="wide")
+st.title("选股王 · 10000 积分旗舰（V4.9 最终版 - T+1 开盘买入修复）")
 st.markdown("输入你的 Tushare Token（仅本次运行使用）。若有权限缺失，脚本会自动降级并继续运行。")
 
 # ---------------------------
@@ -59,7 +61,7 @@ with st.sidebar:
     # 使用最低涨幅代理缓存破坏键
     BT_MIN_PCT_FOR_CACHE = float(st.number_input("回测：最低涨幅 (缓存破坏键)", value=-3.0, step=0.5))
     
-    st.caption("提示：**本次回测强制使用均值回归策略。**")
+    st.caption("提示：**本次回测强制使用 T 日收阴低吸策略。**")
 
 # ---------------------------
 # Token 输入（主区）
@@ -685,7 +687,9 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k, bt_min_pct_for
         try:
             current_index = trade_dates.index(buy_date)
             for h in hold_days:
-                required_dates.add(trade_dates[current_index + h])
+                # 预加载买入日(T+1)和卖出日(T+1+h)
+                required_dates.add(trade_dates[current_index + 1])
+                required_dates.add(trade_dates[current_index + 1 + h])
         except (ValueError, IndexError):
             continue
             
@@ -695,6 +699,7 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k, bt_min_pct_for
     pbar_bt = st.progress(0)
     
     for i, buy_date in enumerate(backtest_dates):
+        # buy_date 是 T 日（信号生成日）
         daily_df_cached = data_cache.get(buy_date)
         
         if daily_df_cached is None or daily_df_cached.empty:
@@ -710,13 +715,13 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k, bt_min_pct_for
         daily_df['amount_yuan'] = daily_df['amount'].fillna(0) * 1000.0 # 转换成元
         
         
-        # 过滤：V4.7 均值回归策略：寻找回调/盘整的股票
+        # 过滤：V4.9 盘中低吸优化：寻找回调的股票 (当日收阴)
         daily_df = daily_df[
             (daily_df['close'] >= MIN_PRICE) & 
             (daily_df['close'] <= MAX_PRICE) &
             (daily_df['amount_yuan'] >= BACKTEST_MIN_AMOUNT_PROXY) & 
-            (daily_df['pct_chg'] >= -3.0) & # **策略调整：允许小幅回调 (最低 -3.0%)**
-            (daily_df['pct_chg'] <= 3.0) &  # **V4.7 修复：最高涨幅放宽至 3.0% (允许小幅强势)**
+            (daily_df['pct_chg'] >= -9.9) & # **策略调整：允许大幅回调 (最低 -9.9%)**
+            (daily_df['pct_chg'] < 0.0) &   # **V4.9 核心：强制筛选当日收阴的股票（回调）**
             (daily_df['vol'] > 0) & 
             (daily_df['amount_yuan'] > 0)
         ].copy()
@@ -725,24 +730,41 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k, bt_min_pct_for
         daily_df['is_zt'] = (daily_df['open'] == daily_df['high']) & (daily_df['pct_chg'] > 9.5)
         daily_df = daily_df[~daily_df['is_zt']].copy()
         
-        # 2. 模拟评分：v4.5 选股逻辑强制改为按【成交量】排序
-        # 这确保我们选择的是在盘整/回调区间内，流动性最高的股票。
+        # 2. 模拟评分：按【成交量】排序，选择 T 日流动性最高的股票。
         scored_stocks = daily_df.sort_values("vol", ascending=False).head(backtest_top_k).copy()
         
+        
+        # --- 核心：确定 T+1 日开盘价买入 ---
+        try:
+            current_index = trade_dates.index(buy_date)
+            actual_buy_date = trade_dates[current_index + 1] # T+1 日
+        except (ValueError, IndexError):
+            pbar_bt.progress((i+1)/len(backtest_dates)); continue
+
+        actual_buy_df_cached = data_cache.get(actual_buy_date)
+        if actual_buy_df_cached is None or actual_buy_df_cached.empty:
+            pbar_bt.progress((i+1)/len(backtest_dates)); continue
+        # --- 核心结束 ---
+
         for _, row in scored_stocks.iterrows():
             ts_code = row['ts_code']
-            buy_price = float(row['close']) # 买入收盘价
+            
+            # 尝试在 T+1 日以开盘价买入
+            buy_price = np.nan
+            if ts_code in actual_buy_df_cached.index:
+                buy_price = float(actual_buy_df_cached.loc[ts_code, 'open']) # **T+1 日的开盘价 (open) 作为买入价**
             
             if pd.isna(buy_price) or buy_price <= 0: continue
 
             for h in hold_days:
+                # 卖出日：从 T+1 日开始算持股 h 天
                 try:
-                    current_index = trade_dates.index(buy_date)
-                    sell_date = trade_dates[current_index + h]
+                    sell_index = trade_dates.index(actual_buy_date)
+                    sell_date = trade_dates[sell_index + h]
                 except (ValueError, IndexError):
                     continue
         
-                # 从缓存中查找卖出价格 (O(1) 查找)
+                # 从缓存中查找卖出价格 (T+1+h 日收盘价)
                 sell_df_cached = data_cache.get(sell_date)
                 sell_price = np.nan
                 if sell_df_cached is not None and ts_code in sell_df_cached.index:
@@ -785,7 +807,7 @@ if st.checkbox("✅ 运行历史回测", value=False):
     if not HOLD_DAYS_OPTIONS:
         st.warning("请至少选择一个回测持股天数。")
     else:
-        st.header("📈 历史回测结果（买入收盘价 / 卖出收盘价）")
+        st.header("📈 历史回测结果（T+1 开盘价买入 / 收盘价卖出）")
         
         try:
             start_date_for_cal = (datetime.strptime(last_trade, "%Y%m%d") - timedelta(days=200)).strftime("%Y%m%d")
