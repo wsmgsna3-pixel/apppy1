@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 10000 积分旗舰（V6.4 - 缓存稳定性修复 + 趋势延续）
+选股王 · 10000 积分旗舰（V5.0 趋势策略 - 缓存稳定版）
 说明：
-- **V6.4 核心修复：** 引入核心缓存版本号，允许修改策略逻辑（如评分和过滤）而不会导致耗时的历史数据缓存失效。
-- **策略：** 寻找趋势中的强势股（收阳股），T+1 开盘价买入。
-- **已移除：** MA 多头硬过滤，解决交易次数为 0 的问题。
+- **V5.0S 核心修复：** 引入核心缓存版本号，允许修改策略逻辑（如评分和过滤）而不会导致耗时的历史数据缓存失效。
+- **策略：** 趋势延续策略（找收阳强势股），T+1 开盘价买入。
+- **已移除：** 导致交易次数为 0 的 MA 多头硬过滤。
 """
 
 import streamlit as st
@@ -16,17 +16,17 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # ---------------------------
-# V6.4 缓存稳定性变量
+# V5.0S 缓存稳定性变量
 # ---------------------------
 # 只有手动修改此版本号（例如改为 1.1），才会强制清空 get_hist_cached 的历史数据缓存。
-V6_CORE_CACHE_VERSION = 1.0 
+V5_CORE_CACHE_VERSION = 1.0 
 
 
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · 10000旗舰（V6.4 - 稳定版）", layout="wide")
-st.title("选股王 · 10000 积分旗舰（V6.4 - 趋势延续 + 缓存稳定）")
+st.set_page_config(page_title="选股王 · 10000旗舰（V5.0S - 稳定版）", layout="wide")
+st.title("选股王 · 10000 积分旗舰（V5.0S - 趋势策略 + 缓存稳定）")
 st.markdown("输入你的 Tushare Token（仅本次运行使用）。若有权限缺失，脚本会自动降级并继续运行。")
 
 # ---------------------------
@@ -54,7 +54,7 @@ with st.sidebar:
     BACKTEST_TOP_K = int(st.number_input("回测每日最多交易 K 支", value=3, min_value=1, max_value=10))
     HOLD_DAYS_OPTIONS = st.multiselect("回测持股天数", options=[1, 3, 5, 10, 20], default=[1, 3, 5])
     # 新增参数，用于强制缓存失效
-    BT_CACHE_KEY = float(st.number_input("回测：缓存破坏键（任意改动刷新回测）", value=1.24, step=0.01))
+    BT_CACHE_KEY = float(st.number_input("回测：缓存破坏键（任意改动刷新回测）", value=1.25, step=0.01))
     st.caption("提示：本次回测为 **T+1 日开盘价买入** 趋势策略。")
 
 
@@ -112,11 +112,11 @@ st.info(f"参考最近交易日：{last_trade}")
 
 
 # ---------------------------
-# 选股逻辑 (使用 V6.4 的缓存稳定性)
+# 选股逻辑 (使用 V5.0S 的缓存稳定性)
 # ---------------------------
-# V6.4 核心优化：延长历史数据缓存至 24 小时 (86400秒)，并添加版本控制
+# V5.0S 核心优化：延长历史数据缓存至 24 小时 (86400秒)，并添加版本控制
 @st.cache_data(ttl=86400) 
-def get_hist_cached(ts_code, end_date, days=60, code_version=V6_CORE_CACHE_VERSION): 
+def get_hist_cached(ts_code, end_date, days=60, code_version=V5_CORE_CACHE_VERSION): 
     """获取单只股票的历史数据"""
     try:
         start = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=days*2)).strftime("%Y%m%d")
@@ -440,8 +440,8 @@ def compute_scores(trade_date):
         turnover_rate = getattr(row, 'turnover_rate', np.nan)
         net_mf = float(getattr(row, 'net_mf', 0.0))
         
-        # V6.4 核心修改：增加 code_version 参数，保证稳定性
-        hist = get_hist_cached(ts_code, trade_date, days=60, code_version=V6_CORE_CACHE_VERSION)
+        # V5.0S 核心修改：增加 code_version 参数，保证稳定性
+        hist = get_hist_cached(ts_code, trade_date, days=60, code_version=V5_CORE_CACHE_VERSION)
         ind = compute_indicators(hist)
 
         vol_ratio = ind.get('vol_ratio', np.nan)
@@ -489,25 +489,25 @@ def compute_scores(trade_date):
         return pd.DataFrame()
 
     # ---------------------------
-    # 5. 风险过滤 (MA 多头过滤放在评分后)
+    # 5. 风险过滤 (策略核心部分)
     # ---------------------------
     try:
-        # A: 高位大阳线 -> last_close > ma20*1.10 且 pct_chg > HIGH_PCT_THRESHOLD
+        # A: 高位大阳线过滤 (V5.0保留)
         if all(c in fdf.columns for c in ['ma20','last_close','pct_chg']):
             mask_high_big = (fdf['last_close'] > fdf['ma20'] * 1.10) & (fdf['pct_chg'] > HIGH_PCT_THRESHOLD)
             fdf = fdf[~mask_high_big]
 
-        # B: 下跌途中反抽 -> prev3_sum < 0 且 pct_chg > HIGH_PCT_THRESHOLD (保留)
+        # B: 下跌途中反抽过滤 (V5.0保留)
         if all(c in fdf.columns for c in ['prev3_sum','pct_chg']):
             mask_down_rebound = (fdf['prev3_sum'] < 0) & (fdf['pct_chg'] > HIGH_PCT_THRESHOLD)
             fdf = fdf[~mask_down_rebound]
 
-        # C: 巨量放量大阳 -> vol_ratio > VOL_SPIKE_MULT
+        # C: 巨量放量大阳过滤 (V5.0保留)
         if 'vol_ratio' in fdf.columns:
             mask_vol_spike = fdf['vol_ratio'] > VOL_SPIKE_MULT
             fdf = fdf[~mask_vol_spike]
 
-        # D: 极端波动 -> volatility_10 > VOLATILITY_MAX
+        # D: 极端波动过滤 (V5.0保留)
         if 'volatility_10' in fdf.columns:
             mask_volatility = fdf['volatility_10'] > VOLATILITY_MAX
             fdf = fdf[~mask_volatility]
@@ -515,9 +515,8 @@ def compute_scores(trade_date):
         pass
 
     # ---------------------------
-    # 6. MA 多头硬过滤 (已临时注释)
+    # 6. MA 多头硬过滤 (已移除，V5.0S 不进行硬过滤)
     # ---------------------------
-    # 这部分是导致交易次数为0的主要原因，现已移除硬过滤
     try:
         if all(c in fdf.columns for c in ['ma5','ma10','ma20']):
             # fdf = fdf[(fdf['ma5'] > fdf['ma10']) & (fdf['ma10'] > fdf['ma20'])].copy() 
@@ -526,7 +525,7 @@ def compute_scores(trade_date):
         pass
 
     # ---------------------------
-    # 7. RSL、归一化与评分 (保持不变)
+    # 7. RSL、归一化与评分 (保持V5.0/V6.0逻辑)
     # ---------------------------
     if '10d_return' in fdf.columns:
         try:
@@ -614,9 +613,9 @@ if st.button("🚀 运行当日选股（初次运行可能较久）"):
 
 
 # ---------------------------
-# 历史回测部分（V6.4 稳定版）
+# 历史回测部分（V5.0S 稳定版）
 # ---------------------------
-# V6.4 核心优化：延长回测数据缓存至 24 小时 (86400秒)
+# V5.0S 核心优化：延长回测数据缓存至 24 小时 (86400秒)
 @st.cache_data(ttl=86400)
 def load_backtest_data(all_trade_dates):
     """预加载所有回测日期的 daily 数据，以字典 {trade_date: DataFrame} 缓存。"""
@@ -665,7 +664,7 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k, bt_cache_key):
         except (ValueError, IndexError):
             continue
             
-    # V6.4 核心：这里加载数据（如果有缓存，会跳过 API 调用）
+    # V5.0S 核心：这里加载数据（如果有缓存，会跳过 API 调用）
     data_cache = load_backtest_data(sorted(list(required_dates)))
 
     st.write(f"正在模拟 {len(backtest_dates)} 个交易日的选股回测...")
@@ -698,7 +697,7 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k, bt_cache_key):
             # 确定买入价 (T+1 日开盘价)
             buy_price = np.nan
             if t_plus_1_df_cached is not None and ts_code in t_plus_1_df_cached.index:
-                # V6.4 核心修正：使用 T+1 日的 open price
+                # V5.0S 核心修正：使用 T+1 日的 open price
                 buy_price = t_plus_1_df_cached.loc[ts_code, 'open'] 
             
             if pd.isna(buy_price) or buy_price <= 0: continue
@@ -714,7 +713,7 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k, bt_cache_key):
                 sell_df_cached = data_cache.get(sell_date)
                 sell_price = np.nan
                 if sell_df_cached is not None and ts_code in sell_df_cached.index:
-                    # V6.4 修正：使用 T+1+H 日的 close price
+                    # V5.0S 修正：使用 T+1+H 日的 close price
                     sell_price = sell_df_cached.loc[ts_code, 'close']
                 
                 if pd.isna(sell_price) or sell_price <= 0: continue
@@ -754,7 +753,7 @@ if st.checkbox("✅ 运行历史回测", value=False):
     if not HOLD_DAYS_OPTIONS:
         st.warning("请至少选择一个回测持股天数。")
     else:
-        st.header("📈 历史回测结果（V6.4 稳定版 / 无 MA 强过滤）")
+        st.header("📈 历史回测结果（V5.0S 稳定版 / 趋势策略）")
         
         try:
             start_date_for_cal = (datetime.strptime(last_trade, "%Y%m%d") - timedelta(days=200)).strftime("%Y%m%d")
@@ -790,12 +789,12 @@ if st.checkbox("✅ 运行历史回测", value=False):
 # ---------------------------
 # 小结与操作提示（简洁）
 # ---------------------------
-st.markdown("### 小结与操作提示（V6.4 重点）")
+st.markdown("### 小结与操作提示（V5.0S 稳定版重点）")
 st.markdown("""
-- **状态：** **趋势加强策略版 v6.4**（已修复缓存重置问题，消除了频繁更换代码导致的长时间等待）。
-- **缓存策略：** 只有手动修改代码第 33 行的 `V6_CORE_CACHE_VERSION`，才会重置历史数据缓存。
-- **操作步骤：** 1. **请使用上方 V6.4 完整代码替换您的脚本内容。**
-    2. **关键步骤：** 由于更换代码，您必须进行**最后一次**低负荷缓存重建。
+- **状态：** **趋势加强策略版 v5.0S**（已彻底修复缓存重置问题）。
+- **缓存策略：** 只有手动修改代码第 33 行的 `V5_CORE_CACHE_VERSION`，才会重置历史数据缓存。
+- **操作步骤：** 1. **请使用上方 V5.0S 完整代码替换您的脚本内容。**
+    2. **关键步骤（最后一次等待）：** 确保您停止了之前的运行后，进行最后一次低负荷缓存重建：
         - 将 **“回测交易日天数”** 设为 **20**。
         - 将 **“清洗后取前 M 进入评分”** 设为 **50**。
     3. **运行回测**。这次运行预计耗时 **10-30 分钟**。
