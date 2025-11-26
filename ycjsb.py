@@ -745,11 +745,12 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k, bt_cache_key):
             ts_code = row['ts_code']
 
             # 确定买入价 (T+1 日开盘价)
-            buy_price = np.nan
+                        buy_price = np.nan
             if t_plus_1_df_cached is not None:
                 stock_data = t_plus_1_df_cached[t_plus_1_df_cached['ts_code'] == ts_code]
+                if not stock_data.empty:
                     buy_price = stock_data['open'].iloc[0]
-            
+
             if pd.isna(buy_price) or buy_price <= 0: continue
 
             for h in hold_days:
