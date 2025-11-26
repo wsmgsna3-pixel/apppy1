@@ -3,7 +3,7 @@
 选股王 · 10000 积分旗舰（V5.0X - 最终平衡修正版 - 锁定市值上限）
 说明：
 - **核心架构：** 缓存传递 (CT)。
-- **策略调整：** V5.0X 平衡权重定稿，修复超大市值股票混入的问题。
+- **策略调整：** V5.0X 平衡权重定稿，修复超大市值股票混入和回测缩进问题。
 """
 
 # V5.0X Final Code: Balanced Trend Weight Adjustment with Market Cap FIX
@@ -745,12 +745,12 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k, bt_cache_key):
             ts_code = row['ts_code']
 
             # 确定买入价 (T+1 日开盘价)
-                        buy_price = np.nan
+            buy_price = np.nan
             if t_plus_1_df_cached is not None:
                 stock_data = t_plus_1_df_cached[t_plus_1_df_cached['ts_code'] == ts_code]
                 if not stock_data.empty:
                     buy_price = stock_data['open'].iloc[0]
-
+            
             if pd.isna(buy_price) or buy_price <= 0: continue
 
             for h in hold_days:
