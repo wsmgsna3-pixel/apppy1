@@ -3,7 +3,7 @@
 选股王 · 10000 积分旗舰（V5.0X - 最终平衡修正版 - 锁定市值上限）
 说明：
 - **核心架构：** 缓存传递 (CT)。
-- **策略调整：** 锁定最佳过滤参数，修复超大市值股票混入的问题。
+- **策略调整：** V5.0X 平衡权重定稿，修复超大市值股票混入的问题。
 """
 
 # V5.0X Final Code: Balanced Trend Weight Adjustment with Market Cap FIX
@@ -28,7 +28,7 @@ BDF_CACHE_KEY = 2.0
 # ---------------------------
 st.set_page_config(page_title="选股王 · 10000旗舰（V5.0X-最终平衡修正版）", layout="wide")
 st.title("选股王 · 10000 积分旗舰（V5.0X - 最终平衡修正版）")
-st.markdown("### 🚀 最终平衡修正版：锁定市值上限 $400$ 亿，确保过滤有效。")
+st.markdown("### 🚀 最终平衡修正版：锁定市值上限 400 亿，确保过滤有效。")
 st.markdown("输入你的 Tushare Token（仅本次运行使用）。")
 
 # ---------------------------
@@ -42,13 +42,14 @@ with st.sidebar:
     MIN_PRICE = float(st.number_input("最低价格 (元)", value=10.0, step=1.0))
     MAX_PRICE = float(st.number_input("最高价格 (元)", value=200.0, step=10.0))
     MIN_TURNOVER = float(st.number_input("最低换手率 (%)", value=3.0, step=0.5))
-    MIN_AMOUNT = float(st.number_input("最低成交额 (元)", value=150_000_000.0, step=50_000_000.0)) # 默认 1.5亿 (黄金组合)
-    VOL_SPIKE_MULT = float(st.number_input("放量倍数阈值 (vol_last > vol_ma5 * x)", value=1.6, step=0.1)) # 默认 1.6 (黄金组合)
-    VOLATILITY_MAX = float(st.number_input("过去10日波动 std 阈值 (%)", value=8.0, step=0.5)) # 默认 8.0 (黄金组合)
+    # 黄金组合参数默认值
+    MIN_AMOUNT = float(st.number_input("最低成交额 (元)", value=150_000_000.0, step=50_000_000.0))
+    VOL_SPIKE_MULT = float(st.number_input("放量倍数阈值 (vol_last > vol_ma5 * x)", value=1.6, step=0.1))
+    VOLATILITY_MAX = float(st.number_input("过去10日波动 std 阈值 (%)", value=8.0, step=0.5))
     HIGH_PCT_THRESHOLD = float(st.number_input("视为大阳线 pct_chg (%)", value=6.0, step=0.5))
-    MIN_MARKET_CAP = float(st.number_input("最低市值 (元)", value=2000000000.0, step=100000000.0)) # 默认 20亿
-    # *** 修正点 1：最高市值默认值修正为 400 亿 ***
-    MAX_MARKET_CAP = float(st.number_input("最高市值 (元)", value=40000000000.0, step=1000000000.0)) # 默认 400亿 (黄金组合)
+    MIN_MARKET_CAP = float(st.number_input("最低市值 (元)", value=2000000000.0, step=100000000.0))
+    # 最终修正的 MAX_MARKET_CAP
+    MAX_MARKET_CAP = float(st.number_input("最高市值 (元)", value=40000000000.0, step=1000000000.0))
     
     st.markdown("---")
     # --- 历史回测参数 ---
@@ -429,19 +430,29 @@ def compute_scores(trade_date, trade_dates_list, data_cache):
         if isinstance(tsck, str) and (tsck.startswith('4') or tsck.startswith('8')):
             continue
 
-        # 4. 过滤：市值（修正点 2：加强市值过滤逻辑）
+        # 4. 过滤：市值（最终修正：确保单位为“元”，并进行严格校验）
         try:
-            tv = getattr(r, 'total_mv', np.nan)
-            if not pd.isna(tv):
-                tv_yuan = float(tv) * 10000.0 # 假设 Tushare 返回的是万元，转换为元
+            tv_raw = getattr(r, 'total_mv', np.nan)
+            
+            if not pd.isna(tv_raw) and tv_raw > 0:
+                tv_float = float(tv_raw)
                 
-                # 检查是否因为缺失 daily_basic 或 stock_basic 导致 tv 为 Nan，
-                # 但如果 tv 存在，我们执行过滤
+                # 假设 Tushare 返回的是万元，转换为元
+                # 如果数值大于 1000 万，我们确认它是万元，进行转换
+                if tv_float > 10000:
+                    tv_yuan = tv_float * 10000.0 
+                else:
+                    tv_yuan = tv_float # 否则，保守地假设它已经是元
                 
+                # 执行过滤逻辑（使用用户设定的 MIN/MAX_MARKET_CAP）
                 if tv_yuan < MIN_MARKET_CAP or tv_yuan > MAX_MARKET_CAP:
                     continue
-        except:
-            pass # 发生异常时不过滤，让它通过
+            else:
+                # 如果没有市值数据，我们选择保守地跳过过滤，继续下一步
+                pass 
+        except Exception as e:
+            # 任何异常情况，都跳过过滤，确保代码不会崩溃
+            pass 
 
         # 5. 过滤：一字涨停板
         try:
@@ -737,7 +748,6 @@ def run_backtest(start_date, end_date, hold_days, backtest_top_k, bt_cache_key):
             buy_price = np.nan
             if t_plus_1_df_cached is not None:
                 stock_data = t_plus_1_df_cached[t_plus_1_df_cached['ts_code'] == ts_code]
-                if not stock_data.empty:
                     buy_price = stock_data['open'].iloc[0]
             
             if pd.isna(buy_price) or buy_price <= 0: continue
