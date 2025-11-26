@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 10000 积分旗舰（V5.0X - 最终平衡修正版 - 鲁棒性回退）
+选股王 · 10000 积分旗舰（V5.1 - 最终稳定版 - 双重过滤强化）
 说明：
 - **核心架构：** 缓存传递 (CT)。
 - **策略调整：** V5.0X 最终权重定稿。
-- **最终修正：** 市值过滤逻辑回退：仅在市值有效时才过滤，允许缺失市值数据通过（避免空结果）。
+- **V5.1 修正：** 1. 强化大市值过滤：统一单位，确保大盘股不逃逸。
+    2. 新增新股过滤：上市天数不足 60 天的股票强制过滤。
 """
 
-# V5.0X Final Code: Robustness Rollback of Market Cap Filter
+# V5.1 Final Code: Dual Filter Enhanced
 
 import streamlit as st
 import pandas as pd
@@ -19,17 +20,19 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # ---------------------------
-# V5.0X CT 配置
+# V5.1 CT 配置
 # ---------------------------
 # 数据加载缓存键（用于 Streamlit 缓存批量数据）
 BDF_CACHE_KEY = 2.0 
+# 新股过滤天数
+MIN_LISTING_DAYS = 60 # 上市至少 60 天
 
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · 10000旗舰（V5.0X-最终平衡修正版）", layout="wide")
-st.title("选股王 · 10000 积分旗舰（V5.0X - 最终平衡修正版）")
-st.markdown("### 🚀 鲁棒性回退版：市值过滤逻辑调整，修复由于数据缺失导致的“无数据”错误。")
+st.set_page_config(page_title="选股王 · 10000旗舰（V5.1-最终稳定版）", layout="wide")
+st.title("选股王 · 10000 积分旗舰（V5.1 - 最终稳定版）")
+st.markdown("### 🚀 双重过滤强化版：修复大市值股和新股混入问题。")
 st.markdown("输入你的 Tushare Token（仅本次运行使用）。")
 
 # ---------------------------
@@ -353,6 +356,7 @@ def compute_scores(trade_date, trade_dates_list, data_cache):
     # ---------------------------
     # 2. 尝试加载高级接口
     # ---------------------------
+    # 关键：加载 list_date, total_mv (for fallback)
     stock_basic = safe_get(pro.stock_basic, list_status='L', fields='ts_code,name,industry,list_date,total_mv,circ_mv')
     daily_basic = safe_get(pro.daily_basic, trade_date=trade_date, fields='ts_code,turnover_rate,amount,total_mv,circ_mv')
     mf_raw = safe_get(pro.moneyflow, trade_date=trade_date)
@@ -370,15 +374,19 @@ def compute_scores(trade_date, trade_dates_list, data_cache):
         
     # merge stock_basic
     if not stock_basic.empty:
-        keep = [c for c in ['ts_code','name','industry','total_mv','circ_mv'] if c in stock_basic.columns]
+        # 关键：获取 list_date
+        keep = [c for c in ['ts_code','name','industry','list_date','total_mv','circ_mv'] if c in stock_basic.columns]
         try:
             pool0 = pool0.merge(stock_basic[keep], on='ts_code', how='left')
         except Exception:
             pool0['name'] = pool0['ts_code']; pool0['industry'] = ''
+            pool0['list_date'] = np.nan
     else:
         pool0['name'] = pool0['ts_code']; pool0['industry'] = ''
+        pool0['list_date'] = np.nan
         
     # merge daily_basic
+    # daily_basic 的 total_mv 会覆盖 stock_basic 的 total_mv
     pool_merged = safe_merge_pool(pool0, daily_basic, ['turnover_rate','amount','total_mv','circ_mv'])
     pool_merged.rename(columns={'amount': 'amount_basic'}, inplace=True) # daily_basic的amount
     
@@ -401,6 +409,10 @@ def compute_scores(trade_date, trade_dates_list, data_cache):
     # ---------------------------
     # 3. 基本清洗
     # ---------------------------
+    
+    # 准备上市天数计算
+    trade_date_dt = datetime.strptime(trade_date, "%Y%m%d").date()
+    
     clean_list = []
     # 统一使用 daily 里的 amount（单位千元） 和 daily_basic 里的 turnover_rate（单位 %）
     for i, r in enumerate(pool_merged.itertuples()):
@@ -433,32 +445,36 @@ def compute_scores(trade_date, trade_dates_list, data_cache):
         if isinstance(tsck, str) and (tsck.startswith('4') or tsck.startswith('8')):
             continue
 
-        # 4. 过滤：市值（最终修正：要求市值数据必须有效且在设定区间内）
+        # 4. 过滤：新股过滤 (V5.1 关键修正)
+        list_date_str = getattr(r, 'list_date', None)
+        if list_date_str:
+            try:
+                list_date_dt = datetime.strptime(str(list_date_str), "%Y%m%d").date()
+                if (trade_date_dt - list_date_dt).days < MIN_LISTING_DAYS:
+                    continue # 强制过滤上市不足 MIN_LISTING_DAYS 的新股
+            except:
+                pass # 解析失败则放行 (但大盘股过滤会兜底)
+
+
+        # 5. 过滤：市值（V5.1 关键修正：强制统一单位和过滤）
         tv_yuan = np.nan
         try:
             tv_raw = getattr(r, 'total_mv', np.nan)
-            
             if not pd.isna(tv_raw) and tv_raw > 0:
                 tv_float = float(tv_raw)
-                
-                # Tushare市值通常为万元。如果数值较大，则进行万元到元的转换
-                if tv_float > 10000:
-                    tv_yuan = tv_float * 10000.0 
-                else:
-                    tv_yuan = tv_float # 小于1万，可能是已是元或异常数据，保守处理
+                # 强制统一单位：假设 Tushare 返回的是万元，转换为元
+                tv_yuan = tv_float * 10000.0 
         except Exception:
-            tv_yuan = np.nan # 转换失败，视为无效市值
+            tv_yuan = np.nan 
 
-        # ---- 核心修正区域：鲁棒性回退 ----
-        # 仅在市值数据有效时，才执行过滤。如果缺失，则跳过过滤（允许通过，防止空结果）
+        # 严格过滤市值超限股票
         if not pd.isna(tv_yuan) and tv_yuan > 0:
-            # 严格过滤市值超限股票（上次需要解决的问题）
             if tv_yuan < MIN_MARKET_CAP or tv_yuan > MAX_MARKET_CAP:
                 continue 
-        # ---------------------------------
+        # 注意：如果市值缺失或无效，根据V5.0X回退逻辑，则跳过市值过滤，允许通过。
 
 
-        # 5. 过滤：一字涨停板
+        # 6. 过滤：一字涨停板
         try:
             high = getattr(r, 'high', np.nan); low = getattr(r, 'low', np.nan)
             if (not pd.isna(open_p) and not pd.isna(high) and not pd.isna(low) and not pd.isna(pre_close)):
@@ -467,7 +483,7 @@ def compute_scores(trade_date, trade_dates_list, data_cache):
         except:
             pass # 发生异常时不过滤
 
-        # 6. 过滤：换手率
+        # 7. 过滤：换手率
         if not pd.isna(turnover):
             try:
                 if float(turnover) < MIN_TURNOVER: 
@@ -475,13 +491,13 @@ def compute_scores(trade_date, trade_dates_list, data_cache):
             except:
                 pass # 发生异常时不过滤
 
-        # 7. 过滤：成交额（修正单位：daily amount是千元）
+        # 8. 过滤：成交额（修正单位：daily amount是千元）
         if not pd.isna(amount_daily):
             amt = amount_daily * 1000.0 # 转换成元
             if amt < MIN_AMOUNT: 
                 continue
 
-        # 8. 过滤：T 日收阳过滤
+        # 9. 过滤：T 日收阳过滤
         try:
             if float(pct) < 0: 
                 continue
@@ -808,7 +824,7 @@ if st.checkbox("✅ 运行历史回测", value=False):
     if not HOLD_DAYS_OPTIONS:
         st.warning("请至少选择一个回测持股天数。")
     else:
-        st.header("📈 历史回测结果（V5.0X-最终平衡修正版 / 趋势策略）")
+        st.header("📈 历史回测结果（V5.1-最终稳定版 / 趋势策略）")
         
         try:
             start_date_for_cal = (datetime.strptime(last_trade, "%Y%m%d") - timedelta(days=200)).strftime("%Y%m%d")
