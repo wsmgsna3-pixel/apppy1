@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 10000 积分旗舰（V5.0X - 最终平衡版 - 趋势权重 48%）
+选股王 · 10000 积分旗舰（V5.0X - 最终平衡修正版 - 锁定市值上限）
 说明：
-- **核心架构：** 缓存传递 (CT)，彻底消除 global 错误。
-- **策略调整：** 锁定最佳过滤参数，趋势权重微调至 48%，旨在稳定 3天收益并保持 1天收益优势。
+- **核心架构：** 缓存传递 (CT)。
+- **策略调整：** 锁定最佳过滤参数，修复超大市值股票混入的问题。
 """
 
-# V5.0X Final Code: Balanced Trend Weight Adjustment
+# V5.0X Final Code: Balanced Trend Weight Adjustment with Market Cap FIX
 
 import streamlit as st
 import pandas as pd
@@ -26,9 +26,9 @@ BDF_CACHE_KEY = 2.0
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · 10000旗舰（V5.0X-最终平衡版）", layout="wide")
-st.title("选股王 · 10000 积分旗舰（V5.0X - 最终平衡版）")
-st.markdown("### 🚀 最终平衡版：趋势权重 48%，在短线爆发和中期稳定性之间寻求最优解")
+st.set_page_config(page_title="选股王 · 10000旗舰（V5.0X-最终平衡修正版）", layout="wide")
+st.title("选股王 · 10000 积分旗舰（V5.0X - 最终平衡修正版）")
+st.markdown("### 🚀 最终平衡修正版：锁定市值上限 $400$ 亿，确保过滤有效。")
 st.markdown("输入你的 Tushare Token（仅本次运行使用）。")
 
 # ---------------------------
@@ -42,12 +42,13 @@ with st.sidebar:
     MIN_PRICE = float(st.number_input("最低价格 (元)", value=10.0, step=1.0))
     MAX_PRICE = float(st.number_input("最高价格 (元)", value=200.0, step=10.0))
     MIN_TURNOVER = float(st.number_input("最低换手率 (%)", value=3.0, step=0.5))
-    MIN_AMOUNT = float(st.number_input("最低成交额 (元)", value=100_000_000.0, step=50_000_000.0)) # 默认 1亿
-    VOL_SPIKE_MULT = float(st.number_input("放量倍数阈值 (vol_last > vol_ma5 * x)", value=1.7, step=0.1))
-    VOLATILITY_MAX = float(st.number_input("过去10日波动 std 阈值 (%)", value=12.0, step=0.5))
+    MIN_AMOUNT = float(st.number_input("最低成交额 (元)", value=150_000_000.0, step=50_000_000.0)) # 默认 1.5亿 (黄金组合)
+    VOL_SPIKE_MULT = float(st.number_input("放量倍数阈值 (vol_last > vol_ma5 * x)", value=1.6, step=0.1)) # 默认 1.6 (黄金组合)
+    VOLATILITY_MAX = float(st.number_input("过去10日波动 std 阈值 (%)", value=8.0, step=0.5)) # 默认 8.0 (黄金组合)
     HIGH_PCT_THRESHOLD = float(st.number_input("视为大阳线 pct_chg (%)", value=6.0, step=0.5))
     MIN_MARKET_CAP = float(st.number_input("最低市值 (元)", value=2000000000.0, step=100000000.0)) # 默认 20亿
-    MAX_MARKET_CAP = float(st.number_input("最高市值 (元)", value=50000000000.0, step=1000000000.0)) # 默认 500亿
+    # *** 修正点 1：最高市值默认值修正为 400 亿 ***
+    MAX_MARKET_CAP = float(st.number_input("最高市值 (元)", value=40000000000.0, step=1000000000.0)) # 默认 400亿 (黄金组合)
     
     st.markdown("---")
     # --- 历史回测参数 ---
@@ -428,19 +429,19 @@ def compute_scores(trade_date, trade_dates_list, data_cache):
         if isinstance(tsck, str) and (tsck.startswith('4') or tsck.startswith('8')):
             continue
 
-        # 4. 过滤：市值（兼容万元单位）
+        # 4. 过滤：市值（修正点 2：加强市值过滤逻辑）
         try:
             tv = getattr(r, 'total_mv', np.nan)
             if not pd.isna(tv):
-                tv = float(tv)
-                if tv > 1e6:
-                    tv_yuan = tv * 10000.0
-                else:
-                    tv_yuan = tv
+                tv_yuan = float(tv) * 10000.0 # 假设 Tushare 返回的是万元，转换为元
+                
+                # 检查是否因为缺失 daily_basic 或 stock_basic 导致 tv 为 Nan，
+                # 但如果 tv 存在，我们执行过滤
+                
                 if tv_yuan < MIN_MARKET_CAP or tv_yuan > MAX_MARKET_CAP:
                     continue
         except:
-            pass # 发生异常时不过滤
+            pass # 发生异常时不过滤，让它通过
 
         # 5. 过滤：一字涨停板
         try:
@@ -619,14 +620,14 @@ def compute_scores(trade_date, trade_dates_list, data_cache):
 
     # 核心调整区域：最终综合评分（趋势主导） - V5.0X 最终平衡版
     fdf['综合评分'] = (
-        fdf['trend_score'] * 0.48 +      # 趋势得分 (0.50 -> 0.48)
-        fdf.get('s_10d', 0)*0.10 +       # 10日收益 (不变)
-        fdf.get('s_rsl', 0)*0.09 +       # 相对强度 (0.07 -> 0.09)
-        fdf.get('s_volratio', 0)*0.07 +  # 量比得分 (不变)
-        fdf.get('s_turn', 0)*0.05 +      # 换手率得分 (不变)
-        fdf.get('s_money', 0)*0.10 +     # 资金得分 (不变)
-        fdf.get('s_pct', 0)*0.09 +       # 当日涨幅 (0.11 -> 0.09) - 略降激进性
-        fdf.get('s_volatility', 0)*0.02   # 波动率得分 (0.00 -> 0.02)
+        fdf['trend_score'] * 0.48 +      # 趋势得分
+        fdf.get('s_10d', 0)*0.10 +       # 10日收益
+        fdf.get('s_rsl', 0)*0.09 +       # 相对强度 
+        fdf.get('s_volratio', 0)*0.07 +  # 量比得分 
+        fdf.get('s_turn', 0)*0.05 +      # 换手率得分 
+        fdf.get('s_money', 0)*0.10 +     # 资金得分 
+        fdf.get('s_pct', 0)*0.09 +       # 当日涨幅 
+        fdf.get('s_volatility', 0)*0.02   # 波动率得分 
     )
     
     return fdf
@@ -793,7 +794,7 @@ if st.checkbox("✅ 运行历史回测", value=False):
     if not HOLD_DAYS_OPTIONS:
         st.warning("请至少选择一个回测持股天数。")
     else:
-        st.header("📈 历史回测结果（V5.0X-最终平衡版 / 趋势策略）")
+        st.header("📈 历史回测结果（V5.0X-最终平衡修正版 / 趋势策略）")
         
         try:
             start_date_for_cal = (datetime.strptime(last_trade, "%Y%m%d") - timedelta(days=200)).strftime("%Y%m%d")
