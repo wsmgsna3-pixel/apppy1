@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 10000 积分旗舰（V5.0X - 最终平衡修正版 - 锁定市值上限）
+选股王 · 10000 积分旗舰（V5.0X - 最终平衡修正版 - 鲁棒性强化）
 说明：
 - **核心架构：** 缓存传递 (CT)。
-- **策略调整：** V5.0X 平衡权重定稿，修复超大市值股票混入和回测缩进问题。
-- **最终修正：** 强化市值过滤逻辑，对缺失市值的股票执行强制过滤。
+- **策略调整：** V5.0X 最终权重定稿。
+- **鲁棒性强化：** 默认参数放宽，并强制过滤市值缺失或超限的股票。
 """
 
-# V5.0X Final Code: Balanced Trend Weight Adjustment with Market Cap FIX (Aggressive)
+# V5.0X Final Code: Robustness Enhanced with Market Cap FIX (Aggressive)
 
 import streamlit as st
 import pandas as pd
@@ -29,7 +29,7 @@ BDF_CACHE_KEY = 2.0
 # ---------------------------
 st.set_page_config(page_title="选股王 · 10000旗舰（V5.0X-最终平衡修正版）", layout="wide")
 st.title("选股王 · 10000 积分旗舰（V5.0X - 最终平衡修正版）")
-st.markdown("### 🚀 最终平衡修正版：锁定市值上限 400 亿，确保过滤有效。")
+st.markdown("### 🚀 鲁棒性强化版：默认参数更宽松，确保数据缺失时程序不崩溃，并强制过滤市值超限股票。")
 st.markdown("输入你的 Tushare Token（仅本次运行使用）。")
 
 # ---------------------------
@@ -37,14 +37,15 @@ st.markdown("输入你的 Tushare Token（仅本次运行使用）。")
 # ---------------------------
 with st.sidebar:
     st.header("可调参数（策略核心）")
+    # 默认值使用更宽松的，确保程序能出结果
     INITIAL_TOP_N = int(st.number_input("初筛：涨幅榜取前 N", value=1000, step=100))
     FINAL_POOL = int(st.number_input("清洗后取前 M 进入评分", value=300, step=50))
     TOP_DISPLAY = int(st.number_input("界面显示 Top K", value=30, step=5))
     MIN_PRICE = float(st.number_input("最低价格 (元)", value=10.0, step=1.0))
     MAX_PRICE = float(st.number_input("最高价格 (元)", value=200.0, step=10.0))
-    MIN_TURNOVER = float(st.number_input("最低换手率 (%)", value=3.0, step=0.5))
+    MIN_TURNOVER = float(st.number_input("最低换手率 (%)", value=1.0, step=0.5)) # 宽松默认值
     # 黄金组合参数默认值
-    MIN_AMOUNT = float(st.number_input("最低成交额 (元)", value=150_000_000.0, step=50_000_000.0))
+    MIN_AMOUNT = float(st.number_input("最低成交额 (元)", value=50_000_000.0, step=50_000_000.0)) # 宽松默认值
     VOL_SPIKE_MULT = float(st.number_input("放量倍数阈值 (vol_last > vol_ma5 * x)", value=1.6, step=0.1))
     VOLATILITY_MAX = float(st.number_input("过去10日波动 std 阈值 (%)", value=8.0, step=0.5))
     HIGH_PCT_THRESHOLD = float(st.number_input("视为大阳线 pct_chg (%)", value=6.0, step=0.5))
@@ -343,7 +344,8 @@ def compute_scores(trade_date, trade_dates_list, data_cache):
         daily_all = daily_all_raw.copy()
         
     if daily_all.empty:
-        return pd.DataFrame()
+        # 即使是初筛拉取失败，也提前退出，避免进入复杂的逻辑导致崩溃
+        return pd.DataFrame() 
 
     daily_all = daily_all.sort_values("pct_chg", ascending=False).reset_index(drop=True)
     pool0 = daily_all.head(int(INITIAL_TOP_N)).copy().reset_index(drop=True)
@@ -402,7 +404,7 @@ def compute_scores(trade_date, trade_dates_list, data_cache):
     clean_list = []
     # 统一使用 daily 里的 amount（单位千元） 和 daily_basic 里的 turnover_rate（单位 %）
     for i, r in enumerate(pool_merged.itertuples()):
-        ts = getattr(r, 'ts_code')
+        ts_code = getattr(r, 'ts_code')
         vol = getattr(r, 'vol', 0)
 
         close = getattr(r, 'close', np.nan)
@@ -411,7 +413,7 @@ def compute_scores(trade_date, trade_dates_list, data_cache):
         pct = getattr(r, 'pct_chg', np.nan)
         amount_daily = getattr(r, 'amount', np.nan) # daily 里的 amount
         turnover = getattr(r, 'turnover_rate', np.nan)
-        name = getattr(r, 'name', ts)
+        name = getattr(r, 'name', ts_code)
 
     
         # 1. 过滤：停牌/无成交
@@ -447,12 +449,14 @@ def compute_scores(trade_date, trade_dates_list, data_cache):
         except Exception:
             tv_yuan = np.nan # 转换失败，视为无效市值
 
-        # 强制过滤逻辑：如果市值数据无效，或者不在设定的[MIN, MAX]范围内，则过滤。
+        # 鲁棒性过滤逻辑：如果市值数据无效，则强制过滤（上次导致错误的原因）
         if pd.isna(tv_yuan) or tv_yuan <= 0:
             continue # 强制过滤掉市值数据缺失的股票
             
+        # 严格过滤市值超限股票（上次需要解决的问题）
         if tv_yuan < MIN_MARKET_CAP or tv_yuan > MAX_MARKET_CAP:
-            continue # 过滤掉超限的股票
+            continue 
+
 
         # 5. 过滤：一字涨停板
         try:
@@ -684,7 +688,6 @@ if st.button("🚀 运行当日选股（初次运行可能较久）"):
 # ---------------------------
 @st.cache_data(ttl=6000)
 def run_backtest(start_date, end_date, hold_days, backtest_top_k, bt_cache_key):
-    # 彻底移除 global ALL_DAILY_DATA_CACHE
     
     _ = bt_cache_key 
 
