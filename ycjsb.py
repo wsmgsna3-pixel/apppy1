@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 10000 积分旗舰（V5.0X - 最终平衡修正版 - 鲁棒性强化）
+选股王 · 10000 积分旗舰（V5.0X - 最终平衡修正版 - 鲁棒性回退）
 说明：
 - **核心架构：** 缓存传递 (CT)。
 - **策略调整：** V5.0X 最终权重定稿。
-- **鲁棒性强化：** 默认参数放宽，并强制过滤市值缺失或超限的股票。
+- **最终修正：** 市值过滤逻辑回退：仅在市值有效时才过滤，允许缺失市值数据通过（避免空结果）。
 """
 
-# V5.0X Final Code: Robustness Enhanced with Market Cap FIX (Aggressive)
+# V5.0X Final Code: Robustness Rollback of Market Cap Filter
 
 import streamlit as st
 import pandas as pd
@@ -29,7 +29,7 @@ BDF_CACHE_KEY = 2.0
 # ---------------------------
 st.set_page_config(page_title="选股王 · 10000旗舰（V5.0X-最终平衡修正版）", layout="wide")
 st.title("选股王 · 10000 积分旗舰（V5.0X - 最终平衡修正版）")
-st.markdown("### 🚀 鲁棒性强化版：默认参数更宽松，确保数据缺失时程序不崩溃，并强制过滤市值超限股票。")
+st.markdown("### 🚀 鲁棒性回退版：市值过滤逻辑调整，修复由于数据缺失导致的“无数据”错误。")
 st.markdown("输入你的 Tushare Token（仅本次运行使用）。")
 
 # ---------------------------
@@ -449,13 +449,13 @@ def compute_scores(trade_date, trade_dates_list, data_cache):
         except Exception:
             tv_yuan = np.nan # 转换失败，视为无效市值
 
-        # 鲁棒性过滤逻辑：如果市值数据无效，则强制过滤（上次导致错误的原因）
-        if pd.isna(tv_yuan) or tv_yuan <= 0:
-            continue # 强制过滤掉市值数据缺失的股票
-            
-        # 严格过滤市值超限股票（上次需要解决的问题）
-        if tv_yuan < MIN_MARKET_CAP or tv_yuan > MAX_MARKET_CAP:
-            continue 
+        # ---- 核心修正区域：鲁棒性回退 ----
+        # 仅在市值数据有效时，才执行过滤。如果缺失，则跳过过滤（允许通过，防止空结果）
+        if not pd.isna(tv_yuan) and tv_yuan > 0:
+            # 严格过滤市值超限股票（上次需要解决的问题）
+            if tv_yuan < MIN_MARKET_CAP or tv_yuan > MAX_MARKET_CAP:
+                continue 
+        # ---------------------------------
 
 
         # 5. 过滤：一字涨停板
