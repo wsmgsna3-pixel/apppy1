@@ -4,9 +4,10 @@
 说明：
 - **核心架构：** 缓存传递 (CT)。
 - **策略调整：** V5.0X 平衡权重定稿，修复超大市值股票混入和回测缩进问题。
+- **最终修正：** 强化市值过滤逻辑，对缺失市值的股票执行强制过滤。
 """
 
-# V5.0X Final Code: Balanced Trend Weight Adjustment with Market Cap FIX
+# V5.0X Final Code: Balanced Trend Weight Adjustment with Market Cap FIX (Aggressive)
 
 import streamlit as st
 import pandas as pd
@@ -430,29 +431,28 @@ def compute_scores(trade_date, trade_dates_list, data_cache):
         if isinstance(tsck, str) and (tsck.startswith('4') or tsck.startswith('8')):
             continue
 
-        # 4. 过滤：市值（最终修正：确保单位为“元”，并进行严格校验）
+        # 4. 过滤：市值（最终修正：要求市值数据必须有效且在设定区间内）
+        tv_yuan = np.nan
         try:
             tv_raw = getattr(r, 'total_mv', np.nan)
             
             if not pd.isna(tv_raw) and tv_raw > 0:
                 tv_float = float(tv_raw)
                 
-                # 假设 Tushare 返回的是万元，转换为元
-                # 如果数值大于 1000 万，我们确认它是万元，进行转换
+                # Tushare市值通常为万元。如果数值较大，则进行万元到元的转换
                 if tv_float > 10000:
                     tv_yuan = tv_float * 10000.0 
                 else:
-                    tv_yuan = tv_float # 否则，保守地假设它已经是元
-                
-                # 执行过滤逻辑（使用用户设定的 MIN/MAX_MARKET_CAP）
-                if tv_yuan < MIN_MARKET_CAP or tv_yuan > MAX_MARKET_CAP:
-                    continue
-            else:
-                # 如果没有市值数据，我们选择保守地跳过过滤，继续下一步
-                pass 
-        except Exception as e:
-            # 任何异常情况，都跳过过滤，确保代码不会崩溃
-            pass 
+                    tv_yuan = tv_float # 小于1万，可能是已是元或异常数据，保守处理
+        except Exception:
+            tv_yuan = np.nan # 转换失败，视为无效市值
+
+        # 强制过滤逻辑：如果市值数据无效，或者不在设定的[MIN, MAX]范围内，则过滤。
+        if pd.isna(tv_yuan) or tv_yuan <= 0:
+            continue # 强制过滤掉市值数据缺失的股票
+            
+        if tv_yuan < MIN_MARKET_CAP or tv_yuan > MAX_MARKET_CAP:
+            continue # 过滤掉超限的股票
 
         # 5. 过滤：一字涨停板
         try:
