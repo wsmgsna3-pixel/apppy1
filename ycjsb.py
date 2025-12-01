@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 10000 积分旗舰（V11.0 最终决战版）· 含回测功能
+选股王 · 10000 积分旗舰（V11.0 最终决战版）· 最终修正版
 核心权重：
 - **资金流 (w_money): 0.35**
 - **MACD (w_macd): 0.20** - **60日位置 (w_position): 0.15** (防御/安全边际)
@@ -12,7 +12,10 @@
 1. 当日选股 (旗舰模式)
 2. 历史回测 (验证模式)
 
-**【重要修正】**：已移除 pct_chg > 0 的硬性过滤，允许当日下跌但满足低位和资金流条件的股票入选。
+**【最终修正说明】**：
+1. 完整保留回测功能。
+2. 移除 pct_chg > 0 的硬性过滤，允许当日下跌的低位吸筹股入选。
+3. 重新添加 'Close' (股票价格) 和 'Circ_MV' (流通市值) 到最终结果显示表格。
 """
 
 import streamlit as st
@@ -27,9 +30,9 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V11.0 最终决战旗舰版（修正版）", layout="wide")
-st.title("选股王 · V11.0 最终决战旗舰版（修正版 - 含回测）")
-st.markdown("🎯 **本版本已集成 V11.0 最终权重，并移除了当日涨幅 > 0 的硬性过滤，允许逆势低位吸筹股入选。**")
+st.set_page_config(page_title="选股王 · V11.0 最终决战旗舰版（最终修正版）", layout="wide")
+st.title("选股王 · V11.0 最终决战旗舰版（最终修正版 - 含回测）")
+st.markdown("✅ **本版本已集成 V11.0 最终权重，并修复了回测、过滤和显示列丢失等所有问题。**")
 
 # ---------------------------
 # 全局变量初始化
@@ -67,13 +70,12 @@ def get_trade_days(end_date_str, num_days):
     trade_days_df = trade_days_df[trade_days_df['cal_date'] <= end_date_str]
     return trade_days_df['cal_date'].head(num_days).tolist()
 
-# 使用非复权数据计算未来收益率 (简化版，无需再拉取复权因子)
 def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
+    """使用非复权数据计算未来收益率 (回测使用)"""
     d0 = datetime.strptime(selection_date, "%Y%m%d")
-    start_date = (d0 - timedelta(days=1)).strftime("%Y%m%d") # 前一天
+    start_date = (d0 - timedelta(days=1)).strftime("%Y%m%d") 
     end_date = (d0 + timedelta(days=15)).strftime("%Y%m%d")
     
-    # 拉取包含选股日和未来日期的非复权数据
     hist = safe_get('daily', ts_code=ts_code, start_date=start_date, end_date=end_date)
     if hist.empty or 'close' not in hist.columns:
         results = {}
@@ -83,13 +85,8 @@ def get_future_prices(ts_code, selection_date, days_ahead=[1, 3, 5]):
     hist['close'] = pd.to_numeric(hist['close'], errors='coerce')
     hist = hist.dropna(subset=['close']).sort_values('trade_date').reset_index(drop=True)
     
-    # 找到选股日的收盘价 (作为买入价)
     selection_price = hist[hist['trade_date'] == selection_date]['close'].iloc[-1] if not hist[hist['trade_date'] == selection_date].empty else np.nan
-    
-    results = {}
-    
-    # 找到选股日之后的所有交易日数据
-    future_hist = hist[hist['trade_date'] > selection_date].reset_index(drop=True)
+    results = {}; future_hist = hist[hist['trade_date'] > selection_date].reset_index(drop=True)
 
     if pd.isna(selection_price) or selection_price < 1e-9:
         for n in days_ahead: results[f'Return_D{n} (%)'] = np.nan
@@ -115,16 +112,17 @@ with st.sidebar:
     
     st.markdown("---")
     st.header("当日选股/通用参数")
-    INITIAL_TOP_N = int(st.number_input("初筛：涨幅榜取前 N", value=1000, step=100))
-    FINAL_POOL = int(st.number_input("清洗后取前 M 进入评分", value=500, step=50))
+    # 涨幅初筛 N：性能优化，允许用户调高到5000+，但在逻辑上不作为策略必要条件。
+    INITIAL_TOP_N = int(st.number_input("初筛：涨幅榜取前 N", value=1000, step=100, help="为了兼顾速度，先从涨幅靠前的股票中进行筛选。如需包含所有股票，请设置为5500。"))
+    FINAL_POOL = int(st.number_input("清洗后取前 M 进入评分", value=500, step=50, help="硬性过滤后，取前M支股票进行历史数据拉取和深度评分（内部限制最多300支以保障接口稳定）。"))
     TOP_DISPLAY = int(st.number_input("界面显示 Top K", value=30, step=5))
     MIN_PRICE = float(st.number_input("最低价格 (元)", value=10.0, step=1.0))
     MAX_PRICE = float(st.number_input("最高价格 (元)", value=200.0, step=10.0))
     MIN_TURNOVER = float(st.number_input("最低换手率 (%)", value=3.0, step=0.5))
     MIN_AMOUNT = float(st.number_input("最低成交额 (元)", value=200_000_000.0, step=50_000_000.0))
-    VOL_SPIKE_MULT = float(st.number_input("放量倍数阈值", value=1.7, step=0.1))
-    VOLATILITY_MAX = float(st.number_input("10日波动 std 阈值 (%)", value=8.0, step=0.5))
-    HIGH_PCT_THRESHOLD = float(st.number_input("大阳线 pct_chg (%)", value=6.0, step=0.5))
+    VOL_SPIKE_MULT = float(st.number_input("放量倍数阈值 (风险过滤)", value=1.7, step=0.1))
+    VOLATILITY_MAX = float(st.number_input("10日波动 std 阈值 (%) (风险过滤)", value=8.0, step=0.5))
+    HIGH_PCT_THRESHOLD = float(st.number_input("大阳线 pct_chg (%) (高位风险过滤)", value=6.0, step=0.5))
     
     if mode == "历史回测":
         st.markdown("---")
@@ -159,12 +157,13 @@ def get_hist(ts_code, end_date, days=60):
         return pd.DataFrame()
 
 def compute_indicators(df):
+    """计算 MACD, 60日位置, 波动率等指标"""
     res = {}
     if df.empty or len(df) < 3: return res
     close = df['close'].astype(float); high = df['high'].astype(float); low = df['low'].astype(float)
 
-    try: res['last_close'] = close.iloc[-1]
-    except: res['last_close'] = np.nan
+    try: res['Close'] = close.iloc[-1] # 股票价格
+    except: res['Close'] = np.nan
 
     # MACD (12,26,9)
     if len(close) >= 26:
@@ -183,12 +182,7 @@ def compute_indicators(df):
         res['vol_last'] = vols[-1]
         res['vol_ma5'] = avg_prev5
     else: res['vol_ratio'] = res['vol_last'] = res['vol_ma5'] = np.nan
-
-    # 10d return
-    if len(close) >= 10:
-        res['10d_return'] = close.iloc[-1] / close.iloc[-10] - 1
-    else: res['10d_return'] = np.nan
-
+        
     # volatility (std of last 10 pct_chg)
     if 'pct_chg' in df.columns and len(df) >= 10:
         res['volatility_10'] = df['pct_chg'].astype(float).tail(10).std()
@@ -216,11 +210,12 @@ def run_selection_for_a_day(trade_date, FINAL_POOL, INITIAL_TOP_N, MIN_PRICE, MA
     if daily_all.empty or 'ts_code' not in daily_all.columns: return pd.DataFrame(), f"数据缺失或拉取失败：{trade_date}"
     
     if not is_backtest:
-        st.write(f"当日记录：{len(daily_all)}，取涨幅前 {INITIAL_TOP_N} 作为初筛。")
+        st.write(f"当日记录：{len(daily_all)} 支，取涨幅前 {INITIAL_TOP_N} 作为初筛池。")
 
     # 2. 初筛与数据合并
     daily_all = daily_all.sort_values("pct_chg", ascending=False).reset_index(drop=True)
-    # 【性能优化】只对涨幅靠前的股票进行初筛，以减少后续合并和拉取历史数据的量。
+    
+    # 允许用户通过设置 INITIAL_TOP_N 来包含当日下跌的股票（即取所有股票）
     pool0 = daily_all.head(int(INITIAL_TOP_N)).copy().reset_index(drop=True)
     
     stock_basic = safe_get('stock_basic', list_status='L', fields='ts_code,name,list_date,total_mv,circ_mv')
@@ -237,9 +232,12 @@ def run_selection_for_a_day(trade_date, FINAL_POOL, INITIAL_TOP_N, MIN_PRICE, MA
 
     # merge daily_basic
     if not daily_basic.empty:
-        pool_merged = pool_merged.merge(daily_basic, on='ts_code', how='left', suffixes=('_x', ''))
+        # 重命名流通市值，方便显示
+        daily_basic['Circ_MV (亿)'] = daily_basic['circ_mv'].fillna(0) 
+        pool_merged = pool_merged.merge(daily_basic.drop(columns=['circ_mv']), on='ts_code', how='left', suffixes=('_x', ''))
+    else: pool_merged['Circ_MV (亿)'] = np.nan
     
-    # merge moneyflow robustly
+    # merge moneyflow
     moneyflow = pd.DataFrame(columns=['ts_code','net_mf'])
     if not mf_raw.empty and 'net_mf' in mf_raw.columns:
         moneyflow = mf_raw[['ts_code', 'net_mf']].fillna(0)
@@ -273,11 +271,12 @@ def run_selection_for_a_day(trade_date, FINAL_POOL, INITIAL_TOP_N, MIN_PRICE, MA
     mask_amt = df['amount'] >= MIN_AMOUNT
     df = df[mask_amt]
     
-    # 【已修正】移除 mask_pct_chg = df['pct_chg'] > 0 的硬性过滤，允许当日下跌的股票入选。
+    # **【已修正】**：不进行 pct_chg > 0 的硬性过滤，允许当日下跌票入选。
     
     if len(df) == 0: return pd.DataFrame(), f"过滤后无股票：{trade_date}"
     
     # 4. 限制评分池大小并进行深度评分
+    # 这里的排序是为了让评分池优先包含当日涨幅较高的股票，但池子本身包含了涨跌幅所有股票。
     clean_df = df.sort_values('pct_chg', ascending=False).head(min(int(FINAL_POOL), 300)).reset_index(drop=True)
     
     records = []
@@ -293,6 +292,7 @@ def run_selection_for_a_day(trade_date, FINAL_POOL, INITIAL_TOP_N, MIN_PRICE, MA
         pct_chg = getattr(row, 'pct_chg', 0.0)
         turnover_rate = getattr(row, 'turnover_rate', np.nan)
         net_mf = float(getattr(row, 'net_mf', 0.0))
+        circ_mv = float(getattr(row, 'Circ_MV (亿)', np.nan))
         
         hist = get_hist(ts_code, trade_date, days=60)
         ind = compute_indicators(hist)
@@ -304,15 +304,19 @@ def run_selection_for_a_day(trade_date, FINAL_POOL, INITIAL_TOP_N, MIN_PRICE, MA
         rec = {
             'ts_code': ts_code, 'name': name, 'pct_chg': pct_chg,
             'turnover_rate': turnover_rate, 'net_mf': net_mf,
+            
+            # 重新添加的关键显示列
+            'Close': ind.get('Close', np.nan),
+            'Circ_MV (亿)': circ_mv,
+            
+            # 指标列
             'vol_ratio': vol_ratio,
-            '10d_return': ind.get('10d_return', np.nan),
             'macd': ind.get('macd', np.nan),
             'volatility_10': ind.get('volatility_10', np.nan),
             'position_60d': ind.get('position_60d', np.nan),
             'vol_last': ind.get('vol_last', np.nan),
             'vol_ma5': ind.get('vol_ma5', np.nan),
             'proxy_money': proxy_money,
-            'last_close': ind.get('last_close', np.nan)
         }
         
         # 仅在回测模式下计算未来收益
@@ -330,15 +334,15 @@ def run_selection_for_a_day(trade_date, FINAL_POOL, INITIAL_TOP_N, MIN_PRICE, MA
     
     # 5. 风险过滤（V11.0 逻辑）
     
-    # C: 巨量放量大阳 -> vol_last > vol_ma5 * VOL_SPIKE_MULT
+    # C: 巨量放量大阳 -> vol_last > vol_ma5 * VOL_SPIKE_MULT (风险)
     mask_vol_spike = (fdf['vol_last'] > (fdf['vol_ma5'] * VOL_SPIKE_MULT))
     fdf = fdf[~mask_vol_spike]
 
-    # D: 极端波动 -> volatility_10 > VOLATILITY_MAX
+    # D: 极端波动 -> volatility_10 > VOLATILITY_MAX (风险)
     mask_volatility = fdf['volatility_10'] > VOLATILITY_MAX
     fdf = fdf[~mask_volatility]
 
-    # E: 高位大阳线 -> 60日位置 > 80% 且 pct_chg > HIGH_PCT_THRESHOLD (简化风险过滤)
+    # E: 高位大阳线 -> 60日位置 > 80% 且 pct_chg > HIGH_PCT_THRESHOLD (风险)
     mask_high_big = (fdf['position_60d'] > 80.0) & (fdf['pct_chg'] > HIGH_PCT_THRESHOLD)
     fdf = fdf[~mask_high_big]
 
@@ -351,15 +355,13 @@ def run_selection_for_a_day(trade_date, FINAL_POOL, INITIAL_TOP_N, MIN_PRICE, MA
 
     fdf['s_pct'] = norm_col(fdf['pct_chg'])
     fdf['s_turn'] = norm_col(fdf['turnover_rate'])
-    fdf['s_volratio'] = norm_col(fdf['vol_ratio'])
-    
+        
     if 'net_mf' in fdf.columns and fdf['net_mf'].abs().sum() > 0:
         fdf['s_money'] = norm_col(fdf['net_mf']) # 优先使用 net_mf
     else:
         fdf['s_money'] = norm_col(fdf['proxy_money']) # 否则使用代理资金流
         
     fdf['s_macd'] = norm_col(fdf['macd'])
-    fdf['s_10d'] = norm_col(fdf['10d_return'])
     
     fdf['s_volatility'] = 1 - norm_col(fdf['volatility_10']) # 波动率越低得分越高
     fdf['s_position'] = 1 - (fdf['position_60d'].fillna(50.0) / 100) # 60日位置越低得分越高
@@ -368,7 +370,6 @@ def run_selection_for_a_day(trade_date, FINAL_POOL, INITIAL_TOP_N, MIN_PRICE, MA
     # V11.0 最终权重配置 (总和 1.00)
     w_money = 0.35; w_macd = 0.20; w_position = 0.15; w_volatility = 0.10
     w_pct = 0.10; w_turn = 0.10
-    w_volratio = 0.00; w_10d = 0.00; w_rsl = 0.00
     
     score = (
         fdf['s_pct'] * w_pct + fdf['s_turn'] * w_turn + 
@@ -377,10 +378,7 @@ def run_selection_for_a_day(trade_date, FINAL_POOL, INITIAL_TOP_N, MIN_PRICE, MA
         
         # 防御项
         fdf['s_position'] * w_position + 
-        fdf['s_volatility'] * w_volatility + 
-        
-        # 归零项
-        fdf['s_volratio'] * w_volratio + fdf['s_10d'] * w_10d
+        fdf['s_volatility'] * w_volatility 
     )
     fdf['综合评分'] = score * 100
     fdf = fdf.sort_values('综合评分', ascending=False).reset_index(drop=True)
@@ -391,24 +389,24 @@ def run_selection_for_a_day(trade_date, FINAL_POOL, INITIAL_TOP_N, MIN_PRICE, MA
 # ---------------------------
 # 主运行块
 # ---------------------------
+def find_last_trade_day(max_days=20):
+    """Helper for daily mode"""
+    today = datetime.now().date()
+    for i in range(max_days):
+        d = today - timedelta(days=i)
+        ds = d.strftime("%Y%m%d")
+        df = safe_get('daily', trade_date=ds)
+        if not df.empty:
+            return ds
+    return None
+
 if mode == "当日选股 (旗舰)":
     
-    def find_last_trade_day(max_days=20):
-        """Helper for daily mode"""
-        today = datetime.now().date()
-        for i in range(max_days):
-            d = today - timedelta(days=i)
-            ds = d.strftime("%Y%m%d")
-            df = safe_get('daily', trade_date=ds)
-            if not df.empty:
-                return ds
-        return None
-        
-    last_trade = find_last_trade_day(20) # 寻找最近交易日
+    last_trade = find_last_trade_day(20) 
     if not last_trade:
         st.error("无法找到最近交易日，请检查网络或 Token 权限。")
         st.stop()
-    st.info(f"🚀 **当前运行模式：当日选股 (旗舰)** | 选股基准日：{last_trade}")
+    st.info(f"🚀 **当前运行模式：当日选股 (旗舰) - 最终修正版** | 选股基准日：{last_trade}")
     st.markdown("---")
     
     st.write(f"正在进行当日选股和评分...")
@@ -421,22 +419,24 @@ if mode == "当日选股 (旗舰)":
         st.error(f"选股失败：{error}")
     elif not scored_df.empty:
         st.success(f"评分完成：总候选 {len(scored_df)} 支，显示 Top {min(TOP_DISPLAY, len(scored_df))}。")
-        display_cols = ['name','ts_code','综合评分','pct_chg','turnover_rate','net_mf','position_60d','volatility_10']
+        
+        # 【最终修正】重新添加股票价格和流通市值
+        display_cols = ['name','ts_code','综合评分','Close','pct_chg','Circ_MV (亿)','turnover_rate','net_mf','position_60d','volatility_10']
         
         st.dataframe(scored_df[display_cols].head(TOP_DISPLAY), use_container_width=True)
         
         out_csv = scored_df[display_cols].head(200).to_csv(index=True, encoding='utf-8-sig')
-        st.download_button("下载评分结果（前200）CSV", data=out_csv, file_name=f"score_result_{last_trade}.csv", mime="text/csv")
+        st.download_button("下载评分结果（前200）CSV", data=out_csv, file_name=f"score_result_{last_trade}_final.csv", mime="text/csv")
         
     st.markdown("---")
     st.markdown("### 小结与操作提示")
-    st.info("当前使用 V11.0 最佳权重：资金流 $0.35$ + MACD $0.20$ + 60日低位 $0.15$。请根据 $\mathbf{9:40-10:05}$ 量价节奏择优介入。")
+    st.info("当前使用 V11.0 最佳权重：资金流 $0.35$ + MACD $0.20$ + 60日低位 $0.15$。**已支持当日下跌的低位防御票选入。**")
 
 # ---------------------------
 # 历史回测块
 # ---------------------------
 elif mode == "历史回测":
-    st.info(f"🔬 **当前运行模式：历史回测** | 结束日期：{backtest_date_end.strftime('%Y%m%d')}，天数：{BACKTEST_DAYS}")
+    st.info(f"🔬 **当前运行模式：历史回测 - 最终修正版** | 结束日期：{backtest_date_end.strftime('%Y%m%d')}，天数：{BACKTEST_DAYS}")
     st.markdown("---")
 
     if st.button(f"🚀 开始 {BACKTEST_DAYS} 日回测 (Top {TOP_BACKTEST})"):
@@ -501,8 +501,10 @@ elif mode == "历史回测":
 
         st.header("📋 每日回测详情 (Top K 明细)")
         
+        # 【最终修正】回测详情也增加关键列
         display_cols = ['Trade_Date', 'name', 'ts_code', '综合评分', 
-                        'pct_chg', 'position_60d',
+                        'Close', 'pct_chg', 'Circ_MV (亿)', 
+                        'position_60d',
                         'Return_D1 (%)', 'Return_D3 (%)', 'Return_D5 (%)']
         
         st.dataframe(all_results[display_cols].sort_values('Trade_Date', ascending=False), use_container_width=True)
