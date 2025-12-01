@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 10000 积分旗舰（V11.0 最终决战版）· 最终修正版
+选股王 · 10000 积分旗舰（V11.0 最终决战版）· 硬性过滤强化版
 核心权重：
 - **资金流 (w_money): 0.35**
 - **MACD (w_macd): 0.20** - **60日位置 (w_position): 0.15** (防御/安全边际)
@@ -12,10 +12,10 @@
 1. 当日选股 (旗舰模式)
 2. 历史回测 (验证模式)
 
-**【最终修正说明】**：
-1. 完整保留回测功能。
-2. 移除 pct_chg > 0 的硬性过滤，允许当日下跌的低位吸筹股入选。
-3. 重新添加 'Close' (股票价格) 和 'Circ_MV' (流通市值) 到最终结果显示表格。
+**【硬性过滤强化说明】**：
+1. 修复流通市值单位转换问题，确保正确显示 'Circ_MV (亿)'。
+2. **新增过滤：** 排除北交所股票 (ts_code 以 '8' 开头)。
+3. **新增过滤：** 排除流通市值低于侧边栏设定值（默认20亿）的股票。
 """
 
 import streamlit as st
@@ -30,9 +30,9 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 · V11.0 最终决战旗舰版（最终修正版）", layout="wide")
-st.title("选股王 · V11.0 最终决战旗舰版（最终修正版 - 含回测）")
-st.markdown("✅ **本版本已集成 V11.0 最终权重，并修复了回测、过滤和显示列丢失等所有问题。**")
+st.set_page_config(page_title="选股王 · V11.0 硬性过滤强化版", layout="wide")
+st.title("选股王 · V11.0 最终决战旗舰版（硬性过滤强化版）")
+st.markdown("✅ **本版本已修复所有硬性过滤和数据显示问题，确保排除ST/北交所/低市值股票。**")
 
 # ---------------------------
 # 全局变量初始化
@@ -112,14 +112,20 @@ with st.sidebar:
     
     st.markdown("---")
     st.header("当日选股/通用参数")
-    # 涨幅初筛 N：性能优化，允许用户调高到5000+，但在逻辑上不作为策略必要条件。
-    INITIAL_TOP_N = int(st.number_input("初筛：涨幅榜取前 N", value=1000, step=100, help="为了兼顾速度，先从涨幅靠前的股票中进行筛选。如需包含所有股票，请设置为5500。"))
+    INITIAL_TOP_N = int(st.number_input("初筛：涨幅榜取前 N", value=1000, step=100, help="默认1000，建议设为5500以覆盖所有股票。"))
     FINAL_POOL = int(st.number_input("清洗后取前 M 进入评分", value=500, step=50, help="硬性过滤后，取前M支股票进行历史数据拉取和深度评分（内部限制最多300支以保障接口稳定）。"))
     TOP_DISPLAY = int(st.number_input("界面显示 Top K", value=30, step=5))
+    
+    st.markdown("##### 市场硬性过滤条件")
     MIN_PRICE = float(st.number_input("最低价格 (元)", value=10.0, step=1.0))
     MAX_PRICE = float(st.number_input("最高价格 (元)", value=200.0, step=10.0))
     MIN_TURNOVER = float(st.number_input("最低换手率 (%)", value=3.0, step=0.5))
     MIN_AMOUNT = float(st.number_input("最低成交额 (元)", value=200_000_000.0, step=50_000_000.0))
+    
+    # 【新增】最低流通市值过滤参数
+    MIN_CIRC_MV = float(st.number_input("最低流通市值 (亿)", value=20.0, step=5.0, help="流通市值低于此值的股票将被排除（默认20亿）"))
+    
+    st.markdown("##### 风险过滤条件")
     VOL_SPIKE_MULT = float(st.number_input("放量倍数阈值 (风险过滤)", value=1.7, step=0.1))
     VOLATILITY_MAX = float(st.number_input("10日波动 std 阈值 (%) (风险过滤)", value=8.0, step=0.5))
     HIGH_PCT_THRESHOLD = float(st.number_input("大阳线 pct_chg (%) (高位风险过滤)", value=6.0, step=0.5))
@@ -202,7 +208,7 @@ def compute_indicators(df):
 # ---------------------------
 # 核心选股与评分逻辑（为回测/当日选股服务）
 # ---------------------------
-def run_selection_for_a_day(trade_date, FINAL_POOL, INITIAL_TOP_N, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MIN_AMOUNT, VOL_SPIKE_MULT, VOLATILITY_MAX, HIGH_PCT_THRESHOLD, is_backtest=False):
+def run_selection_for_a_day(trade_date, FINAL_POOL, INITIAL_TOP_N, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MIN_AMOUNT, VOL_SPIKE_MULT, VOLATILITY_MAX, HIGH_PCT_THRESHOLD, MIN_CIRC_MV, is_backtest=False):
     """为单个交易日运行选股和评分逻辑"""
     
     # 1. 拉取全市场 Daily 数据
@@ -218,22 +224,22 @@ def run_selection_for_a_day(trade_date, FINAL_POOL, INITIAL_TOP_N, MIN_PRICE, MA
     # 允许用户通过设置 INITIAL_TOP_N 来包含当日下跌的股票（即取所有股票）
     pool0 = daily_all.head(int(INITIAL_TOP_N)).copy().reset_index(drop=True)
     
-    stock_basic = safe_get('stock_basic', list_status='L', fields='ts_code,name,list_date,total_mv,circ_mv')
-    daily_basic = safe_get('daily_basic', trade_date=trade_date, fields='ts_code,turnover_rate,amount,total_mv,circ_mv')
+    stock_basic = safe_get('stock_basic', list_status='L', fields='ts_code,name,total_mv,circ_mv')
+    daily_basic = safe_get('daily_basic', trade_date=trade_date, fields='ts_code,turnover_rate,amount,circ_mv')
     mf_raw = safe_get('moneyflow', trade_date=trade_date)
 
     pool_merged = pool0.copy()
 
-    # merge stock_basic
+    # merge stock_basic (用于获取名字)
     if not stock_basic.empty:
-        keep = [c for c in ['ts_code','name','total_mv','circ_mv'] if c in stock_basic.columns]
+        keep = [c for c in ['ts_code','name'] if c in stock_basic.columns]
         pool_merged = pool_merged.merge(stock_basic[keep], on='ts_code', how='left')
     else: pool_merged['name'] = pool_merged['ts_code']
 
     # merge daily_basic
     if not daily_basic.empty:
-        # 重命名流通市值，方便显示
-        daily_basic['Circ_MV (亿)'] = daily_basic['circ_mv'].fillna(0) 
+        # 【修复1】Tushare的circ_mv字段单位是“万元”，转换为“亿元” (10000万元 = 1亿元)
+        daily_basic['Circ_MV (亿)'] = pd.to_numeric(daily_basic['circ_mv'], errors='coerce') / 10000 
         pool_merged = pool_merged.merge(daily_basic.drop(columns=['circ_mv']), on='ts_code', how='left', suffixes=('_x', ''))
     else: pool_merged['Circ_MV (亿)'] = np.nan
     
@@ -259,19 +265,32 @@ def run_selection_for_a_day(trade_date, FINAL_POOL, INITIAL_TOP_N, MIN_PRICE, MA
         return amt
     df['amount'] = df['amount'].apply(normalize_amount)
     
+    # 排除 ST/退市股
     mask_st = df['name'].str.contains('ST|退', case=False, na=False)
     df = df[~mask_st]
     
+    # 【修复2】排除北交所股票 (ts_code以 '8' 开头)
+    mask_bj = df['ts_code'].str.startswith('8', na=False)
+    df = df[~mask_bj]
+    
+    # 价格过滤
     mask_price = (df['close'] >= MIN_PRICE) & (df['close'] <= MAX_PRICE)
     df = df[mask_price]
     
+    # 换手率过滤
     mask_turn = df['turnover_rate'] >= MIN_TURNOVER 
     df = df[mask_turn]
     
+    # 成交额过滤
     mask_amt = df['amount'] >= MIN_AMOUNT
     df = df[mask_amt]
     
-    # **【已修正】**：不进行 pct_chg > 0 的硬性过滤，允许当日下跌票入选。
+    # 【修复3】流通市值过滤
+    df['Circ_MV (亿)'] = pd.to_numeric(df['Circ_MV (亿)'], errors='coerce')
+    mask_circ_mv = df['Circ_MV (亿)'] >= MIN_CIRC_MV
+    df = df[mask_circ_mv]
+    
+    # 不进行 pct_chg > 0 的硬性过滤，允许当日下跌票入选。
     
     if len(df) == 0: return pd.DataFrame(), f"过滤后无股票：{trade_date}"
     
@@ -283,7 +302,7 @@ def run_selection_for_a_day(trade_date, FINAL_POOL, INITIAL_TOP_N, MIN_PRICE, MA
     
     # 使用 st.progress 显示进度条，仅在非回测模式下
     if not is_backtest:
-        st.write(f"已通过硬性过滤股票 {len(clean_df)} 支（取涨幅前 {min(int(FINAL_POOL), 300)} 支进入深度评分）")
+        st.write(f"已通过硬性过滤股票 {len(df)} 支，取涨幅前 {min(int(FINAL_POOL), 300)} 支进入深度评分。")
         pbar = st.progress(0)
     
     for idx, row in enumerate(clean_df.itertuples()):
@@ -305,7 +324,7 @@ def run_selection_for_a_day(trade_date, FINAL_POOL, INITIAL_TOP_N, MIN_PRICE, MA
             'ts_code': ts_code, 'name': name, 'pct_chg': pct_chg,
             'turnover_rate': turnover_rate, 'net_mf': net_mf,
             
-            # 重新添加的关键显示列
+            # 关键显示列
             'Close': ind.get('Close', np.nan),
             'Circ_MV (亿)': circ_mv,
             
@@ -406,13 +425,13 @@ if mode == "当日选股 (旗舰)":
     if not last_trade:
         st.error("无法找到最近交易日，请检查网络或 Token 权限。")
         st.stop()
-    st.info(f"🚀 **当前运行模式：当日选股 (旗舰) - 最终修正版** | 选股基准日：{last_trade}")
+    st.info(f"🚀 **当前运行模式：当日选股 (旗舰) - 硬性过滤强化版** | 选股基准日：{last_trade}")
     st.markdown("---")
     
     st.write(f"正在进行当日选股和评分...")
     
     scored_df, error = run_selection_for_a_day(
-        last_trade, FINAL_POOL, INITIAL_TOP_N, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MIN_AMOUNT, VOL_SPIKE_MULT, VOLATILITY_MAX, HIGH_PCT_THRESHOLD, is_backtest=False
+        last_trade, FINAL_POOL, INITIAL_TOP_N, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MIN_AMOUNT, VOL_SPIKE_MULT, VOLATILITY_MAX, HIGH_PCT_THRESHOLD, MIN_CIRC_MV, is_backtest=False
     )
     
     if error:
@@ -420,23 +439,23 @@ if mode == "当日选股 (旗舰)":
     elif not scored_df.empty:
         st.success(f"评分完成：总候选 {len(scored_df)} 支，显示 Top {min(TOP_DISPLAY, len(scored_df))}。")
         
-        # 【最终修正】重新添加股票价格和流通市值
+        # 最终显示列
         display_cols = ['name','ts_code','综合评分','Close','pct_chg','Circ_MV (亿)','turnover_rate','net_mf','position_60d','volatility_10']
         
         st.dataframe(scored_df[display_cols].head(TOP_DISPLAY), use_container_width=True)
         
         out_csv = scored_df[display_cols].head(200).to_csv(index=True, encoding='utf-8-sig')
-        st.download_button("下载评分结果（前200）CSV", data=out_csv, file_name=f"score_result_{last_trade}_final.csv", mime="text/csv")
+        st.download_button("下载评分结果（前200）CSV", data=out_csv, file_name=f"score_result_{last_trade}_final_filtered.csv", mime="text/csv")
         
     st.markdown("---")
     st.markdown("### 小结与操作提示")
-    st.info("当前使用 V11.0 最佳权重：资金流 $0.35$ + MACD $0.20$ + 60日低位 $0.15$。**已支持当日下跌的低位防御票选入。**")
+    st.info("当前使用 V11.0 最佳权重，**已确保排除 ST/北交所和低市值股票。**")
 
 # ---------------------------
 # 历史回测块
 # ---------------------------
 elif mode == "历史回测":
-    st.info(f"🔬 **当前运行模式：历史回测 - 最终修正版** | 结束日期：{backtest_date_end.strftime('%Y%m%d')}，天数：{BACKTEST_DAYS}")
+    st.info(f"🔬 **当前运行模式：历史回测 - 硬性过滤强化版** | 结束日期：{backtest_date_end.strftime('%Y%m%d')}，天数：{BACKTEST_DAYS}")
     st.markdown("---")
 
     if st.button(f"🚀 开始 {BACKTEST_DAYS} 日回测 (Top {TOP_BACKTEST})"):
@@ -458,7 +477,7 @@ elif mode == "历史回测":
             progress_text.text(f"🚀 正在处理第 {i+1}/{total_days} 个交易日：{trade_date}")
             
             daily_result_df, error = run_selection_for_a_day(
-                trade_date, FINAL_POOL, INITIAL_TOP_N, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MIN_AMOUNT, VOL_SPIKE_MULT, VOLATILITY_MAX, HIGH_PCT_THRESHOLD, is_backtest=True
+                trade_date, FINAL_POOL, INITIAL_TOP_N, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MIN_AMOUNT, VOL_SPIKE_MULT, VOLATILITY_MAX, HIGH_PCT_THRESHOLD, MIN_CIRC_MV, is_backtest=True
             )
             
             if error:
@@ -501,7 +520,7 @@ elif mode == "历史回测":
 
         st.header("📋 每日回测详情 (Top K 明细)")
         
-        # 【最终修正】回测详情也增加关键列
+        # 回测详情显示列
         display_cols = ['Trade_Date', 'name', 'ts_code', '综合评分', 
                         'Close', 'pct_chg', 'Circ_MV (亿)', 
                         'position_60d',
