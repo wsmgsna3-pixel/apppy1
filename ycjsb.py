@@ -34,7 +34,7 @@ MIN_PRICE = st.sidebar.number_input("最低股价", min_value=1, max_value=2000,
 MAX_PRICE = st.sidebar.number_input("最高股价", min_value=1, max_value=2000, value=200)
 MIN_CIRC_MV_BILLIONS = st.sidebar.number_input("最小流通市值 (亿元)", min_value=0, max_value=5000, value=20)
 MIN_TURNOVER = st.sidebar.number_input("最低换手率", min_value=0, max_value=100, value=1)
-MIN_AMOUNT = st.sidebar.number_input("最低成交额 (元)", min_value=0, max_value=1e12, value=1000000)
+MIN_AMOUNT = st.sidebar.number_input("最低成交额 (元)", min_value=0, max_value=int(1e12), value=1000000, step=10000)
 
 # ---------------------------
 # 辅助函数 (API调用和数据获取)
