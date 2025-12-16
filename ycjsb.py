@@ -206,6 +206,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
 # 主运行块 
 # ---------------------------
 if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
+    BACKTEST_DAYS = 200  # 确保 BACKTEST_DAYS 被正确初始化
     trade_days_str = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS)
     if not trade_days_str:
         st.error("无法获取交易日列表，请检查日期或 Token。")
