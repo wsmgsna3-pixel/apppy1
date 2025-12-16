@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.5 磐石 Plus：稳健成长型策略 (Alpha 复合框架) - [MA60 趋势过滤版]
-V30.5.0 更新：
-1. **策略升级核心**：在硬性过滤中加入了 **股价 > MA60** 的趋势过滤。
-2. **量能优化**：新增了 **最高换手率 (15%)** 上限过滤，避免追高过热股。
-3. **市值优化**：新增了 **最高流通市值 (200 亿)** 上限过滤，聚焦高弹性中小盘股。
-4. 策略名称变更为 **磐石 Plus V30.5**。
+选股王 · V30.6 磐石 Plus：风险黑名单防御版 (Alpha 复合框架)
+V30.6.0 更新：
+1. **策略升级核心**：在 V30.5 优等生过滤基础上，新增**双重风险黑名单**过滤。
+2. **风险排除 1**：硬性排除 **position_60d >= 95.0%** (超买位置) 的股票。
+3. **风险排除 2**：硬性排除 **D0 Pct_Chg >= 7.0%** (当日涨幅过高) 的股票。
+4. 策略名称变更为 **磐石 Plus V30.6**。
 """
 
 import streamlit as st
@@ -29,9 +29,9 @@ GLOBAL_QFQ_BASE_FACTORS = {} # {ts_code: latest_adj_factor}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="磐石 Plus V30.5：稳健成长型策略（MA60 趋势过滤）", layout="wide")
-st.title("磐石 Plus V30.5：稳健成长型策略（📈 MA60 趋势过滤 / 优等生硬核筛选）")
-st.markdown("🎯 **V30.5 策略说明：** 在 V30.4 绝对 MACD 优势基础上，**强制加入 MA60 趋势过滤**，同时限定换手率和市值范围，只选择爆发力最强的“优等生”。")
+st.set_page_config(page_title="磐石 Plus V30.6：风险黑名单防御版", layout="wide")
+st.title("磐石 Plus V30.6：风险黑名单防御版（🛡️ 排除超买高位股）")
+st.markdown("🎯 **V30.6 策略说明：** 基于历史亏损分析，在 **MA60 趋势过滤**基础上，强制排除 **60日超买高位 (>95%)** 和 **当日涨幅过高 (>7.0%)** 的高风险样本，以牺牲小部分暴利换取准确率和回撤的稳定性。")
 st.markdown("✅ **技术说明：** 沿用 V30.4 的资金流、每日指标双重鲁棒性修复和增量缓存机制。")
 
 
@@ -92,7 +92,6 @@ def fetch_and_cache_daily_data(date):
 # ----------------------------------------------------------------------
 # 核心加速函数：按日期循环拉取历史数据 
 # ----------------------------------------------------------------------
-# ⚠️ 注意：此处不再使用 @st.cache_data，转而依赖内部的 fetch_and_cache_daily_data
 def get_all_historical_data(trade_days_list):
     """
     通过循环调用 fetch_and_cache_daily_data 构建全局数据，
@@ -143,7 +142,6 @@ def get_all_historical_data(trade_days_list):
         except Exception as e:
             # 如果某个日期下载失败，记录错误并尝试继续/中断
             st.error(f"❌ 警告：日期 {date} 的数据拉取失败，可能是 Tushare 超时。错误：{e}")
-            # 由于我们依赖于 per-date 缓存，这里即使失败也可以让循环继续，下次运行时会重试失败的日期
             continue 
             
     
@@ -325,13 +323,13 @@ def compute_indicators(ts_code, end_date):
         
     # MA60 计算 (V30.5 趋势过滤需要)
     if len(close) >= 60:
-        res['ma60'] = close.tail(60).mean() # <--- 新增 MA60
+        res['ma60'] = close.tail(60).mean() 
     else: res['ma60'] = np.nan
         
     # 波动率计算
     res['volatility'] = df['pct_chg'].tail(10).std() if len(df)>=10 else 0
     
-    # 60日位置计算 (原代码保留)
+    # 60日位置计算 (V30.6 风险黑名单需要)
     if len(df) >= 60:
         hist_60 = df.tail(60)
         min_low = hist_60['low'].min()
@@ -381,13 +379,12 @@ def get_market_state(trade_date):
        
         
 # ----------------------------------------------------
-# 侧边栏参数 (新增 MA60/换手率上下限/市值上下限参数)
+# 侧边栏参数 (V30.5 优等生过滤条件)
 # ----------------------------------------------------
 with st.sidebar:
     st.header("模式与日期选择")
     backtest_date_end = st.date_input("选择**回测结束日期**", value=datetime.now().date(), max_value=datetime.now().date())
     
-    # ⚠️ V30.4 优化：移除回测天数上限
     BACKTEST_DAYS = int(st.number_input(
         "**自动回测天数 (N)**", 
         value=50, 
@@ -400,23 +397,26 @@ with st.sidebar:
     st.header("核心参数")
     FINAL_POOL = int(st.number_input("最终入围评分数量 (M)", value=100, step=1, min_value=1)) 
     TOP_DISPLAY = int(st.number_input("界面显示 Top K", value=10, step=1))
-    TOP_BACKTEST = int(st.number_input("回测分析 Top K", value=5, step=1, min_value=1)) # 默认 Top 5
+    TOP_BACKTEST = int(st.number_input("回测分析 Top K", value=5, step=1, min_value=1)) 
     
     st.markdown("---")
     st.header("🛒 磐石 Plus 优等生过滤条件 (V30.5)")
     MIN_PRICE = st.number_input("最低股价 (元)", value=10.0, step=0.5, min_value=0.1) 
     MAX_PRICE = st.number_input("最高股价 (元)", value=300.0, step=5.0, min_value=1.0)
     
-    # ⭐️ 优等生过滤条件 1: 换手率
     MIN_TURNOVER = st.number_input("最低换手率 (%)", value=5.0, step=0.5, min_value=0.1) 
-    MAX_TURNOVER = st.number_input("最高换手率 (%)", value=15.0, step=0.5, min_value=5.0) # <--- 新增上限
+    MAX_TURNOVER = st.number_input("最高换手率 (%)", value=15.0, step=0.5, min_value=5.0) 
     
-    # ⭐️ 优等生过滤条件 2: 市值
     MIN_CIRC_MV_BILLIONS = st.number_input("最低流通市值 (亿元)", value=20.0, step=1.0, min_value=1.0)
-    MAX_CIRC_MV_BILLIONS = st.number_input("最高流通市值 (亿元)", value=200.0, step=10.0, min_value=50.0) # <--- 新增上限
+    MAX_CIRC_MV_BILLIONS = st.number_input("最高流通市值 (亿元)", value=200.0, step=10.0, min_value=50.0) 
 
     MIN_AMOUNT_MILLIONS = st.number_input("最低成交额 (亿元)", value=1.0, step=0.1, min_value=0.1) 
     MIN_AMOUNT = MIN_AMOUNT_MILLIONS * 100000000 
+    
+    st.markdown("---")
+    st.header("🛡️ V30.6 风险黑名单参数")
+    OVERBOUGHT_THRESHOLD = st.number_input("最高60日位置 (%)", value=95.0, step=1.0, min_value=50.0, help="高于此百分比位置的超买股将被剔除，建议95.0")
+    MAX_PCT_CHG_THRESHOLD = st.number_input("最高当日涨幅 (%)", value=7.0, step=0.5, min_value=2.0, help="当日涨幅高于此值的个股将被剔除，建议7.0")
 
 # ---------------------------
 # Token 输入与初始化 
@@ -431,24 +431,23 @@ pro = ts.pro_api()
 # ----------------------------------------------------------------------
 # 核心回测逻辑函数 (run_backtest_for_a_day)
 # ----------------------------------------------------------------------
-def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MAX_TURNOVER, MIN_AMOUNT, MIN_CIRC_MV_BILLIONS, MAX_CIRC_MV_BILLIONS): # <--- 参数列表更新
+def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MAX_TURNOVER, MIN_AMOUNT, MIN_CIRC_MV_BILLIONS, MAX_CIRC_MV_BILLIONS, OVERBOUGHT_THRESHOLD, MAX_PCT_CHG_THRESHOLD): # <--- 参数列表更新
     """为单个交易日运行选股和回测逻辑"""
     global GLOBAL_DAILY_RAW
     
     # 1. 判定市场状态 (V30.0 核心)
     market_state = get_market_state(last_trade)
-    # st.info(f"市场状态判定：{last_trade} 处于 **【{market_state}】** 市场，切换到相应策略。") # ⚠️ V30.4.1：隐藏每日日志
    
     # 2. 拉取全市场 Daily 数据 
     daily_all = safe_get('daily', trade_date=last_trade) 
     if daily_all.empty: return pd.DataFrame(), f"数据缺失或拉取失败：{last_trade}"
 
-    # ... (数据合并和初步过滤 - 保持不变) ...
+    # ... (数据合并和初步过滤 - 保持 V30.5 原有逻辑) ...
     pool_raw = daily_all.reset_index(drop=True) 
     stock_basic = safe_get('stock_basic', list_status='L', fields='ts_code,name,list_date') 
     REQUIRED_BASIC_COLS = ['ts_code','turnover_rate','amount','total_mv','circ_mv'] 
     daily_basic = safe_get('daily_basic', trade_date=last_trade, fields=','.join(REQUIRED_BASIC_COLS))
-    mf_raw = safe_get('moneyflow', trade_date=last_trade) # 尝试获取资金流
+    mf_raw = safe_get('moneyflow', trade_date=last_trade) 
     pool_merged = pool_raw.copy()
 
     if not stock_basic.empty and 'name' in stock_basic.columns:
@@ -464,45 +463,31 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
         pool_merged = pool_merged.merge(daily_basic[cols_to_merge], on='ts_code', how='left')
     
     
-    # -----------------------------------------------------------
-    # ⭐️ V30.4.3 鲁棒修复：确保每日基础数据字段存在 (解决 circ_mv, turnover_rate 等缺失)
-    # -----------------------------------------------------------
+    # ⭐️ V30.4.3 鲁棒修复：确保每日基础数据字段存在
     required_daily_basic_cols = ['turnover_rate','amount','total_mv','circ_mv']
     for col in required_daily_basic_cols:
         if col not in pool_merged.columns:
-            # 如果接口返回空数据或缺失字段，则手动添加并填充 0
             pool_merged[col] = 0.0
             
-    # -----------------------------------------------------------
-  
-    # -----------------------------------------------------------
-    # V30.4.2 鲁棒修复：资金流数据处理 (解决 net_mf 缺失)
-    # -----------------------------------------------------------
+    # V30.4.2 鲁棒修复：资金流数据处理 
     moneyflow = pd.DataFrame(columns=['ts_code','net_mf'])
     if not mf_raw.empty:
         possible = ['net_mf','net_mf_amount','net_mf_in']
         for c in possible:
             if c in mf_raw.columns:
-                # 成功获取资金流数据
                 moneyflow = mf_raw[['ts_code', c]].rename(columns={c:'net_mf'}).fillna(0)
                 break            
     
-    # 尝试合并资金流数据
     if not moneyflow.empty:
         pool_merged = pool_merged.merge(moneyflow, on='ts_code', how='left')
     
-    # 鲁棒修复：如果资金流数据未获取成功 (merge被跳过)，手动添加 'net_mf' 列
     if 'net_mf' not in pool_merged.columns:
-        pool_merged['net_mf'] = 0.0 # 默认资金流为 0
-       
-    # 确保所有股票的资金流值都是数字 (处理merge后产生的NaN)
-    pool_merged['net_mf'] = pool_merged['net_mf'].fillna(0) 
-    # -----------------------------------------------------------
+        pool_merged['net_mf'] = 0.0 
     
-   
+    pool_merged['net_mf'] = pool_merged['net_mf'].fillna(0) 
+       
     df = pool_merged.copy()
     df['close'] = pd.to_numeric(df['close'], errors='coerce') 
-    # 确保使用的列都存在且是数字
     df['turnover_rate'] = pd.to_numeric(df['turnover_rate'], errors='coerce').fillna(0)
     df['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0) * 1000 
     df['circ_mv_billion'] = pd.to_numeric(df['circ_mv'], errors='coerce').fillna(0) / 10000 
@@ -529,17 +514,17 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     mask_price = (df['close'] >= MIN_PRICE) & (df['close'] <= MAX_PRICE)
     df = df[mask_price]
 
-    # 市值过滤 (MIN_CIRC_MV_BILLIONS 和 MAX_CIRC_MV_BILLIONS)
+    # 市值过滤
     mask_circ_mv = (df['circ_mv_billion'] >= MIN_CIRC_MV_BILLIONS) & \
-                   (df['circ_mv_billion'] <= MAX_CIRC_MV_BILLIONS) # <--- 优等生过滤
+                   (df['circ_mv_billion'] <= MAX_CIRC_MV_BILLIONS) 
     df = df[mask_circ_mv] 
     
-    # 换手率过滤 (MIN_TURNOVER 和 MAX_TURNOVER)
+    # 换手率过滤
     mask_turn = (df['turnover_rate'] >= MIN_TURNOVER) & \
-                (df['turnover_rate'] <= MAX_TURNOVER) # <--- 优等生过滤
+                (df['turnover_rate'] <= MAX_TURNOVER) 
     df = df[mask_turn]
     
-    # 成交额过滤 (保留)
+    # 成交额过滤
     mask_amt = df['amount'] * 1000 >= MIN_AMOUNT
     df = df[mask_amt]
     
@@ -548,7 +533,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     
     # --------------------------------------------------------------------
 
-    # 3. 初步筛选 (动量/资金流初筛) - 保持不变
+    # 3. 初步筛选 (动量/资金流初筛) - 保持 V30.5 原有逻辑
     limit_mf = int(FINAL_POOL * 0.5)
     df_mf = df.sort_values('net_mf', ascending=False).head(limit_mf).copy()
     limit_pct = FINAL_POOL - len(df_mf)
@@ -556,7 +541,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     df_pct = df[~df['ts_code'].isin(existing_codes)].sort_values('pct_chg', ascending=False).head(limit_pct).copy()
     final_candidates = pd.concat([df_mf, df_pct]).reset_index(drop=True)
     
-    # 鲁棒性强化检查 - 保持不变
     if not GLOBAL_DAILY_RAW.empty:
         try:
             codes_with_d0_data = GLOBAL_DAILY_RAW.loc[(slice(None), last_trade), :].index.get_level_values('ts_code').unique()
@@ -568,34 +552,45 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     if final_candidates.empty:
         return pd.DataFrame(), f"跳过 {last_trade}：初步筛选后评分列表为空。"
 
-    # 4. 深度评分和策略切换 (V30.5 核心：MA60 趋势过滤)
+    # 4. 深度评分和策略切换 (V30.6 核心：新增双重风险黑名单)
     records = []
     
     for row in final_candidates.itertuples():
         ts_code = row.ts_code
         raw_close = getattr(row, 'close', np.nan)
-        
+        d0_pct_chg = getattr(row, 'pct_chg', np.nan) # <--- 获取当日涨幅
+
         # 核心指标计算
         ind = compute_indicators(ts_code, last_trade) 
         d0_qfq_close = ind.get('last_close', np.nan)
+        d0_ma60 = ind.get('ma60', np.nan) 
+        d0_position_60d = ind.get('position_60d', np.nan) # <--- 获取 60日位置
         d0_ma20 = ind.get('ma20', np.nan) 
-        d0_ma60 = ind.get('ma60', np.nan) # <--- 获取 MA60
-        d0_position_60d = ind.get('position_60d', np.nan)
-
+        d0_volatility = ind.get('volatility', np.nan)
+        
         # --------------------------------------------------------------------
-        # ⭐️ 优等生过滤 V30.5：趋势硬性过滤 (MA60之上)
+        # ⭐️ V30.6 风险黑名单 1：超买位置硬性排除
         # --------------------------------------------------------------------
-        if pd.isna(d0_ma60) or d0_ma60 == 0 or d0_qfq_close < d0_ma60:
-            continue # 优等生必须处于 MA60 之上，否则剔除！
+        if pd.notna(d0_position_60d) and d0_position_60d >= OVERBOUGHT_THRESHOLD:
+            continue # 排除处于 60 日区间高位 (>95.0%) 的股票！
             
         # --------------------------------------------------------------------
-        
-        # ⚠️ 弱市的**硬性防御过滤** (V30.4 原有逻辑：在弱市模式下，需要更严格的 MA20 和 60日超卖防御)
+        # ⭐️ V30.6 风险黑名单 2：当日涨幅过高排除
+        # --------------------------------------------------------------------
+        if pd.notna(d0_pct_chg) and d0_pct_chg >= MAX_PCT_CHG_THRESHOLD:
+            continue # 排除当日涨幅已接近或超过 7.0% 的股票！
+
+        # --------------------------------------------------------------------
+        # MA60 趋势过滤 (V30.5 原有逻辑)
+        if pd.isna(d0_ma60) or d0_ma60 == 0 or d0_qfq_close < d0_ma60:
+            continue
+            
+        # 弱市的硬性防御过滤 (V30.4 原有逻辑)
         if market_state == 'Weak':
             if pd.isna(d0_ma20) or d0_ma20 == 0 or d0_qfq_close < d0_ma20:
-                continue # 个股必须处于中期上升趋势 (MA20之上)
+                continue 
             if pd.isna(d0_position_60d) or d0_position_60d > 20.0:
-                continue # 个股必须处于 60 日超卖区间 (V28.0 极度防御核心)
+                continue 
         # --------------------------------------------------------------------
 
         if pd.notna(d0_qfq_close) and d0_qfq_close > 1e-9:
@@ -610,7 +605,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
                 'Pct_Chg (%)': getattr(row, 'pct_chg', 0),
                 'net_mf': getattr(row, 'net_mf', 0),
                 'macd': ind.get('macd_val', np.nan), 
-                'volatility': ind.get('volatility', np.nan),
+                'volatility': d0_volatility, # 使用计算出的波动率
                 'position_60d': d0_position_60d, 
                 'Return_D1 (%)': future_returns.get('Return_D1', np.nan),
                 'Return_D3 (%)': future_returns.get('Return_D3', np.nan),
@@ -621,10 +616,10 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     fdf = pd.DataFrame(records)
     
     if fdf.empty: 
-        return pd.DataFrame(), f"跳过 {last_trade}：优等生 MA60 趋势或弱市防御过滤后无有效股票。"
+        return pd.DataFrame(), f"跳过 {last_trade}：黑名单/MA60/弱市防御过滤后无有效股票。"
 
 
-    # 5. 归一化与动态策略评分 (V30.5 策略名称更新)
+    # 5. 归一化与动态策略评分 (V30.6 策略名称更新)
     
     # ⚠️ V30.4 策略：只对 'net_mf' 和 'volatility' 进行归一化
     def normalize(series):
@@ -635,44 +630,33 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     fdf['s_mf'] = normalize(fdf['net_mf'])
     fdf['s_volatility'] = normalize(fdf['volatility']) 
     
-    # --- V30.5 动态策略评分 ---
+    # --- V30.6 动态策略评分 ---
     if market_state == 'Strong':
-        # 策略 1: 绝对 MACD 优势模式 (直接使用原始 MACD 绝对值评分)
-        fdf['策略'] = '磐石Plus V30.5：稳健MACD优势' # <--- 策略名称更新
+        # 策略 1: 绝对 MACD 优势模式 
+        fdf['策略'] = '磐石Plus V30.6：MACD优势防御版' # <--- 策略名称更新
         
-        # 筛选 MACD > 0 的股票，确保是启动信号
         fdf_strong = fdf[fdf['macd'] > 0].copy()
         if fdf_strong.empty:
-            fdf['综合评分'] = 0.0 # 空仓
+            fdf['综合评分'] = 0.0 
             fdf = fdf[fdf['综合评分'] > 10000000] 
         else:
-            # 基础分：MACD 原始值 * 10000 (放大差异，作为主导分数)
             fdf_strong['Score_MACD'] = fdf_strong['macd'] * 10000
-            
-            # 辅助分：低波动率和资金流作为加分项 (归一化后权重)
             fdf_strong['Score_Aux'] = (fdf_strong['s_volatility'].rsub(1) * 0.3) + (fdf_strong['s_mf'] * 0.7)
-            
             fdf_strong['综合评分'] = fdf_strong['Score_MACD'] + fdf_strong['Score_Aux']
-            
             fdf = fdf_strong.sort_values('综合评分', ascending=False)
             
     else: # Weak Market
         # 策略 2: 极致反弹防御模式 
-        fdf['策略'] = '磐石Plus V30.5：极致反弹防御' # <--- 策略名称更新
-        # 弱市下仍需归一化 MACD
+        fdf['策略'] = '磐石Plus V30.6：极致反弹防御版' # <--- 策略名称更新
         fdf['s_macd'] = normalize(fdf['macd']) 
         
-        w_volatility = 0.45  # 波动率反向 (45%，提高安全边际)
-        w_macd = 0.45  # MACD (45%，核心反弹信号)
-        w_mf = 0.10  # 资金流 (降权，作为微弱辅助)
-        
+        w_volatility = 0.45 
+        w_macd = 0.45  
+        w_mf = 0.10  
         
         score = (
-            # 波动率越低，得分越高 (反向，占 45%) - 提高防御安全边际
             fdf['s_volatility'].rsub(1).fillna(0.5) * w_volatility + 
-            # MACD越大，得分越高 (正向，占 45%) - 核心反弹信号
             fdf['s_macd'].fillna(0.5) * w_macd +
-            # 资金流入越多，得分越高 (正向，占 10%) - 辅助催化剂
             fdf['s_mf'].fillna(0.5) * w_mf 
         )
         
@@ -685,12 +669,11 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_
     return fdf.head(TOP_BACKTEST).copy(), None
 
 # ---------------------------
-# 主运行块 (保持不变)
+# 主运行块 (保持 V30.5 原有逻辑)
 # ---------------------------
 if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
     
-    # 🚨 V30.4.4 指引：现在只需要清除旧的整体缓存
-    st.info("💡 **重要提示 (V30.5)：** 首次运行时速度较慢，请等待。若中途失败，无需清除缓存，只需重新点击按钮，程序将从失败点**快速恢复**。")
+    st.info("💡 **重要提示 (V30.6)：** 首次运行时速度较慢，请等待。若中途失败，只需重新点击按钮，程序将从失败点**快速恢复**。")
    
     trade_days_str = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS)
     if not trade_days_str:
@@ -718,7 +701,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
         progress_text.text(f"⏳ 正在处理第 {i+1}/{total_days} 个交易日：{trade_date}")
         
         daily_result_df, error = run_backtest_for_a_day(
-            trade_date, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MAX_TURNOVER, MIN_AMOUNT, MIN_CIRC_MV_BILLIONS, MAX_CIRC_MV_BILLIONS # <--- 参数列表更新
+            trade_date, TOP_BACKTEST, FINAL_POOL, MIN_PRICE, MAX_PRICE, MIN_TURNOVER, MAX_TURNOVER, MIN_AMOUNT, MIN_CIRC_MV_BILLIONS, MAX_CIRC_MV_BILLIONS, OVERBOUGHT_THRESHOLD, MAX_PCT_CHG_THRESHOLD # <--- 参数列表更新
         )
       
         if error:
@@ -739,7 +722,6 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
         
     all_results = pd.concat(results_list)
     
-    # 兼容处理：如果 Trade_Date 是对象类型，尝试转换为字符串
     if all_results['Trade_Date'].dtype != 'object':
         all_results['Trade_Date'] = all_results['Trade_Date'].astype(str)
         
@@ -763,7 +745,7 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
             
         st.metric(f"Top {TOP_BACKTEST}：D+{n} 平均收益 / 准确率", 
                   f"{avg_return:.2f}% / {hit_rate:.1f}%", 
-                  help=f"总有效样本数：{total_count}。**磐石 Plus V30.5 稳健成长策略**")
+                  help=f"总有效样本数：{total_count}。**磐石 Plus V30.6 风险防御策略**")
 
     st.header("📋 每日回测详情 (Top K 明细)")
     
@@ -772,4 +754,3 @@ if st.button(f"🚀 开始 {BACKTEST_DAYS} 日自动回测"):
                     'Return_D1 (%)', 'Return_D3 (%)', 'Return_D5 (%)', 'position_60d']
     
     st.dataframe(all_results[display_cols].sort_values('Trade_Date', ascending=False), use_container_width=True)
-
