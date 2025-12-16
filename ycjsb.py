@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.12 Alpha 恢复版 (波段稳定性优化) - FULL VERSION
-V30.12.0 更新：
-1. **核心逻辑**：保持 V30.11 (实体力度 Alpha 恢复，RSI/Bias 降级为评分)。
-2. **新增因子**：引入 `vol_ratio` (今日成交量 / 前 5 日均量)。
-3. **评分优化**：新增 `s_vol_profile` (成交量质量分)，奖励温和放量 (1.0x-3.0x)，惩罚巨量换手 (>5.0x)。
-4. **权重调整**：将成交量质量分纳入最终评分 (10% 权重)，目标提升 D+1/D+3 胜率 > 50%。
+选股王 · V30.11 Alpha 恢复版 (最终修复版) - FULL VERSION
+V30.11.0 更新：
+1. **核心逻辑**：与 V30.10 保持一致。恢复 V30.8 实体力度 Alpha，将 RSI/Bias 冷却降级为评分权重。
+2. **NameError 修复**：修复 get_all_historical_data 函数中变量名 adj_factor_list 的错误引用。
+3. **目标**：恢复 D+5 收益至 > 2.0%。
 """
 
 import streamlit as st
@@ -23,54 +22,17 @@ warnings.filterwarnings("ignore")
 pro = None 
 GLOBAL_ADJ_FACTOR = pd.DataFrame() 
 GLOBAL_DAILY_RAW = pd.DataFrame() 
-GLOBAL_QFQ_BASE_FACTORS = {} # {ts_code: latest_adj_factor}
+GLOBAL_QFQ_BASE_FACTORS = {} 
 
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V30.12：波段稳定性优化", layout="wide")
-st.title("选股王 V30.12：波段稳定性优化（📈 引入成交量质量）")
-st.markdown("🎯 **V30.12 策略核心：** 在保证 D+5 收益的基础上，引入**成交量质量**因子 (10% 权重)，惩罚巨量换手股，以提升 D+1 和 D+3 的短周期胜率。")
-
-# ----------------------------------------------------
-# 侧边栏参数 
-# ----------------------------------------------------
-with st.sidebar:
-    st.header("模式与日期选择")
-    backtest_date_end = st.date_input("回测结束日期", value=datetime.now().date())
-    BACKTEST_DAYS = int(st.number_input("自动回测天数 (N)", value=50, step=1))
-    
-    st.markdown("---")
-    st.header("核心参数")
-    FINAL_POOL = int(st.number_input("入围评分数量", value=100)) 
-    TOP_BACKTEST = int(st.number_input("回测分析 Top K", value=5)) 
-    
-    st.markdown("---")
-    st.header("🛡️ V30.12 核心 Alpha 参数 (V30.8 保持)")
-    MAX_UPPER_SHADOW = st.number_input("最大上影线比例 (%)", value=4.0)
-    MIN_BODY_POS = st.number_input("最低实体位置 (0-1)", value=0.7)
-    MAX_TURNOVER_RATE = st.number_input("最大换手率 (%)", value=20.0)
-    
-    st.markdown("---")
-    st.header("🧊 V30.12 评分权重 (新)")
-    st.write("Alpha 70% / 安全性 20% / **成交量质量 10%**")
-
-    # 隐藏的固定过滤参数
-    MIN_PRICE, MAX_PRICE = 10.0, 300.0
-    MIN_TURNOVER = 5.0 
-    MIN_CIRC_MV_BILLIONS, MAX_CIRC_MV_BILLIONS = 20.0, 200.0
-    MIN_AMOUNT = 100000000
+st.set_page_config(page_title="选股王 V30.11：Alpha 恢复版", layout="wide")
+st.title("选股王 V30.11：Alpha 恢复版（✅ 修复 NameError）")
+st.markdown("🎯 **V30.11 策略核心：** 核心逻辑与 V30.10 保持一致，全力恢复 V30.8 的超高 D+5 收益。本版本仅为修复代码错误。")
 
 # ---------------------------
-# Token 
-# ---------------------------
-TS_TOKEN = st.text_input("Tushare Token", type="password")
-if not TS_TOKEN: st.stop()
-ts.set_token(TS_TOKEN)
-pro = ts.pro_api() 
-
-# ---------------------------
-# 辅助函数 (保持 V30.11 修复后的代码)
+# 辅助函数 (已修复 NameError)
 # ---------------------------
 @st.cache_data(ttl=3600*12) 
 def safe_get(func_name, **kwargs):
@@ -113,6 +75,7 @@ def get_all_historical_data(trade_days_list):
     all_dates = all_trade_dates_df['cal_date'].tolist()
     st.info(f"⏳ 正在下载 {start_date} 到 {end_date} 间的全市场历史数据...")
 
+    # 注意：这里使用了 adj_factor_data_list (修复了 NameError)
     adj_factor_data_list = [] 
     daily_data_list = []
     download_progress = st.progress(0, text="下载进度...")
@@ -130,6 +93,7 @@ def get_all_historical_data(trade_days_list):
 
     if not adj_factor_data_list or not daily_data_list: return False
         
+    # FIX: 修复 NameError，使用 adj_factor_data_list
     adj_factor_data = pd.concat(adj_factor_data_list)
     adj_factor_data['adj_factor'] = pd.to_numeric(adj_factor_data['adj_factor'], errors='coerce').fillna(0)
     GLOBAL_ADJ_FACTOR = adj_factor_data.set_index(['ts_code', 'trade_date']).sort_index(level=[0, 1]) 
@@ -229,16 +193,6 @@ def compute_indicators(ts_code, end_date):
     rsi_series = calculate_rsi(close, period=12)
     res['rsi_12'] = rsi_series.iloc[-1]
     
-    # V30.12 New: Volume Ratio Calculation
-    vol = df['vol']
-    res['vol_ratio'] = 1.0 # Default neutral
-    if len(vol) >= 6:
-        # 排除今天的成交量，计算前 5 个交易日的平均成交量
-        avg_vol_5d = vol.iloc[-6:-1].mean() 
-        current_vol = vol.iloc[-1]
-        if avg_vol_5d > 0:
-            res['vol_ratio'] = current_vol / avg_vol_5d
-    
     res['volatility'] = df['pct_chg'].tail(10).std() if len(df)>=10 else 0
     
     return res
@@ -253,27 +207,68 @@ def get_market_state(trade_date):
     ma20 = index_data['close'].tail(20).mean()
     return 'Strong' if latest_close > ma20 else 'Weak'
        
+# ----------------------------------------------------
+# 侧边栏参数 
+# ----------------------------------------------------
+with st.sidebar:
+    st.header("模式与日期选择")
+    backtest_date_end = st.date_input("回测结束日期", value=datetime.now().date())
+    BACKTEST_DAYS = int(st.number_input("自动回测天数 (N)", value=50, step=1))
+    
+    st.markdown("---")
+    st.header("核心参数")
+    FINAL_POOL = int(st.number_input("入围评分数量", value=100)) 
+    TOP_BACKTEST = int(st.number_input("回测分析 Top K", value=5)) 
+    
+    st.markdown("---")
+    st.header("🛡️ V30.11 核心 Alpha 参数 (V30.8 保持)")
+    MAX_UPPER_SHADOW = st.number_input("最大上影线比例 (%)", value=4.0)
+    MIN_BODY_POS = st.number_input("最低实体位置 (0-1)", value=0.7)
+    MAX_TURNOVER_RATE = st.number_input("最大换手率 (%)", value=20.0)
+    
+    st.markdown("---")
+    st.header("🧊 冷却因子 (V30.11 仅用于评分)")
+    st.write("RSI/Bias **不再硬性过滤**，仅用于评分降权。")
+    
+    # 隐藏的固定过滤参数
+    MIN_PRICE, MAX_PRICE = 10.0, 300.0
+    MIN_TURNOVER = 5.0 
+    MIN_CIRC_MV_BILLIONS, MAX_CIRC_MV_BILLIONS = 20.0, 200.0
+    MIN_AMOUNT = 100000000
+
+# ---------------------------
+# Token 
+# ---------------------------
+TS_TOKEN = st.text_input("Tushare Token", type="password")
+if not TS_TOKEN: st.stop()
+ts.set_token(TS_TOKEN)
+pro = ts.pro_api() 
+
 # ----------------------------------------------------------------------
 # 核心回测逻辑函数 
 # ----------------------------------------------------------------------
 def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS): 
     market_state = get_market_state(last_trade)
     
-    # 1-3. 数据获取、清洗与初筛 (与 V30.11 保持一致)
+    # 1. 基础数据获取与过滤
     daily_all = safe_get('daily', trade_date=last_trade) 
     if daily_all.empty: return pd.DataFrame(), f"数据缺失 {last_trade}"
+
     daily_basic = safe_get('daily_basic', trade_date=last_trade, fields='ts_code,turnover_rate,circ_mv,total_mv,amount')
     mf_raw = safe_get('moneyflow', trade_date=last_trade) 
     stock_basic = safe_get('stock_basic', list_status='L', fields='ts_code,name,list_date')
     
+    # 合并
     df = daily_all.merge(stock_basic, on='ts_code', how='left')
     if not daily_basic.empty: df = df.merge(daily_basic, on='ts_code', how='left')
     else: df['turnover_rate'] = 0; df['circ_mv'] = 0; df['amount'] = 0
+    
     if not mf_raw.empty:
         mf = mf_raw[['ts_code','net_mf_amount']].rename(columns={'net_mf_amount':'net_mf'})
         df = df.merge(mf, on='ts_code', how='left')
     df['net_mf'] = df['net_mf'].fillna(0)
     
+    # 清洗
     df['close'] = pd.to_numeric(df['close'], errors='coerce')
     df['open'] = pd.to_numeric(df['open'], errors='coerce')
     df['high'] = pd.to_numeric(df['high'], errors='coerce')
@@ -285,6 +280,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     df['list_date'] = pd.to_datetime(df['list_date'], errors='coerce')
     df = df[(datetime.strptime(last_trade, "%Y%m%d") - df['list_date']).dt.days > 120]
     
+    # 硬性过滤
     df = df[(df['close'] >= MIN_PRICE) & (df['close'] <= MAX_PRICE)]
     df = df[(df['circ_mv_billion'] >= MIN_CIRC_MV_BILLIONS) & (df['circ_mv_billion'] <= MAX_CIRC_MV_BILLIONS)]
     df = df[df['turnover_rate'] >= MIN_TURNOVER]
@@ -293,13 +289,14 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
 
     if len(df) == 0: return pd.DataFrame(), "过滤后无标的"
 
+    # 3. 初筛
     limit_mf = int(FINAL_POOL * 0.5)
     df_mf = df.sort_values('net_mf', ascending=False).head(limit_mf)
     limit_pct = FINAL_POOL - len(df_mf)
     df_pct = df[~df['ts_code'].isin(df_mf['ts_code'])].sort_values('pct_chg', ascending=False).head(limit_pct)
     final_candidates = pd.concat([df_mf, df_pct]).reset_index(drop=True)
     
-    # 4. 深度计算与过滤 (与 V30.11 保持一致)
+    # 4. 深度计算
     records = []
     for row in final_candidates.itertuples():
         ts_code = row.ts_code
@@ -312,15 +309,25 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         d0_pos60 = ind.get('position_60d', np.nan)
         d0_rsi = ind.get('rsi_12', 50)
         d0_bias = ind.get('bias_20', 0)
-        d0_vol_ratio = ind.get('vol_ratio', 1.0) # V30.12 New
-
-        # 核心过滤 (V30.8/V30.11 逻辑)
+        
+        # --- V30.11 过滤器核心 (V30.8 逻辑) ---
+        
+        # 1. 趋势保护 (价格高于 60日均线)
         if pd.isna(d0_ma60) or d0_close < d0_ma60: continue
+            
+        # 2. 上影线 (V30.8)
         if pd.notna(d0_high) and pd.notna(d0_close) and d0_close > 0:
-            if (d0_high - d0_close) / d0_close * 100 > MAX_UPPER_SHADOW: continue 
+            upper_shadow = (d0_high - d0_close) / d0_close * 100
+            if upper_shadow > MAX_UPPER_SHADOW: continue 
+        
+        # 3. 实体位置 (V30.8)
         if pd.notna(d0_high) and pd.notna(d0_low) and pd.notna(d0_close):
             range_len = d0_high - d0_low
-            if range_len > 0 and (d0_close - d0_low) / range_len < MIN_BODY_POS: continue 
+            if range_len > 0:
+                body_pos = (d0_close - d0_low) / range_len
+                if body_pos < MIN_BODY_POS: continue 
+
+        # 4. 弱市防御
         if market_state == 'Weak':
             if pd.isna(d0_ma20) or d0_close < d0_ma20: continue 
             if pd.notna(d0_pos60) and d0_pos60 > 20.0: continue
@@ -336,7 +343,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
                 'rsi': d0_rsi, 
                 'bias': d0_bias, 
                 'net_mf': row.net_mf,
-                'vol_ratio': d0_vol_ratio, # V30.12 New
                 'Return_D1 (%)': future.get('Return_D1', np.nan),
                 'Return_D3 (%)': future.get('Return_D3', np.nan),
                 'Return_D5 (%)': future.get('Return_D5', np.nan),
@@ -346,54 +352,32 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     fdf = pd.DataFrame(records)
     if fdf.empty: return pd.DataFrame(), "深度筛选后无标的"
     
-    # 5. 评分 (V30.12 核心：统一归一化评分)
+    # 5. 评分 (V30.11 核心：冷却降级为低权重评分)
     def normalize(s): 
-        # 统一归一化函数
         if s.max() == s.min(): return pd.Series([0.5] * len(s), index=s.index) 
         return (s - s.min()) / (s.max() - s.min() + 1e-9)
     
-    # --- V30.12 成交量质量评分 ---
-    def calculate_vol_score(ratio):
-        if ratio < 1.0: return 0.2 
-        elif ratio <= 3.0: return 1.0 
-        elif ratio <= 5.0: return 0.6 
-        else: return 0.1 
-        
-    fdf['s_vol_profile'] = fdf['vol_ratio'].apply(calculate_vol_score)
-    # -----------------------------
-
-    # 1. Alpha 动能因子 (MACD, 资金流) - 目标 70% 权重
-    fdf['s_macd'] = normalize(fdf['macd'])
     fdf['s_mf'] = normalize(fdf['net_mf'])
-    fdf['s_alpha_norm'] = fdf['s_macd'] * 0.6 + fdf['s_mf'] * 0.4 
-    
-    # 2. 安全性因子 (RSI, Bias) - 目标 20% 权重
     fdf['s_rsi_safety'] = 1 - normalize(fdf['rsi']) 
     fdf['s_bias_safety'] = 1 - normalize(fdf['bias']) 
-    fdf['s_safety'] = fdf['s_rsi_safety'] * 0.5 + fdf['s_bias_safety'] * 0.5
+    
+    # 综合安全分 (Beta)
+    fdf['s_safety'] = (fdf['s_rsi_safety'] * 0.5 + fdf['s_bias_safety'] * 0.5) 
 
-    # 3. 最终得分计算
-    # 强市：更依赖 Alpha (70% Alpha, 20% Safety, 10% Vol)
     if market_state == 'Strong':
-        fdf['策略'] = 'V30.12 强市波段优化版'
+        fdf['策略'] = 'V30.11 Alpha 强市恢复版'
         fdf_strong = fdf[fdf['macd'] > 0].copy()
         if fdf_strong.empty: fdf['Score'] = 0
         else:
-            fdf_strong['Score'] = (
-                fdf_strong['s_alpha_norm'] * 0.7 + 
-                fdf_strong['s_safety'] * 0.2 + 
-                fdf_strong['s_vol_profile'] * 0.1 
-            ) * 10000 # 放大分数以便排序
+            # Alpha 权重 (MACD, MF) 80% + Beta 权重 (Safety) 20%
+            fdf_strong['s_alpha'] = fdf_strong['macd'] * 10000 + fdf_strong['s_mf'] * 50
+            fdf_strong['Score'] = fdf_strong['s_alpha'] * 0.8 + fdf_strong['s_safety'] * 0.2
             fdf = fdf_strong.sort_values('Score', ascending=False)
-            
-    # 弱市：依赖 Alpha 和 Safety，Volume 作用不变
     else:
-        fdf['策略'] = 'V30.12 弱市波段优化版'
-        fdf['Score'] = (
-            fdf['s_alpha_norm'] * 0.7 + 
-            fdf['s_safety'] * 0.2 + 
-            fdf['s_vol_profile'] * 0.1
-        ) * 10000
+        fdf['策略'] = 'V30.11 Alpha 弱市恢复版'
+        fdf['s_macd'] = normalize(fdf['macd'])
+        fdf['s_alpha'] = fdf['s_macd'] * 0.6 + fdf['s_mf'] * 0.4
+        fdf['Score'] = fdf['s_alpha'] * 0.8 + fdf['s_safety'] * 0.2
         fdf = fdf.sort_values('Score', ascending=False)
         
     return fdf.head(TOP_BACKTEST), None
@@ -401,7 +385,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
 # ---------------------------
 # 主运行块
 # ---------------------------
-if st.button(f"🚀 运行 V30.12 波段稳定性优化版回测 ({BACKTEST_DAYS}天)"):
+if st.button(f"🚀 运行 V30.11 Alpha 恢复版回测 ({BACKTEST_DAYS}天)"):
     
     try:
         trade_days = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS)
@@ -409,6 +393,7 @@ if st.button(f"🚀 运行 V30.12 波段稳定性优化版回测 ({BACKTEST_DAYS
         st.error("无法找到 Tushare 交易日数据，请检查 Tushare Token。")
         st.stop()
 
+    # 此处调用了 get_all_historical_data，现在已修复其内部 NameError
     if not get_all_historical_data(trade_days): 
         st.error("数据下载失败或缺失，请稍后重试。")
         st.stop()
@@ -426,7 +411,7 @@ if st.button(f"🚀 运行 V30.12 波段稳定性优化版回测 ({BACKTEST_DAYS
     if results:
         all_res = pd.concat(results)
         
-        st.header("📊 V30.12 平均回测结果")
+        st.header("📊 V30.11 平均回测结果")
         for n in [1, 3, 5]:
             col = f'Return_D{n} (%)'
             valid = all_res.dropna(subset=[col])
@@ -435,7 +420,6 @@ if st.button(f"🚀 运行 V30.12 波段稳定性优化版回测 ({BACKTEST_DAYS
                 win = (valid[col] > 0).mean() * 100
                 st.metric(f"D+{n} 收益/胜率", f"{avg:.2f}% / {win:.1f}%")
                 
-        # 额外展示 vol_ratio 因子以便分析
-        st.dataframe(all_res[['Trade_Date','name','Pct_Chg','Turnover','rsi','bias','vol_ratio','Return_D1 (%)']].head(100))
+        st.dataframe(all_res[['Trade_Date','name','Pct_Chg','Turnover','rsi','bias','Return_D1 (%)']].head(100))
     else:
         st.info("回测完成，但没有选出符合条件的股票。")
