@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.7 修正版：拒绝分歧与拥挤 (Alpha 复合框架)
-V30.7.0 更新：
-1. **回滚**：删除了 V30.6 导致的性能下降的“高位”和“高涨幅”硬性过滤。
-2. **新增防御 1**：上影线过滤 (Upper Shadow)。排除上影线 > 2.0% 的股票（避免拉高出货）。
-3. **新增防御 2**：高换手过滤 (Max Turnover)。排除换手率 > 20% 的股票（避免筹码松动）。
-4. 保留 V30.4/V30.5 的所有优秀机制（资金流、MACD评分、趋势过滤）。
+选股王 · V30.8 实体力度进阶版 (Alpha 复合框架)
+V30.8.0 更新：
+1. **优化防御 1**：放宽上影线限制至 4.0%（避免误杀仙人指路）。
+2. **新增防御 2**：新增【K线实体位置】过滤。要求 (Close-Low)/(High-Low) > 0.7，确保收盘强势。
+3. **保持**：换手率 < 20% 的拥挤度防御。
+4. **目标**：结合 V30.5 的爆发力和 V30.7 的稳定性，冲击 D+3 > 1.8%。
 """
 
 import streamlit as st
@@ -25,17 +25,15 @@ GLOBAL_ADJ_FACTOR = pd.DataFrame()
 GLOBAL_DAILY_RAW = pd.DataFrame() 
 GLOBAL_QFQ_BASE_FACTORS = {} 
 
-
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V30.7：拒绝分歧修正版", layout="wide")
-st.title("选股王 V30.7：拒绝分歧修正版（🛡️ 排除长上影线 & 极高换手）")
-st.markdown("🎯 **V30.7 策略核心：** 承认 V30.6 的失败，**取消对高位/高涨幅的限制**（找回爆发力）。转而通过 **排除长上影线（>2%）** 和 **排除极高换手（>20%）** 来规避真正的顶部出货风险。")
-
+st.set_page_config(page_title="选股王 V30.8：实体力度进阶版", layout="wide")
+st.title("选股王 V30.8：实体力度进阶版（💪 锁定高位收盘）")
+st.markdown("🎯 **V30.8 策略核心：** 既然 V30.7 的 D+5 创新高，说明防御有效。V30.8 **放宽上影线限制**（找回爆发力），同时新增 **K线实体位置 > 0.7** 过滤，强制要求收盘价位于全天高位，拒绝“冲高回落”的假强势。")
 
 # ---------------------------
-# 辅助函数 (API调用和数据获取)
+# 辅助函数 
 # ---------------------------
 @st.cache_data(ttl=3600*12) 
 def safe_get(func_name, **kwargs):
@@ -161,6 +159,7 @@ def compute_indicators(ts_code, end_date):
     res['last_close'] = close.iloc[-1]
     res['last_open'] = df['open'].iloc[-1]
     res['last_high'] = df['high'].iloc[-1]
+    res['last_low'] = df['low'].iloc[-1]
     
     # MACD
     if len(close) >= 26:
@@ -211,11 +210,12 @@ with st.sidebar:
     TOP_BACKTEST = int(st.number_input("回测分析 Top K", value=5)) 
     
     st.markdown("---")
-    st.header("🛡️ V30.7 风险过滤器 (修正版)")
-    MAX_UPPER_SHADOW = st.number_input("最大上影线比例 (%)", value=2.0, step=0.1, help="排除上影线长度超过此值的股票。")
-    MAX_TURNOVER_RATE = st.number_input("最大换手率 (%)", value=20.0, step=1.0, help="排除换手率过高（筹码松动）的股票。")
+    st.header("🛡️ V30.8 进阶防御参数")
+    MAX_UPPER_SHADOW = st.number_input("最大上影线比例 (%)", value=4.0, step=0.5, help="放宽至4.0%，允许仙人指路。")
+    MIN_BODY_POS = st.number_input("最低实体位置 (0-1)", value=0.7, step=0.05, help="收盘价必须位于当日振幅的 Top 30% 区间，确保收盘强势。")
+    MAX_TURNOVER_RATE = st.number_input("最大换手率 (%)", value=20.0, step=1.0)
     
-    # 隐藏的固定过滤参数 (保持 V30.5 标准)
+    # 隐藏的固定过滤参数
     MIN_PRICE, MAX_PRICE = 10.0, 300.0
     MIN_TURNOVER = 5.0 
     MIN_CIRC_MV_BILLIONS, MAX_CIRC_MV_BILLIONS = 20.0, 200.0
@@ -232,7 +232,7 @@ pro = ts.pro_api()
 # ----------------------------------------------------------------------
 # 核心回测逻辑函数 
 # ----------------------------------------------------------------------
-def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE): 
+def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS): 
     market_state = get_market_state(last_trade)
     
     # 1. 基础数据获取与过滤
@@ -257,6 +257,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     df['close'] = pd.to_numeric(df['close'], errors='coerce')
     df['open'] = pd.to_numeric(df['open'], errors='coerce')
     df['high'] = pd.to_numeric(df['high'], errors='coerce')
+    df['low'] = pd.to_numeric(df['low'], errors='coerce')
     df['circ_mv_billion'] = pd.to_numeric(df['circ_mv'], errors='coerce').fillna(0) / 10000
     df['amount'] = pd.to_numeric(df['amount'], errors='coerce').fillna(0) * 1000
     df = df[~df['name'].str.contains('ST|退', na=False)]
@@ -264,13 +265,13 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     df['list_date'] = pd.to_datetime(df['list_date'], errors='coerce')
     df = df[(datetime.strptime(last_trade, "%Y%m%d") - df['list_date']).dt.days > 120]
     
-    # 硬性过滤 (V30.5 标准)
+    # 硬性过滤
     df = df[(df['close'] >= MIN_PRICE) & (df['close'] <= MAX_PRICE)]
     df = df[(df['circ_mv_billion'] >= MIN_CIRC_MV_BILLIONS) & (df['circ_mv_billion'] <= MAX_CIRC_MV_BILLIONS)]
     df = df[df['turnover_rate'] >= MIN_TURNOVER]
     df = df[df['amount'] >= MIN_AMOUNT]
 
-    # V30.7 新增：换手率天花板过滤 (避免拥挤)
+    # V30.8 防御：换手率天花板
     df = df[df['turnover_rate'] <= MAX_TURNOVER_RATE] 
 
     if len(df) == 0: return pd.DataFrame(), "过滤后无标的"
@@ -289,25 +290,31 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         # 指标计算
         ind = compute_indicators(ts_code, last_trade)
         d0_close = ind.get('last_close', np.nan)
-        d0_open = ind.get('last_open', np.nan)
         d0_high = ind.get('last_high', np.nan)
+        d0_low = ind.get('last_low', np.nan)
         d0_ma60 = ind.get('ma60', np.nan)
         d0_ma20 = ind.get('ma20', np.nan)
         d0_pos60 = ind.get('position_60d', np.nan)
         
-        # --- V30.7 过滤器核心 ---
+        # --- V30.8 核心过滤器 ---
         
-        # 1. 趋势保护 (MA60)
+        # 1. 趋势保护
         if pd.isna(d0_ma60) or d0_close < d0_ma60: continue
             
-        # 2. 上影线过滤 (V30.7 新增)
-        # 逻辑：(最高价 - 收盘价) / 收盘价 > 2% -> 视为抛压过大，排除
+        # 2. 上影线过滤 (放宽至 4%)
         if pd.notna(d0_high) and pd.notna(d0_close) and d0_close > 0:
             upper_shadow = (d0_high - d0_close) / d0_close * 100
-            if upper_shadow > MAX_UPPER_SHADOW:
-                continue 
+            if upper_shadow > MAX_UPPER_SHADOW: continue 
         
-        # 3. 弱市防御 (保持 V30.4 逻辑)
+        # 3. 新增：实体位置过滤 (Close Location Value)
+        # 逻辑：(Close - Low) / (High - Low) > 0.7
+        if pd.notna(d0_high) and pd.notna(d0_low) and pd.notna(d0_close):
+            range_len = d0_high - d0_low
+            if range_len > 0:
+                body_pos = (d0_close - d0_low) / range_len
+                if body_pos < MIN_BODY_POS: continue # 收盘太弱，排除
+        
+        # 4. 弱市防御
         if market_state == 'Weak':
             if pd.isna(d0_ma20) or d0_close < d0_ma20: continue
             if pd.notna(d0_pos60) and d0_pos60 > 20.0: continue
@@ -340,8 +347,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     fdf['s_vol'] = normalize(fdf['volatility'])
     
     if market_state == 'Strong':
-        fdf['策略'] = 'V30.7 强势MACD修正'
-        # 允许高MACD，但通过上影线和换手率已过滤掉风险
+        fdf['策略'] = 'V30.8 实体强势版'
         fdf_strong = fdf[fdf['macd'] > 0].copy()
         if fdf_strong.empty: fdf['Score'] = 0
         else:
@@ -349,7 +355,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
                                   (fdf_strong['s_vol'].rsub(1) * 0.3 + fdf_strong['s_mf'] * 0.7)
             fdf = fdf_strong.sort_values('Score', ascending=False)
     else:
-        fdf['策略'] = 'V30.7 弱势反弹修正'
+        fdf['策略'] = 'V30.8 弱势收盘增强'
         fdf['s_macd'] = normalize(fdf['macd'])
         fdf['Score'] = fdf['s_vol'].rsub(1) * 0.45 + fdf['s_macd'] * 0.45 + fdf['s_mf'] * 0.1
         fdf = fdf.sort_values('Score', ascending=False)
@@ -359,14 +365,14 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
 # ---------------------------
 # 主运行块
 # ---------------------------
-if st.button(f"🚀 运行 V30.7 修正版回测 ({BACKTEST_DAYS}天)"):
+if st.button(f"🚀 运行 V30.8 实体版回测 ({BACKTEST_DAYS}天)"):
     trade_days = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS)
     if not get_all_historical_data(trade_days): st.stop()
     
     results = []
     bar = st.progress(0)
     for i, date in enumerate(trade_days):
-        res, err = run_backtest_for_a_day(date, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE)
+        res, err = run_backtest_for_a_day(date, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS)
         if not res.empty:
             res['Trade_Date'] = date
             results.append(res)
@@ -375,7 +381,7 @@ if st.button(f"🚀 运行 V30.7 修正版回测 ({BACKTEST_DAYS}天)"):
     
     if results:
         all_res = pd.concat(results)
-        st.header("📊 V30.7 平均回测结果")
+        st.header("📊 V30.8 平均回测结果")
         for n in [1, 3, 5]:
             col = f'Return_D{n} (%)'
             valid = all_res.dropna(subset=[col])
