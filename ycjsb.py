@@ -4,7 +4,7 @@ import numpy as np
 import tushare as ts
 from datetime import datetime, timedelta
 import warnings
-import time  
+import time
 warnings.filterwarnings("ignore")
 
 # ---------------------------
@@ -22,6 +22,13 @@ GLOBAL_QFQ_BASE_FACTORS = {}  # {ts_code: latest_adj_factor}
 st.set_page_config(page_title="选股王 V30.11 Alpha 恢复版", layout="wide")
 st.title("选股王 V30.11：Alpha 恢复版（✅ 修复 NameError）")
 st.markdown("🎯 **V30.11 策略核心：** 核心逻辑与 V30.10 保持一致，全力恢复 V30.8 的超高 D+5 收益。本版本仅为修复代码错误。")
+
+# ---------------------------
+# 侧边栏设置
+# ---------------------------
+st.sidebar.title("选股配置")
+BACKTEST_DAYS = st.sidebar.number_input("回测天数", min_value=1, max_value=500, value=100, step=1)
+TOP_BACKTEST = st.sidebar.slider("回测选股池大小", min_value=1, max_value=100, value=10, step=1)
 
 # ---------------------------
 # 辅助函数 (API调用和数据获取)
