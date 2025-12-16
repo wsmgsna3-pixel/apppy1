@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.8 实体力度进阶版 (Alpha 复合框架)
-V30.8.0 更新：
-1. **优化防御 1**：放宽上影线限制至 4.0%（避免误杀仙人指路）。
-2. **新增防御 2**：新增【K线实体位置】过滤。要求 (Close-Low)/(High-Low) > 0.7，确保收盘强势。
-3. **保持**：换手率 < 20% 的拥挤度防御。
-4. **目标**：结合 V30.5 的爆发力和 V30.7 的稳定性，冲击 D+3 > 1.8%。
+选股王 · V30.9 冷却修正版 (Alpha 复合框架)
+V30.9.0 更新：
+1. **保留 V30.8 核心**：实体力度 > 0.7，上影线 < 4.0%，换手 < 20%。
+2. **新增防御 1**：RSI 超买过滤。排除 RSI(12) > 85 的股票（防止买在情绪顶点）。
+3. **新增防御 2**：乖离率 (Bias) 过滤。排除 (Close - MA20)/MA20 > 25% 的股票（防止均线偏离过大回撤）。
+4. **目标**：在维持 D+5 > 2.0% 的基础上，提升 D+1 和 D+3 的胜率与收益。
 """
 
 import streamlit as st
@@ -28,9 +28,9 @@ GLOBAL_QFQ_BASE_FACTORS = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V30.8：实体力度进阶版", layout="wide")
-st.title("选股王 V30.8：实体力度进阶版（💪 锁定高位收盘）")
-st.markdown("🎯 **V30.8 策略核心：** 既然 V30.7 的 D+5 创新高，说明防御有效。V30.8 **放宽上影线限制**（找回爆发力），同时新增 **K线实体位置 > 0.7** 过滤，强制要求收盘价位于全天高位，拒绝“冲高回落”的假强势。")
+st.set_page_config(page_title="选股王 V30.9：冷却修正版", layout="wide")
+st.title("选股王 V30.9：冷却修正版（🧊 拒绝超买与乖离）")
+st.markdown("🎯 **V30.9 策略核心：** 继承 V30.8 的强势基因（D+5收益新高），引入 **RSI > 85** 和 **Bias > 25%** 双重熔断机制。只买“强势但在合理范围内”的股票，避开“强弩之末”。")
 
 # ---------------------------
 # 辅助函数 
@@ -147,12 +147,20 @@ def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[1, 3, 5
         else: results[col] = np.nan
     return results
 
+# 计算 RSI 辅助函数
+def calculate_rsi(series, period=12):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).ewm(alpha=1/period, adjust=False).mean()
+    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/period, adjust=False).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
 @st.cache_data(ttl=3600*12) 
 def compute_indicators(ts_code, end_date):
-    start_date = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=120)).strftime("%Y%m%d")
+    start_date = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=150)).strftime("%Y%m%d")
     df = get_qfq_data_v4_optimized_final(ts_code, start_date=start_date, end_date=end_date)
     res = {}
-    if df.empty or len(df) < 3: return res
+    if df.empty or len(df) < 20: return res
     
     df['pct_chg'] = df['close'].pct_change().fillna(0) * 100 
     close = df['close']
@@ -170,9 +178,12 @@ def compute_indicators(ts_code, end_date):
         res['macd_val'] = ((diff - dea) * 2).iloc[-1]
     else: res['macd_val'] = np.nan
         
-    # MA / Volatility / Position
-    if len(close) >= 20: res['ma20'] = close.tail(20).mean()
-    else: res['ma20'] = np.nan
+    # MA & Bias
+    res['ma20'] = close.tail(20).mean()
+    if pd.notna(res['ma20']) and res['ma20'] > 0:
+        res['bias_20'] = (res['last_close'] - res['ma20']) / res['ma20'] * 100
+    else:
+        res['bias_20'] = np.nan
     
     if len(close) >= 60:
         res['ma60'] = close.tail(60).mean()
@@ -182,6 +193,13 @@ def compute_indicators(ts_code, end_date):
         res['ma60'] = np.nan
         res['position_60d'] = np.nan
         
+    # RSI (12)
+    if len(close) >= 15:
+        rsi_series = calculate_rsi(close, period=12)
+        res['rsi_12'] = rsi_series.iloc[-1]
+    else:
+        res['rsi_12'] = 50.0
+    
     res['volatility'] = df['pct_chg'].tail(10).std() if len(df)>=10 else 0
     
     return res
@@ -210,11 +228,16 @@ with st.sidebar:
     TOP_BACKTEST = int(st.number_input("回测分析 Top K", value=5)) 
     
     st.markdown("---")
-    st.header("🛡️ V30.8 进阶防御参数")
-    MAX_UPPER_SHADOW = st.number_input("最大上影线比例 (%)", value=4.0, step=0.5, help="放宽至4.0%，允许仙人指路。")
-    MIN_BODY_POS = st.number_input("最低实体位置 (0-1)", value=0.7, step=0.05, help="收盘价必须位于当日振幅的 Top 30% 区间，确保收盘强势。")
-    MAX_TURNOVER_RATE = st.number_input("最大换手率 (%)", value=20.0, step=1.0)
+    st.header("🛡️ V30.9 进阶防御参数")
+    MAX_UPPER_SHADOW = st.number_input("最大上影线比例 (%)", value=4.0)
+    MIN_BODY_POS = st.number_input("最低实体位置 (0-1)", value=0.7)
+    MAX_TURNOVER_RATE = st.number_input("最大换手率 (%)", value=20.0)
     
+    st.markdown("---")
+    st.header("🧊 冷却参数 (V30.9 新增)")
+    MAX_RSI = st.number_input("最大 RSI(12)", value=85.0, step=1.0, help="排除 RSI 超过此值的股票（防止情绪过热）。")
+    MAX_BIAS_20 = st.number_input("最大乖离率 Bias20 (%)", value=25.0, step=1.0, help="排除收盘价超过 20日均线 N% 的股票。")
+
     # 隐藏的固定过滤参数
     MIN_PRICE, MAX_PRICE = 10.0, 300.0
     MIN_TURNOVER = 5.0 
@@ -232,10 +255,10 @@ pro = ts.pro_api()
 # ----------------------------------------------------------------------
 # 核心回测逻辑函数 
 # ----------------------------------------------------------------------
-def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS): 
+def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS, MAX_RSI, MAX_BIAS_20): 
     market_state = get_market_state(last_trade)
     
-    # 1. 基础数据获取与过滤
+    # 1. 基础数据获取
     daily_all = safe_get('daily', trade_date=last_trade) 
     if daily_all.empty: return pd.DataFrame(), f"数据缺失 {last_trade}"
 
@@ -253,7 +276,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         df = df.merge(mf, on='ts_code', how='left')
     df['net_mf'] = df['net_mf'].fillna(0)
     
-    # 基础清洗
+    # 清洗
     df['close'] = pd.to_numeric(df['close'], errors='coerce')
     df['open'] = pd.to_numeric(df['open'], errors='coerce')
     df['high'] = pd.to_numeric(df['high'], errors='coerce')
@@ -270,8 +293,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     df = df[(df['circ_mv_billion'] >= MIN_CIRC_MV_BILLIONS) & (df['circ_mv_billion'] <= MAX_CIRC_MV_BILLIONS)]
     df = df[df['turnover_rate'] >= MIN_TURNOVER]
     df = df[df['amount'] >= MIN_AMOUNT]
-
-    # V30.8 防御：换手率天花板
     df = df[df['turnover_rate'] <= MAX_TURNOVER_RATE] 
 
     if len(df) == 0: return pd.DataFrame(), "过滤后无标的"
@@ -287,7 +308,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     records = []
     for row in final_candidates.itertuples():
         ts_code = row.ts_code
-        # 指标计算
         ind = compute_indicators(ts_code, last_trade)
         d0_close = ind.get('last_close', np.nan)
         d0_high = ind.get('last_high', np.nan)
@@ -295,31 +315,38 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         d0_ma60 = ind.get('ma60', np.nan)
         d0_ma20 = ind.get('ma20', np.nan)
         d0_pos60 = ind.get('position_60d', np.nan)
+        d0_rsi = ind.get('rsi_12', 50)
+        d0_bias = ind.get('bias_20', 0)
         
-        # --- V30.8 核心过滤器 ---
+        # --- V30.9 过滤器核心 ---
         
         # 1. 趋势保护
         if pd.isna(d0_ma60) or d0_close < d0_ma60: continue
             
-        # 2. 上影线过滤 (放宽至 4%)
+        # 2. 上影线 (V30.8)
         if pd.notna(d0_high) and pd.notna(d0_close) and d0_close > 0:
             upper_shadow = (d0_high - d0_close) / d0_close * 100
             if upper_shadow > MAX_UPPER_SHADOW: continue 
         
-        # 3. 新增：实体位置过滤 (Close Location Value)
-        # 逻辑：(Close - Low) / (High - Low) > 0.7
+        # 3. 实体位置 (V30.8)
         if pd.notna(d0_high) and pd.notna(d0_low) and pd.notna(d0_close):
             range_len = d0_high - d0_low
             if range_len > 0:
                 body_pos = (d0_close - d0_low) / range_len
-                if body_pos < MIN_BODY_POS: continue # 收盘太弱，排除
+                if body_pos < MIN_BODY_POS: continue 
+
+        # 4. 冷却机制 (V30.9 新增)
+        # 排除 RSI 过热
+        if d0_rsi > MAX_RSI: continue
+        # 排除 乖离率 过大
+        if d0_bias > MAX_BIAS_20: continue
         
-        # 4. 弱市防御
+        # 5. 弱市防御
         if market_state == 'Weak':
             if pd.isna(d0_ma20) or d0_close < d0_ma20: continue
             if pd.notna(d0_pos60) and d0_pos60 > 20.0: continue
 
-        # --- 通过过滤，计算收益 ---
+        # --- 通过过滤 ---
         if pd.notna(d0_close):
             future = get_future_prices(ts_code, last_trade, d0_close)
             rec = {
@@ -327,9 +354,9 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
                 'Close': row.close, 'Pct_Chg': row.pct_chg,
                 'Turnover': row.turnover_rate,
                 'macd': ind.get('macd_val', 0),
-                'volatility': ind.get('volatility', 0),
+                'rsi': d0_rsi,
+                'bias': d0_bias,
                 'net_mf': row.net_mf,
-                'position_60d': d0_pos60,
                 'Return_D1 (%)': future.get('Return_D1', np.nan),
                 'Return_D3 (%)': future.get('Return_D3', np.nan),
                 'Return_D5 (%)': future.get('Return_D5', np.nan),
@@ -344,20 +371,22 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         return (s - s.min()) / (s.max() - s.min() + 1e-9)
     
     fdf['s_mf'] = normalize(fdf['net_mf'])
-    fdf['s_vol'] = normalize(fdf['volatility'])
+    # V30.9 评分微调：在同等条件下，优先选择 RSI 较低（上涨潜力更大）的
+    fdf['s_rsi_safe'] = 1 - normalize(fdf['rsi']) 
     
     if market_state == 'Strong':
-        fdf['策略'] = 'V30.8 实体强势版'
+        fdf['策略'] = 'V30.9 冷却增强版'
         fdf_strong = fdf[fdf['macd'] > 0].copy()
         if fdf_strong.empty: fdf['Score'] = 0
         else:
+            # 引入 RSI 安全因子进入评分 (0.1 权重)
             fdf_strong['Score'] = fdf_strong['macd'] * 10000 + \
-                                  (fdf_strong['s_vol'].rsub(1) * 0.3 + fdf_strong['s_mf'] * 0.7)
+                                  (fdf_strong['s_mf'] * 0.7 + fdf_strong['s_rsi_safe'] * 0.3)
             fdf = fdf_strong.sort_values('Score', ascending=False)
     else:
-        fdf['策略'] = 'V30.8 弱势收盘增强'
+        fdf['策略'] = 'V30.9 弱势稳健版'
         fdf['s_macd'] = normalize(fdf['macd'])
-        fdf['Score'] = fdf['s_vol'].rsub(1) * 0.45 + fdf['s_macd'] * 0.45 + fdf['s_mf'] * 0.1
+        fdf['Score'] = fdf['s_macd'] * 0.5 + fdf['s_mf'] * 0.3 + fdf['s_rsi_safe'] * 0.2
         fdf = fdf.sort_values('Score', ascending=False)
         
     return fdf.head(TOP_BACKTEST), None
@@ -365,14 +394,14 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
 # ---------------------------
 # 主运行块
 # ---------------------------
-if st.button(f"🚀 运行 V30.8 实体版回测 ({BACKTEST_DAYS}天)"):
+if st.button(f"🚀 运行 V30.9 冷却版回测 ({BACKTEST_DAYS}天)"):
     trade_days = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS)
     if not get_all_historical_data(trade_days): st.stop()
     
     results = []
     bar = st.progress(0)
     for i, date in enumerate(trade_days):
-        res, err = run_backtest_for_a_day(date, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS)
+        res, err = run_backtest_for_a_day(date, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS, MAX_RSI, MAX_BIAS_20)
         if not res.empty:
             res['Trade_Date'] = date
             results.append(res)
@@ -381,7 +410,7 @@ if st.button(f"🚀 运行 V30.8 实体版回测 ({BACKTEST_DAYS}天)"):
     
     if results:
         all_res = pd.concat(results)
-        st.header("📊 V30.8 平均回测结果")
+        st.header("📊 V30.9 平均回测结果")
         for n in [1, 3, 5]:
             col = f'Return_D{n} (%)'
             valid = all_res.dropna(subset=[col])
@@ -390,4 +419,4 @@ if st.button(f"🚀 运行 V30.8 实体版回测 ({BACKTEST_DAYS}天)"):
                 win = (valid[col] > 0).mean() * 100
                 st.metric(f"D+{n} 收益/胜率", f"{avg:.2f}% / {win:.1f}%")
                 
-        st.dataframe(all_res[['Trade_Date','name','Pct_Chg','Turnover','Return_D1 (%)','Return_D3 (%)']].head(100))
+        st.dataframe(all_res[['Trade_Date','name','Pct_Chg','Turnover','rsi','bias','Return_D1 (%)']].head(100))
