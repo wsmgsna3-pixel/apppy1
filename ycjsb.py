@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.10 Alpha 恢复版 (冷却机制降级) - FULL VERSION
-V30.10.0 更新：
-1. **核心恢复**：完全移除 V30.9 引入的 RSI > 85 和 Bias > 25% 的硬性过滤。
-2. **Alpha保留**：保留 V30.8 实体力度 > 0.7 的核心 Alpha 源。
-3. **冷却降级**：RSI 和 Bias 降级为评分项，权重大幅降低 (20%)，避免误杀强势股。
-4. **代码修复**：补全所有辅助函数 (safe_get, get_trade_days, etc.)，修复 NameError。
+选股王 · V30.11 Alpha 恢复版 (最终修复版) - FULL VERSION
+V30.11.0 更新：
+1. **核心逻辑**：与 V30.10 保持一致。恢复 V30.8 实体力度 Alpha，将 RSI/Bias 冷却降级为评分权重。
+2. **NameError 修复**：修复 get_all_historical_data 函数中变量名 adj_factor_list 的错误引用。
+3. **目标**：恢复 D+5 收益至 > 2.0%。
 """
 
 import streamlit as st
@@ -28,12 +27,12 @@ GLOBAL_QFQ_BASE_FACTORS = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V30.10：Alpha 恢复版", layout="wide")
-st.title("选股王 V30.10：Alpha 恢复版（💡 恢复惯性，冷却降级）")
-st.markdown("🎯 **V30.10 策略核心：** 鉴于 V30.9 硬性过滤导致 Alpha 死亡，本版本**移除 RSI 和 Bias 的绝对过滤**，将其降级为评分辅助项。全力确保 V30.8 的实体强势股入围，并用安全指标做精选。")
+st.set_page_config(page_title="选股王 V30.11：Alpha 恢复版", layout="wide")
+st.title("选股王 V30.11：Alpha 恢复版（✅ 修复 NameError）")
+st.markdown("🎯 **V30.11 策略核心：** 核心逻辑与 V30.10 保持一致，全力恢复 V30.8 的超高 D+5 收益。本版本仅为修复代码错误。")
 
 # ---------------------------
-# 辅助函数 (已补全)
+# 辅助函数 (已修复 NameError)
 # ---------------------------
 @st.cache_data(ttl=3600*12) 
 def safe_get(func_name, **kwargs):
@@ -76,7 +75,8 @@ def get_all_historical_data(trade_days_list):
     all_dates = all_trade_dates_df['cal_date'].tolist()
     st.info(f"⏳ 正在下载 {start_date} 到 {end_date} 间的全市场历史数据...")
 
-    adj_factor_data_list = []
+    # 注意：这里使用了 adj_factor_data_list (修复了 NameError)
+    adj_factor_data_list = [] 
     daily_data_list = []
     download_progress = st.progress(0, text="下载进度...")
     
@@ -93,7 +93,8 @@ def get_all_historical_data(trade_days_list):
 
     if not adj_factor_data_list or not daily_data_list: return False
         
-    adj_factor_data = pd.concat(adj_factor_list)
+    # FIX: 修复 NameError，使用 adj_factor_data_list
+    adj_factor_data = pd.concat(adj_factor_data_list)
     adj_factor_data['adj_factor'] = pd.to_numeric(adj_factor_data['adj_factor'], errors='coerce').fillna(0)
     GLOBAL_ADJ_FACTOR = adj_factor_data.set_index(['ts_code', 'trade_date']).sort_index(level=[0, 1]) 
     
@@ -220,13 +221,13 @@ with st.sidebar:
     TOP_BACKTEST = int(st.number_input("回测分析 Top K", value=5)) 
     
     st.markdown("---")
-    st.header("🛡️ V30.10 核心 Alpha 参数 (V30.8 保持)")
+    st.header("🛡️ V30.11 核心 Alpha 参数 (V30.8 保持)")
     MAX_UPPER_SHADOW = st.number_input("最大上影线比例 (%)", value=4.0)
     MIN_BODY_POS = st.number_input("最低实体位置 (0-1)", value=0.7)
     MAX_TURNOVER_RATE = st.number_input("最大换手率 (%)", value=20.0)
     
     st.markdown("---")
-    st.header("🧊 冷却因子 (V30.10 仅用于评分)")
+    st.header("🧊 冷却因子 (V30.11 仅用于评分)")
     st.write("RSI/Bias **不再硬性过滤**，仅用于评分降权。")
     
     # 隐藏的固定过滤参数
@@ -309,7 +310,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         d0_rsi = ind.get('rsi_12', 50)
         d0_bias = ind.get('bias_20', 0)
         
-        # --- V30.10 过滤器核心 (恢复 V30.8 逻辑) ---
+        # --- V30.11 过滤器核心 (V30.8 逻辑) ---
         
         # 1. 趋势保护 (价格高于 60日均线)
         if pd.isna(d0_ma60) or d0_close < d0_ma60: continue
@@ -328,9 +329,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
 
         # 4. 弱市防御
         if market_state == 'Weak':
-            # 弱市必须高于 20日均线
             if pd.isna(d0_ma20) or d0_close < d0_ma20: continue 
-            # 弱市拒绝绝对高位
             if pd.notna(d0_pos60) and d0_pos60 > 20.0: continue
 
         # --- 通过过滤，计算收益 ---
@@ -353,14 +352,12 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     fdf = pd.DataFrame(records)
     if fdf.empty: return pd.DataFrame(), "深度筛选后无标的"
     
-    # 5. 评分 (V30.10 核心：冷却降级为低权重评分)
+    # 5. 评分 (V30.11 核心：冷却降级为低权重评分)
     def normalize(s): 
-        # 避免除以 0 或 极小值
-        if s.max() == s.min(): return pd.Series([0.5] * len(s)) 
+        if s.max() == s.min(): return pd.Series([0.5] * len(s), index=s.index) 
         return (s - s.min()) / (s.max() - s.min() + 1e-9)
     
     fdf['s_mf'] = normalize(fdf['net_mf'])
-    # 冷却安全因子：RSI/Bias 越低越安全，所以用 1 - Normalize
     fdf['s_rsi_safety'] = 1 - normalize(fdf['rsi']) 
     fdf['s_bias_safety'] = 1 - normalize(fdf['bias']) 
     
@@ -368,7 +365,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     fdf['s_safety'] = (fdf['s_rsi_safety'] * 0.5 + fdf['s_bias_safety'] * 0.5) 
 
     if market_state == 'Strong':
-        fdf['策略'] = 'V30.10 Alpha 强市恢复版'
+        fdf['策略'] = 'V30.11 Alpha 强市恢复版'
         fdf_strong = fdf[fdf['macd'] > 0].copy()
         if fdf_strong.empty: fdf['Score'] = 0
         else:
@@ -377,7 +374,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
             fdf_strong['Score'] = fdf_strong['s_alpha'] * 0.8 + fdf_strong['s_safety'] * 0.2
             fdf = fdf_strong.sort_values('Score', ascending=False)
     else:
-        fdf['策略'] = 'V30.10 Alpha 弱市恢复版'
+        fdf['策略'] = 'V30.11 Alpha 弱市恢复版'
         fdf['s_macd'] = normalize(fdf['macd'])
         fdf['s_alpha'] = fdf['s_macd'] * 0.6 + fdf['s_mf'] * 0.4
         fdf['Score'] = fdf['s_alpha'] * 0.8 + fdf['s_safety'] * 0.2
@@ -388,14 +385,15 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
 # ---------------------------
 # 主运行块
 # ---------------------------
-if st.button(f"🚀 运行 V30.10 Alpha 恢复版回测 ({BACKTEST_DAYS}天)"):
-    # 修复 NameError
+if st.button(f"🚀 运行 V30.11 Alpha 恢复版回测 ({BACKTEST_DAYS}天)"):
+    
     try:
         trade_days = get_trade_days(backtest_date_end.strftime("%Y%m%d"), BACKTEST_DAYS)
-    except NameError:
+    except Exception:
         st.error("无法找到 Tushare 交易日数据，请检查 Tushare Token。")
         st.stop()
 
+    # 此处调用了 get_all_historical_data，现在已修复其内部 NameError
     if not get_all_historical_data(trade_days): 
         st.error("数据下载失败或缺失，请稍后重试。")
         st.stop()
@@ -413,7 +411,7 @@ if st.button(f"🚀 运行 V30.10 Alpha 恢复版回测 ({BACKTEST_DAYS}天)"):
     if results:
         all_res = pd.concat(results)
         
-        st.header("📊 V30.10 平均回测结果")
+        st.header("📊 V30.11 平均回测结果")
         for n in [1, 3, 5]:
             col = f'Return_D{n} (%)'
             valid = all_res.dropna(subset=[col])
@@ -425,4 +423,3 @@ if st.button(f"🚀 运行 V30.10 Alpha 恢复版回测 ({BACKTEST_DAYS}天)"):
         st.dataframe(all_res[['Trade_Date','name','Pct_Chg','Turnover','rsi','bias','Return_D1 (%)']].head(100))
     else:
         st.info("回测完成，但没有选出符合条件的股票。")
-
