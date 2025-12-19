@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.12 板块共振增强版
+选股王 · V30.12.1 板块共振修正版
 1. **代码完整性**：继承 V30.11 所有功能。
-2. **板块共振**：新增申万一级行业强弱判定，剔除“独狼”个股。
+2. **板块共振修复**：修复行业数据拉取限制，覆盖全市场 5000+ 股票。
 3. **动态风控**：保留 RSI/Bias/Score 逻辑。
 """
 
@@ -22,18 +22,18 @@ pro = None
 GLOBAL_ADJ_FACTOR = pd.DataFrame() 
 GLOBAL_DAILY_RAW = pd.DataFrame() 
 GLOBAL_QFQ_BASE_FACTORS = {} 
-GLOBAL_STOCK_INDUSTRY = {} # 新增：用于缓存股票-行业映射关系
+GLOBAL_STOCK_INDUSTRY = {} # 缓存股票-行业映射关系
 
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V30.12：板块共振版", layout="wide")
-st.title("选股王 V30.12：板块共振版（✅ 拒绝独狼 & 胜率增强）")
+st.set_page_config(page_title="选股王 V30.12：板块共振修正版", layout="wide")
+st.title("选股王 V30.12：板块共振修正版（✅ 全市场覆盖）")
 st.markdown("""
-**版本更新说明 (V30.12)：**
-1. 🛡️ **板块共振过滤器**：强制要求股票所属的**申万一级行业**当日涨幅必须达标（默认>1.0%）。
-2. 🐢 **API 限流保护**：完整保留所有 `time.sleep` 逻辑。
-3. 🧠 **智能拦截系统**：保留 RSI/Bias 动态风控。
+**版本更新说明 (V30.12.1)：**
+1. 🛠️ **全市场行业覆盖**：已将行业数据拉取限制提升至 10000 行，解决只覆盖 1117 只股票的问题。
+2. 🛡️ **板块共振过滤器**：强制要求股票所属行业当日涨幅达标，拒绝“独狼”。
+3. 🐢 **稳健性**：保留所有防崩溃与限流逻辑。
 """)
 
 # ---------------------------
@@ -71,14 +71,15 @@ def fetch_and_cache_daily_data(date):
     daily_df = safe_get('daily', trade_date=date)
     return {'adj': adj_df, 'daily': daily_df}
 
-# --- 新增：加载行业映射 ---
-@st.cache_data(ttl=3600*24*7) # 行业分类变动不频繁，缓存一周
+# --- 核心修复：加载行业映射 ---
+@st.cache_data(ttl=3600*24*7) 
 def load_industry_mapping():
     global pro
     if pro is None: return {}
     try:
-        # 获取申万2021一级行业成分 (需2000积分)
-        df = pro.index_member(level='L1', is_new='Y')
+        # 【关键修改】增加 limit=10000，确保拉取全市场所有成分股
+        df = pro.index_member(level='L1', is_new='Y', limit=10000)
+        
         if df.empty: return {}
         # 构建字典: {'000001.SZ': '801010.SI', ...}
         return dict(zip(df['con_code'], df['index_code']))
@@ -90,17 +91,18 @@ def get_all_historical_data(trade_days_list):
     if not trade_days_list: return False
     
     # 1. 优先加载行业数据
-    with st.spinner("正在加载申万行业分类数据..."):
+    with st.spinner("正在加载申万行业分类数据 (Limit=10000)..."):
         GLOBAL_STOCK_INDUSTRY = load_industry_mapping()
-        if not GLOBAL_STOCK_INDUSTRY:
-            st.warning("⚠️ 行业数据加载失败或积分不足，板块共振功能将自动失效。")
+        stock_count = len(GLOBAL_STOCK_INDUSTRY)
+        if stock_count < 2000:
+            st.warning(f"⚠️ 行业数据仅加载了 {stock_count} 只。请检查积分或网络。")
         else:
-            st.success(f"✅ 已加载行业映射，覆盖 {len(GLOBAL_STOCK_INDUSTRY)} 只股票")
+            st.success(f"✅ 已成功加载行业映射，覆盖 {stock_count} 只股票 (全市场覆盖成功)")
 
     latest_trade_date = max(trade_days_list) 
     earliest_trade_date = min(trade_days_list)
     
-    # 扩展日期范围用于技术指标计算和未来收益获取
+    # 扩展日期范围
     start_date_dt = datetime.strptime(earliest_trade_date, "%Y%m%d") - timedelta(days=200)
     end_date_dt = datetime.strptime(latest_trade_date, "%Y%m%d") + timedelta(days=30)
     start_date = start_date_dt.strftime("%Y%m%d")
@@ -280,8 +282,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     mf_raw = safe_get('moneyflow', trade_date=last_trade) 
     stock_basic = safe_get('stock_basic', list_status='L', fields='ts_code,name,list_date')
     
-    # --- 新增：板块共振检查 ---
-    # 获取当日申万一级行业行情 (sw_daily)
+    # --- 修复：板块共振检查 ---
     strong_industry_codes = set()
     try:
         sw_df = safe_get('sw_daily', trade_date=last_trade)
@@ -290,7 +291,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
             strong_sw = sw_df[sw_df['pct_chg'] >= SECTOR_THRESHOLD]
             strong_industry_codes = set(strong_sw['index_code'].tolist())
     except Exception as e:
-        pass # 如果拉取失败，集合为空，后面处理逻辑需注意
+        pass 
         
     df = daily_all.merge(stock_basic, on='ts_code', how='left')
     
@@ -362,7 +363,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
             'Return_D3 (%)': future.get('Return_D3', np.nan),
             'Return_D5 (%)': future.get('Return_D5', np.nan),
             'market_state': market_state,
-            'Sector_Boost': 'Yes' if GLOBAL_STOCK_INDUSTRY else 'N/A' # 标记是否启用了板块
+            'Sector_Boost': 'Yes' if GLOBAL_STOCK_INDUSTRY else 'N/A'
         })
             
     if not records: return pd.DataFrame(), "深度筛选后无标的"
@@ -384,14 +385,14 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V30.12 全量配置 (共振版)")
+    st.header("V30.12.1 全量配置 (共振修复版)")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数", value=30, step=1)
     TOP_BACKTEST = st.number_input("每日优选 TopK", value=5)
     
     st.markdown("---")
     st.subheader("🔥 板块共振设置")
-    SECTOR_THRESHOLD = st.number_input("板块当日最低涨幅 (%)", value=1.0, step=0.1, help="只有所属行业涨幅超过此值的股票才会被选中。设为0则关闭此功能。")
+    SECTOR_THRESHOLD = st.number_input("板块当日最低涨幅 (%)", value=1.0, step=0.1, help="只有所属行业涨幅超过此值的股票才会被选中。建议设为 1.0。")
     
     st.markdown("---")
     RSI_LIMIT = st.number_input("RSI 拦截线", value=80.0)
@@ -405,7 +406,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V30.12 板块共振回测"):
+if st.button(f"🚀 启动 V30.12.1 增强版回测"):
     trade_days = get_trade_days(backtest_date_end.strftime("%Y%m%d"), int(BACKTEST_DAYS))
     
     if not get_all_historical_data(trade_days):
@@ -430,7 +431,7 @@ if st.button(f"🚀 启动 V30.12 板块共振回测"):
     if results:
         all_res = pd.concat(results)
         
-        st.header("📊 V30.12 统计仪表盘 (含板块共振)")
+        st.header("📊 V30.12.1 统计仪表盘 (含板块共振)")
         cols = st.columns(3)
         for idx, n in enumerate([1, 3, 5]):
             col_name = f'Return_D{n} (%)'
