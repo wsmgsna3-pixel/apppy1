@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.12.2 板块共振终极修复版
-1. **代码完整性**：继承 V30.11 所有功能。
-2. **板块共振修复**：采用“遍历行业列表”方式拉取数据，彻底解决 1117 只限制，覆盖全市场。
-3. **动态风控**：保留 RSI/Bias/Score 逻辑。
+选股王 · V30.12.3 中盘共振版
+1. **市值修正**：调整为 50亿-1000亿，聚焦中盘趋势股，提升胜率稳定性。
+2. **板块共振**：全市场行业遍历覆盖，拒绝独狼。
+3. **参数微调**：默认板块阈值提升至 1.5%。
 """
 
 import streamlit as st
@@ -22,18 +22,18 @@ pro = None
 GLOBAL_ADJ_FACTOR = pd.DataFrame() 
 GLOBAL_DAILY_RAW = pd.DataFrame() 
 GLOBAL_QFQ_BASE_FACTORS = {} 
-GLOBAL_STOCK_INDUSTRY = {} # 缓存股票-行业映射关系
+GLOBAL_STOCK_INDUSTRY = {} 
 
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V30.12.2：全市场共振版", layout="wide")
-st.title("选股王 V30.12.2：全市场共振版（✅ 遍历获取 100% 覆盖）")
+st.set_page_config(page_title="选股王 V30.12.3：中盘共振版", layout="wide")
+st.title("选股王 V30.12.3：中盘共振版（✅ 50亿-1000亿 & 全市场共振）")
 st.markdown("""
-**版本更新说明 (V30.12.2)：**
-1. 🛠️ **行业数据重构**：弃用单次拉取，改为**遍历 31 个申万一级行业**，确保抓取 5000+ 全量股票。
-2. 🛡️ **板块共振**：拒绝无板块效应的“独狼”个股。
-3. 🐢 **稳健性**：针对 10000 积分优化了 API 调用频率。
+**版本更新说明 (V30.12.3)：**
+1. 💰 **市值策略升级**：从“小微盘(20-200亿)”调整为“**中盘成长(50-1000亿)**”，旨在降低波动，提升胜率。
+2. 🛡️ **板块共振优化**：建议阈值提升至 1.5% 以上，确保只做真热点。
+3. 🛠️ **全市场覆盖**：保留行业遍历逻辑，无死角过滤。
 """)
 
 # ---------------------------
@@ -77,68 +77,46 @@ def load_industry_mapping():
     global pro
     if pro is None: return {}
     
-    industry_map = {}
     try:
-        # 1. 获取申万2021版所有一级行业列表 (约31个)
-        # 积分要求：2000+
         sw_indices = pro.index_classify(level='L1', src='SW2021')
-        
-        if sw_indices.empty: 
-            return {}
+        if sw_indices.empty: return {}
         
         index_codes = sw_indices['index_code'].tolist()
-        
-        # 2. 遍历拉取每个行业的成分股
-        # 虽然这需要30+次请求，但对于10000积分用户(1000次/分)是安全的
-        # 且只会执行一次并缓存
-        
         all_members = []
-        # 创建一个临时的进度条显示加载过程
         load_bar = st.progress(0, text="正在遍历加载行业数据...")
         
         for i, idx_code in enumerate(index_codes):
-            # 获取该行业下的所有成分股
             df = pro.index_member(index_code=idx_code, is_new='Y')
             if not df.empty:
                 all_members.append(df)
-            
-            # 这里的sleep是为了防止极短时间内并发太高，虽有积分也建议加上
             time.sleep(0.02) 
             load_bar.progress((i + 1) / len(index_codes), text=f"加载行业数据: {idx_code}")
             
         load_bar.empty()
         
         if not all_members: return {}
-        
         full_df = pd.concat(all_members)
-        # 去重，防止某些股票跨行业（理论上L1不跨，但防止数据源问题）
         full_df = full_df.drop_duplicates(subset=['con_code'])
-        
-        # 构建字典: {'000001.SZ': '801010.SI', ...}
         return dict(zip(full_df['con_code'], full_df['index_code']))
         
     except Exception as e:
-        print(f"Error loading industries: {e}")
         return {}
 
 def get_all_historical_data(trade_days_list):
     global GLOBAL_ADJ_FACTOR, GLOBAL_DAILY_RAW, GLOBAL_QFQ_BASE_FACTORS, GLOBAL_STOCK_INDUSTRY
     if not trade_days_list: return False
     
-    # 1. 加载行业数据 (使用新逻辑)
     with st.spinner("正在同步全市场行业数据 (遍历模式)..."):
         GLOBAL_STOCK_INDUSTRY = load_industry_mapping()
         stock_count = len(GLOBAL_STOCK_INDUSTRY)
-        
         if stock_count < 3000:
-            st.warning(f"⚠️ 行业数据加载异常，仅覆盖 {stock_count} 只股票。可能是网络波动或Tushare服务繁忙。")
+            st.warning(f"⚠️ 行业数据加载异常，仅覆盖 {stock_count} 只股票。")
         else:
             st.success(f"✅ 行业映射图谱构建完成，覆盖 {stock_count} 只股票 (100% 全市场)")
 
     latest_trade_date = max(trade_days_list) 
     earliest_trade_date = min(trade_days_list)
     
-    # 扩展日期范围
     start_date_dt = datetime.strptime(earliest_trade_date, "%Y%m%d") - timedelta(days=200)
     end_date_dt = datetime.strptime(latest_trade_date, "%Y%m%d") + timedelta(days=30)
     start_date = start_date_dt.strftime("%Y%m%d")
@@ -269,7 +247,6 @@ def compute_indicators(ts_code, end_date):
     res['last_high'] = df['high'].iloc[-1]
     res['last_low'] = df['low'].iloc[-1]
     
-    # MACD 原始计算
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
     diff = ema12 - ema26
@@ -279,16 +256,13 @@ def compute_indicators(ts_code, end_date):
     res['ma20'] = close.tail(20).mean()
     res['ma60'] = close.tail(60).mean()
     
-    # Bias(20) 精准计算
     if pd.notna(res['ma20']) and res['ma20'] > 0:
         res['bias_20'] = (res['last_close'] - res['ma20']) / res['ma20'] * 100
     else: res['bias_20'] = 0
 
-    # RSI(12) 计算
     rsi_series = calculate_rsi(close, period=12)
     res['rsi_12'] = rsi_series.iloc[-1]
     
-    # 60日位置
     hist_60 = df.tail(60)
     res['position_60d'] = (close.iloc[-1] - hist_60['low'].min()) / (hist_60['high'].max() - hist_60['low'].min() + 1e-9) * 100
     
@@ -305,9 +279,9 @@ def get_market_state(trade_date):
     return 'Strong' if latest_close > ma20 else 'Weak'
 
 # ---------------------------
-# 核心回测逻辑函数 (含板块共振)
+# 核心回测逻辑函数 (含市值修正)
 # ---------------------------
-def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, BIAS_LIMIT, SECTOR_THRESHOLD):
+def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, BIAS_LIMIT, SECTOR_THRESHOLD, MIN_MV, MAX_MV):
     global GLOBAL_STOCK_INDUSTRY
     
     market_state = get_market_state(last_trade)
@@ -318,12 +292,10 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     mf_raw = safe_get('moneyflow', trade_date=last_trade) 
     stock_basic = safe_get('stock_basic', list_status='L', fields='ts_code,name,list_date')
     
-    # --- 修复：板块共振检查 ---
     strong_industry_codes = set()
     try:
         sw_df = safe_get('sw_daily', trade_date=last_trade)
         if not sw_df.empty:
-            # 筛选出涨幅大于 SECTOR_THRESHOLD 的板块代码
             strong_sw = sw_df[sw_df['pct_chg'] >= SECTOR_THRESHOLD]
             strong_industry_codes = set(strong_sw['index_code'].tolist())
     except Exception as e:
@@ -344,13 +316,16 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         if col not in df.columns: df[col] = 0
     
     df['net_mf'] = df['net_mf'].fillna(0)
-    df['circ_mv_billion'] = df['circ_mv'] / 10000
+    df['circ_mv_billion'] = df['circ_mv'] / 10000 # 换算为亿元
     
-    # 基础清洗流程
+    # 基础清洗流程 (已应用市值修正)
     df = df[~df['name'].str.contains('ST|退', na=False)]
     df = df[~df['ts_code'].str.startswith('92')]
     df = df[(df['close'] >= 10.0) & (df['close'] <= 300.0)]
-    df = df[(df['circ_mv_billion'] >= 20.0) & (df['circ_mv_billion'] <= 200.0)]
+    
+    # 【核心修正】市值筛选
+    df = df[(df['circ_mv_billion'] >= MIN_MV) & (df['circ_mv_billion'] <= MAX_MV)]
+    
     df = df[df['turnover_rate'] <= MAX_TURNOVER_RATE] 
 
     if len(df) == 0: return pd.DataFrame(), "过滤后无标的"
@@ -359,14 +334,10 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     
     records = []
     for row in candidates.itertuples():
-        # --- 核心修改：板块共振过滤 ---
         if GLOBAL_STOCK_INDUSTRY and strong_industry_codes:
-            # 查该股票所属行业
             ind_code = GLOBAL_STOCK_INDUSTRY.get(row.ts_code)
-            # 如果能查到行业，且行业不在强势列表中 -> 剔除
             if ind_code and (ind_code not in strong_industry_codes):
                 continue
-        # ---------------------------
 
         ind = compute_indicators(row.ts_code, last_trade)
         if not ind: continue
@@ -375,7 +346,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         d0_rsi = ind.get('rsi_12', 50)
         d0_bias = ind.get('bias_20', 0)
         
-        # 嵌入自适应风控逻辑
         if market_state == 'Weak':
             if d0_rsi > RSI_LIMIT or d0_bias > BIAS_LIMIT: continue
             if d0_close < ind['ma20'] or ind['position_60d'] > 20.0: continue
@@ -421,14 +391,20 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V30.12.2 全量配置 (终极共振版)")
+    st.header("V30.12.3 全量配置 (中盘共振)")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数", value=30, step=1)
     TOP_BACKTEST = st.number_input("每日优选 TopK", value=5)
     
     st.markdown("---")
+    st.subheader("💰 市值筛选 (亿元)")
+    col_mv1, col_mv2 = st.columns(2)
+    MIN_MV = col_mv1.number_input("最小市值", value=50.0, step=10.0, help="单位：亿元")
+    MAX_MV = col_mv2.number_input("最大市值", value=1000.0, step=50.0, help="单位：亿元")
+    
+    st.markdown("---")
     st.subheader("🔥 板块共振设置")
-    SECTOR_THRESHOLD = st.number_input("板块当日最低涨幅 (%)", value=1.0, step=0.1, help="只有所属行业涨幅超过此值的股票才会被选中。建议设为 1.0。")
+    SECTOR_THRESHOLD = st.number_input("板块当日最低涨幅 (%)", value=1.5, step=0.1, help="建议设为 1.5% 以上以增强过滤效果。")
     
     st.markdown("---")
     RSI_LIMIT = st.number_input("RSI 拦截线", value=80.0)
@@ -442,7 +418,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V30.12.2 终极版回测"):
+if st.button(f"🚀 启动 V30.12.3 中盘回测"):
     trade_days = get_trade_days(backtest_date_end.strftime("%Y%m%d"), int(BACKTEST_DAYS))
     
     if not get_all_historical_data(trade_days):
@@ -453,12 +429,11 @@ if st.button(f"🚀 启动 V30.12.2 终极版回测"):
     bar = st.progress(0, text="回测引擎流水线启动...")
     
     for i, date in enumerate(trade_days):
-        res, err = run_backtest_for_a_day(date, int(TOP_BACKTEST), 100, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, BIAS_LIMIT, SECTOR_THRESHOLD)
+        res, err = run_backtest_for_a_day(date, int(TOP_BACKTEST), 100, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, BIAS_LIMIT, SECTOR_THRESHOLD, MIN_MV, MAX_MV)
         if not res.empty:
             res['Trade_Date'] = date
             results.append(res)
         
-        # 核心限流
         time.sleep(0.2) 
         bar.progress((i+1)/len(trade_days), text=f"正在分析第 {i+1} 天: {date}")
         
@@ -467,7 +442,7 @@ if st.button(f"🚀 启动 V30.12.2 终极版回测"):
     if results:
         all_res = pd.concat(results)
         
-        st.header("📊 V30.12.2 统计仪表盘 (含板块共振)")
+        st.header("📊 V30.12.3 统计仪表盘")
         cols = st.columns(3)
         for idx, n in enumerate([1, 3, 5]):
             col_name = f'Return_D{n} (%)'
@@ -483,4 +458,4 @@ if st.button(f"🚀 启动 V30.12.2 终极版回测"):
                         'rsi','bias','Sector_Boost']
         st.dataframe(all_res[display_cols].sort_values('Trade_Date', ascending=False), use_container_width=True)
     else:
-        st.warning("⚠️ 没有选出任何股票。可能是板块过滤条件(SECTOR_THRESHOLD)太严格，或者市场环境太差。")
+        st.warning("⚠️ 没有选出任何股票。")
