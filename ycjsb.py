@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.12.3 冠军复刻版 (中盘共振)
-1. **核心策略**：锁定 50亿-1000亿 中盘股，剔除流动性陷阱。
-2. **板块共振**：全市场行业遍历，只做“个股+板块”双强的品种。
-3. **纯粹动量**：移除所有实验性因子(北向等)，回归 MACD + 资金流 + 强弱市风控。
-4. **极速架构**：纯本地计算，无额外API请求，运行飞快。
+选股王 · V30.12.3 中盘共振版
+1. **市值修正**：调整为 50亿-1000亿，聚焦中盘趋势股，提升胜率稳定性。
+2. **板块共振**：全市场行业遍历覆盖，拒绝独狼。
+3. **参数微调**：默认板块阈值提升至 1.5%。
 """
 
 import streamlit as st
@@ -28,13 +27,13 @@ GLOBAL_STOCK_INDUSTRY = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V30.12.3：冠军复刻版", layout="wide")
-st.title("选股王 V30.12.3：冠军复刻版（🏆 50-1000亿 + 🛡️ 板块共振）")
+st.set_page_config(page_title="选股王 V30.12.3：中盘共振版", layout="wide")
+st.title("选股王 V30.12.3：中盘共振版（✅ 50亿-1000亿 & 全市场共振）")
 st.markdown("""
-**策略逻辑 (The Champion Logic)：**
-1. 🎯 **中盘锁定**：50亿 - 1000亿，机构与游资共舞的最佳战场。
-2. 🔥 **板块共振**：拒绝独狼，只做有板块效应的领涨股 (默认阈值 1.5%)。
-3. ⚡️ **极致纯粹**：无滞后因子，专注于右侧动量爆发。
+**版本更新说明 (V30.12.3)：**
+1. 💰 **市值策略升级**：从“小微盘(20-200亿)”调整为“**中盘成长(50-1000亿)**”，旨在降低波动，提升胜率。
+2. 🛡️ **板块共振优化**：建议阈值提升至 1.5% 以上，确保只做真热点。
+3. 🛠️ **全市场覆盖**：保留行业遍历逻辑，无死角过滤。
 """)
 
 # ---------------------------
@@ -72,7 +71,7 @@ def fetch_and_cache_daily_data(date):
     daily_df = safe_get('daily', trade_date=date)
     return {'adj': adj_df, 'daily': daily_df}
 
-# --- 核心：全市场行业遍历 (防封禁优化) ---
+# --- 核心修复：遍历拉取所有行业成分股 ---
 @st.cache_data(ttl=3600*24*7) 
 def load_industry_mapping():
     global pro
@@ -107,7 +106,7 @@ def get_all_historical_data(trade_days_list):
     global GLOBAL_ADJ_FACTOR, GLOBAL_DAILY_RAW, GLOBAL_QFQ_BASE_FACTORS, GLOBAL_STOCK_INDUSTRY
     if not trade_days_list: return False
     
-    with st.spinner("正在同步全市场行业数据..."):
+    with st.spinner("正在同步全市场行业数据 (遍历模式)..."):
         GLOBAL_STOCK_INDUSTRY = load_industry_mapping()
         stock_count = len(GLOBAL_STOCK_INDUSTRY)
         if stock_count < 3000:
@@ -131,7 +130,7 @@ def get_all_historical_data(trade_days_list):
     adj_factor_data_list = [] 
     daily_data_list = []
     
-    progress_text = "数据同步中..."
+    progress_text = "Tushare 数据同步中..."
     my_bar = st.progress(0, text=progress_text)
     total_steps = len(all_dates)
     
@@ -194,7 +193,7 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
     df = daily_df.merge(adj_series.rename('adj_factor'), left_index=True, right_index=True, how='left')
     df = df.dropna(subset=['adj_factor'])
     
-    for col in ['open', 'high', 'low', 'close']:
+    for col in ['open', 'high', 'low', 'close', 'pre_close']:
         if col in df.columns:
             df[col + '_qfq'] = df[col] * df['adj_factor'] / latest_adj_factor
     
@@ -280,7 +279,7 @@ def get_market_state(trade_date):
     return 'Strong' if latest_close > ma20 else 'Weak'
 
 # ---------------------------
-# 核心回测逻辑函数
+# 核心回测逻辑函数 (含市值修正)
 # ---------------------------
 def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, BIAS_LIMIT, SECTOR_THRESHOLD, MIN_MV, MAX_MV):
     global GLOBAL_STOCK_INDUSTRY
@@ -293,7 +292,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     mf_raw = safe_get('moneyflow', trade_date=last_trade) 
     stock_basic = safe_get('stock_basic', list_status='L', fields='ts_code,name,list_date')
     
-    # 板块共振判定
     strong_industry_codes = set()
     try:
         sw_df = safe_get('sw_daily', trade_date=last_trade)
@@ -318,14 +316,14 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         if col not in df.columns: df[col] = 0
     
     df['net_mf'] = df['net_mf'].fillna(0)
-    df['circ_mv_billion'] = df['circ_mv'] / 10000 
+    df['circ_mv_billion'] = df['circ_mv'] / 10000 # 换算为亿元
     
-    # 基础清洗
+    # 基础清洗流程 (已应用市值修正)
     df = df[~df['name'].str.contains('ST|退', na=False)]
     df = df[~df['ts_code'].str.startswith('92')]
     df = df[(df['close'] >= 10.0) & (df['close'] <= 300.0)]
     
-    # 【冠军参数】市值筛选 (50-1000亿)
+    # 【核心修正】市值筛选
     df = df[(df['circ_mv_billion'] >= MIN_MV) & (df['circ_mv_billion'] <= MAX_MV)]
     
     df = df[df['turnover_rate'] <= MAX_TURNOVER_RATE] 
@@ -336,7 +334,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     
     records = []
     for row in candidates.itertuples():
-        # 【冠军参数】板块共振过滤
         if GLOBAL_STOCK_INDUSTRY and strong_industry_codes:
             ind_code = GLOBAL_STOCK_INDUSTRY.get(row.ts_code)
             if ind_code and (ind_code not in strong_industry_codes):
@@ -349,7 +346,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         d0_rsi = ind.get('rsi_12', 50)
         d0_bias = ind.get('bias_20', 0)
         
-        # 风控
         if market_state == 'Weak':
             if d0_rsi > RSI_LIMIT or d0_bias > BIAS_LIMIT: continue
             if d0_close < ind['ma20'] or ind['position_60d'] > 20.0: continue
@@ -373,7 +369,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
             'Return_D3 (%)': future.get('Return_D3', np.nan),
             'Return_D5 (%)': future.get('Return_D5', np.nan),
             'market_state': market_state,
-            'Sector_Boost': 'Yes'
+            'Sector_Boost': 'Yes' if GLOBAL_STOCK_INDUSTRY else 'N/A'
         })
             
     if not records: return pd.DataFrame(), "深度筛选后无标的"
@@ -395,7 +391,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V30.12.3 冠军版配置")
+    st.header("V30.12.3 全量配置 (中盘共振)")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数", value=30, step=1)
     TOP_BACKTEST = st.number_input("每日优选 TopK", value=5)
@@ -403,12 +399,12 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("💰 市值筛选 (亿元)")
     col_mv1, col_mv2 = st.columns(2)
-    MIN_MV = col_mv1.number_input("最小市值", value=50.0, step=10.0, help="黄金区间")
-    MAX_MV = col_mv2.number_input("最大市值", value=1000.0, step=50.0, help="黄金区间")
+    MIN_MV = col_mv1.number_input("最小市值", value=50.0, step=10.0, help="单位：亿元")
+    MAX_MV = col_mv2.number_input("最大市值", value=1000.0, step=50.0, help="单位：亿元")
     
     st.markdown("---")
     st.subheader("🔥 板块共振设置")
-    SECTOR_THRESHOLD = st.number_input("板块当日最低涨幅 (%)", value=1.5, step=0.1, help="建议 1.5%")
+    SECTOR_THRESHOLD = st.number_input("板块当日最低涨幅 (%)", value=1.5, step=0.1, help="建议设为 1.5% 以上以增强过滤效果。")
     
     st.markdown("---")
     RSI_LIMIT = st.number_input("RSI 拦截线", value=80.0)
@@ -422,8 +418,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V30.12.3 冠军版"):
-    st.info("⚡️ 极速引擎启动中 (纯本地计算)...")
+if st.button(f"🚀 启动 V30.12.3 中盘回测"):
     trade_days = get_trade_days(backtest_date_end.strftime("%Y%m%d"), int(BACKTEST_DAYS))
     
     if not get_all_historical_data(trade_days):
@@ -439,7 +434,7 @@ if st.button(f"🚀 启动 V30.12.3 冠军版"):
             res['Trade_Date'] = date
             results.append(res)
         
-        # 极速版不需要 sleep
+        time.sleep(0.2) 
         bar.progress((i+1)/len(trade_days), text=f"正在分析第 {i+1} 天: {date}")
         
     bar.empty()
@@ -447,7 +442,7 @@ if st.button(f"🚀 启动 V30.12.3 冠军版"):
     if results:
         all_res = pd.concat(results)
         
-        st.header("📊 V30.12.3 冠军仪表盘")
+        st.header("📊 V30.12.3 统计仪表盘")
         cols = st.columns(3)
         for idx, n in enumerate([1, 3, 5]):
             col_name = f'Return_D{n} (%)'
@@ -457,7 +452,7 @@ if st.button(f"🚀 启动 V30.12.3 冠军版"):
                 win = (valid[col_name] > 0).mean() * 100
                 cols[idx].metric(f"D+{n} 均益 / 胜率", f"{avg:.2f}% / {win:.1f}%")
         
-        st.subheader("📋 优选清单")
+        st.subheader("📋 回测清单")
         display_cols = ['Trade_Date','name','ts_code','Close','Pct_Chg',
                         'Return_D1 (%)', 'Return_D3 (%)', 'Return_D5 (%)',
                         'rsi','bias','Sector_Boost']
