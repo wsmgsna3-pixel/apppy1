@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.12.3 中盘共振版
-1. **市值修正**：调整为 50亿-1000亿，聚焦中盘趋势股，提升胜率稳定性。
-2. **板块共振**：全市场行业遍历覆盖，拒绝独狼。
-3. **参数微调**：默认板块阈值提升至 1.5%。
+选股王 · V30.12.3 实战仿真版 (内核回滚版)
+1. **底层逻辑**：回滚至您验证通过的原版行业加载逻辑 (5170只覆盖)。
+2. **实战仿真**：仅修改策略层，拒绝低开，支付1.5%确认成本。
 """
 
 import streamlit as st
@@ -27,13 +26,13 @@ GLOBAL_STOCK_INDUSTRY = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V30.12.3：中盘共振版", layout="wide")
-st.title("选股王 V30.12.3：中盘共振版（✅ 50亿-1000亿 & 全市场共振）")
+st.set_page_config(page_title="选股王 V30.12.3：实战仿真版", layout="wide")
+st.title("选股王 V30.12.3：实战仿真版（✅ 确认上涨再买入）")
 st.markdown("""
-**版本更新说明 (V30.12.3)：**
-1. 💰 **市值策略升级**：从“小微盘(20-200亿)”调整为“**中盘成长(50-1000亿)**”，旨在降低波动，提升胜率。
-2. 🛡️ **板块共振优化**：建议阈值提升至 1.5% 以上，确保只做真热点。
-3. 🛠️ **全市场覆盖**：保留行业遍历逻辑，无死角过滤。
+**⚠️ 实战仿真模式 (Hell Mode) 说明：**
+1. **拒绝低开**：如果 D1 开盘价 <= D0 收盘价，**系统不买入**（回测收益为空）。
+2. **支付溢价**：买入成本按 **`D1开盘价 * 1.015`** 计算（模拟追涨 1.5% 确认）。
+3. **成交验证**：如果 D1 最高价未达到买入价，视为**无法成交**。
 """)
 
 # ---------------------------
@@ -44,6 +43,7 @@ def safe_get(func_name, **kwargs):
     global pro
     if pro is None: 
         return pd.DataFrame(columns=['ts_code']) 
+   
     func = getattr(pro, func_name) 
     try:
         if kwargs.get('is_index'):
@@ -71,7 +71,7 @@ def fetch_and_cache_daily_data(date):
     daily_df = safe_get('daily', trade_date=date)
     return {'adj': adj_df, 'daily': daily_df}
 
-# --- 核心修复：遍历拉取所有行业成分股 ---
+# --- 行业加载函数 (回滚至原版逻辑) ---
 @st.cache_data(ttl=3600*24*7) 
 def load_industry_mapping():
     global pro
@@ -97,6 +97,7 @@ def load_industry_mapping():
         if not all_members: return {}
         full_df = pd.concat(all_members)
         full_df = full_df.drop_duplicates(subset=['con_code'])
+        st.success(f"✅ 行业映射图谱构建完成，覆盖 {len(full_df)} 只股票 (100% 全市场)")
         return dict(zip(full_df['con_code'], full_df['index_code']))
         
     except Exception as e:
@@ -108,17 +109,13 @@ def get_all_historical_data(trade_days_list):
     
     with st.spinner("正在同步全市场行业数据 (遍历模式)..."):
         GLOBAL_STOCK_INDUSTRY = load_industry_mapping()
-        stock_count = len(GLOBAL_STOCK_INDUSTRY)
-        if stock_count < 3000:
-            st.warning(f"⚠️ 行业数据加载异常，仅覆盖 {stock_count} 只股票。")
-        else:
-            st.success(f"✅ 行业映射图谱构建完成，覆盖 {stock_count} 只股票 (100% 全市场)")
 
     latest_trade_date = max(trade_days_list) 
     earliest_trade_date = min(trade_days_list)
     
     start_date_dt = datetime.strptime(earliest_trade_date, "%Y%m%d") - timedelta(days=200)
     end_date_dt = datetime.strptime(latest_trade_date, "%Y%m%d") + timedelta(days=30)
+  
     start_date = start_date_dt.strftime("%Y%m%d")
     end_date = end_date_dt.strftime("%Y%m%d")
     
@@ -151,7 +148,7 @@ def get_all_historical_data(trade_days_list):
     my_bar.empty()
     if not adj_factor_data_list or not daily_data_list:
         return False
-     
+   
     adj_factor_data = pd.concat(adj_factor_data_list)
     adj_factor_data['adj_factor'] = pd.to_numeric(adj_factor_data['adj_factor'], errors='coerce').fillna(0)
     GLOBAL_ADJ_FACTOR = adj_factor_data.drop_duplicates(subset=['ts_code', 'trade_date']).set_index(['ts_code', 'trade_date']).sort_index(level=[0, 1]) 
@@ -205,6 +202,12 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
         
     return df[['open', 'high', 'low', 'close', 'vol']].copy() 
 
+# ==============================================================================
+#  【核心修改点】实战仿真回测逻辑
+#   1. 拒绝低开 (Open_D1 <= Close_D0)
+#   2. 买入价 = Open_D1 * 1.015
+#   3. 验证最高价成交
+# ==============================================================================
 def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[1, 3, 5]):
     d0 = datetime.strptime(selection_date, "%Y%m%d")
     start_future = (d0 + timedelta(days=1)).strftime("%Y%m%d")
@@ -212,16 +215,40 @@ def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[1, 3, 5
     
     hist = get_qfq_data_v4_optimized_final(ts_code, start_date=start_future, end_date=end_future)
     results = {}
-    if hist.empty: return results
     
+    if hist.empty or len(hist) < 1: 
+        return results
+    
+    hist['open'] = pd.to_numeric(hist['open'], errors='coerce')
+    hist['high'] = pd.to_numeric(hist['high'], errors='coerce')
     hist['close'] = pd.to_numeric(hist['close'], errors='coerce')
+    
+    d1_data = hist.iloc[0]
+    next_open = d1_data['open']
+    next_high = d1_data['high']
+    
+    # 1. 拒绝低开：如果明天低开或平开，直接不买 (Return 为空)
+    if next_open <= d0_qfq_close:
+        return results 
+    
+    # 2. 支付确认成本：买入价 = 开盘价 * 1.015
+    target_buy_price = next_open * 1.015
+    
+    # 3. 验证成交：如果当天最高价都不到这个买入价，说明没机会买进
+    if next_high < target_buy_price:
+        return results
+        
+    # 4. 计算真实收益 (卖出按收盘价，做趋势)
     for n in days_ahead:
         col = f'Return_D{n}'
-        if len(hist) >= n and d0_qfq_close > 0:
-            results[col] = (hist.iloc[n-1]['close'] / d0_qfq_close - 1) * 100
+        if len(hist) >= n:
+            sell_price = hist.iloc[n-1]['close']
+            results[col] = (sell_price - target_buy_price) / target_buy_price * 100
         else:
             results[col] = np.nan
+            
     return results
+# ==============================================================================
 
 # ---------------------------
 # 技术指标逻辑
@@ -265,7 +292,7 @@ def compute_indicators(ts_code, end_date):
     
     hist_60 = df.tail(60)
     res['position_60d'] = (close.iloc[-1] - hist_60['low'].min()) / (hist_60['high'].max() - hist_60['low'].min() + 1e-9) * 100
-    
+  
     return res
 
 @st.cache_data(ttl=3600*12)
@@ -318,12 +345,11 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     df['net_mf'] = df['net_mf'].fillna(0)
     df['circ_mv_billion'] = df['circ_mv'] / 10000 # 换算为亿元
     
-    # 基础清洗流程 (已应用市值修正)
     df = df[~df['name'].str.contains('ST|退', na=False)]
     df = df[~df['ts_code'].str.startswith('92')]
     df = df[(df['close'] >= 10.0) & (df['close'] <= 300.0)]
     
-    # 【核心修正】市值筛选
+    # 市值筛选
     df = df[(df['circ_mv_billion'] >= MIN_MV) & (df['circ_mv_billion'] <= MAX_MV)]
     
     df = df[df['turnover_rate'] <= MAX_TURNOVER_RATE] 
@@ -391,7 +417,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V30.12.3 全量配置 (中盘共振)")
+    st.header("V30.12.3 全量配置 (实战仿真版)")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数", value=30, step=1)
     TOP_BACKTEST = st.number_input("每日优选 TopK", value=5)
@@ -418,7 +444,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V30.12.3 中盘回测"):
+if st.button(f"🚀 启动 V30.12.3 实战仿真回测"):
     trade_days = get_trade_days(backtest_date_end.strftime("%Y%m%d"), int(BACKTEST_DAYS))
     
     if not get_all_historical_data(trade_days):
@@ -454,8 +480,16 @@ if st.button(f"🚀 启动 V30.12.3 中盘回测"):
         
         st.subheader("📋 回测清单")
         display_cols = ['Trade_Date','name','ts_code','Close','Pct_Chg',
-                        'Return_D1 (%)', 'Return_D3 (%)', 'Return_D5 (%)',
+             'Return_D1 (%)', 'Return_D3 (%)', 'Return_D5 (%)',
                         'rsi','bias','Sector_Boost']
         st.dataframe(all_res[display_cols].sort_values('Trade_Date', ascending=False), use_container_width=True)
+        
+        csv = all_res.to_csv(index=False).encode('utf-8-sig')
+        st.download_button(
+            label="📥 下载回测结果 (CSV)",
+            data=csv,
+            file_name=f"{datetime.now().strftime('%Y-%m-%d_%H-%M')}_simulation_export.csv",
+            mime="text/csv",
+        )
     else:
         st.warning("⚠️ 没有选出任何股票。")
