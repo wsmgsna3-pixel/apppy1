@@ -1,13 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.12.3 最终实战完全体
+选股王 · V30.12.3 最终实战完全体 (修复版)
 ------------------------------------------------
-核心逻辑：
-1. **多线程极速版**：5线程下载 + 批量筹码读取。
-2. **Top 5 精英制**：只选前五，防止杂毛拖累业绩。
-3. **精准风控**：昨日涨幅限制 19.0% (防20CM大面)，获利盘 > 80% (防套牢)。
-4. **王者加分**：RSI > 90 给予 5000分 重奖，确保真龙入选。
-5. **实战仿真**：拒绝低开 + 1.5% 确认买入。
+修复说明：
+1. 修复了 stock_basic 获取失败导致 KeyError: 'name' 的崩溃问题。
+2. 增加了对基础数据完整性的校验。
 ------------------------------------------------
 """
 
@@ -18,7 +15,7 @@ import tushare as ts
 from datetime import datetime, timedelta
 import warnings
 import time
-import concurrent.futures # 引入多线程库
+import concurrent.futures 
 
 warnings.filterwarnings("ignore")
 
@@ -35,7 +32,7 @@ GLOBAL_STOCK_INDUSTRY = {}
 # 页面设置
 # ---------------------------
 st.set_page_config(page_title="选股王 V30.12.3：最终实战完全体", layout="wide")
-st.title("选股王 V30.12.3：最终实战完全体（🚀 5线程 + 筹码穿透 + RSI重奖）")
+st.title("选股王 V30.12.3：最终实战完全体（🚀 修复崩溃版）")
 st.markdown("""
 **⚠️ 实战仿真模式 (Hell Mode) 说明：**
 1. **买入条件**：D1开盘价 > D0收盘价 (拒绝低开) **且** D1最高价 >= D1开盘价 * 1.015 (确认突破)。
@@ -71,7 +68,8 @@ def safe_get(func_name, **kwargs):
             except:
                 time.sleep(1)
                 continue
-                
+        
+        # 如果失败，返回带有 ts_code 的空表，避免后续 merge 报错
         return pd.DataFrame(columns=['ts_code']) 
     except Exception as e:
         return pd.DataFrame(columns=['ts_code'])
@@ -345,7 +343,7 @@ def get_market_state(trade_date):
     return 'Strong' if latest_close > ma20 else 'Weak'
 
 # ---------------------------
-# 核心回测逻辑函数 (最终优化版)
+# 核心回测逻辑函数 (最终优化版 - 修复KeyError)
 # ---------------------------
 def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, MAX_PREV_PCT):
     global GLOBAL_STOCK_INDUSTRY
@@ -356,8 +354,16 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
 
     daily_basic = safe_get('daily_basic', trade_date=last_trade)
     mf_raw = safe_get('moneyflow', trade_date=last_trade) 
-    stock_basic = safe_get('stock_basic', list_status='L', fields='ts_code,name,list_date')
     
+    # === 修复点 1: 增强 stock_basic 获取稳定性 ===
+    stock_basic = safe_get('stock_basic', list_status='L', fields='ts_code,name,list_date')
+    if stock_basic.empty or 'name' not in stock_basic.columns:
+        # 如果获取失败，尝试不带 fields 参数裸取一次
+        stock_basic = safe_get('stock_basic', list_status='L')
+        if stock_basic.empty or 'name' not in stock_basic.columns:
+            return pd.DataFrame(), f"股票基础信息缺失 {last_trade}"
+    # ==========================================
+
     # --- 批量获取全市场筹码数据 (极速模式) ---
     chip_dict = {}
     try:
@@ -378,6 +384,11 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         
     df = daily_all.merge(stock_basic, on='ts_code', how='left')
     
+    # === 修复点 2: 防止 name 列丢失导致的 KeyError ===
+    if 'name' not in df.columns:
+        df['name'] = '' # 极端情况填充空名，防止崩盘
+    # =============================================
+
     if not daily_basic.empty:
         needed_cols = ['ts_code','turnover_rate','circ_mv','amount']
         existing_cols = [c for c in needed_cols if c in daily_basic.columns]
@@ -393,6 +404,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     df['net_mf'] = df['net_mf'].fillna(0)
     df['circ_mv_billion'] = df['circ_mv'] / 10000 
     
+    # ST过滤 (现在安全了)
     df = df[~df['name'].str.contains('ST|退', na=False)]
     df = df[~df['ts_code'].str.startswith('92')]
     df = df[(df['close'] >= 10.0) & (df['close'] <= 300.0)]
@@ -412,7 +424,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
                 continue
         
         # === 核心风控：20CM 涨停过滤 ===
-        # 精准剔除昨日涨幅超过设定值(默认19.0%)的股票，规避20%大面风险
         if row.pct_chg > MAX_PREV_PCT:
             continue
         # ============================
@@ -425,7 +436,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         
         # 1. 基础风控
         if market_state == 'Weak':
-            # 注意：此处只拦截超过 limit 的，默认 limit 为 100 即不拦截
             if d0_rsi > RSI_LIMIT: continue
             if d0_close < ind['ma20'] or ind['position_60d'] > 20.0: continue
         
@@ -439,11 +449,10 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
             body_pos = (d0_close - ind['last_low']) / range_len
             if body_pos < MIN_BODY_POS: continue
 
-        # 2. 从字典获取筹码数据 (极速内存读取)
+        # 2. 从字典获取筹码数据
         win_rate = chip_dict.get(row.ts_code, None)
         
         if win_rate is not None:
-            # 筹码底线：80%
             if win_rate < CHIP_MIN_WIN_RATE: 
                 continue
         else:
@@ -465,16 +474,12 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     fdf = pd.DataFrame(records)
     
     def dynamic_score(r):
-        # 基础分：MACD * 1000 + 资金流/10000
         base_score = r['macd'] * 1000 + (r['net_mf'] / 10000) 
         
-        # 筹码加分：获利盘 > 90% 加 1000分
         if r['winner_rate'] > 90:
             base_score += 1000
             
         # === RSI 王者重奖 5000分 ===
-        # 给予 RSI>90 的股票超级权重 (相当于5000万资金流)
-        # 确保缩量真龙能插队进入 Top 5
         if r['rsi'] > 90:
             base_score += 5000
             
@@ -505,7 +510,7 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("⚔️ 核心风控参数 (关键)")
     
-    # 1. 精准狙击 20CM 大面 (新加的按钮)
+    # 1. 精准狙击 20CM 大面
     MAX_PREV_PCT = st.number_input("昨日最大涨幅限制 (%)", value=19.0, 
                                  help="⭐ 核心风控：建议设为19.0，精准剔除20CM涨停的深套股，保留10-19%的真龙")
     
