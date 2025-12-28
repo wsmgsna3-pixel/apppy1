@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.12.3 极速筹码版
-1. **多线程核心**：5线程并发获取数据，大幅提升加载速度。
-2. **筹码因子**：引入 'cyq_perf' 获利盘比例，替换原有的乖离度风控。
-3. **实战仿真**：保留拒绝低开 + 1.5% 确认的核心买入逻辑。
+选股王 · V30.12.3 极速终极版
+1. **多线程核心**：5线程并发获取数据，下载飞快。
+2. **批量筹码优化**：每天仅需 1 次网络请求获取全市场筹码数据，分析飞快。
+3. **实战逻辑**：拒绝低开 + 1.5% 确认 + 筹码获利盘风控。
 """
 
 import streamlit as st
@@ -29,13 +29,13 @@ GLOBAL_STOCK_INDUSTRY = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V30.12.3：极速筹码版", layout="wide")
-st.title("选股王 V30.12.3：极速筹码版（🚀 5线程 + 筹码穿透）")
+st.set_page_config(page_title="选股王 V30.12.3：极速终极版", layout="wide")
+st.title("选股王 V30.12.3：极速终极版（🚀 双重加速 + 筹码穿透）")
 st.markdown("""
 **⚠️ 实战仿真模式 (Hell Mode) 说明：**
 1. **拒绝低开**：如果 D1 开盘价 <= D0 收盘价，**系统不买入**。
 2. **支付溢价**：买入成本按 **`D1开盘价 * 1.015`** 计算。
-3. **筹码风控**：使用 Tushare 筹码接口，**剔除获利盘 < 80%** 的套牢股，**优选 > 90%** 的主升浪。
+3. **筹码风控**：批量获取Tushare筹码数据，**剔除获利盘 < 80%** 的套牢股，**优选 > 90%** 的主升浪。
 """)
 
 # ---------------------------
@@ -92,7 +92,7 @@ def fetch_and_cache_daily_data(date):
     daily_df = safe_get('daily', trade_date=date)
     return {'adj': adj_df, 'daily': daily_df}
 
-# --- 行业加载函数 (保持原版稳健逻辑) ---
+# --- 行业加载函数 ---
 @st.cache_data(ttl=3600*24*7) 
 def load_industry_mapping():
     global pro
@@ -106,7 +106,6 @@ def load_industry_mapping():
         all_members = []
         load_bar = st.progress(0, text="正在遍历加载行业数据...")
         
-        # 行业数据量不大，依然维持串行以保证稳定性
         for i, idx_code in enumerate(index_codes):
             df = pro.index_member(index_code=idx_code, is_new='Y')
             if not df.empty:
@@ -166,12 +165,10 @@ def get_all_historical_data(trade_days_list):
     my_bar = st.progress(0, text=progress_text)
     total_steps = len(all_dates)
     
-    # 开启线程池 (Max Workers = 5，适合 5000+ 积分用户)
+    # 开启线程池 (Max Workers = 5)
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        # 提交所有任务
         future_to_date = {executor.submit(fetch_worker, date): date for date in all_dates}
         
-        # 使用 as_completed 实时更新进度条
         for i, future in enumerate(concurrent.futures.as_completed(future_to_date)):
             try:
                 data = future.result()
@@ -182,8 +179,8 @@ def get_all_historical_data(trade_days_list):
             except Exception as exc:
                 pass
             
-            # 更新进度条
-            if i % 5 == 0: # 减少刷新频率提升前端性能
+            # 减少进度条刷新频率以提升性能
+            if i % 10 == 0 or i == total_steps - 1:
                 my_bar.progress((i + 1) / total_steps, text=f"极速加载中: {i+1}/{total_steps}")
 
     my_bar.empty()
@@ -324,9 +321,7 @@ def compute_indicators(ts_code, end_date):
     res['ma20'] = close.tail(20).mean()
     res['ma60'] = close.tail(60).mean()
     
-    # 注意：这里不再计算 Bias，因为我们要用筹码来替代它
-    # res['bias_20'] = ... (已移除)
-
+    # 移除 Bias 计算，改用筹码
     rsi_series = calculate_rsi(close, period=12)
     res['rsi_12'] = rsi_series.iloc[-1]
     
@@ -345,22 +340,8 @@ def get_market_state(trade_date):
     ma20 = index_data['close'].tail(20).mean()
     return 'Strong' if latest_close > ma20 else 'Weak'
 
-# --- 筹码获利盘检测函数 (新武器) ---
-def get_chip_winner_rate(ts_code, trade_date):
-    """
-    获取指定日期的筹码获利盘比例 (0-100)
-    """
-    try:
-        # cyq_perf 是每日筹码概况接口，积分消耗极小，速度快
-        df = safe_get('cyq_perf', ts_code=ts_code, trade_date=trade_date)
-        if df.empty: return None
-        # winner_rate 单位是百分比
-        return df.iloc[0]['winner_rate']
-    except:
-        return None
-
 # ---------------------------
-# 核心回测逻辑函数 (集成筹码)
+# 核心回测逻辑函数 (批量筹码终极优化版)
 # ---------------------------
 def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV):
     global GLOBAL_STOCK_INDUSTRY
@@ -372,6 +353,16 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     daily_basic = safe_get('daily_basic', trade_date=last_trade)
     mf_raw = safe_get('moneyflow', trade_date=last_trade) 
     stock_basic = safe_get('stock_basic', list_status='L', fields='ts_code,name,list_date')
+    
+    # --- 批量获取全市场筹码数据 (速度优化关键) ---
+    chip_dict = {}
+    try:
+        # 一次性获取当天所有股票的筹码概况
+        chip_df = safe_get('cyq_perf', trade_date=last_trade)
+        if not chip_df.empty:
+            chip_dict = dict(zip(chip_df['ts_code'], chip_df['winner_rate']))
+    except:
+        pass 
     
     strong_industry_codes = set()
     try:
@@ -410,8 +401,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     candidates = df.sort_values('pct_chg', ascending=False).head(FINAL_POOL)
     
     records = []
-    # 增加一个筹码检测计数器，防止过多请求
-    chip_check_count = 0
     
     for row in candidates.itertuples():
         if GLOBAL_STOCK_INDUSTRY and strong_industry_codes:
@@ -440,17 +429,14 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
             body_pos = (d0_close - ind['last_low']) / range_len
             if body_pos < MIN_BODY_POS: continue
 
-        # 2. 【核心升级】筹码获利盘检测
-        # 为了不拖慢速度，只对形态已经符合要求的股票查筹码
-        win_rate = get_chip_winner_rate(row.ts_code, last_trade)
+        # 2. 从字典获取筹码数据 (极速内存读取)
+        win_rate = chip_dict.get(row.ts_code, None)
         
-        # 如果获取到了筹码数据，进行筛选
         if win_rate is not None:
-            # 如果获利盘比例太低 (例如 < 80%)，说明上方全是套牢盘，剔除
             if win_rate < CHIP_MIN_WIN_RATE: 
                 continue
         else:
-            # 如果没获取到数据（可能是新股或接口问题），默认给个中性分，不剔除
+            # 如果缺数，给中性分，不剔除
             win_rate = 50 
 
         future = get_future_prices(row.ts_code, last_trade, d0_close)
@@ -469,18 +455,15 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     fdf = pd.DataFrame(records)
     
     def dynamic_score(r):
-        # 基础分：MACD + 资金流
         base_score = r['macd'] * 1000 + (r['net_mf'] / 10000) 
         
-        # 筹码加分项：
-        # 如果获利盘 > 90%，说明筹码穿透，主力无抛压，大幅加分！
+        # 筹码加分
         if r['winner_rate'] > 90:
             base_score += 1000
             
         if r['market_state'] == 'Strong':
             penalty = 0
             if r['rsi'] > RSI_LIMIT: penalty += 500
-            # 移除了 Bias 惩罚，因为筹码已经过滤了套牢盘
             return base_score - penalty
         return base_score
 
@@ -491,7 +474,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V30.12.3 极速筹码版配置")
+    st.header("V30.12.3 极速终极版配置")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数", value=30, step=1)
     TOP_BACKTEST = st.number_input("每日优选 TopK", value=5)
@@ -507,12 +490,11 @@ with st.sidebar:
     SECTOR_THRESHOLD = st.number_input("板块当日最低涨幅 (%)", value=1.5, step=0.1)
     
     st.markdown("---")
-    st.subheader("💎 筹码风控 (新)")
-    CHIP_MIN_WIN_RATE = st.number_input("最低获利盘比例 (%)", value=80.0, help="剔除获利盘低于此比例的股票（套牢盘重）")
+    st.subheader("💎 筹码风控")
+    CHIP_MIN_WIN_RATE = st.number_input("最低获利盘比例 (%)", value=80.0, help="低于此比例(套牢盘多)直接剔除")
     
     st.markdown("---")
     RSI_LIMIT = st.number_input("RSI 拦截线", value=80.0)
-    # 移除了 BIAS_LIMIT 输入框，因为已不再使用
     MAX_UPPER_SHADOW = st.number_input("最大上影线 (%)", value=4.0)
     MIN_BODY_POS = st.number_input("最低实体位置", value=0.7)
     MAX_TURNOVER_RATE = st.number_input("最大换手率 (%)", value=20.0)
@@ -522,7 +504,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V30.12.3 极速筹码回测"):
+if st.button(f"🚀 启动 V30.12.3 极速回测"):
     trade_days_list = get_trade_days(backtest_date_end.strftime("%Y%m%d"), int(BACKTEST_DAYS))
     
     if not trade_days_list:
@@ -541,7 +523,6 @@ if st.button(f"🚀 启动 V30.12.3 极速筹码回测"):
             res['Trade_Date'] = date
             results.append(res)
         
-        # 多线程已经很快了，这里不需要 sleep 太多
         bar.progress((i+1)/len(trade_days_list), text=f"正在分析第 {i+1} 天: {date}")
         
     bar.empty()
