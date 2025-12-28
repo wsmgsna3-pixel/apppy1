@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.12.3 最终实战·安全稳健版
+选股王 · V30.12.3 最终修复版 (Final Fix)
 ------------------------------------------------
-版本特性：
-1. **安全降速**：线程数调整为 3 (3线程)，平衡速度与稳定性，彻底杜绝接口被封。
-2. **策略核心**：Top 5 + 筹码穿透(>80%) + 19%涨幅限制 + RSI重奖(>90加5000分)。
-3. **稳健性**：移除硬编码限制，增强容错，防止崩溃。
+本次修复核心：
+1. **RSI 权重回调**：RSI > 90 加分从 5000 降为 1000，防止劣币驱逐良币。
+2. **20CM 特赦机制**：涨幅 > 19% 的股票，只有 RSI > 85 (超强) 才保留，否则剔除。
+3. **安全稳健**：3线程防封 + 移除硬编码价格限制 + 防崩溃补丁。
 ------------------------------------------------
 """
 
@@ -32,15 +32,15 @@ GLOBAL_STOCK_INDUSTRY = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V30.12.3：安全稳健版", layout="wide")
-st.title("选股王 V30.12.3：安全稳健版（🛡️ 3线程防封 + 🐉 擒龙策略）")
+st.set_page_config(page_title="选股王 V30.12.3：最终修复版", layout="wide")
+st.title("选股王 V30.12.3：最终修复版（⚖️ 权重平衡 + 🛡️ 智能风控）")
 st.markdown("""
-**⚠️ 实战仿真模式 (Hell Mode) 说明：**
+**⚠️ 实战仿真模式说明：**
 1. **买入条件**：D1开盘价 > D0收盘价 (拒绝低开) **且** D1最高价 >= D1开盘价 * 1.015 (确认突破)。
-2. **核心风控**：
-   - **防大面**：剔除昨日涨幅 > 19.0% 的个股 (规避20CM收割)。
+2. **智能排雷**：
+   - **20CM特赦**：涨幅 > 19% 且 RSI < 85 的剔除；RSI > 85 的保留（抓妖）。
    - **防套牢**：剔除获利盘 < 80% 的个股。
-3. **进攻策略**：RSI > 90 不拦截且给予 **5000分** 重奖，确保缩量真龙自动入选。
+3. **策略微调**：RSI > 90 加分调整为 **1000分**，不再盲目重奖。
 """)
 
 # ---------------------------
@@ -48,16 +48,12 @@ st.markdown("""
 # ---------------------------
 @st.cache_data(ttl=3600*12) 
 def safe_get(func_name, **kwargs):
-    """
-    Tushare 接口安全调用包装器 (支持重试)
-    """
     global pro
     if pro is None: 
         return pd.DataFrame(columns=['ts_code']) 
    
     func = getattr(pro, func_name) 
     try:
-        # 增加重试机制
         for _ in range(3):
             try:
                 if kwargs.get('is_index'):
@@ -71,7 +67,6 @@ def safe_get(func_name, **kwargs):
             except:
                 time.sleep(1)
                 continue
-        
         return pd.DataFrame(columns=['ts_code']) 
     except Exception as e:
         return pd.DataFrame(columns=['ts_code'])
@@ -90,9 +85,6 @@ def get_trade_days(end_date_str, num_days):
 
 @st.cache_data(ttl=3600*24)
 def fetch_and_cache_daily_data(date):
-    """
-    单日数据获取单元
-    """
     adj_df = safe_get('adj_factor', trade_date=date)
     daily_df = safe_get('daily', trade_date=date)
     return {'adj': adj_df, 'daily': daily_df}
@@ -148,7 +140,6 @@ def get_all_historical_data(trade_days_list):
         
     all_dates = all_trade_dates_df['cal_date'].tolist()
     
-    # === 修改点：提示改为 3 线程 ===
     st.info(f"⚡ [安全加速模式] 正在开启 3 线程并发加载数据: {start_date} 至 {end_date}...")
 
     adj_factor_data_list = [] 
@@ -161,7 +152,7 @@ def get_all_historical_data(trade_days_list):
     my_bar = st.progress(0, text=progress_text)
     total_steps = len(all_dates)
     
-    # === 关键修改：max_workers=3，防止被封 ===
+    # === 关键：max_workers=3，防止被封 ===
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
         future_to_date = {executor.submit(fetch_worker, date): date for date in all_dates}
         for i, future in enumerate(concurrent.futures.as_completed(future_to_date)):
@@ -328,7 +319,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     if stock_basic.empty or 'name' not in stock_basic.columns:
         stock_basic = safe_get('stock_basic', list_status='L')
     
-    # 筹码数据 (极速模式)
+    # 筹码数据
     chip_dict = {}
     try:
         chip_df = safe_get('cyq_perf', trade_date=last_trade)
@@ -366,7 +357,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     df = df[~df['name'].str.contains('ST|退', na=False)]
     df = df[~df['ts_code'].str.startswith('92')]
     
-    # === 移除硬编码价格限制，改用参数 ===
+    # === 使用侧边栏配置的价格限制 ===
     df = df[(df['close'] >= MIN_PRICE) & (df['close'] <= 2000.0)]
     
     df = df[(df['circ_mv_billion'] >= MIN_MV) & (df['circ_mv_billion'] <= MAX_MV)]
@@ -382,13 +373,22 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
             ind_code = GLOBAL_STOCK_INDUSTRY.get(row.ts_code)
             if ind_code and (ind_code not in strong_industry_codes): continue
         
-        # === 核心风控：19% 涨幅限制 ===
-        if row.pct_chg > MAX_PREV_PCT: continue
+        # === 核心逻辑修改：20CM 特赦机制 ===
+        # 注意：这里我们不再直接 continue，而是等到算了 RSI 之后再判断
+        # 如果 pct_chg > 19，先放行，后面查 RSI
+        # ================================
 
         ind = compute_indicators(row.ts_code, last_trade)
         if not ind: continue
         d0_close = ind['last_close']
         d0_rsi = ind.get('rsi_12', 50)
+        
+        # === 核心逻辑修改：20CM 风控落地 ===
+        # 规则：涨幅 > 19% 且 RSI < 85 (不够强) -> 剔除
+        #      涨幅 > 19% 且 RSI >= 85 (超强妖股) -> 保留
+        if row.pct_chg > MAX_PREV_PCT and d0_rsi < 85:
+            continue
+        # ================================
         
         # 基础风控
         if market_state == 'Weak':
@@ -427,8 +427,9 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         base_score = r['macd'] * 1000 + (r['net_mf'] / 10000) 
         if r['winner_rate'] > 90: base_score += 1000
         
-        # === RSI 王者重奖 5000分 ===
-        if r['rsi'] > 90: base_score += 5000
+        # === 核心逻辑修改：RSI 加分回调至 1000 ===
+        # 确保真龙能入选，但不让垃圾股插队
+        if r['rsi'] > 90: base_score += 1000
             
         if r['market_state'] == 'Strong':
             penalty = 0
@@ -443,7 +444,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V30.12.3 安全稳健版")
+    st.header("V30.12.3 最终修复版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数", value=30, step=1)
     TOP_BACKTEST = st.number_input("每日优选 TopK", value=5, help="保持 Top 5 精英策略")
@@ -458,13 +459,13 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("⚔️ 核心风控参数")
     
-    # 1. 精准狙击 20CM 大面
+    # 1. 20CM 特赦逻辑
     MAX_PREV_PCT = st.number_input("昨日最大涨幅限制 (%)", value=19.0, 
-                                 help="⭐ 核心风控：建议设为19.0，精准剔除20CM涨停的深套股")
+                                 help="涨幅>19%的票，若RSI<85则剔除，RSI>85则保留（抓妖）")
     
-    # 2. RSI 策略调整 (不再拦截)
+    # 2. RSI 策略
     RSI_LIMIT = st.number_input("RSI 拦截线 (建议100)", value=100.0, 
-                              help="设为100表示不拦截。数据证明 RSI>90 胜率最高，不应剔除。")
+                              help="设为100表示不拦截。")
     
     # 3. 筹码底线
     CHIP_MIN_WIN_RATE = st.number_input("最低获利盘 (%)", value=80.0, 
@@ -481,7 +482,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V30.12.3 安全回测"):
+if st.button(f"🚀 启动 V30.12.3 修复回测"):
     trade_days_list = get_trade_days(backtest_date_end.strftime("%Y%m%d"), int(BACKTEST_DAYS))
     
     if not trade_days_list:
