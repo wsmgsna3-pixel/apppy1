@@ -1,9 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.12.3 极速终极版
-1. **多线程核心**：5线程并发获取数据，下载飞快。
-2. **批量筹码优化**：每天仅需 1 次网络请求获取全市场筹码数据，分析飞快。
-3. **实战逻辑**：拒绝低开 + 1.5% 确认 + 筹码获利盘风控。
+选股王 · V30.12.3 最终实战完全体
+------------------------------------------------
+核心逻辑：
+1. **多线程极速版**：5线程下载 + 批量筹码读取。
+2. **Top 5 精英制**：只选前五，防止杂毛拖累业绩。
+3. **精准风控**：昨日涨幅限制 19.0% (防20CM大面)，获利盘 > 80% (防套牢)。
+4. **王者加分**：RSI > 90 给予 5000分 重奖，确保真龙入选。
+5. **实战仿真**：拒绝低开 + 1.5% 确认买入。
+------------------------------------------------
 """
 
 import streamlit as st
@@ -29,13 +34,13 @@ GLOBAL_STOCK_INDUSTRY = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V30.12.3：极速终极版", layout="wide")
-st.title("选股王 V30.12.3：极速终极版（🚀 双重加速 + 筹码穿透）")
+st.set_page_config(page_title="选股王 V30.12.3：最终实战完全体", layout="wide")
+st.title("选股王 V30.12.3：最终实战完全体（🚀 5线程 + 筹码穿透 + RSI重奖）")
 st.markdown("""
 **⚠️ 实战仿真模式 (Hell Mode) 说明：**
-1. **拒绝低开**：如果 D1 开盘价 <= D0 收盘价，**系统不买入**。
-2. **支付溢价**：买入成本按 **`D1开盘价 * 1.015`** 计算。
-3. **筹码风控**：批量获取Tushare筹码数据，**剔除获利盘 < 80%** 的套牢股，**优选 > 90%** 的主升浪。
+1. **买入条件**：D1开盘价 > D0收盘价 (拒绝低开) **且** D1最高价 >= D1开盘价 * 1.015 (确认突破)。
+2. **排雷机制**：剔除昨日涨幅 > 19% 的个股 (防20CM收割)；剔除获利盘 < 80% 的个股 (防套牢)。
+3. **RSI策略**：RSI > 90 不拦截且大幅加分，捕捉缩量主升浪。
 """)
 
 # ---------------------------
@@ -52,7 +57,7 @@ def safe_get(func_name, **kwargs):
    
     func = getattr(pro, func_name) 
     try:
-        # 增加重试机制，应对多线程可能的网络抖动
+        # 增加重试机制
         for _ in range(3):
             try:
                 if kwargs.get('is_index'):
@@ -179,7 +184,7 @@ def get_all_historical_data(trade_days_list):
             except Exception as exc:
                 pass
             
-            # 减少进度条刷新频率以提升性能
+            # 减少进度条刷新频率
             if i % 10 == 0 or i == total_steps - 1:
                 my_bar.progress((i + 1) / total_steps, text=f"极速加载中: {i+1}/{total_steps}")
 
@@ -321,7 +326,6 @@ def compute_indicators(ts_code, end_date):
     res['ma20'] = close.tail(20).mean()
     res['ma60'] = close.tail(60).mean()
     
-    # 移除 Bias 计算，改用筹码
     rsi_series = calculate_rsi(close, period=12)
     res['rsi_12'] = rsi_series.iloc[-1]
     
@@ -341,9 +345,9 @@ def get_market_state(trade_date):
     return 'Strong' if latest_close > ma20 else 'Weak'
 
 # ---------------------------
-# 核心回测逻辑函数 (批量筹码终极优化版)
+# 核心回测逻辑函数 (最终优化版)
 # ---------------------------
-def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV):
+def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, MAX_PREV_PCT):
     global GLOBAL_STOCK_INDUSTRY
     
     market_state = get_market_state(last_trade)
@@ -354,10 +358,9 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     mf_raw = safe_get('moneyflow', trade_date=last_trade) 
     stock_basic = safe_get('stock_basic', list_status='L', fields='ts_code,name,list_date')
     
-    # --- 批量获取全市场筹码数据 (速度优化关键) ---
+    # --- 批量获取全市场筹码数据 (极速模式) ---
     chip_dict = {}
     try:
-        # 一次性获取当天所有股票的筹码概况
         chip_df = safe_get('cyq_perf', trade_date=last_trade)
         if not chip_df.empty:
             chip_dict = dict(zip(chip_df['ts_code'], chip_df['winner_rate']))
@@ -407,6 +410,12 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
             ind_code = GLOBAL_STOCK_INDUSTRY.get(row.ts_code)
             if ind_code and (ind_code not in strong_industry_codes):
                 continue
+        
+        # === 核心风控：20CM 涨停过滤 ===
+        # 精准剔除昨日涨幅超过设定值(默认19.0%)的股票，规避20%大面风险
+        if row.pct_chg > MAX_PREV_PCT:
+            continue
+        # ============================
 
         ind = compute_indicators(row.ts_code, last_trade)
         if not ind: continue
@@ -416,6 +425,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         
         # 1. 基础风控
         if market_state == 'Weak':
+            # 注意：此处只拦截超过 limit 的，默认 limit 为 100 即不拦截
             if d0_rsi > RSI_LIMIT: continue
             if d0_close < ind['ma20'] or ind['position_60d'] > 20.0: continue
         
@@ -433,10 +443,10 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         win_rate = chip_dict.get(row.ts_code, None)
         
         if win_rate is not None:
+            # 筹码底线：80%
             if win_rate < CHIP_MIN_WIN_RATE: 
                 continue
         else:
-            # 如果缺数，给中性分，不剔除
             win_rate = 50 
 
         future = get_future_prices(row.ts_code, last_trade, d0_close)
@@ -455,11 +465,18 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     fdf = pd.DataFrame(records)
     
     def dynamic_score(r):
+        # 基础分：MACD * 1000 + 资金流/10000
         base_score = r['macd'] * 1000 + (r['net_mf'] / 10000) 
         
-        # 筹码加分
+        # 筹码加分：获利盘 > 90% 加 1000分
         if r['winner_rate'] > 90:
             base_score += 1000
+            
+        # === RSI 王者重奖 5000分 ===
+        # 给予 RSI>90 的股票超级权重 (相当于5000万资金流)
+        # 确保缩量真龙能插队进入 Top 5
+        if r['rsi'] > 90:
+            base_score += 5000
             
         if r['market_state'] == 'Strong':
             penalty = 0
@@ -474,10 +491,10 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V30.12.3 极速终极版配置")
+    st.header("V30.12.3 最终实战版配置")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数", value=30, step=1)
-    TOP_BACKTEST = st.number_input("每日优选 TopK", value=5)
+    TOP_BACKTEST = st.number_input("每日优选 TopK", value=5, help="保持 Top 5 精英策略")
     
     st.markdown("---")
     st.subheader("💰 市值筛选 (亿元)")
@@ -486,15 +503,23 @@ with st.sidebar:
     MAX_MV = col_mv2.number_input("最大市值", value=1000.0, step=50.0, help="单位：亿元")
     
     st.markdown("---")
-    st.subheader("🔥 板块共振设置")
+    st.subheader("⚔️ 核心风控参数 (关键)")
+    
+    # 1. 精准狙击 20CM 大面 (新加的按钮)
+    MAX_PREV_PCT = st.number_input("昨日最大涨幅限制 (%)", value=19.0, 
+                                 help="⭐ 核心风控：建议设为19.0，精准剔除20CM涨停的深套股，保留10-19%的真龙")
+    
+    # 2. RSI 策略调整 (不再拦截)
+    RSI_LIMIT = st.number_input("RSI 拦截线 (建议100)", value=100.0, 
+                              help="设为100表示不拦截。数据证明 RSI>90 胜率最高，不应剔除。")
+    
+    # 3. 筹码底线
+    CHIP_MIN_WIN_RATE = st.number_input("最低获利盘比例 (%)", value=80.0, 
+                                      help="低于此比例(套牢盘多)直接剔除")
+    
+    st.markdown("---")
+    st.subheader("板块与形态")
     SECTOR_THRESHOLD = st.number_input("板块当日最低涨幅 (%)", value=1.5, step=0.1)
-    
-    st.markdown("---")
-    st.subheader("💎 筹码风控")
-    CHIP_MIN_WIN_RATE = st.number_input("最低获利盘比例 (%)", value=80.0, help="低于此比例(套牢盘多)直接剔除")
-    
-    st.markdown("---")
-    RSI_LIMIT = st.number_input("RSI 拦截线", value=80.0)
     MAX_UPPER_SHADOW = st.number_input("最大上影线 (%)", value=4.0)
     MIN_BODY_POS = st.number_input("最低实体位置", value=0.7)
     MAX_TURNOVER_RATE = st.number_input("最大换手率 (%)", value=20.0)
@@ -504,7 +529,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V30.12.3 极速回测"):
+if st.button(f"🚀 启动 V30.12.3 终极回测"):
     trade_days_list = get_trade_days(backtest_date_end.strftime("%Y%m%d"), int(BACKTEST_DAYS))
     
     if not trade_days_list:
@@ -518,7 +543,7 @@ if st.button(f"🚀 启动 V30.12.3 极速回测"):
     bar = st.progress(0, text="回测引擎流水线启动...")
     
     for i, date in enumerate(trade_days_list):
-        res, err = run_backtest_for_a_day(date, int(TOP_BACKTEST), 100, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV)
+        res, err = run_backtest_for_a_day(date, int(TOP_BACKTEST), 100, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, MAX_PREV_PCT)
         if not res.empty:
             res['Trade_Date'] = date
             results.append(res)
