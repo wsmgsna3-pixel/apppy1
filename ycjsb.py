@@ -425,7 +425,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         
         # === RSI 策略：加分 1000 ===
         # 奖励缩量真龙，但不让指标虚高的票插队
-        if r['rsi'] > 90: base_score += 1000
+        if r['rsi'] > 90: base_score += 3000
             
         if r['market_state'] == 'Strong':
             penalty = 0
