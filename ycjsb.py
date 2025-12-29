@@ -12,8 +12,8 @@
    - RSI > 90 加 3000 分 (锁定主板龙头 & 科创板真龙)
    - 涨幅 > 19% 铁血剔除 (避开大面)
 3. **系统增强**：
-   - [span_0](start_span)单线程模式 (100% 稳定，防封号，防丢包)[span_0](end_span)
-   - [span_1](start_span)资金流数据防抖 (防止排名乱跳)[span_1](end_span)
+   - 单线程模式 (100% 稳定，防封号，防丢包)
+   - 资金流数据防抖 (防止排名乱跳)
 ------------------------------------------------
 """
 
@@ -44,7 +44,7 @@ st.set_page_config(page_title="选股王 V30.12.3 实战版", layout="wide")
 st.title("选股王 V30.12.3：最终实战定制版")
 st.markdown("""
 **🎯 实战铁律 (Top 3 策略)：**
-1. **[span_2](start_span)只看前三**：Rank 1 (妖股博弈), Rank 2-3 (稳健大肉). 放弃 Rank 4-5.[span_2](end_span)
+1. **只看前三**：Rank 1 (妖股博弈), Rank 2-3 (稳健大肉). 放弃 Rank 4-5.
 2. **科创板纪律**：若选出 688/300 开头的票，**必须 RSI > 90** 才能上，否则剔除顺延.
 3. **风控底线**：昨日涨幅 > 19% 一律不碰.
 """)
@@ -62,20 +62,21 @@ def safe_get(func_name, **kwargs):
     try:
         for _ in range(3):
             try:
+                # 修复点：这里之前有格式乱码，已清理
                 if kwargs.get('is_index'):
-                    [span_3](start_span)df = pro.index_daily(**kwargs)[span_3](end_span)
+                    df = pro.index_daily(**kwargs)
                 else:
                     df = func(**kwargs)
                 
                 if df is not None and not df.empty:
-                    [span_4](start_span)return df[span_4](end_span)
+                    return df
                 time.sleep(0.5)
             except:
                 time.sleep(1)
                 continue
         return pd.DataFrame(columns=['ts_code']) 
     except Exception as e:
-        [span_5](start_span)return pd.DataFrame(columns=['ts_code'])[span_5](end_span)
+        return pd.DataFrame(columns=['ts_code'])
 
 def get_trade_days(end_date_str, num_days):
     lookback_days = max(num_days * 3, 365) 
@@ -92,7 +93,7 @@ def get_trade_days(end_date_str, num_days):
 @st.cache_data(ttl=3600*24)
 def fetch_and_cache_daily_data(date):
     adj_df = safe_get('adj_factor', trade_date=date)
-    [span_6](start_span)daily_df = safe_get('daily', trade_date=date)[span_6](end_span)
+    daily_df = safe_get('daily', trade_date=date)
     return {'adj': adj_df, 'daily': daily_df}
 
 # --- 行业加载函数 ---
@@ -107,14 +108,14 @@ def load_industry_mapping():
         all_members = []
         load_bar = st.progress(0, text="正在遍历加载行业数据...")
         for i, idx_code in enumerate(index_codes):
-            [span_7](start_span)df = pro.index_member(index_code=idx_code, is_new='Y')[span_7](end_span)
+            df = pro.index_member(index_code=idx_code, is_new='Y')
             if not df.empty: all_members.append(df)
             time.sleep(0.02) 
             load_bar.progress((i + 1) / len(index_codes), text=f"加载行业数据: {idx_code}")
         load_bar.empty()
         if not all_members: return {}
         full_df = pd.concat(all_members)
-        [span_8](start_span)full_df = full_df.drop_duplicates(subset=['con_code'])[span_8](end_span)
+        full_df = full_df.drop_duplicates(subset=['con_code'])
         return dict(zip(full_df['con_code'], full_df['index_code']))
     except Exception as e:
         return {}
@@ -133,7 +134,7 @@ def get_all_historical_data(trade_days_list):
     earliest_trade_date = min(trade_days_list)
     
     start_date_dt = datetime.strptime(earliest_trade_date, "%Y%m%d") - timedelta(days=200)
-    [span_9](start_span)end_date_dt = datetime.strptime(latest_trade_date, "%Y%m%d") + timedelta(days=30)[span_9](end_span)
+    end_date_dt = datetime.strptime(latest_trade_date, "%Y%m%d") + timedelta(days=30)
   
     start_date = start_date_dt.strftime("%Y%m%d")
     end_date = end_date_dt.strftime("%Y%m%d")
@@ -149,7 +150,7 @@ def get_all_historical_data(trade_days_list):
     st.info(f"⚡ [单线程稳定模式] 正在加载数据: {start_date} 至 {end_date}...")
 
     adj_factor_data_list = [] 
-    [span_10](start_span)daily_data_list = [][span_10](end_span)
+    daily_data_list = []
     
     def fetch_worker(date):
         return fetch_and_cache_daily_data(date)
@@ -163,12 +164,12 @@ def get_all_historical_data(trade_days_list):
         future_to_date = {executor.submit(fetch_worker, date): date for date in all_dates}
         for i, future in enumerate(concurrent.futures.as_completed(future_to_date)):
             try:
-                [span_11](start_span)data = future.result()[span_11](end_span)
+                data = future.result()
                 if not data['adj'].empty: adj_factor_data_list.append(data['adj'])
                 if not data['daily'].empty: daily_data_list.append(data['daily'])
             except Exception as exc: pass
             
-            [span_12](start_span)if i % 5 == 0 or i == total_steps - 1:[span_12](end_span)
+            if i % 5 == 0 or i == total_steps - 1:
                 my_bar.progress((i + 1) / total_steps, text=f"加载中: {i+1}/{total_steps}")
 
     my_bar.empty()
@@ -182,7 +183,7 @@ def get_all_historical_data(trade_days_list):
         adj_factor_data['adj_factor'] = pd.to_numeric(adj_factor_data['adj_factor'], errors='coerce').fillna(0)
         GLOBAL_ADJ_FACTOR = adj_factor_data.drop_duplicates(subset=['ts_code', 'trade_date']).set_index(['ts_code', 'trade_date']).sort_index(level=[0, 1]) 
         
-        [span_13](start_span)daily_raw_data = pd.concat(daily_data_list)[span_13](end_span)
+        daily_raw_data = pd.concat(daily_data_list)
         GLOBAL_DAILY_RAW = daily_raw_data.drop_duplicates(subset=['ts_code', 'trade_date']).set_index(['ts_code', 'trade_date']).sort_index(level=[0, 1])
 
         latest_global_date = GLOBAL_ADJ_FACTOR.index.get_level_values('trade_date').max()
@@ -190,7 +191,7 @@ def get_all_historical_data(trade_days_list):
             try:
                 latest_adj_df = GLOBAL_ADJ_FACTOR.loc[(slice(None), latest_global_date), 'adj_factor']
                 GLOBAL_QFQ_BASE_FACTORS = latest_adj_df.droplevel(1).to_dict()
-            [span_14](start_span)except: GLOBAL_QFQ_BASE_FACTORS = {}[span_14](end_span)
+            except: GLOBAL_QFQ_BASE_FACTORS = {}
             
     return True
 
@@ -207,7 +208,7 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
     try:
         daily_df = GLOBAL_DAILY_RAW.loc[ts_code]
         daily_df = daily_df.loc[(daily_df.index >= start_date) & (daily_df.index <= end_date)]
-        [span_15](start_span)adj_series = GLOBAL_ADJ_FACTOR.loc[ts_code]['adj_factor'][span_15](end_span)
+        adj_series = GLOBAL_ADJ_FACTOR.loc[ts_code]['adj_factor']
         adj_series = adj_series.loc[(adj_series.index >= start_date) & (adj_series.index <= end_date)]
     except KeyError: return pd.DataFrame()
     
@@ -218,7 +219,7 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
     
     for col in ['open', 'high', 'low', 'close', 'pre_close']:
         if col in df.columns:
-            [span_16](start_span)df[col + '_qfq'] = df[col] * df['adj_factor'] / latest_adj_factor[span_16](end_span)
+            df[col + '_qfq'] = df[col] * df['adj_factor'] / latest_adj_factor
     
     df = df.reset_index().rename(columns={'trade_date': 'trade_date_str'})
     df = df.sort_values('trade_date_str').set_index('trade_date_str')
@@ -234,7 +235,7 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
 def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[1, 3, 5]):
     d0 = datetime.strptime(selection_date, "%Y%m%d")
     start_future = (d0 + timedelta(days=1)).strftime("%Y%m%d")
-    [span_17](start_span)end_future = (d0 + timedelta(days=15)).strftime("%Y%m%d")[span_17](end_span)
+    end_future = (d0 + timedelta(days=15)).strftime("%Y%m%d")
     
     hist = get_qfq_data_v4_optimized_final(ts_code, start_date=start_future, end_date=end_future)
     results = {}
@@ -250,7 +251,7 @@ def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[1, 3, 5
     next_high = d1_data['high']
     
     if next_open <= d0_qfq_close: return results 
-    [span_18](start_span)target_buy_price = next_open * 1.015[span_18](end_span)
+    target_buy_price = next_open * 1.015
     if next_high < target_buy_price: return results
         
     for n in days_ahead:
@@ -259,7 +260,7 @@ def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[1, 3, 5
             sell_price = hist.iloc[n-1]['close']
             results[col] = (sell_price - target_buy_price) / target_buy_price * 100
         else:
-            [span_19](start_span)results[col] = np.nan[span_19](end_span)
+            results[col] = np.nan
     return results
 
 def calculate_rsi(series, period=12):
@@ -276,7 +277,7 @@ def compute_indicators(ts_code, end_date):
     res = {}
     if df.empty or len(df) < 26: return res 
     
-    [span_20](start_span)df['pct_chg'] = df['close'].pct_change().fillna(0) * 100[span_20](end_span)
+    df['pct_chg'] = df['close'].pct_change().fillna(0) * 100 
     close = df['close']
     res['last_close'] = close.iloc[-1]
     res['last_open'] = df['open'].iloc[-1]
@@ -292,7 +293,7 @@ def compute_indicators(ts_code, end_date):
     res['ma20'] = close.tail(20).mean()
     res['ma60'] = close.tail(60).mean()
     
-    [span_21](start_span)rsi_series = calculate_rsi(close, period=12)[span_21](end_span)
+    rsi_series = calculate_rsi(close, period=12)
     res['rsi_12'] = rsi_series.iloc[-1]
     
     hist_60 = df.tail(60)
@@ -308,7 +309,7 @@ def get_market_state(trade_date):
     index_data = index_data.sort_values('trade_date')
     latest_close = index_data.iloc[-1]['close']
     ma20 = index_data['close'].tail(20).mean()
-    [span_22](start_span)return 'Strong' if latest_close > ma20 else 'Weak'[span_22](end_span)
+    return 'Strong' if latest_close > ma20 else 'Weak'
 
 # ---------------------------
 # 核心回测逻辑函数 (最终稳定版)
@@ -325,7 +326,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     if stock_basic.empty or 'name' not in stock_basic.columns:
         stock_basic = safe_get('stock_basic', list_status='L')
     
-    # [span_23](start_span)筹码数据[span_23](end_span)
+    # 筹码数据
     chip_dict = {}
     try:
         chip_df = safe_get('cyq_perf', trade_date=last_trade)
@@ -337,7 +338,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     try:
         sw_df = safe_get('sw_daily', trade_date=last_trade)
         if not sw_df.empty:
-            [span_24](start_span)strong_sw = sw_df[sw_df['pct_chg'] >= SECTOR_THRESHOLD][span_24](end_span)
+            strong_sw = sw_df[sw_df['pct_chg'] >= SECTOR_THRESHOLD]
             strong_industry_codes = set(strong_sw['index_code'].tolist())
     except: pass 
         
@@ -348,7 +349,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     if not daily_basic.empty:
         needed_cols = ['ts_code','turnover_rate','circ_mv','amount']
         existing_cols = [c for c in needed_cols if c in daily_basic.columns]
-        [span_25](start_span)df = df.merge(daily_basic[existing_cols], on='ts_code', how='left')[span_25](end_span)
+        df = df.merge(daily_basic[existing_cols], on='ts_code', how='left')
     
     # === 资金流防抖逻辑 ===
     mf_raw = safe_get('moneyflow', trade_date=last_trade)
@@ -360,7 +361,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         df['net_mf'] = 0 
     
     for col in ['net_mf', 'turnover_rate', 'circ_mv', 'amount']:
-        [span_26](start_span)if col not in df.columns: df[col] = 0[span_26](end_span)
+        if col not in df.columns: df[col] = 0
     df['net_mf'] = df['net_mf'].fillna(0)
     df['circ_mv_billion'] = df['circ_mv'] / 10000 
     
@@ -375,7 +376,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
 
     if len(df) == 0: return pd.DataFrame(), "过滤后无标的"
 
-    [span_27](start_span)candidates = df.sort_values('pct_chg', ascending=False).head(FINAL_POOL)[span_27](end_span)
+    candidates = df.sort_values('pct_chg', ascending=False).head(FINAL_POOL)
     records = []
     
     for row in candidates.itertuples():
@@ -385,7 +386,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         
         # === 核心风控：铁血执行 19% 限制 ===
         if row.pct_chg > MAX_PREV_PCT: 
-            [span_28](start_span)continue[span_28](end_span)
+            continue
 
         ind = compute_indicators(row.ts_code, last_trade)
         if not ind: continue
@@ -395,14 +396,14 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         # 基础风控
         if market_state == 'Weak':
             if d0_rsi > RSI_LIMIT: continue
-            [span_29](start_span)if d0_close < ind['ma20'] or ind['position_60d'] > 20.0: continue[span_29](end_span)
+            if d0_close < ind['ma20'] or ind['position_60d'] > 20.0: continue
         if d0_close < ind['ma60']: continue
         
         upper_shadow = (ind['last_high'] - d0_close) / d0_close * 100
         if upper_shadow > MAX_UPPER_SHADOW: continue
         range_len = ind['last_high'] - ind['last_low']
         if range_len > 0:
-            [span_30](start_span)body_pos = (d0_close - ind['last_low']) / range_len[span_30](end_span)
+            body_pos = (d0_close - ind['last_low']) / range_len
             if body_pos < MIN_BODY_POS: continue
 
         # 筹码风控 (使用 UI 配置的值, 默认 70)
@@ -412,13 +413,13 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         else: win_rate = 50 
 
         future = get_future_prices(row.ts_code, last_trade, d0_close)
-        [span_31](start_span)records.append({[span_31](end_span)
+        records.append({
             'ts_code': row.ts_code, 'name': row.name, 'Close': row.close, 'Pct_Chg': row.pct_chg,
             'rsi': d0_rsi, 'winner_rate': win_rate, 'macd': ind['macd_val'], 'net_mf': row.net_mf,
             'Return_D1 (%)': future.get('Return_D1', np.nan),
             'Return_D3 (%)': future.get('Return_D3', np.nan),
             'Return_D5 (%)': future.get('Return_D5', np.nan),
-            [span_32](start_span)'market_state': market_state,[span_32](end_span)
+            'market_state': market_state,
             'Sector_Boost': 'Yes' if GLOBAL_STOCK_INDUSTRY else 'N/A'
         })
             
@@ -429,14 +430,14 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         base_score = r['macd'] * 1000 + (r['net_mf'] / 10000) 
         if r['winner_rate'] > 90: base_score += 1000
         
-        # [span_33](start_span)=== RSI 策略：维持 3000分 重奖 ===[span_33](end_span)
+        # === RSI 策略：维持 3000分 重奖 ===
         # 确保主板龙头和科创板妖股能排进前三
         if r['rsi'] > 90: base_score += 3000
             
         if r['market_state'] == 'Strong':
             penalty = 0
             if r['rsi'] > RSI_LIMIT: penalty += 500
-            [span_34](start_span)return base_score - penalty[span_34](end_span)
+            return base_score - penalty
         return base_score
 
     fdf['Score'] = fdf.apply(dynamic_score, axis=1)
@@ -454,7 +455,7 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("💰 基础过滤")
     col1, col2 = st.columns(2)
-    # [span_35](start_span)[修改点 1] 最低股价默认 10.0[span_35](end_span)
+    # [修改点 1] 最低股价默认 10.0
     MIN_PRICE = col1.number_input("最低股价", value=10.0, help="厌恶低价股，默认设为10元")
     MIN_MV = col2.number_input("最小市值(亿)", value=50.0)
     MAX_MV = st.number_input("最大市值(亿)", value=1000.0)
@@ -466,14 +467,14 @@ with st.sidebar:
     CHIP_MIN_WIN_RATE = st.number_input("最低获利盘 (%)", value=70.0, 
                                       help="设为70以激活科创板妖股。低于此比例直接剔除")
     
-    # [span_36](start_span)20CM 铁血风控[span_36](end_span)
+    # 20CM 铁血风控
     MAX_PREV_PCT = st.number_input("昨日最大涨幅限制 (%)", value=19.0, 
                                  help="⭐ 核心风控：定死19.0，精准剔除20CM涨停的深套股")
     
     RSI_LIMIT = st.number_input("RSI 拦截线 (建议100)", value=100.0, 
                               help="设为100表示不拦截。")
     
-    [span_37](start_span)st.markdown("---")[span_37](end_span)
+    st.markdown("---")
     st.subheader("📊 形态参数")
     SECTOR_THRESHOLD = st.number_input("板块涨幅 (%)", value=1.5)
     # [修改点 3] 上影线默认 5.0
@@ -492,7 +493,7 @@ if st.button(f"🚀 启动 V30.12.3 实战版回测"):
     
     if not trade_days_list:
         st.error("❌ 无法获取交易日期列表，请检查网络或 Token。")
-        [span_38](start_span)st.stop()[span_38](end_span)
+        st.stop()
         
     if not get_all_historical_data(trade_days_list):
         st.stop()
@@ -503,7 +504,7 @@ if st.button(f"🚀 启动 V30.12.3 实战版回测"):
     for i, date in enumerate(trade_days_list):
         res, err = run_backtest_for_a_day(date, int(TOP_BACKTEST), 100, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, MAX_PREV_PCT, MIN_PRICE)
         if not res.empty:
-            [span_39](start_span)res['Trade_Date'] = date[span_39](end_span)
+            res['Trade_Date'] = date
             results.append(res)
         
         bar.progress((i+1)/len(trade_days_list), text=f"正在分析第 {i+1} 天: {date}")
@@ -515,13 +516,13 @@ if st.button(f"🚀 启动 V30.12.3 实战版回测"):
         
         st.header("📊 V30.12.3 统计仪表盘")
         cols = st.columns(3)
-        [span_40](start_span)for idx, n in enumerate([1, 3, 5]):[span_40](end_span)
+        for idx, n in enumerate([1, 3, 5]):
             col_name = f'Return_D{n} (%)'
             valid = all_res.dropna(subset=[col_name]) 
             if not valid.empty:
                 avg = valid[col_name].mean()
                 win = (valid[col_name] > 0).mean() * 100
-                [span_41](start_span)cols[idx].metric(f"D+{n} 均益 / 胜率", f"{avg:.2f}% / {win:.1f}%")[span_41](end_span)
+                cols[idx].metric(f"D+{n} 均益 / 胜率", f"{avg:.2f}% / {win:.1f}%")
         
         st.subheader("📋 回测清单")
         display_cols = ['Trade_Date','name','ts_code','Close','Pct_Chg',
@@ -529,7 +530,7 @@ if st.button(f"🚀 启动 V30.12.3 实战版回测"):
                         'rsi','winner_rate','Sector_Boost']
         st.dataframe(all_res[display_cols].sort_values('Trade_Date', ascending=False), use_container_width=True)
         
-        [span_42](start_span)csv = all_res.to_csv(index=False).encode('utf-8-sig')[span_42](end_span)
+        csv = all_res.to_csv(index=False).encode('utf-8-sig')
         st.download_button(
             label="📥 下载回测结果 (CSV)",
             data=csv,
