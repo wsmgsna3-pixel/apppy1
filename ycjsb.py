@@ -1,13 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.12.3 最终修正回退版 (Revert)
+选股王 · V30.12.3 最终实战定制版
 ------------------------------------------------
-版本核心：
-1. **铁血风控**：恢复最严厉的 19% 涨幅限制。
-   - 只要昨日涨幅 > 19.0% (20CM涨停)，一律剔除！
-   - 彻底规避“幸福蓝海(-30%)”式的次日大面。
-2. **RSI 策略**：保留 RSI > 90 加 1000分，只奖励稳健的真龙。
-3. **安全稳健**：3线程并发 + 全套防崩溃补丁。
+版本特性 (User Customized):
+1. **参数固化**：
+   - 最低股价 >= 10.0 元 (厌恶低价股)
+   - 上影线 <= 5.0% (最佳平衡点)
+   - 实体位置 >= 0.6 (容忍洗盘)
+   - 获利盘 >= 70% (激活科创板妖股)
+2. **核心策略**：
+   - RSI > 90 加 3000 分 (锁定主板龙头 & 科创板真龙)
+   - 涨幅 > 19% 铁血剔除 (避开大面)
+3. **系统增强**：
+   - 3线程并发 (防封号)
+   - 资金流数据防抖 (防止排名乱跳)
 ------------------------------------------------
 """
 
@@ -34,15 +40,13 @@ GLOBAL_STOCK_INDUSTRY = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V30.12.3：最终修正回退版", layout="wide")
-st.title("选股王 V30.12.3：最终修正回退版（🛡️ 铁血风控 + 🐉 稳健擒龙）")
+st.set_page_config(page_title="选股王 V30.12.3 实战版", layout="wide")
+st.title("选股王 V30.12.3：最终实战定制版")
 st.markdown("""
-**⚠️ 实战仿真模式说明：**
-1. **买入条件**：D1开盘价 > D0收盘价 (拒绝低开) **且** D1最高价 >= D1开盘价 * 1.015 (确认突破)。
-2. **铁血排雷**：
-   - **拒绝诱惑**：昨日涨幅 > 19.0% (20CM涨停) **一律剔除**。数据证明次日大面率极高。
-   - **防套牢**：剔除获利盘 < 80% 的个股。
-3. **策略核心**：RSI > 90 给予 **1000分** 奖励，优选缩量主升浪。
+**🎯 实战铁律 (Top 3 策略)：**
+1. **只看前三**：Rank 1 (妖股博弈), Rank 2-3 (稳健大肉). 放弃 Rank 4-5.
+2. **科创板纪律**：若选出 688/300 开头的票，**必须 RSI > 90** 才能上，否则剔除顺延。
+3. **风控底线**：昨日涨幅 > 19% 一律不碰。
 """)
 
 # ---------------------------
@@ -154,7 +158,6 @@ def get_all_historical_data(trade_days_list):
     my_bar = st.progress(0, text=progress_text)
     total_steps = len(all_dates)
     
-    # === 关键：max_workers=3，防止被封 ===
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
         future_to_date = {executor.submit(fetch_worker, date): date for date in all_dates}
         for i, future in enumerate(concurrent.futures.as_completed(future_to_date)):
@@ -346,10 +349,14 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         existing_cols = [c for c in needed_cols if c in daily_basic.columns]
         df = df.merge(daily_basic[existing_cols], on='ts_code', how='left')
     
+    # === 资金流防抖逻辑 ===
     mf_raw = safe_get('moneyflow', trade_date=last_trade)
     if not mf_raw.empty:
         mf = mf_raw[['ts_code','net_mf_amount']].rename(columns={'net_mf_amount':'net_mf'})
         df = df.merge(mf, on='ts_code', how='left')
+    else:
+        # 如果资金流缺失，不要静默失败，给个标记但继续运行
+        df['net_mf'] = 0 
     
     for col in ['net_mf', 'turnover_rate', 'circ_mv', 'amount']:
         if col not in df.columns: df[col] = 0
@@ -359,7 +366,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     df = df[~df['name'].str.contains('ST|退', na=False)]
     df = df[~df['ts_code'].str.startswith('92')]
     
-    # === 使用侧边栏配置的价格限制 ===
+    # === 使用侧边栏配置的价格限制 (默认10元) ===
     df = df[(df['close'] >= MIN_PRICE) & (df['close'] <= 2000.0)]
     
     df = df[(df['circ_mv_billion'] >= MIN_MV) & (df['circ_mv_billion'] <= MAX_MV)]
@@ -376,10 +383,8 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
             if ind_code and (ind_code not in strong_industry_codes): continue
         
         # === 核心风控：铁血执行 19% 限制 ===
-        # 不管 RSI 多高，只要昨日涨幅 > 19%，一律剔除！
         if row.pct_chg > MAX_PREV_PCT: 
             continue
-        # ================================
 
         ind = compute_indicators(row.ts_code, last_trade)
         if not ind: continue
@@ -399,7 +404,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
             body_pos = (d0_close - ind['last_low']) / range_len
             if body_pos < MIN_BODY_POS: continue
 
-        # 筹码风控
+        # 筹码风控 (使用 UI 配置的值, 默认 70)
         win_rate = chip_dict.get(row.ts_code, None)
         if win_rate is not None:
             if win_rate < CHIP_MIN_WIN_RATE: continue
@@ -423,8 +428,8 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         base_score = r['macd'] * 1000 + (r['net_mf'] / 10000) 
         if r['winner_rate'] > 90: base_score += 1000
         
-        # === RSI 策略：加分 1000 ===
-        # 奖励缩量真龙，但不让指标虚高的票插队
+        # === RSI 策略：维持 3000分 重奖 ===
+        # 确保主板龙头和科创板妖股能排进前三
         if r['rsi'] > 90: base_score += 3000
             
         if r['market_state'] == 'Strong':
@@ -440,37 +445,40 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V30.12.3 最终修正回退版")
+    st.header("V30.12.3 实战定制版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
-    BACKTEST_DAYS = st.number_input("分析天数", value=30, step=1)
-    TOP_BACKTEST = st.number_input("每日优选 TopK", value=5, help="保持 Top 5 精英策略")
+    BACKTEST_DAYS = st.number_input("分析天数", value=30, step=1, help="建议30-50天，太长容易卡顿")
+    TOP_BACKTEST = st.number_input("每日优选 TopK", value=5, help="保持 Top 5, 实盘只看 Top 3")
     
     st.markdown("---")
     st.subheader("💰 基础过滤")
     col1, col2 = st.columns(2)
-    MIN_PRICE = col1.number_input("最低股价", value=2.0, help="建议设为2.0，防止误杀低价龙头")
+    # [修改点 1] 最低股价默认 10.0
+    MIN_PRICE = col1.number_input("最低股价", value=10.0, help="厌恶低价股，默认设为10元")
     MIN_MV = col2.number_input("最小市值(亿)", value=50.0)
     MAX_MV = st.number_input("最大市值(亿)", value=1000.0)
     
     st.markdown("---")
     st.subheader("⚔️ 核心风控参数")
     
-    # 1. 20CM 铁血风控
+    # [修改点 2] 筹码获利盘默认 70.0
+    CHIP_MIN_WIN_RATE = st.number_input("最低获利盘 (%)", value=70.0, 
+                                      help="设为70以激活科创板妖股。低于此比例直接剔除")
+    
+    # 20CM 铁血风控
     MAX_PREV_PCT = st.number_input("昨日最大涨幅限制 (%)", value=19.0, 
                                  help="⭐ 核心风控：定死19.0，精准剔除20CM涨停的深套股")
     
-    # 2. RSI 策略
     RSI_LIMIT = st.number_input("RSI 拦截线 (建议100)", value=100.0, 
                               help="设为100表示不拦截。")
     
-    # 3. 筹码底线
-    CHIP_MIN_WIN_RATE = st.number_input("最低获利盘 (%)", value=80.0, 
-                                      help="低于此比例(套牢盘多)直接剔除")
-    
     st.markdown("---")
+    st.subheader("📊 形态参数")
     SECTOR_THRESHOLD = st.number_input("板块涨幅 (%)", value=1.5)
-    MAX_UPPER_SHADOW = st.number_input("上影线 (%)", value=4.0)
-    MIN_BODY_POS = st.number_input("实体位置", value=0.7)
+    # [修改点 3] 上影线默认 5.0
+    MAX_UPPER_SHADOW = st.number_input("上影线 (%)", value=5.0, help="最佳平衡点")
+    # [修改点 4] 实体位置默认 0.6
+    MIN_BODY_POS = st.number_input("实体位置", value=0.6, help="0.6表示允许适当下影线")
     MAX_TURNOVER_RATE = st.number_input("换手率 (%)", value=20.0)
 
 TS_TOKEN = st.text_input("Tushare Token", type="password")
@@ -478,7 +486,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V30.12.3 回退版回测"):
+if st.button(f"🚀 启动 V30.12.3 实战版回测"):
     trade_days_list = get_trade_days(backtest_date_end.strftime("%Y%m%d"), int(BACKTEST_DAYS))
     
     if not trade_days_list:
