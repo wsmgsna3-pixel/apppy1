@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.12.3 最终实战定制版
+选股王 · V30.12.3 最终实战定制版 (MACD改进版)
 ------------------------------------------------
 版本特性 (User Customized):
 1. **参数固化**：
@@ -10,6 +10,7 @@
    - 获利盘 >= 70% (激活科创板妖股)
 2. **核心策略**：
    - RSI > 90 加 3000 分 (锁定主板龙头 & 科创板真龙)
+   - MACD 改进参数 (8, 17, 5) 更灵敏捕捉起爆
    - 涨幅 > 19% 铁血剔除 (避开大面)
 3. **系统增强**：
    - 单线程模式 (100% 稳定，防封号，防丢包)
@@ -41,7 +42,7 @@ GLOBAL_STOCK_INDUSTRY = {}
 # 页面设置
 # ---------------------------
 st.set_page_config(page_title="选股王 V30.12.3 实战版", layout="wide")
-st.title("选股王 V30.12.3：最终实战定制版")
+st.title("选股王 V30.12.3：最终实战定制版 (MACD 8-17-5)")
 st.markdown("""
 **🎯 实战铁律 (Top 3 策略)：**
 1. **只看前三**：Rank 1 (妖股博弈), Rank 2-3 (稳健大肉). 放弃 Rank 4-5.
@@ -62,7 +63,6 @@ def safe_get(func_name, **kwargs):
     try:
         for _ in range(3):
             try:
-                # 修复点：这里之前有格式乱码，已清理
                 if kwargs.get('is_index'):
                     df = pro.index_daily(**kwargs)
                 else:
@@ -159,7 +159,7 @@ def get_all_historical_data(trade_days_list):
     my_bar = st.progress(0, text=progress_text)
     total_steps = len(all_dates)
     
-    # ▼▼▼ 核心修改：改为单线程 max_workers=1 ▼▼▼
+    # 保持单线程以确保不丢包
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         future_to_date = {executor.submit(fetch_worker, date): date for date in all_dates}
         for i, future in enumerate(concurrent.futures.as_completed(future_to_date)):
@@ -284,10 +284,12 @@ def compute_indicators(ts_code, end_date):
     res['last_high'] = df['high'].iloc[-1]
     res['last_low'] = df['low'].iloc[-1]
     
-    ema12 = close.ewm(span=12, adjust=False).mean()
-    ema26 = close.ewm(span=26, adjust=False).mean()
+    # === 修改点：使用改进版 MACD (8, 17, 5) ===
+    # 逻辑：加快反应速度，更适合 A 股的短线搏杀
+    ema12 = close.ewm(span=8, adjust=False).mean()   # 原12改为8
+    ema26 = close.ewm(span=17, adjust=False).mean()  # 原26改为17
     diff = ema12 - ema26
-    dea = diff.ewm(span=9, adjust=False).mean()
+    dea = diff.ewm(span=5, adjust=False).mean()      # 原9改为5
     res['macd_val'] = ((diff - dea) * 2).iloc[-1]
     
     res['ma20'] = close.tail(20).mean()
