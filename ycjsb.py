@@ -1,20 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.12.3 最终实战定制版 (MACD改进版)
+选股王 · V30.12.3 黄金实战版 (Golden Version)
 ------------------------------------------------
-版本特性 (User Customized):
-1. **参数固化**：
-   - 最低股价 >= 10.0 元 (厌恶低价股)
-   - 上影线 <= 5.0% (最佳平衡点)
-   - 实体位置 >= 0.6 (容忍洗盘)
-   - 获利盘 >= 70% (激活科创板妖股)
-2. **核心策略**：
-   - RSI > 90 加 3000 分 (锁定主板龙头 & 科创板真龙)
-   - MACD 改进参数 (8, 17, 5) 更灵敏捕捉起爆
-   - 涨幅 > 19% 铁血剔除 (避开大面)
-3. **系统增强**：
-   - 单线程模式 (100% 稳定，防封号，防丢包)
-   - 资金流数据防抖 (防止排名乱跳)
+版本特性 (最终定稿):
+1. **核心逻辑**：
+   - 主板：正常选股 (RSI > 90 依然加分)
+   - 科创/创业板 (688/300)：**铁血执行 RSI > 90**，否则直接剔除！
+2. **指标参数**：
+   - MACD：回归经典 (12, 26, 9)，拒绝噪点。
+3. **参数固化**：
+   - 最低股价 >= 10.0
+   - 上影线 <= 5.0
+   - 实体位置 >= 0.6
+   - 获利盘 >= 70%
+4. **系统增强**：
+   - 单线程模式 (max_workers=1)：拒绝网络丢包，确保排名绝对准确。
 ------------------------------------------------
 """
 
@@ -41,12 +41,12 @@ GLOBAL_STOCK_INDUSTRY = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V30.12.3 实战版", layout="wide")
-st.title("选股王 V30.12.3：最终实战定制版 (MACD 8-17-5)")
+st.set_page_config(page_title="选股王 V30.12.3 黄金版", layout="wide")
+st.title("选股王 V30.12.3：黄金实战版 (最终定稿)")
 st.markdown("""
 **🎯 实战铁律 (Top 3 策略)：**
 1. **只看前三**：Rank 1 (妖股博弈), Rank 2-3 (稳健大肉). 放弃 Rank 4-5.
-2. **科创板纪律**：若选出 688/300 开头的票，**必须 RSI > 90** 才能上，否则剔除顺延.
+2. **科创板纪律**：688/300 开头的票，**必须 RSI > 90** 才能上，否则剔除顺延.
 3. **风控底线**：昨日涨幅 > 19% 一律不碰.
 """)
 
@@ -159,7 +159,7 @@ def get_all_historical_data(trade_days_list):
     my_bar = st.progress(0, text=progress_text)
     total_steps = len(all_dates)
     
-    # 保持单线程以确保不丢包
+    # ▼▼▼ 核心保障：单线程，确保数据不丢包 ▼▼▼
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         future_to_date = {executor.submit(fetch_worker, date): date for date in all_dates}
         for i, future in enumerate(concurrent.futures.as_completed(future_to_date)):
@@ -284,12 +284,12 @@ def compute_indicators(ts_code, end_date):
     res['last_high'] = df['high'].iloc[-1]
     res['last_low'] = df['low'].iloc[-1]
     
-    # === 修改点：使用改进版 MACD (8, 17, 5) ===
-    # 逻辑：加快反应速度，更适合 A 股的短线搏杀
-    ema12 = close.ewm(span=8, adjust=False).mean()   # 原12改为8
-    ema26 = close.ewm(span=17, adjust=False).mean()  # 原26改为17
+    # === 回归传统 MACD (12, 26, 9) ===
+    # 逻辑：稳定压倒一切，拒绝燥热信号
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
     diff = ema12 - ema26
-    dea = diff.ewm(span=5, adjust=False).mean()      # 原9改为5
+    dea = diff.ewm(span=9, adjust=False).mean()
     res['macd_val'] = ((diff - dea) * 2).iloc[-1]
     
     res['ma20'] = close.tail(20).mean()
@@ -395,6 +395,10 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         d0_close = ind['last_close']
         d0_rsi = ind.get('rsi_12', 50)
         
+        # === 黄金版核心逻辑：科创/创业板 RSI必须 > 90 ===
+        if row.ts_code.startswith('688') or row.ts_code.startswith('300'):
+            if d0_rsi <= 90: continue
+        
         # 基础风控
         if market_state == 'Weak':
             if d0_rsi > RSI_LIMIT: continue
@@ -449,7 +453,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V30.12.3 实战定制版")
+    st.header("V30.12.3 黄金实战版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数", value=30, step=1, help="建议30-50天，太长容易卡顿")
     TOP_BACKTEST = st.number_input("每日优选 TopK", value=5, help="保持 Top 5, 实盘只看 Top 3")
@@ -490,7 +494,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V30.12.3 实战版回测"):
+if st.button(f"🚀 启动 V30.12.3 黄金版回测"):
     trade_days_list = get_trade_days(backtest_date_end.strftime("%Y%m%d"), int(BACKTEST_DAYS))
     
     if not trade_days_list:
