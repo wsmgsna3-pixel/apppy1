@@ -1,10 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 终极PK版 (D0持有 vs D3接力)
-功能：
-1. 专为验证用户的“D3买入法”设计。
-2. 不显示每日明细，防止浏览器卡死。
-3. 直接输出两大策略的胜率、收益、回撤对比。
+选股王 · D3 接力策略 (纯净独立版)
+功能：单独验证“D3买入法” (D3赚钱才买，D5卖出)。
+修复：解决了日期格式导致的 AttributeError 报错。
 """
 
 import streamlit as st
@@ -16,15 +14,17 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # ---------------------------
-# 页面设置
+# 页面配置
 # ---------------------------
-st.set_page_config(page_title="V30.23 终极PK", layout="wide")
-st.title("🥊 终极擂台：D0 持有策略 vs D3 接力策略")
+st.set_page_config(page_title="D3 接力策略独立验证", layout="wide")
+st.title("🧪 D3 接力策略独立验证 (D3买 -> D5卖)")
 st.markdown("""
-**⚔️ 对决规则：**
-* **选股池：** V30.22 Top 4 (剔除 Rank 2)。
-* **🔴 红方 (D0 潜伏)：** T日突破买入 -> 死拿至 T+5 收盘卖出。
-* **🔵 蓝方 (D3 接力)：** T日不买 -> T+3 收盘确认浮盈 -> T+3 收盘买入 -> T+5 收盘卖出。
+**📝 策略逻辑 (您的天才想法)：**
+1. **D0 (选股日)：** 选中 Top 4 (剔除 Rank 2)，记录 **模拟买入价** (开盘+1.5%)。
+2. **D3 (决策日)：** 观察收盘价。
+   - 🔴 如果 **D3收盘价 > D0模拟买入价** (说明是赢家) -> **买入**。
+   - ⚪ 如果 **D3收盘价 <= D0模拟买入价** (说明是输家) -> **放弃**。
+3. **D5 (卖出日)：** 收盘卖出。
 """)
 
 # 全局变量
@@ -34,7 +34,7 @@ GLOBAL_DAILY_RAW = pd.DataFrame()
 GLOBAL_QFQ_BASE_FACTORS = {} 
 
 # ---------------------------
-# 辅助函数 
+# 基础工具
 # ---------------------------
 @st.cache_data(ttl=3600*12) 
 def safe_get(func_name, **kwargs):
@@ -50,13 +50,14 @@ def safe_get(func_name, **kwargs):
     except Exception: return pd.DataFrame(columns=['ts_code'])
 
 def get_trade_days(end_date_str, num_days):
-    start_date = (datetime.strptime(end_date_str, "%Y%m%d") - timedelta(days=num_days * 3)).strftime("%Y%m%d")
+    # 多取一些日子以防假期
+    start_date = (datetime.strptime(end_date_str, "%Y%m%d") - timedelta(days=num_days * 5)).strftime("%Y%m%d")
     cal = safe_get('trade_cal', start_date=start_date, end_date=end_date_str)
     if cal.empty: return []
     return cal[cal['is_open'] == 1].sort_values('cal_date', ascending=False)['cal_date'].head(num_days).tolist()
 
 # ----------------------------------------------------------------------
-# 数据拉取与处理 (同前，略微精简)
+# 数据核心
 # ----------------------------------------------------------------------
 @st.cache_data(ttl=3600*24)
 def fetch_and_cache_daily_data(date):
@@ -70,12 +71,13 @@ def get_all_historical_data(trade_days_list):
     
     latest = max(trade_days_list) 
     earliest = min(trade_days_list)
+    # 往后多取25天，确保能拿到 D5 的数据
     start_dt = (datetime.strptime(earliest, "%Y%m%d") - timedelta(days=150)).strftime("%Y%m%d")
-    end_dt = (datetime.strptime(latest, "%Y%m%d") + timedelta(days=30)).strftime("%Y%m%d") 
+    end_dt = (datetime.strptime(latest, "%Y%m%d") + timedelta(days=40)).strftime("%Y%m%d") 
     
     dates = safe_get('trade_cal', start_date=start_dt, end_date=end_dt, is_open='1')['cal_date'].tolist()
     
-    progress = st.progress(0, text="正在构建全市场数据矩阵...")
+    progress = st.progress(0, text="正在加载数据 (请耐心等待)...")
     adj_list, daily_list = [], []
     
     for i, d in enumerate(dates):
@@ -92,13 +94,15 @@ def get_all_historical_data(trade_days_list):
     GLOBAL_ADJ_FACTOR = adj_all.set_index(['ts_code', 'trade_date']).sort_index()
     
     daily_raw = pd.concat(daily_list)
-    for c in ['open','high','low','close','pre_close','vol']:
+    for c in ['open','high','low','close','pre_close','vol','amount']:
         if c in daily_raw.columns: daily_raw[c] = pd.to_numeric(daily_raw[c], errors='coerce')
     GLOBAL_DAILY_RAW = daily_raw.set_index(['ts_code', 'trade_date']).sort_index()
     
     latest_dt = GLOBAL_ADJ_FACTOR.index.get_level_values('trade_date').max()
     if latest_dt:
-        GLOBAL_QFQ_BASE_FACTORS = GLOBAL_ADJ_FACTOR.xs(latest_dt, level='trade_date')['adj_factor'].to_dict()
+        try:
+            GLOBAL_QFQ_BASE_FACTORS = GLOBAL_ADJ_FACTOR.xs(latest_dt, level='trade_date')['adj_factor'].to_dict()
+        except: GLOBAL_QFQ_BASE_FACTORS = {}
         
     return True
 
@@ -108,6 +112,7 @@ def get_qfq_data(ts_code, start_date, end_date):
     if not base: return pd.DataFrame()
     
     try:
+        # 这里的切片依赖索引排序
         df = GLOBAL_DAILY_RAW.loc[(ts_code, slice(start_date, end_date)), :].copy()
         factors = GLOBAL_ADJ_FACTOR.loc[(ts_code, slice(start_date, end_date)), 'adj_factor']
         if df.empty or factors.empty: return pd.DataFrame()
@@ -115,68 +120,70 @@ def get_qfq_data(ts_code, start_date, end_date):
         df = df.join(factors)
         norm = df['adj_factor'] / base
         for c in ['open','high','low','close','pre_close']: df[c] *= norm
-        return df.reset_index()
+        
+        # 修复：直接重置索引，trade_date 变成字符串列
+        return df.reset_index() 
     except: return pd.DataFrame()
 
 # ----------------------------------------------------------------------
-# 核心：双策略收益计算
+# 核心逻辑：D3 接力计算 (修复日期Bug版)
 # ----------------------------------------------------------------------
-def calculate_pk_returns(ts_code, selection_date, buy_threshold=1.5):
+def calculate_d3_relay(ts_code, selection_date, buy_threshold=1.5):
     d0 = datetime.strptime(selection_date, "%Y%m%d")
     start = d0.strftime("%Y%m%d")
-    end = (d0 + timedelta(days=20)).strftime("%Y%m%d")
+    end = (d0 + timedelta(days=25)).strftime("%Y%m%d") # 足够覆盖 D5
     
     df = get_qfq_data(ts_code, start, end)
     if df.empty: return None
     
-    dates = df['trade_date'].dt.strftime('%Y%m%d').tolist()
-    if selection_date not in dates: return None
+    # 获取日期列表 (已经是字符串格式，无需 .dt.strftime)
+    trade_dates = df['trade_date'].tolist()
+    if selection_date not in trade_dates: return None
     
-    idx_0 = dates.index(selection_date)
-    row_0 = df.iloc[idx_0]
+    idx_0 = trade_dates.index(selection_date)
     
-    # --- 1. D0 触发判断 ---
-    # 过滤低开
-    if row_0['open'] <= row_0['pre_close']: return None
-    # 确认突破 +1.5%
-    buy_price_d0 = row_0['open'] * (1 + buy_threshold/100)
-    if row_0['high'] < buy_price_d0: return None
-    
-    # 确保有 D3 和 D5 的数据
+    # 检查是否有足够的未来数据 (至少要有 D5, 即 idx+5)
     if len(df) <= idx_0 + 5: return None
     
+    row_d0 = df.iloc[idx_0]
     row_d3 = df.iloc[idx_0 + 3]
     row_d5 = df.iloc[idx_0 + 5]
     
-    # --- 🔴 策略 A: D0 买入，D5 卖出 ---
-    ret_a = (row_d5['close'] / buy_price_d0 - 1) * 100
+    # 1. 计算 D0 模拟买入价 (门槛)
+    if row_d0['open'] <= row_d0['pre_close']: return None # 低开过滤
     
-    # --- 🔵 策略 B: D3 接力 (用户的天才想法) ---
-    # 条件: D3收盘价 > D0买入价 (即该股目前是赚钱的)
-    ret_b = 0.0
-    status_b = "空仓"
+    buy_price_d0 = row_d0['open'] * (1 + buy_threshold/100)
+    if row_d0['high'] < buy_price_d0: return None # 没触发
     
+    # 2. D3 接力判定
+    # 只有当 D3收盘价 > D0买入价 (即目前是赚钱的) 才买
     if row_d3['close'] > buy_price_d0:
-        # 触发接力买入
+        status = "买入"
         buy_price_d3 = row_d3['close']
-        # D5 卖出
-        ret_b = (row_d5['close'] / buy_price_d3 - 1) * 100
-        status_b = "买入"
-    else:
-        # D3 是亏的，不接力
-        ret_b = np.nan # 标记为没交易
-        status_b = "观望"
+        sell_price_d5 = row_d5['close']
         
-    return {
-        'buy_price_d0': buy_price_d0,
-        'close_d3': row_d3['close'],
-        'Strategy_A_Return': ret_a,
-        'Strategy_B_Return': ret_b,
-        'Strategy_B_Status': status_b
-    }
+        # 收益率 = (D5卖出 / D3买入 - 1)
+        profit = (sell_price_d5 / buy_price_d3 - 1) * 100
+        
+        return {
+            'Status': status,
+            'D3_Buy_Price': buy_price_d3,
+            'D5_Sell_Price': sell_price_d5,
+            'Relay_Return': profit,
+            'D0_Simulated_Cost': buy_price_d0
+        }
+    else:
+        # D3 亏损，不接力
+        return {
+            'Status': '观望',
+            'D3_Buy_Price': np.nan,
+            'D5_Sell_Price': np.nan,
+            'Relay_Return': np.nan,
+            'D0_Simulated_Cost': buy_price_d0
+        }
 
 # ----------------------------------------------------------------------
-# 选股核心
+# 选股
 # ----------------------------------------------------------------------
 def compute_v3022_score(ts_code, trade_date):
     start = (datetime.strptime(trade_date, "%Y%m%d") - timedelta(days=150)).strftime("%Y%m%d")
@@ -211,26 +218,28 @@ def compute_v3022_score(ts_code, trade_date):
     return {'score': macd_val * 10000 * bonus}
 
 # ----------------------------------------------------------------------
-# 回测执行
+# 主回测循环
 # ----------------------------------------------------------------------
-def run_pk_backtest(dates):
+def run_solo_backtest(dates):
     results = []
-    bar = st.progress(0, text="擂台赛开始...")
+    bar = st.progress(0, text="正在验证您的天才想法...")
     
-    # 提前获取名称，防止 KeyError
+    # 获取股票名称 (一次性获取，防止循环中调用慢)
     basic = safe_get('stock_basic', list_status='L', fields='ts_code,name')
     
     for i, date in enumerate(dates):
         daily = safe_get('daily', trade_date=date)
         if daily.empty: continue
         
+        # 合并名称
         if basic.empty: daily['name'] = 'Unknown'
         else: daily = daily.merge(basic, on='ts_code', how='left')
         
+        # 简单过滤
         candidates = daily[~daily['name'].str.contains('ST|退', na=False)]
         candidates = candidates[~candidates['ts_code'].str.startswith('92')]
         
-        # 只算前300成交额，加速
+        # 仅计算 Top 300 活跃股，加速
         candidates['amount'] = pd.to_numeric(candidates['amount'], errors='coerce')
         candidates = candidates.sort_values('amount', ascending=False).head(300)
         
@@ -241,23 +250,23 @@ def run_pk_backtest(dates):
                 res['ts_code'] = code
                 res['name'] = candidates.loc[candidates['ts_code']==code, 'name'].values[0]
                 scores.append(res)
-                
+        
         if not scores: continue
         
-        # 排序 Top 4
+        # 选出 Top 4
         df_day = pd.DataFrame(scores).sort_values('score', ascending=False).head(4).reset_index(drop=True)
         df_day['Rank'] = df_day.index + 1
         
         # 剔除 Rank 2
         df_final = df_day[df_day['Rank'] != 2].copy()
         
-        # 计算双策略收益
+        # 计算接力收益
         for _, row in df_final.iterrows():
-            pk_res = calculate_pk_returns(row['ts_code'], date)
-            if pk_res:
+            res = calculate_d3_relay(row['ts_code'], date)
+            if res:
                 rec = row.to_dict()
-                rec.update(pk_res)
-                rec['Trade_Date'] = date
+                rec.update(res)
+                rec['Signal_Date'] = date
                 results.append(rec)
         
         bar.progress((i+1)/len(dates))
@@ -266,15 +275,15 @@ def run_pk_backtest(dates):
     return pd.DataFrame(results)
 
 # ---------------------------
-# 主程序
+# 侧边栏 & 启动
 # ---------------------------
 with st.sidebar:
-    st.header("PK 参数")
+    st.header("参数设置")
     days_back = st.number_input("回测天数", value=100)
     ts_token = st.text_input("Tushare Token", type="password")
 
-if st.button("🚀 开始终极 PK"):
-    if not ts_token: st.error("Token?"); st.stop()
+if st.button("🚀 开始验证 (D3接力法)"):
+    if not ts_token: st.error("请填入 Token"); st.stop()
     ts.set_token(ts_token)
     pro = ts.pro_api()
     
@@ -284,48 +293,49 @@ if st.button("🚀 开始终极 PK"):
     
     if not get_all_historical_data(dates): st.stop()
     
-    df = run_pk_backtest(dates)
+    df = run_solo_backtest(dates)
     
-    if df.empty: st.warning("无交易"); st.stop()
+    if df.empty: st.warning("没有产生信号"); st.stop()
     
-    # --- 结果展示 ---
+    # --- 统计结果 ---
     st.markdown("---")
-    st.header("🏆 终极对决结果")
+    st.header("🧪 D3 接力策略 · 实测结果")
     
-    # 策略 A 统计
-    valid_a = df.dropna(subset=['Strategy_A_Return'])
-    win_a = (valid_a['Strategy_A_Return'] > 0).mean() * 100
-    avg_a = valid_a['Strategy_A_Return'].mean()
-    count_a = len(valid_a)
+    # 筛选出真正买入的交易 (Status == '买入')
+    trades = df[df['Status'] == '买入'].copy()
     
-    # 策略 B 统计 (排除没交易的)
-    valid_b = df.dropna(subset=['Strategy_B_Return']) # 自动排除了 NaN (观望)
-    win_b = (valid_b['Strategy_B_Return'] > 0).mean() * 100
-    avg_b = valid_b['Strategy_B_Return'].mean()
-    count_b = len(valid_b)
+    total_signals = len(df) # 总共触发选股次数 (包括观望的)
+    executed_trades = len(trades) # 实际 D3 接力次数
     
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     
-    with col1:
-        st.subheader("🔴 策略 A: D0 买入 (死拿)")
-        st.metric("胜率 (Win Rate)", f"{win_a:.1f}%")
-        st.metric("平均收益", f"{avg_a:.2f}%")
-        st.metric("交易次数", f"{count_a}")
+    # 1. 胜率
+    win_rate = 0
+    if executed_trades > 0:
+        win_rate = (trades['Relay_Return'] > 0).mean() * 100
+        avg_ret = trades['Relay_Return'].mean()
         
-    with col2:
-        st.subheader("🔵 策略 B: D3 接力 (您的想法)")
-        st.metric("胜率 (Win Rate)", f"{win_b:.1f}%")
-        st.metric("平均收益", f"{avg_b:.2f}%")
-        st.metric("交易次数", f"{count_b}")
-        
-    # 判定胜负
-    st.markdown("---")
-    if win_b > win_a and avg_b > avg_a:
-        st.success("🎉 **结果：策略 B (D3 接力) 完胜！** 您的天才想法是对的！")
-    elif win_b < win_a:
-        st.error("📉 **结果：策略 A (D0 持有) 胜出。** 看来还是买在起爆点比较安全。")
+        # 简单年化计算
+        daily_ret = trades.groupby('Signal_Date')['Relay_Return'].mean()
+        dates_idx = pd.to_datetime(daily_ret.index)
+        days_span = (dates_idx.max() - dates_idx.min()).days
+        if days_span > 0:
+            cagr = ((1 + avg_ret/100 * executed_trades/days_span) ** 250 - 1) * 100 # 粗略估算
+        else: cagr = 0
     else:
-        st.info("⚖️ **结果：各有千秋。**")
+        avg_ret = 0
+        cagr = 0
         
-    st.markdown("### 📝 详细对决记录")
-    st.dataframe(df[['Trade_Date', 'Rank', 'ts_code', 'name', 'Strategy_A_Return', 'Strategy_B_Status', 'Strategy_B_Return']], use_container_width=True)
+    col1.metric("接力胜率 (Win Rate)", f"{win_rate:.1f}%", f"基准线: 50%")
+    col2.metric("接力平均收益 (每笔)", f"{avg_ret:.2f}%", "D3买->D5卖")
+    col3.metric("接力开仓率", f"{executed_trades}/{total_signals}", "符合接力条件的比例")
+    
+    st.info(f"""
+    **结果解读：**
+    * 您原本的选股产生了 {total_signals} 次机会。
+    * 其中有 {executed_trades} 次在 D3 确认盈利，触发了您的接力买入。
+    * 这 {executed_trades} 次接力操作，最终只有 {win_rate:.1f}% 是赚钱出来的。
+    """)
+    
+    st.markdown("### 📋 详细交易记录")
+    st.dataframe(df[['Signal_Date', 'Rank', 'ts_code', 'name', 'Status', 'D0_Simulated_Cost', 'D3_Buy_Price', 'Relay_Return']], use_container_width=True)
