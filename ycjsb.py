@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.24 逻辑回归版 (大道至简 + 大盘风控)
+选股王 · V30.24 逻辑回归版 (全排名解锁 + 大盘风控)
 核心理念：
 1. [纯粹] 移除所有人工加分(涨停/波动率)，回归 MACD/Price 纯粹强度。
 2. [广度] 价格放宽至 20-300元，取消"入围数量"限制，全市场扫描。
 3. [风控] 引入大盘(上证指数)MA20过滤，大盘走坏时自动空仓。
-4. [真实] 剔除一字板，剔除ST/退市/微盘股。
+4. [验证] 解锁 Top 5 完整报告，验证策略的线性衰减逻辑。
 """
 
 import streamlit as st
@@ -19,7 +19,7 @@ import time
 # 页面配置
 # ---------------------------
 st.set_page_config(page_title="选股王 · V30.24 逻辑回归版", layout="wide")
-st.title("选股王 · V30.24 逻辑回归版 (🛡️ 大盘风控 + 🎯 纯粹动量)")
+st.title("选股王 · V30.24 逻辑回归版 (🛡️ 大盘风控 + 🎯 纯粹动量 + 🔓 全排名)")
 st.markdown("""
 **📝 策略逻辑重构：**
 1. **海选池 (宽进)：** 价格 `20-300元` + 流通市值 `>30亿` + 剔除ST/一字板。
@@ -287,15 +287,13 @@ def run_backtest_daily(date_str):
     pool = pool[pool['circ_mv_billion'] >= MIN_CIRC_MV]
     
     # 3.3 剔除 ST 和 北交所
-    pool = pool[~pool['ts_code'].str.startswith(('8', '4', '92'))] # 剔除北交/新三板
-    # (ST名称过滤需要stock_basic，为速度暂忽略，价格+市值通常能过滤大部分ST)
+    pool = pool[~pool['ts_code'].str.startswith(('8', '4', '92'))] 
     
     # 3.4 剔除一字板 (High == Low 且 涨幅 > 9%) - 核心防坑
     pool = pool[~((pool['high'] == pool['low']) & (pool['pct_chg'] > 9.0))]
 
     # 3.5 [V30.24关键] 全扫描模式，不限制"前100名"
     # 但为了不超时，我们至少要求是"上涨的" (Pct_Chg > 0)
-    # 跌的票做动量策略没有意义
     candidates = pool[pool['pct_chg'] > 0]
     
     if len(candidates) > 400:
@@ -307,14 +305,10 @@ def run_backtest_daily(date_str):
     # 4. 精细计算 (MACD)
     records = []
     
-    # 这里需要循环，可能会慢，显示进度条
     for row in candidates.itertuples():
         ind = compute_indicators(row.ts_code, date_str)
         
         # 核心条件：
-        # 1. 趋势向上 (收盘 > MA20)
-        # 2. 放量 (量 > 1.2倍 5日均量)
-        # 3. MACD 金叉/多头 (Val > 0)
         if ind.get('close_current', 0) <= ind.get('ma20_current', 0): continue
         if ind.get('vol_current', 0) <= ind.get('ma5_vol_current', 0) * 1.2: continue
         if pd.isna(ind.get('macd_val')) or ind.get('macd_val') <= 0: continue
@@ -322,7 +316,7 @@ def run_backtest_daily(date_str):
         # 满足条件，计算未来收益
         future = get_future_returns(row.ts_code, date_str, buy_threshold_pct=BUY_THRESHOLD)
         
-        # 评分：纯粹的相对强度
+        # 评分：纯粹的相对强度 (MACD / Price)
         score = (ind['macd_val'] / row.close) * 100000
         
         records.append({
@@ -366,11 +360,7 @@ if st.button(f"🚀 运行 V30.24 (逻辑回归 + 风控)"):
                 # 重新计算 Rank (1-5)
                 df['Rank'] = range(1, len(df) + 1)
                 results.append(df)
-            else:
-                # 记录空仓日志 (可选)
-                pass
         except Exception as e:
-            print(e)
             pass
         bar.progress((i + 1) / len(trade_days))
     
@@ -384,31 +374,67 @@ if st.button(f"🚀 运行 V30.24 (逻辑回归 + 风控)"):
     all_res = pd.concat(results)
     if all_res['Trade_Date'].dtype != 'object': all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-    st.header(f"📊 V30.24 回测报告")
-    st.info(f"统计说明：本报告仅统计 Rank 1 (第一名) 的表现，这是本策略推荐的唯一买点。")
+    st.header(f"📊 V30.24 全排名对比报告")
+    st.markdown("通过对比 Rank 1 到 Rank 5 的表现，验证策略逻辑的纯粹性与线性度。")
     
-    # 只分析 Rank 1
+    # 1. 总体统计
     rank1_df = all_res[all_res['Rank'] == 1]
-    valid_days = rank1_df['Return_D1'].notnull().sum() # 有成交的天数
-    total_signals = len(rank1_df) # 发出信号的天数 (含未成交)
-    
-    st.markdown(f"**大盘风控后产生信号天数：** {total_signals} 天")
-    st.markdown(f"**实盘成交天数 (非低开/冲高达标)：** {valid_days} 天")
+    total_signals = len(rank1_df)
+    valid_days = rank1_df['Return_D1'].notnull().sum()
+    st.caption(f"大盘风控后产生信号天数：{total_signals} 天 | 实战成交天数：{valid_days} 天")
 
-    cols = st.columns(3)
-    for idx, n in enumerate([1, 3, 5]):
-        col = f'Return_D{n}'
-        valid_trades = rank1_df.dropna(subset=[col])
-        if not valid_trades.empty:
-            avg_ret = valid_trades[col].mean()
-            win_rate = (valid_trades[col] > 0).sum() / len(valid_trades) * 100
-        else: avg_ret, win_rate = 0, 0
+    # 2. 分排名详细统计
+    results_list = []
+    chart_data = pd.DataFrame() # 用于画图
+    
+    for r in range(1, 6):
+        # 提取对应排名的子集
+        df_r = all_res[all_res['Rank'] == r]
         
-        with cols[idx]:
-            st.metric(f"D+{n} 平均收益 / 胜率", f"{avg_ret:.2f}% / {win_rate:.1f}%")
+        # 准备画图数据
+        daily_ret = df_r.set_index('Trade_Date')['Return_D1'].groupby(level=0).mean()
+        # 填充空交易日为0
+        full_idx = pd.to_datetime(rank1_df['Trade_Date'].unique()).sort_values()
+        # 注意这里简单处理：用所有产生信号的日子做轴，未成交的日收益为0
+        daily_ret = daily_ret.reindex(full_idx.astype(str), fill_value=0)
+        
+        # 累积收益曲线 (简单单利累加或复利，这里用复利)
+        equity_curve = (1 + daily_ret.fillna(0)/100).cumprod()
+        chart_data[f'Rank {r}'] = equity_curve
+        
+        # 计算 D+1 胜率和收益
+        valid_trades = df_r.dropna(subset=['Return_D1'])
+        count = len(valid_trades)
+        
+        if count > 0:
+            avg_ret = valid_trades['Return_D1'].mean()
+            win_rate = (valid_trades['Return_D1'] > 0).sum() / count * 100
+            
+            # 简单估算年化
+            total_ret = equity_curve.iloc[-1] - 1
+            if not equity_curve.empty:
+                mdd = (equity_curve - equity_curve.cummax()) / equity_curve.cummax()
+                max_dd = mdd.min()
+            else:
+                max_dd = 0
+        else:
+            avg_ret, win_rate, total_ret, max_dd = 0, 0, 0, 0
 
-    st.header("📋 每日 Rank 1 明细")
-    st.dataframe(rank1_df[['Trade_Date', 'ts_code', 'Close', 'Pct_Chg', 'Score', 'Return_D1']].sort_values('Trade_Date', ascending=False), use_container_width=True)
-    
-    st.header("📉 完整排名数据 (Top 5)")
-    st.dataframe(all_res, use_container_width=True)
+        results_list.append({
+            '排名 (Rank)': f"第 {r} 名",
+            'D+1 均收': f"{avg_ret:.2f}%",
+            'D+1 胜率': f"{win_rate:.1f}%",
+            '累计收益': f"{total_ret:.2%}",
+            '最大回撤': f"{max_dd:.2%}",
+            '成交笔数': count
+        })
+
+    # 3. 展示表格
+    st.table(pd.DataFrame(results_list))
+
+    # 4. 可视化对比
+    st.subheader("📈 分排名收益率曲线对比 (D+1)")
+    st.line_chart(chart_data)
+
+    st.header("📋 每日详细排名 (Top 5)")
+    st.dataframe(all_res.sort_values(['Trade_Date', 'Rank'], ascending=[False, True]), use_container_width=True)
