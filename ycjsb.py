@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.25 终极实战版 (UI修复)
+选股王 · V30.25 终极实战版 (突破买入法)
 策略：双创组合 (688 + 300)
-特性：恢复了包含收盘价、评分的详细交易单，界面更直观。
+买入修正：
+1. 必须高开 (Open > Pre_Close)。
+2. 盘中必须涨幅达到开盘价的 1.5% (Price >= Open * 1.015) 才触发买入。
+3. 买入价格按 Open * 1.015 计算。
 """
 
 import streamlit as st
@@ -14,15 +17,13 @@ from datetime import datetime, timedelta
 # ---------------------------
 # 页面配置
 # ---------------------------
-st.set_page_config(page_title="V30.25 终极实战版", layout="wide")
-st.title("⚔️ V30.25 终极实战版 (双创组合)")
+st.set_page_config(page_title="V30.25 突破买入版", layout="wide")
+st.title("🛡️ V30.25 突破买入版 (确认强势再上车)")
 st.markdown("""
-**核心策略：**
-* **选股范围：** **科创板 (688)** + **创业板 (300)**
-* **过滤条件：** 价格 > 20元 | Rank 1 (最强评分)
-* **交易模式：**
-    * **科创板：** 重仓，D+3 盈利则死拿至 D+5 (博暴利)。
-    * **创业板：** 轻仓，D+3 无论盈亏必须走 (保胜率)。
+**核心逻辑修正：**
+* **观察：** 竞价必须高开 (Open > Pre_Close)。
+* **买入：** 盘中价格突破 **开盘价 + 1.5%** 时触发买入。
+* **目的：** 过滤“高开低走”的骗线，只做真突破。
 """)
 
 # ---------------------------
@@ -59,7 +60,6 @@ def fetch_and_cache_daily_data(date):
     adj_df = safe_get('adj_factor', trade_date=date)
     daily_df = safe_get('daily', trade_date=date)
     
-    # 在这里做初步过滤，提升速度，只留双创
     if not daily_df.empty:
         daily_df = daily_df[daily_df['ts_code'].str.startswith(('30', '688'))]
     if not adj_df.empty:
@@ -78,7 +78,7 @@ def get_all_historical_data(trade_days_list):
     end_date = (datetime.strptime(latest_trade_date, "%Y%m%d") + timedelta(days=25)).strftime("%Y%m%d") 
     
     all_dates = safe_get('trade_cal', start_date=start_date, end_date=end_date, is_open='1')['cal_date'].tolist()
-    st.info(f"⏳ 正在拉取双创数据 ({start_date} ~ {end_date})...")
+    st.info(f"⏳ 正在拉取数据 ({start_date} ~ {end_date})...")
 
     adj_list, daily_list = [], []
     bar = st.progress(0)
@@ -151,7 +151,7 @@ def compute_score(ts_code, end_date):
     return score
 
 # ----------------------------------------------------------------------
-# 回测主逻辑
+# 回测主逻辑 (修正版)
 # ----------------------------------------------------------------------
 def run_backtest_on_date(date, min_price):
     try:
@@ -159,11 +159,9 @@ def run_backtest_on_date(date, min_price):
     except KeyError: return None
     if daily.empty: return None
     
-    # 1. 价格过滤
     pool = daily[daily['close'] >= min_price]
     if pool.empty: return None
     
-    # 2. 粗筛
     pool = pool[pool['pct_chg'] > 0].sort_values('pct_chg', ascending=False)
     if len(pool) > 150: pool = pool.head(150)
     
@@ -171,7 +169,6 @@ def run_backtest_on_date(date, min_price):
     rank1_code = None
     rank1_close = 0
     
-    # 3. 计算 Rank 1
     for row in pool.itertuples():
         score = compute_score(row.Index, date)
         if score > best_score:
@@ -181,7 +178,6 @@ def run_backtest_on_date(date, min_price):
             
     if not rank1_code: return None
     
-    # 4. 模拟交易
     d0 = datetime.strptime(date, "%Y%m%d")
     start_fut = (d0 + timedelta(days=1)).strftime("%Y%m%d")
     end_fut = (d0 + timedelta(days=20)).strftime("%Y%m%d")
@@ -189,28 +185,54 @@ def run_backtest_on_date(date, min_price):
     hist = get_qfq_data(rank1_code, start_fut, end_fut)
     
     ret_d1, ret_d3, ret_d5 = np.nan, np.nan, np.nan
+    buy_triggered = False
     
     if len(hist) >= 1:
         d1_row = hist.iloc[0]
-        # 获取开盘涨幅用于判断
+        
+        # 获取 D1 当天的原始行情 (Open, High, Pre_Close)
         try:
             d1_raw = GLOBAL_DAILY_RAW.loc[(rank1_code, d1_row.name.strftime("%Y%m%d"))]
             if isinstance(d1_raw, pd.Series):
-                open_pct = (d1_raw['open'] / d1_raw['pre_close'] - 1) * 100
-            else: open_pct = 0
-        except: open_pct = 0
+                d1_open = d1_raw['open']
+                d1_high = d1_raw['high']
+                d1_pre = d1_raw['pre_close']
+                d1_close = d1_raw['close']
+                
+                # --- 买入条件判定 ---
+                # 1. 竞价必须高开
+                if d1_open > d1_pre:
+                    # 2. 盘中必须触及 Open * 1.015
+                    target_buy_price_raw = d1_open * 1.015
+                    
+                    if d1_high >= target_buy_price_raw:
+                        # 触发买入！
+                        buy_triggered = True
+                        
+                        # 计算复权后的买入成本
+                        # 注意：hist 数据是复权后的，我们要按比例换算买入价
+                        # 复权因子 = hist_open / raw_open
+                        adj_ratio = d1_row['open'] / d1_open
+                        buy_price_adj = target_buy_price_raw * adj_ratio
+                        
+                        # 3. 计算收益 (相对于买入成本)
+                        ret_d1 = (d1_row['close'] / buy_price_adj - 1) * 100
+                        
+                        if len(hist) >= 3:
+                            ret_d3 = (hist.iloc[2]['close'] / buy_price_adj - 1) * 100
+                        if len(hist) >= 5:
+                            ret_d5 = (hist.iloc[4]['close'] / buy_price_adj - 1) * 100
+                        elif len(hist) > 0:
+                            ret_d5 = (hist.iloc[-1]['close'] / buy_price_adj - 1) * 100
+            else:
+                pass
+        except:
+            pass
             
-        if open_pct > 1.5:
-            buy_price = d1_row['open']
-            ret_d1 = (d1_row['close'] / buy_price - 1) * 100
-            if len(hist) >= 3:
-                ret_d3 = (hist.iloc[2]['close'] / buy_price - 1) * 100
-            if len(hist) >= 5:
-                ret_d5 = (hist.iloc[4]['close'] / buy_price - 1) * 100
-            elif len(hist) > 0:
-                ret_d5 = (hist.iloc[-1]['close'] / buy_price - 1) * 100
+    if not buy_triggered:
+        # 如果没触发买入，返回 None (或者记录为“空仓”)
+        return None 
     
-    # 返回详细数据 (包含 Close 和 Score)
     return {
         'Trade_Date': date,
         'ts_code': rank1_code,
@@ -222,12 +244,12 @@ def run_backtest_on_date(date, min_price):
     }
 
 # ----------------------------------------------------
-# 侧边栏 (恢复经典样式)
+# 侧边栏
 # ----------------------------------------------------
 with st.sidebar:
     st.header("1. 回测设置")
     end_date = st.date_input("结束日期", value=datetime.now().date())
-    days_back = int(st.number_input("回测天数", value=200)) # 恢复默认 200，方便快速跑
+    days_back = int(st.number_input("回测天数", value=200))
     
     st.markdown("---")
     st.header("2. 策略参数")
@@ -243,12 +265,12 @@ pro = ts.pro_api()
 # ---------------------------
 # 主程序
 # ---------------------------
-if st.button("🚀 运行回测 (UI修复版)"):
+if st.button("🚀 运行 (突破买入版)"):
     dates = get_trade_days(end_date.strftime("%Y%m%d"), days_back)
     if not dates: st.stop()
     if not get_all_historical_data(dates): st.stop()
     
-    st.success(f"✅ 双创组合 (300+688) | 价格 > {MIN_PRICE}")
+    st.success(f"✅ 策略：高开且盘中上涨 1.5% 买入")
     
     results = []
     bar = st.progress(0)
@@ -262,14 +284,14 @@ if st.button("🚀 运行回测 (UI修复版)"):
     bar.empty()
     
     if not results:
-        st.warning("无信号。")
+        st.warning("没有触发买入条件的交易。")
         st.stop()
         
     df_res = pd.DataFrame(results)
     valid_trades = df_res.dropna(subset=['Return_D1'])
     
-    st.header("📊 V30.25 终极实战报告")
-    st.caption(f"区间: {dates[-1]} ~ {dates[0]} | 交易数: {len(valid_trades)}")
+    st.header("📊 V30.25 实战报告 (突破买入)")
+    st.caption(f"区间: {dates[-1]} ~ {dates[0]} | 触发交易: {len(valid_trades)}")
     
     col1, col2, col3 = st.columns(3)
     def get_m(col):
@@ -284,16 +306,8 @@ if st.button("🚀 运行回测 (UI修复版)"):
     col2.metric("D+3 收益/胜率", f"{d3_a:.2f}% / {d3_w:.1f}%")
     col3.metric("D+5 收益/胜率", f"{d5_a:.2f}% / {d5_w:.1f}%")
     
-    st.subheader("📋 详细交易单")
-    # 恢复显示 Score 和 Close，且格式化小数位
-    display_df = df_res.copy()
-    display_df['Score'] = display_df['Score'].round(2)
-    display_df['Close'] = display_df['Close'].round(2)
-    display_df['Return_D1'] = display_df['Return_D1'].round(2)
-    display_df['Return_D3'] = display_df['Return_D3'].round(2)
-    display_df['Return_D5'] = display_df['Return_D5'].round(2)
-    
-    st.dataframe(display_df, use_container_width=True)
+    st.subheader("📋 交易明细")
+    st.dataframe(df_res.round(2), use_container_width=True)
     
     csv = df_res.to_csv().encode('utf-8')
-    st.download_button("📥 下载 CSV", csv, "v30.25_final_export.csv", "text/csv")
+    st.download_button("📥 下载 CSV", csv, "v30.25_breakout_export.csv", "text/csv")
