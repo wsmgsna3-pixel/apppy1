@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.25 终极实战版 (突破买入法)
+选股王 · V30.25 区间竞价直落版 (T+1 修正)
 策略：双创组合 (688 + 300)
-买入修正：
-1. 必须高开 (Open > Pre_Close)。
-2. 盘中必须涨幅达到开盘价的 1.5% (Price >= Open * 1.015) 才触发买入。
-3. 买入价格按 Open * 1.015 计算。
+核心修正：
+1. 买入：竞价高开 2.0% ~ 7.5% 直接买入。
+2. 卖出：创业板 D2 开盘卖出；科创板持有至 D5。
 """
 
 import streamlit as st
@@ -17,13 +16,14 @@ from datetime import datetime, timedelta
 # ---------------------------
 # 页面配置
 # ---------------------------
-st.set_page_config(page_title="V30.25 突破买入版", layout="wide")
-st.title("🛡️ V30.25 突破买入版 (确认强势再上车)")
+st.set_page_config(page_title="V30.25 区间直落版", layout="wide")
+st.title("🎯 V30.25 区间直落版 (T+1 真实规则)")
 st.markdown("""
-**核心逻辑修正：**
-* **观察：** 竞价必须高开 (Open > Pre_Close)。
-* **买入：** 盘中价格突破 **开盘价 + 1.5%** 时触发买入。
-* **目的：** 过滤“高开低走”的骗线，只做真突破。
+**核心策略：**
+* **买入条件：** 竞价高开 **+2.0% ~ +7.5%**，开盘直接买入。
+* **卖出规则 (T+1)：**
+    * **创业板 (300)：** **D+2 开盘价** 卖出 (隔夜套利)。
+    * **科创板 (688)：** **D+5 收盘价** 卖出 (趋势博弈)。
 """)
 
 # ---------------------------
@@ -178,69 +178,61 @@ def run_backtest_on_date(date, min_price):
             
     if not rank1_code: return None
     
+    # 获取 D1 当天数据，判断是否高开在区间内
+    try:
+        d1_raw = GLOBAL_DAILY_RAW.loc[(rank1_code, date)]
+        if isinstance(d1_raw, pd.Series):
+            open_pct = (d1_raw['open'] / d1_raw['pre_close'] - 1) * 100
+            
+            # 核心条件：高开 2.0% ~ 7.5%
+            if not (2.0 <= open_pct <= 7.5):
+                return None
+        else:
+            return None
+    except:
+        return None
+
+    # 模拟交易
     d0 = datetime.strptime(date, "%Y%m%d")
-    start_fut = (d0 + timedelta(days=1)).strftime("%Y%m%d")
+    start_fut = (d0 + timedelta(days=1)).strftime("%Y%m%d") # D2
     end_fut = (d0 + timedelta(days=20)).strftime("%Y%m%d")
     
-    hist = get_qfq_data(rank1_code, start_fut, end_fut)
+    # 注意：我们买入是在 D1 开盘 (即 date 当天)，这里为了计算方便取复权后的 D1 数据
+    hist_d1 = get_qfq_data(rank1_code, date, date)
+    if hist_d1.empty: return None
     
-    ret_d1, ret_d3, ret_d5 = np.nan, np.nan, np.nan
-    buy_triggered = False
+    buy_price = hist_d1.iloc[0]['open'] # D1 开盘买入
     
-    if len(hist) >= 1:
-        d1_row = hist.iloc[0]
-        
-        # 获取 D1 当天的原始行情 (Open, High, Pre_Close)
-        try:
-            d1_raw = GLOBAL_DAILY_RAW.loc[(rank1_code, d1_row.name.strftime("%Y%m%d"))]
-            if isinstance(d1_raw, pd.Series):
-                d1_open = d1_raw['open']
-                d1_high = d1_raw['high']
-                d1_pre = d1_raw['pre_close']
-                d1_close = d1_raw['close']
-                
-                # --- 买入条件判定 ---
-                # 1. 竞价必须高开
-                if d1_open > d1_pre:
-                    # 2. 盘中必须触及 Open * 1.015
-                    target_buy_price_raw = d1_open * 1.015
-                    
-                    if d1_high >= target_buy_price_raw:
-                        # 触发买入！
-                        buy_triggered = True
-                        
-                        # 计算复权后的买入成本
-                        # 注意：hist 数据是复权后的，我们要按比例换算买入价
-                        # 复权因子 = hist_open / raw_open
-                        adj_ratio = d1_row['open'] / d1_open
-                        buy_price_adj = target_buy_price_raw * adj_ratio
-                        
-                        # 3. 计算收益 (相对于买入成本)
-                        ret_d1 = (d1_row['close'] / buy_price_adj - 1) * 100
-                        
-                        if len(hist) >= 3:
-                            ret_d3 = (hist.iloc[2]['close'] / buy_price_adj - 1) * 100
-                        if len(hist) >= 5:
-                            ret_d5 = (hist.iloc[4]['close'] / buy_price_adj - 1) * 100
-                        elif len(hist) > 0:
-                            ret_d5 = (hist.iloc[-1]['close'] / buy_price_adj - 1) * 100
-            else:
-                pass
-        except:
-            pass
+    hist_fut = get_qfq_data(rank1_code, start_fut, end_fut)
+    
+    ret_strategy = np.nan
+    
+    # 策略收益计算
+    if rank1_code.startswith('30'): # 创业板
+        if len(hist_fut) >= 1:
+            # D2 开盘卖出
+            sell_price = hist_fut.iloc[0]['open']
+            ret_strategy = (sell_price / buy_price - 1) * 100
             
-    if not buy_triggered:
-        # 如果没触发买入，返回 None (或者记录为“空仓”)
-        return None 
-    
+    elif rank1_code.startswith('688'): # 科创板
+        if len(hist_fut) >= 4: # D5 (从 D1 算起第 5 天，即未来数据的第 4 天？不，是 D+5 交易日)
+             # D1是第一天，D2是第二天... D5是第五天。hist_fut 从 D2 开始。
+             # hist_fut.iloc[0] = D2
+             # hist_fut.iloc[3] = D5
+             sell_price = hist_fut.iloc[3]['close']
+             ret_strategy = (sell_price / buy_price - 1) * 100
+        elif len(hist_fut) > 0:
+             sell_price = hist_fut.iloc[-1]['close']
+             ret_strategy = (sell_price / buy_price - 1) * 100
+             
     return {
         'Trade_Date': date,
         'ts_code': rank1_code,
         'Close': rank1_close,
         'Score': best_score,
-        'Return_D1': ret_d1,
-        'Return_D3': ret_d3,
-        'Return_D5': ret_d5
+        'Board': 'STAR' if rank1_code.startswith('688') else 'ChiNext',
+        'Open_Pct': open_pct,
+        'Return_Strategy': ret_strategy
     }
 
 # ----------------------------------------------------
@@ -265,12 +257,12 @@ pro = ts.pro_api()
 # ---------------------------
 # 主程序
 # ---------------------------
-if st.button("🚀 运行 (突破买入版)"):
+if st.button("🚀 运行 (区间直落版)"):
     dates = get_trade_days(end_date.strftime("%Y%m%d"), days_back)
     if not dates: st.stop()
     if not get_all_historical_data(dates): st.stop()
     
-    st.success(f"✅ 策略：高开且盘中上涨 1.5% 买入")
+    st.success(f"✅ 竞价高开 [2.0%, 7.5%] | T+1 真实规则")
     
     results = []
     bar = st.progress(0)
@@ -284,30 +276,28 @@ if st.button("🚀 运行 (突破买入版)"):
     bar.empty()
     
     if not results:
-        st.warning("没有触发买入条件的交易。")
+        st.warning("无信号。")
         st.stop()
         
     df_res = pd.DataFrame(results)
-    valid_trades = df_res.dropna(subset=['Return_D1'])
+    valid_trades = df_res.dropna(subset=['Return_Strategy'])
     
-    st.header("📊 V30.25 实战报告 (突破买入)")
-    st.caption(f"区间: {dates[-1]} ~ {dates[0]} | 触发交易: {len(valid_trades)}")
+    st.header("📊 V30.25 策略实战报告")
+    st.caption(f"区间: {dates[-1]} ~ {dates[0]} | 交易数: {len(valid_trades)}")
     
-    col1, col2, col3 = st.columns(3)
-    def get_m(col):
-        if valid_trades.empty: return 0, 0
-        return valid_trades[col].mean(), (valid_trades[col]>0).mean()*100
+    # 整体表现
+    avg_ret = valid_trades['Return_Strategy'].mean()
+    win_rate = (valid_trades['Return_Strategy'] > 0).mean() * 100
+    st.metric("策略总收益 / 胜率", f"{avg_ret:.2f}% / {win_rate:.1f}%")
     
-    d1_a, d1_w = get_m('Return_D1')
-    d3_a, d3_w = get_m('Return_D3')
-    d5_a, d5_w = get_m('Return_D5')
-    
-    col1.metric("D+1 收益/胜率", f"{d1_a:.2f}% / {d1_w:.1f}%")
-    col2.metric("D+3 收益/胜率", f"{d3_a:.2f}% / {d3_w:.1f}%")
-    col3.metric("D+5 收益/胜率", f"{d5_a:.2f}% / {d5_w:.1f}%")
+    # 分板块表现
+    st.subheader("板块分项表现")
+    gb = valid_trades.groupby('Board')['Return_Strategy'].agg(['count', 'mean', lambda x: (x>0).mean()*100])
+    gb.columns = ['交易次数', '平均收益', '胜率']
+    st.dataframe(gb.style.format({'平均收益': '{:.2f}%', '胜率': '{:.1f}%'}))
     
     st.subheader("📋 交易明细")
     st.dataframe(df_res.round(2), use_container_width=True)
     
     csv = df_res.to_csv().encode('utf-8')
-    st.download_button("📥 下载 CSV", csv, "v30.25_breakout_export.csv", "text/csv")
+    st.download_button("📥 下载 CSV", csv, "v30.25_range_export.csv", "text/csv")
