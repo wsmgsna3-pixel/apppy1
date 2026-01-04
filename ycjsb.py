@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.25 核武器长期版 (Only STAR 688 Long-Term)
-目标：仅拉取科创板数据，进行 2-3 年的长周期回测。
-新增功能：内置“评分(Score)有效性分析”，验证高分是否对应高胜率。
+选股王 · V30.25 终极实战版 (UI修复)
+策略：双创组合 (688 + 300)
+特性：恢复了包含收盘价、评分的详细交易单，界面更直观。
 """
 
 import streamlit as st
@@ -14,13 +14,15 @@ from datetime import datetime, timedelta
 # ---------------------------
 # 页面配置
 # ---------------------------
-st.set_page_config(page_title="V30.25 核武器长期版", layout="wide")
-st.title("🚀 V30.25 核武器长期版 (Only STAR 688)")
+st.set_page_config(page_title="V30.25 终极实战版", layout="wide")
+st.title("⚔️ V30.25 终极实战版 (双创组合)")
 st.markdown("""
-**🎯 回测目标：**
-* **范围：** 仅限 **科创板 (688)**。
-* **周期：** 建议 **750天 (约3年)**。
-* **核心验证：** 在大样本下，Rank 1 的评分 (Score) 是否是胜率的分水岭？
+**核心策略：**
+* **选股范围：** **科创板 (688)** + **创业板 (300)**
+* **过滤条件：** 价格 > 20元 | Rank 1 (最强评分)
+* **交易模式：**
+    * **科创板：** 重仓，D+3 盈利则死拿至 D+5 (博暴利)。
+    * **创业板：** 轻仓，D+3 无论盈亏必须走 (保胜率)。
 """)
 
 # ---------------------------
@@ -44,24 +46,24 @@ def safe_get(func_name, **kwargs):
     except Exception: return pd.DataFrame(columns=['ts_code'])
 
 def get_trade_days(end_date_str, num_days):
-    start_date = (datetime.strptime(end_date_str, "%Y%m%d") - timedelta(days=num_days * 2)).strftime("%Y%m%d")
+    start_date = (datetime.strptime(end_date_str, "%Y%m%d") - timedelta(days=num_days * 3)).strftime("%Y%m%d")
     cal = safe_get('trade_cal', start_date=start_date, end_date=end_date_str)
     if cal.empty or 'is_open' not in cal.columns: return []
     return cal[cal['is_open'] == 1].sort_values('cal_date', ascending=False)['cal_date'].head(num_days).tolist()
 
 # ----------------------------------------------------------------------
-# 极速数据下载 (Only 688)
+# 数据下载
 # ----------------------------------------------------------------------
 @st.cache_data(ttl=3600*24)
 def fetch_and_cache_daily_data(date):
     adj_df = safe_get('adj_factor', trade_date=date)
     daily_df = safe_get('daily', trade_date=date)
     
-    # 核心优化：只保留 688，极大幅度减少数据量
+    # 在这里做初步过滤，提升速度，只留双创
     if not daily_df.empty:
-        daily_df = daily_df[daily_df['ts_code'].str.startswith('688')]
+        daily_df = daily_df[daily_df['ts_code'].str.startswith(('30', '688'))]
     if not adj_df.empty:
-        adj_df = adj_df[adj_df['ts_code'].str.startswith('688')]
+        adj_df = adj_df[adj_df['ts_code'].str.startswith(('30', '688'))]
         
     return {'adj': adj_df, 'daily': daily_df}
 
@@ -76,7 +78,7 @@ def get_all_historical_data(trade_days_list):
     end_date = (datetime.strptime(latest_trade_date, "%Y%m%d") + timedelta(days=25)).strftime("%Y%m%d") 
     
     all_dates = safe_get('trade_cal', start_date=start_date, end_date=end_date, is_open='1')['cal_date'].tolist()
-    st.info(f"⏳ 正在拉取科创板全历史数据 ({start_date} ~ {end_date})...")
+    st.info(f"⏳ 正在拉取双创数据 ({start_date} ~ {end_date})...")
 
     adj_list, daily_list = [], []
     bar = st.progress(0)
@@ -86,8 +88,7 @@ def get_all_historical_data(trade_days_list):
             cached = fetch_and_cache_daily_data(date)
             if not cached['adj'].empty: adj_list.append(cached['adj'])
             if not cached['daily'].empty: daily_list.append(cached['daily'])
-            # 688数据量小，可以刷新快一点
-            if i % 50 == 0: bar.progress((i+1)/len(all_dates))
+            if i % 20 == 0: bar.progress((i+1)/len(all_dates))
         except: continue 
     bar.empty()
 
@@ -160,13 +161,11 @@ def run_backtest_on_date(date, min_price):
     
     # 1. 价格过滤
     pool = daily[daily['close'] >= min_price]
-    # (数据源本身已是纯血科创，无需再过滤板块)
-    
     if pool.empty: return None
     
     # 2. 粗筛
     pool = pool[pool['pct_chg'] > 0].sort_values('pct_chg', ascending=False)
-    if len(pool) > 80: pool = pool.head(80)
+    if len(pool) > 150: pool = pool.head(150)
     
     best_score = -1
     rank1_code = None
@@ -193,6 +192,7 @@ def run_backtest_on_date(date, min_price):
     
     if len(hist) >= 1:
         d1_row = hist.iloc[0]
+        # 获取开盘涨幅用于判断
         try:
             d1_raw = GLOBAL_DAILY_RAW.loc[(rank1_code, d1_row.name.strftime("%Y%m%d"))]
             if isinstance(d1_raw, pd.Series):
@@ -210,6 +210,7 @@ def run_backtest_on_date(date, min_price):
             elif len(hist) > 0:
                 ret_d5 = (hist.iloc[-1]['close'] / buy_price - 1) * 100
     
+    # 返回详细数据 (包含 Close 和 Score)
     return {
         'Trade_Date': date,
         'ts_code': rank1_code,
@@ -221,12 +222,12 @@ def run_backtest_on_date(date, min_price):
     }
 
 # ----------------------------------------------------
-# 侧边栏
+# 侧边栏 (恢复经典样式)
 # ----------------------------------------------------
 with st.sidebar:
     st.header("1. 回测设置")
     end_date = st.date_input("结束日期", value=datetime.now().date())
-    days_back = int(st.number_input("回测天数", value=750, help="750天约等于3年")) 
+    days_back = int(st.number_input("回测天数", value=200)) # 恢复默认 200，方便快速跑
     
     st.markdown("---")
     st.header("2. 策略参数")
@@ -242,12 +243,12 @@ pro = ts.pro_api()
 # ---------------------------
 # 主程序
 # ---------------------------
-if st.button("🚀 启动科创板长期压力测试"):
+if st.button("🚀 运行回测 (UI修复版)"):
     dates = get_trade_days(end_date.strftime("%Y%m%d"), days_back)
     if not dates: st.stop()
     if not get_all_historical_data(dates): st.stop()
     
-    st.success(f"✅ 数据就绪：Only 688 | 周期: {len(dates)} 天")
+    st.success(f"✅ 双创组合 (300+688) | 价格 > {MIN_PRICE}")
     
     results = []
     bar = st.progress(0)
@@ -256,22 +257,19 @@ if st.button("🚀 启动科创板长期压力测试"):
         res = run_backtest_on_date(date, MIN_PRICE)
         if res:
             results.append(res)
-        if i % 10 == 0: bar.progress((i+1)/len(dates))
+        bar.progress((i+1)/len(dates))
     
     bar.empty()
     
     if not results:
-        st.warning("无交易记录。")
+        st.warning("无信号。")
         st.stop()
         
     df_res = pd.DataFrame(results)
     valid_trades = df_res.dropna(subset=['Return_D1'])
     
-    # ---------------------------
-    # 结果分析
-    # ---------------------------
-    st.header("📊 科创板长期生存报告 (Only 688)")
-    st.caption(f"回测区间: {dates[-1]} 至 {dates[0]} | 交易次数: {len(valid_trades)}")
+    st.header("📊 V30.25 终极实战报告")
+    st.caption(f"区间: {dates[-1]} ~ {dates[0]} | 交易数: {len(valid_trades)}")
     
     col1, col2, col3 = st.columns(3)
     def get_m(col):
@@ -286,37 +284,16 @@ if st.button("🚀 启动科创板长期压力测试"):
     col2.metric("D+3 收益/胜率", f"{d3_a:.2f}% / {d3_w:.1f}%")
     col3.metric("D+5 收益/胜率", f"{d5_a:.2f}% / {d5_w:.1f}%")
     
-    # --- 评分有效性分析 (核心功能) ---
-    st.markdown("---")
-    st.subheader("🔍 评分(Score)有效性验证")
-    st.markdown("将所有交易按分数分为 4 组 (Q1低分 -> Q4高分)，查看高分是否真的对应高胜率：")
-    
-    if len(valid_trades) >= 4:
-        valid_trades['Score_Group'] = pd.qcut(valid_trades['Score'], 4, labels=['Q1 (低分区)', 'Q2 (中低区)', 'Q3 (中高区)', 'Q4 (高分区)'])
-        score_stats = valid_trades.groupby('Score_Group')[['Return_D1', 'Return_D5']].agg(['count', 'mean', lambda x: (x>0).mean()*100])
-        score_stats.columns = ['交易次数', 'D1平均收益', 'D1胜率', 'D5交易次数', 'D5平均收益', 'D5胜率']
-        # 简化展示
-        score_show = score_stats[['交易次数', 'D1平均收益', 'D1胜率', 'D5平均收益', 'D5胜率']]
-        st.dataframe(score_show.style.format("{:.2f}"))
-        
-        # 寻找最佳阈值
-        median_score = valid_trades['Score'].median()
-        high_score_trades = valid_trades[valid_trades['Score'] > median_score]
-        high_win = (high_score_trades['Return_D1'] > 0).mean() * 100
-        high_ret = high_score_trades['Return_D1'].mean()
-        
-        st.info(f"💡 **数据洞察：** 如果只做分数高于中位数 ({median_score:.0f}) 的交易：\n"
-                f"- D+1 胜率将变为 **{high_win:.1f}%**\n"
-                f"- D+1 平均收益将变为 **{high_ret:.2f}%**")
-    else:
-        st.warning("交易样本太少，无法进行分组分析。")
-        
     st.subheader("📋 详细交易单")
-    # 格式化
+    # 恢复显示 Score 和 Close，且格式化小数位
     display_df = df_res.copy()
-    cols_to_round = ['Close', 'Score', 'Return_D1', 'Return_D3', 'Return_D5']
-    display_df[cols_to_round] = display_df[cols_to_round].round(2)
+    display_df['Score'] = display_df['Score'].round(2)
+    display_df['Close'] = display_df['Close'].round(2)
+    display_df['Return_D1'] = display_df['Return_D1'].round(2)
+    display_df['Return_D3'] = display_df['Return_D3'].round(2)
+    display_df['Return_D5'] = display_df['Return_D5'].round(2)
+    
     st.dataframe(display_df, use_container_width=True)
     
     csv = df_res.to_csv().encode('utf-8')
-    st.download_button("📥 下载完整数据", csv, "star_long_term_export.csv", "text/csv")
+    st.download_button("📥 下载 CSV", csv, "v30.25_final_export.csv", "text/csv")
