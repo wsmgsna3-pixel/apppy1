@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.25 区间竞价直落版 (T+1 修正)
+选股王 · V30.25 终极全景版 (实战+上帝视角)
 策略：双创组合 (688 + 300)
-核心修正：
-1. 买入：竞价高开 2.0% ~ 7.5% 直接买入。
-2. 卖出：创业板 D2 开盘卖出；科创板持有至 D5。
+特性：
+1. 实战逻辑：区间竞价直落 (2.0%~7.5%) -> 创业板 D2 跑 / 科创板 D5 跑。
+2. 上帝视角：同时计算 D1/D3/D5 的持仓表现，辅助判断是否“格局”。
 """
 
 import streamlit as st
@@ -16,14 +16,15 @@ from datetime import datetime, timedelta
 # ---------------------------
 # 页面配置
 # ---------------------------
-st.set_page_config(page_title="V30.25 区间直落版", layout="wide")
-st.title("🎯 V30.25 区间直落版 (T+1 真实规则)")
+st.set_page_config(page_title="V30.25 全景驾驶舱", layout="wide")
+st.title("🚀 V30.25 全景驾驶舱 (实战 + 潜能)")
 st.markdown("""
-**核心策略：**
-* **买入条件：** 竞价高开 **+2.0% ~ +7.5%**，开盘直接买入。
-* **卖出规则 (T+1)：**
-    * **创业板 (300)：** **D+2 开盘价** 卖出 (隔夜套利)。
-    * **科创板 (688)：** **D+5 收盘价** 卖出 (趋势博弈)。
+**核心逻辑：**
+* **买入：** 竞价高开 **[+2.0%, +7.5%]** -> 开盘直接买入。
+* **实战卖出 (Strategy)：**
+    * **创业板 (300)：** **D+2 开盘** 卖出。
+    * **科创板 (688)：** **D+5 收盘** 卖出。
+* **潜能参考 (Hold)：** 展示死拿至 D1/D3/D5 的收益，帮您决定是否“格局”。
 """)
 
 # ---------------------------
@@ -78,7 +79,7 @@ def get_all_historical_data(trade_days_list):
     end_date = (datetime.strptime(latest_trade_date, "%Y%m%d") + timedelta(days=25)).strftime("%Y%m%d") 
     
     all_dates = safe_get('trade_cal', start_date=start_date, end_date=end_date, is_open='1')['cal_date'].tolist()
-    st.info(f"⏳ 正在拉取数据 ({start_date} ~ {end_date})...")
+    st.info(f"⏳ 正在拉取全景数据 ({start_date} ~ {end_date})...")
 
     adj_list, daily_list = [], []
     bar = st.progress(0)
@@ -151,7 +152,7 @@ def compute_score(ts_code, end_date):
     return score
 
 # ----------------------------------------------------------------------
-# 回测主逻辑 (修正版)
+# 回测主逻辑 (全景版)
 # ----------------------------------------------------------------------
 def run_backtest_on_date(date, min_price):
     try:
@@ -183,47 +184,48 @@ def run_backtest_on_date(date, min_price):
         d1_raw = GLOBAL_DAILY_RAW.loc[(rank1_code, date)]
         if isinstance(d1_raw, pd.Series):
             open_pct = (d1_raw['open'] / d1_raw['pre_close'] - 1) * 100
-            
-            # 核心条件：高开 2.0% ~ 7.5%
-            if not (2.0 <= open_pct <= 7.5):
-                return None
-        else:
-            return None
-    except:
-        return None
+            if not (2.0 <= open_pct <= 7.5): return None # 核心过滤
+        else: return None
+    except: return None
 
     # 模拟交易
     d0 = datetime.strptime(date, "%Y%m%d")
     start_fut = (d0 + timedelta(days=1)).strftime("%Y%m%d") # D2
     end_fut = (d0 + timedelta(days=20)).strftime("%Y%m%d")
     
-    # 注意：我们买入是在 D1 开盘 (即 date 当天)，这里为了计算方便取复权后的 D1 数据
+    # D1 开盘买入
     hist_d1 = get_qfq_data(rank1_code, date, date)
     if hist_d1.empty: return None
+    buy_price = hist_d1.iloc[0]['open']
     
-    buy_price = hist_d1.iloc[0]['open'] # D1 开盘买入
+    hist_fut = get_qfq_data(rank1_code, start_fut, end_fut) # 从 D2 开始的数据
     
-    hist_fut = get_qfq_data(rank1_code, start_fut, end_fut)
+    # 1. 计算【全景潜能】(D1/D3/D5 Close vs Buy Price)
+    # D1 Close
+    ret_d1_hold = (hist_d1.iloc[0]['close'] / buy_price - 1) * 100
     
+    # D3 Close (从 D1 开始数第 3 天，即 hist_fut 的第 2 天)
+    ret_d3_hold = np.nan
+    if len(hist_fut) >= 2:
+        ret_d3_hold = (hist_fut.iloc[1]['close'] / buy_price - 1) * 100
+    
+    # D5 Close (从 D1 开始数第 5 天，即 hist_fut 的第 4 天)
+    ret_d5_hold = np.nan
+    if len(hist_fut) >= 4:
+        ret_d5_hold = (hist_fut.iloc[3]['close'] / buy_price - 1) * 100
+    elif len(hist_fut) > 0:
+        ret_d5_hold = (hist_fut.iloc[-1]['close'] / buy_price - 1) * 100
+
+    # 2. 计算【实战策略】(按规则卖出)
     ret_strategy = np.nan
     
-    # 策略收益计算
-    if rank1_code.startswith('30'): # 创业板
+    if rank1_code.startswith('30'): # 创业板: D2 Open 卖
         if len(hist_fut) >= 1:
-            # D2 开盘卖出
             sell_price = hist_fut.iloc[0]['open']
             ret_strategy = (sell_price / buy_price - 1) * 100
             
-    elif rank1_code.startswith('688'): # 科创板
-        if len(hist_fut) >= 4: # D5 (从 D1 算起第 5 天，即未来数据的第 4 天？不，是 D+5 交易日)
-             # D1是第一天，D2是第二天... D5是第五天。hist_fut 从 D2 开始。
-             # hist_fut.iloc[0] = D2
-             # hist_fut.iloc[3] = D5
-             sell_price = hist_fut.iloc[3]['close']
-             ret_strategy = (sell_price / buy_price - 1) * 100
-        elif len(hist_fut) > 0:
-             sell_price = hist_fut.iloc[-1]['close']
-             ret_strategy = (sell_price / buy_price - 1) * 100
+    elif rank1_code.startswith('688'): # 科创板: D5 Close 卖
+        ret_strategy = ret_d5_hold # 就是 D5 死拿的结果
              
     return {
         'Trade_Date': date,
@@ -232,7 +234,10 @@ def run_backtest_on_date(date, min_price):
         'Score': best_score,
         'Board': 'STAR' if rank1_code.startswith('688') else 'ChiNext',
         'Open_Pct': open_pct,
-        'Return_Strategy': ret_strategy
+        'Return_Strategy': ret_strategy,
+        'Return_D1': ret_d1_hold,
+        'Return_D3': ret_d3_hold,
+        'Return_D5': ret_d5_hold
     }
 
 # ----------------------------------------------------
@@ -257,12 +262,12 @@ pro = ts.pro_api()
 # ---------------------------
 # 主程序
 # ---------------------------
-if st.button("🚀 运行 (区间直落版)"):
+if st.button("🚀 运行 (全景版)"):
     dates = get_trade_days(end_date.strftime("%Y%m%d"), days_back)
     if not dates: st.stop()
     if not get_all_historical_data(dates): st.stop()
     
-    st.success(f"✅ 竞价高开 [2.0%, 7.5%] | T+1 真实规则")
+    st.success(f"✅ V30.25 全景驾驶舱 | [2.0%, 7.5%] 直接买")
     
     results = []
     bar = st.progress(0)
@@ -282,22 +287,39 @@ if st.button("🚀 运行 (区间直落版)"):
     df_res = pd.DataFrame(results)
     valid_trades = df_res.dropna(subset=['Return_Strategy'])
     
-    st.header("📊 V30.25 策略实战报告")
+    st.header("📊 V30.25 终极战报")
     st.caption(f"区间: {dates[-1]} ~ {dates[0]} | 交易数: {len(valid_trades)}")
     
-    # 整体表现
-    avg_ret = valid_trades['Return_Strategy'].mean()
-    win_rate = (valid_trades['Return_Strategy'] > 0).mean() * 100
-    st.metric("策略总收益 / 胜率", f"{avg_ret:.2f}% / {win_rate:.1f}%")
-    
-    # 分板块表现
-    st.subheader("板块分项表现")
+    # 1. 实战收益
+    st.subheader("💰 实战落袋收益 (按规则卖出)")
+    col1, col2 = st.columns(2)
+    s_avg = valid_trades['Return_Strategy'].mean()
+    s_win = (valid_trades['Return_Strategy'] > 0).mean() * 100
+    col1.metric("策略总收益", f"{s_avg:.2f}%")
+    col2.metric("策略胜率", f"{s_win:.1f}%")
+
     gb = valid_trades.groupby('Board')['Return_Strategy'].agg(['count', 'mean', lambda x: (x>0).mean()*100])
-    gb.columns = ['交易次数', '平均收益', '胜率']
-    st.dataframe(gb.style.format({'平均收益': '{:.2f}%', '胜率': '{:.1f}%'}))
+    gb.columns = ['Count', 'Avg Return', 'Win Rate']
+    st.table(gb.style.format({'Avg Return': '{:.2f}%', 'Win Rate': '{:.1f}%'}))
+
+    # 2. 潜能仪表盘 (上帝视角)
+    st.markdown("---")
+    st.subheader("🔭 潜能仪表盘 (如果死拿不卖...)")
+    cols = st.columns(3)
     
-    st.subheader("📋 交易明细")
+    def metric_pot(col_name, label):
+        avg = valid_trades[col_name].mean()
+        win = (valid_trades[col_name] > 0).mean() * 100
+        return f"{avg:.2f}% / {win:.1f}%"
+        
+    cols[0].metric("D+1 潜能 (收盘)", metric_pot('Return_D1', 'D1'))
+    cols[1].metric("D+3 潜能 (收盘)", metric_pot('Return_D3', 'D3'))
+    cols[2].metric("D+5 潜能 (收盘)", metric_pot('Return_D5', 'D5'))
+
+    # 3. 详细数据
+    st.markdown("---")
+    st.subheader("📋 交易明细 (含潜能分析)")
     st.dataframe(df_res.round(2), use_container_width=True)
     
     csv = df_res.to_csv().encode('utf-8')
-    st.download_button("📥 下载 CSV", csv, "v30.25_range_export.csv", "text/csv")
+    st.download_button("📥 下载详细数据 CSV", csv, "v30.25_panorama_export.csv", "text/csv")
