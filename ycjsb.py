@@ -232,7 +232,7 @@ def run_backtest_on_date(date, min_price):
     return {
         'Trade_Date': date,
         'ts_code': rank1_code,
-        'Name': '加载中...', # 实际代码可调接口获取名称
+        'Name': '加载中...', 
         'Signal': signal_type,
         'Open_Pct': open_pct,
         'Close': rank1_close,
@@ -313,18 +313,32 @@ if st.button("🚀 开始扫描"):
     else:
         st.info("💡 选定区间内无【符合买入条件】的股票。")
 
-    # B. 每日选股明细 (含观望)
+    # B. 每日选股监控 (含观望)
     st.header("📋 每日选股监控 (含未成交)")
     
     # 颜色高亮函数
     def highlight_signal(val):
-        color = 'red' if 'BUY' in val else 'gray'
-        return f'color: {color}; font-weight: bold'
+        if 'BUY' in str(val):
+            return 'color: red; font-weight: bold'
+        elif 'WATCH' in str(val):
+            return 'color: gray'
+        return ''
+
+    # 安全的格式化函数 (防止空值报错)
+    def safe_format(val):
+        if val is None or pd.isna(val):
+            return "-"
+        return f"{val:.2f}%"
 
     st.dataframe(
         df_res[['Trade_Date', 'ts_code', 'Signal', 'Open_Pct', 'Return_Strategy', 'Close', 'Score']]
-        .style.map(highlight_signal, subset=['Signal'])
-        .format({'Open_Pct': '{:.2f}%', 'Return_Strategy': '{:.2f}%', 'Score': '{:.0f}'}),
+        .style
+        .map(highlight_signal, subset=['Signal'])
+        .format({
+            'Open_Pct': safe_format,
+            'Return_Strategy': safe_format,
+            'Score': '{:.0f}'
+        }),
         use_container_width=True
     )
     
