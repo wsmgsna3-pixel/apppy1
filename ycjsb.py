@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · 正规军 1.0 版 (V30.25 Regular Army)
-核心策略：MACD得分模型 (Rank 1) + 板块提纯 (只做双创) + 价格门槛 (20元)
-目标：验证剔除主板后，由双创股票递补上来的 Rank 1 是否具备更强的盈利能力。
+选股王 · 核武器版 (V30.25 STAR Only)
+核心策略：MACD Rank 1 + 纯血科创板 (688)
+目标：极致的动量，极致的赔率。拥抱波动，拥抱 20cm。
 """
 
 import streamlit as st
@@ -14,14 +14,16 @@ from datetime import datetime, timedelta
 # ---------------------------
 # 页面配置
 # ---------------------------
-st.set_page_config(page_title="正规军 1.0 版 (V30.25 Refined)", layout="wide")
-st.title("🛡️ 正规军 1.0 版 (双创专攻)")
+st.set_page_config(page_title="V30.25 核武器版 (科创专攻)", layout="wide")
+st.title("🚀 V30.25 核武器版 (Only STAR 688)")
 st.markdown("""
-**策略核心：**
-1.  **选股范围：** 仅限 **科创板 (688)** 和 **创业板 (30)**。剔除主板和北交所。
-2.  **价格门槛：** 最低股价 **20元** (过滤杂毛)。
-3.  **核心算法：** V30.25 MACD 动量评分，取 **Rank 1**。
-4.  **交易模式：** D+1 开盘买入 (+1.5% 追涨)，D+5 收盘卖出 (中间观察 D+3)。
+**💀 核心纪律：**
+1.  **板块：** 仅限 **科创板 (688)**。创业板、主板一律不看。
+2.  **门槛：** 最低股价 **20元**。
+3.  **买入：** D+1 开盘价买入 (若开盘涨幅 > 1.5% 且非一字板)。
+4.  **持有：**
+    * **D+3 观察：** 浮盈 > 0，死拿到 D+5；浮盈 < 0，坚决止损。
+    * **目标：** 捕捉单笔 +20% ~ +50% 的主升浪。
 """)
 
 # ---------------------------
@@ -149,26 +151,19 @@ def run_backtest_on_date(date, min_price):
     daily = safe_get('daily', trade_date=date)
     if daily.empty: return None
     
-    # --- 核心过滤步骤 ---
-    # 1. 价格过滤
+    # --- 终极过滤：只看科创板 (688) ---
     pool = daily[daily['close'] >= min_price]
-    
-    # 2. 板块过滤 (只保留 30 和 688)
-    # ts_code 格式: 000001.SZ, 600000.SH, 300000.SZ, 688000.SH
-    # 30开头: ChiNext, 688开头: STAR
-    pool = pool[pool['ts_code'].str.startswith(('30', '688'))]
+    pool = pool[pool['ts_code'].str.startswith('688')] # 纯血科创
     
     if pool.empty: return None
     
-    # 3. 简单的涨幅预筛 (减少计算量)
     pool = pool[pool['pct_chg'] > 0].sort_values('pct_chg', ascending=False)
-    if len(pool) > 150: pool = pool.head(150)
+    if len(pool) > 100: pool = pool.head(100)
     
     best_score = -1
     rank1_code = None
     rank1_close = 0
     
-    # 4. 计算分数
     for row in pool.itertuples():
         score = compute_score(row.ts_code, date)
         if score > best_score:
@@ -178,7 +173,7 @@ def run_backtest_on_date(date, min_price):
             
     if not rank1_code: return None
     
-    # 5. 模拟交易 (D+1 买入, 持有到 D+5)
+    # 模拟交易
     d0 = datetime.strptime(date, "%Y%m%d")
     start_fut = (d0 + timedelta(days=1)).strftime("%Y%m%d")
     end_fut = (d0 + timedelta(days=20)).strftime("%Y%m%d")
@@ -188,27 +183,21 @@ def run_backtest_on_date(date, min_price):
     ret_d1, ret_d3, ret_d5 = np.nan, np.nan, np.nan
     
     if len(hist) >= 1:
-        # 模拟买入：D+1 开盘价买入
-        # 条件：开盘价必须 > 昨收 * 1.015 (追涨确认)
+        # D+1 开盘买入判定
         d1_row = hist.iloc[0]
-        # 注意: 这里的 昨收(pre_close) 是 D1 的昨收，也就是 D0 的收盘
-        # 但我们用的是复权数据，最好用涨跌幅计算
-        
-        # 简化判断：使用 Tushare 原始数据的 pre_close 来判断开盘涨幅
-        # 获取 D1 的原始数据以确认开盘涨幅
         try:
             d1_raw = GLOBAL_DAILY_RAW.loc[(rank1_code, d1_row.name.strftime("%Y%m%d"))]
             if isinstance(d1_raw, pd.Series):
                 open_pct = (d1_raw['open'] / d1_raw['pre_close'] - 1) * 100
             else:
-                open_pct = 0 # Fallback
+                open_pct = 0 
         except:
             open_pct = 0
             
         if open_pct > 1.5:
             buy_price = d1_row['open']
             
-            # D+1 收益 (收盘价卖出)
+            # D+1 收益
             ret_d1 = (d1_row['close'] / buy_price - 1) * 100
             
             # D+3 收益
@@ -219,10 +208,9 @@ def run_backtest_on_date(date, min_price):
             if len(hist) >= 5:
                 ret_d5 = (hist.iloc[4]['close'] / buy_price - 1) * 100
             elif len(hist) > 0:
-                ret_d5 = (hist.iloc[-1]['close'] / buy_price - 1) * 100 # 不足5天按最后一天
+                ret_d5 = (hist.iloc[-1]['close'] / buy_price - 1) * 100
         else:
-            # 没触发买入 (低开)
-            pass
+            pass # 没买入
             
     return {
         'Trade_Date': date,
@@ -253,12 +241,12 @@ pro = ts.pro_api()
 # ---------------------------
 # 主程序
 # ---------------------------
-if st.button("🚀 运行正规军 1.0 回测"):
+if st.button("🚀 启动核武器 (Only 688)"):
     dates = get_trade_days(end_date.strftime("%Y%m%d"), days_back)
     if not dates: st.stop()
     if not get_all_historical_data(dates): st.stop()
     
-    st.success(f"✅ 开始回测：仅限双创 (30/688) | 最低 {MIN_PRICE} 元")
+    st.success(f"✅ 目标锁定：科创板 (688) | 价格 > {MIN_PRICE} | Rank 1")
     
     results = []
     bar = st.progress(0)
@@ -272,18 +260,14 @@ if st.button("🚀 运行正规军 1.0 回测"):
     bar.empty()
     
     if not results:
-        st.warning("没有选出符合条件的股票。")
+        st.warning("没有选出符合条件的科创板股票。")
         st.stop()
         
     df_res = pd.DataFrame(results)
-    
-    # 统计
     valid_trades = df_res.dropna(subset=['Return_D1'])
-    total_days = len(dates)
-    trade_count = len(valid_trades)
     
-    st.header("📊 正规军 1.0 (双创版) 回测报告")
-    st.caption(f"回测区间: {dates[-1]} 至 {dates[0]} | 有效交易: {trade_count} 笔 / {total_days} 天")
+    st.header("📊 核武器版 (Only 688) 最终报告")
+    st.caption(f"回测区间: {dates[-1]} 至 {dates[0]} | 有效交易: {len(valid_trades)} 笔")
     
     col1, col2, col3 = st.columns(3)
     
@@ -301,9 +285,13 @@ if st.button("🚀 运行正规军 1.0 回测"):
     col2.metric("D+3 收益 / 胜率", f"{d3_avg:.2f}% / {d3_win:.1f}%")
     col3.metric("D+5 收益 / 胜率", f"{d5_avg:.2f}% / {d5_win:.1f}%")
     
-    st.subheader("📋 交易明细 (Top 1)")
-    st.dataframe(df_res, use_container_width=True)
+    # 模拟 Hybrid 资金曲线
+    if not valid_trades.empty:
+        valid_trades['Return_Hybrid'] = np.where(valid_trades['Return_D3']>0, valid_trades['Return_D5'], valid_trades['Return_D3'])
+        equity = (1 + valid_trades['Return_Hybrid']/100).cumprod()
+        total_ret = (equity.iloc[-1] - 1) * 100
+        st.metric("Hybrid 策略 (D3止盈止损) 总回报", f"{total_ret:.2f}%")
+        st.line_chart(equity)
     
-    # CSV 下载
-    csv = df_res.to_csv().encode('utf-8')
-    st.download_button("📥 下载回测数据 CSV", csv, "regular_army_v1_export.csv", "text/csv")
+    st.subheader("📋 交易明细")
+    st.dataframe(df_res, use_container_width=True)
