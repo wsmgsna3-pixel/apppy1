@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V37.1 全开放参数版
-核心修复：
-1. 【买入开盘条件】参数化：不再死守 2%~7.5%，可调整为低吸模式（如 -3%~1%）。
-2. 逻辑打通：配合"选股最低涨幅"，真正实现"绿盘潜伏"或"低吸反转"策略。
+选股王 · V40.0 极速起爆版 (MACD增量排序)
+战略转型：
+1. 核心排序：使用 [MACD增量] (加速度) 替代 [MACD绝对值] (速度)。
+   - 寻找刚踩油门加速的票，而不是已经跑在山顶的票。
+2. 选股门槛：涨幅 5-19% (剔除涨停) + 站上20日线。
+3. 买入战术：次日开盘 0~4% 顺势上车。
+4. 严格风控：T+1/T+2 累计跌幅>5% 强制D2开盘止损。
 """
 
 import streamlit as st
@@ -17,13 +20,13 @@ import gc
 # ---------------------------
 # 页面配置
 # ---------------------------
-st.set_page_config(page_title="V37.1 全能监控台", layout="wide")
-st.title("🎛️ V37.1 全能监控台 (买入条件可调)")
+st.set_page_config(page_title="V40.0 起爆点战法", layout="wide")
+st.title("🚀 V40.0 起爆点监控台 (MACD增量排序)")
 
 # ---------------------------
 # 全局设置
 # ---------------------------
-SCORE_DB_FILE = "v37_volume_database.csv" # 沿用 V37 的数据库，无需重新算分
+SCORE_DB_FILE = "v40_macd_delta_db.csv" # 专用数据库
 pro = None 
 GLOBAL_ADJ_FACTOR = pd.DataFrame() 
 GLOBAL_DAILY_RAW = pd.DataFrame() 
@@ -63,7 +66,8 @@ def get_trade_days(end_date_str, num_days):
 def fetch_and_cache_daily_data(date):
     daily_df = safe_get('daily', trade_date=date)
     adj_df = safe_get('adj_factor', trade_date=date)
-    basic_df = safe_get('daily_basic', trade_date=date, fields='ts_code,circ_mv,turnover_rate')
+    # 获取量比(volume_ratio)和换手率
+    basic_df = safe_get('daily_basic', trade_date=date, fields='ts_code,circ_mv,turnover_rate,volume_ratio')
     name_df = safe_get('stock_basic', fields='ts_code,name')
     
     if not daily_df.empty:
@@ -115,7 +119,7 @@ def get_all_historical_data(select_days_list):
     GLOBAL_ADJ_FACTOR = adj_data.set_index(['ts_code', 'trade_date']).sort_index(level=[0, 1]) 
     
     daily_raw = pd.concat(daily_list)
-    cols_to_float = ['open', 'high', 'low', 'close', 'pre_close', 'vol', 'circ_mv', 'pct_chg', 'turnover_rate']
+    cols_to_float = ['open', 'high', 'low', 'close', 'pre_close', 'vol', 'circ_mv', 'pct_chg', 'turnover_rate', 'volume_ratio']
     for col in cols_to_float:
         if col in daily_raw.columns:
             daily_raw[col] = pd.to_numeric(daily_raw[col], errors='coerce').astype('float32')
@@ -142,65 +146,102 @@ def get_qfq_data(ts_code, start_date, end_date):
         if col in df.columns: df[col] = df[col] * factor
     return df.reset_index().sort_values('trade_date')
 
-def compute_score_for_stock(ts_code, current_date):
+# ----------------------------------------------------------------------
+# 核心算法：MACD 增量计算
+# ----------------------------------------------------------------------
+def analyze_stock_trend(ts_code, current_date):
     start_date = (datetime.strptime(current_date, "%Y%m%d") - timedelta(days=150)).strftime("%Y%m%d")
     df = get_qfq_data(ts_code, start_date, current_date)
-    if df.empty or len(df) < 30: return -1
-    last_date = df.iloc[-1]['trade_date']
-    last_date_str = last_date.strftime('%Y%m%d') if hasattr(last_date, 'strftime') else str(last_date)
-    if last_date_str != current_date: return -1
+    
+    if df.empty or len(df) < 30: return None
+    
+    last_row = df.iloc[-1]
+    if last_row['trade_date'].strftime('%Y%m%d') != current_date: return None
 
     close = df['close']
+    
+    # 1. 计算 MACD
     ema_fast = close.ewm(span=8, adjust=False).mean()
     ema_slow = close.ewm(span=17, adjust=False).mean()
     diff = ema_fast - ema_slow
     dea = diff.ewm(span=5, adjust=False).mean()
-    macd_val = (diff - dea) * 2
-    score = (macd_val.iloc[-1] / close.iloc[-1]) * 100000
-    if pd.isna(score): score = -1
-    return score
+    macd = (diff - dea) * 2
+    
+    # 2. 计算 20日均线 (MA20)
+    ma20 = close.rolling(window=20).mean()
+    
+    # 3. 计算 MACD 增量 (Acceleration)
+    if len(macd) < 2: return None
+    macd_today = macd.iloc[-1]
+    macd_yesterday = macd.iloc[-2]
+    macd_delta = macd_today - macd_yesterday  # 增量
+    
+    # --- 筛选硬性条件 ---
+    
+    # 条件A: 站上20日线 (趋势向上)
+    trend_ok = close.iloc[-1] > ma20.iloc[-1]
+    
+    # 条件B: MACD 处于金叉发散状态
+    # diff > dea (金叉区) 且 macd > 0 (红柱)
+    macd_ok = (diff.iloc[-1] > dea.iloc[-1]) and (macd.iloc[-1] > 0)
+    
+    # 条件C: 必须是加速的 (增量 > 0)
+    accel_ok = macd_delta > 0
+    
+    if trend_ok and macd_ok and accel_ok:
+        # 返回 Score = MACD增量 (用于排序)
+        # 放大100倍方便查看
+        return macd_delta * 100
+        
+    return None
 
 def batch_compute_scores(date):
     try:
         daily_t = GLOBAL_DAILY_RAW.xs(date, level='trade_date')
     except KeyError: return []
 
-    # 算分时不设太多限制，方便后续调参
-    mask = (daily_t['vol'] > 0) & (daily_t['close'] >= 20.0) & (daily_t['close'] <= 350.0)
+    # 初筛
+    mask = (daily_t['vol'] > 0) & (daily_t['close'] >= 2.0)
     pool = daily_t[mask]
     if pool.empty: return []
 
     results = []
     candidates = pool.index.tolist()
+    
     for code in candidates:
-        s = compute_score_for_stock(code, date)
-        if s > 0:
+        score = analyze_stock_trend(code, date)
+        if score is not None:
             row = pool.loc[code]
-            turnover = float(row['turnover_rate']) if 'turnover_rate' in row else 0.0
+            
             results.append({
                 'Select_Date': date,
                 'Code': code,
-                'Score': s,
+                'Score': score, # MACD增量
                 'Name': row['name'] if 'name' in row else code,
                 'Close': float(row['close']),
                 'Pct_Chg': float(row['pct_chg']) if 'pct_chg' in row else 0.0,
                 'Circ_Mv': float(row['circ_mv']) if 'circ_mv' in row else 0.0,
-                'Turnover': turnover
+                'Turnover': float(row['turnover_rate']) if 'turnover_rate' in row else 0.0,
+                'Vol_Ratio': float(row['volume_ratio']) if 'volume_ratio' in row else 0.0
             })
     return results
 
 # ----------------------------------------------------------------------
-# 动态筛选 (参数全开放)
+# 动态筛选与回测
 # ----------------------------------------------------------------------
-def apply_strategy_and_backtest(df_scores, top_n, min_mv_yi, min_pct, min_turnover, stop_loss_pct, buy_open_min, buy_open_max):
+def apply_strategy_and_backtest(df_scores, top_n, min_mv_yi, min_pct, max_pct, buy_open_min, buy_open_max, stop_loss_pct):
     # 1. 动态过滤
     min_mv_val = min_mv_yi * 10000
-    mask = (df_scores['Circ_Mv'] >= min_mv_val) & (df_scores['Pct_Chg'] >= min_pct)
-    if min_turnover > 0: mask &= (df_scores['Turnover'] >= min_turnover)
+    
+    # 涨幅区间 (5-19%)
+    mask = (df_scores['Circ_Mv'] >= min_mv_val) & \
+           (df_scores['Pct_Chg'] >= min_pct) & \
+           (df_scores['Pct_Chg'] <= max_pct)
 
     filtered_df = df_scores[mask].copy()
     if filtered_df.empty: return []
     
+    # 排序：按 MACD增量 (Score) 从高到低 -> 找加速最猛的
     filtered_df = filtered_df.sort_values('Score', ascending=False).head(top_n)
     
     select_date = str(filtered_df.iloc[0]['Select_Date'])
@@ -216,10 +257,11 @@ def apply_strategy_and_backtest(df_scores, top_n, min_mv_yi, min_pct, min_turnov
     
     for rank, (idx, row) in enumerate(filtered_df.iterrows(), 1):
         code = row['Code']
-        signal = "⏳ 等待开盘"
+        signal = "⏳"
         open_pct = np.nan
         is_buy = False
-        ret_d1, ret_d2, ret_d3 = np.nan, np.nan, np.nan
+        ret_d3, ret_d5 = np.nan, np.nan
+        status = "-"
         
         if buy_date:
             try:
@@ -230,44 +272,58 @@ def apply_strategy_and_backtest(df_scores, top_n, min_mv_yi, min_pct, min_turnov
                 daily_buy_pre = float(d1_raw['pre_close'])
                 open_pct = (daily_buy_open / daily_buy_pre - 1) * 100
                 
-                # ★★★ 动态买入条件 ★★★
+                # 买入条件: 次日开盘 [0, 4]%
                 if buy_open_min <= open_pct <= buy_open_max:
                     is_buy = True
                     signal = "✅ BUY"
-                elif open_pct < buy_open_min:
-                    signal = "👀 弱"
                 else:
-                    signal = "⚠️ 强"
+                    signal = "👀 观望"
                 
                 if is_buy:
                     future_df = get_qfq_data(code, buy_date, "20991231")
+                    
                     if not future_df.empty:
                         buy_price = future_df.iloc[0]['open']
-                        stop_price = buy_price * (1 + stop_loss_pct/100)
+                        stop_price = buy_price * (1 - abs(stop_loss_pct)/100)
                         
-                        # D1
-                        d1_low = future_df.iloc[0]['low']
-                        if d1_low <= stop_price:
-                            ret_d1 = stop_loss_pct
+                        is_stopped = False
+                        
+                        # --- 止损检查 ---
+                        # 1. D1 盘中击穿
+                        if future_df.iloc[0]['low'] <= stop_price:
+                            is_stopped = True
+                        
+                        # 2. D2 开盘击穿
+                        if not is_stopped and len(future_df) >= 2:
+                            if future_df.iloc[1]['open'] <= stop_price:
+                                is_stopped = True
+                        
+                        # --- 结算 ---
+                        if is_stopped:
+                            if len(future_df) >= 2:
+                                sell_price = future_df.iloc[1]['open']
+                                ret_d3 = (sell_price / buy_price - 1) * 100
+                                ret_d5 = ret_d3 
+                                status = "📉 止损(D2开)"
+                            else:
+                                sell_price = future_df.iloc[0]['close']
+                                ret_d3 = (sell_price / buy_price - 1) * 100
+                                ret_d5 = ret_d3
+                                status = "📉 止损(无法卖)"
                         else:
-                            ret_d1 = (future_df.iloc[0]['close'] / buy_price - 1) * 100
-                            
-                        # D2
-                        if len(future_df) >= 2:
-                            if ret_d1 == stop_loss_pct: ret_d2 = stop_loss_pct
-                            elif future_df.iloc[1]['low'] <= stop_price: ret_d2 = stop_loss_pct
-                            else: ret_d2 = (future_df.iloc[1]['close'] / buy_price - 1) * 100
-                        elif not pd.isna(ret_d1): ret_d2 = ret_d1
-                            
-                        # D3
-                        if len(future_df) >= 3:
-                            if ret_d1 == stop_loss_pct or ret_d2 == stop_loss_pct: ret_d3 = stop_loss_pct
-                            elif future_df.iloc[2]['low'] <= stop_price: ret_d3 = stop_loss_pct
-                            else: ret_d3 = (future_df.iloc[2]['close'] / buy_price - 1) * 100
-                        elif not pd.isna(ret_d2): ret_d3 = ret_d2
+                            status = "💰 持有"
+                            if len(future_df) >= 3:
+                                ret_d3 = (future_df.iloc[2]['close'] / buy_price - 1) * 100
+                            else:
+                                ret_d3 = (future_df.iloc[-1]['close'] / buy_price - 1) * 100
+                                
+                            if len(future_df) >= 5:
+                                ret_d5 = (future_df.iloc[4]['close'] / buy_price - 1) * 100
+                            else:
+                                ret_d5 = (future_df.iloc[-1]['close'] / buy_price - 1) * 100
 
-            except:
-                signal = "❌ 无数据"
+            except Exception:
+                signal = "❌ 数据Err"
         
         final_results.append({
             'Select_Date': select_date,
@@ -277,10 +333,10 @@ def apply_strategy_and_backtest(df_scores, top_n, min_mv_yi, min_pct, min_turnov
             'Name': row['Name'],
             'Signal': signal,
             'Open_Pct': open_pct,
-            'Turnover': row['Turnover'],
-            'Ret_D1': ret_d1,
-            'Ret_D2': ret_d2,
-            'Ret_D3': ret_d3
+            'Score': row['Score'],
+            'Ret_D3': ret_d3,
+            'Ret_D5': ret_d5,
+            'Status': status
         })
         
     return final_results
@@ -289,36 +345,39 @@ def apply_strategy_and_backtest(df_scores, top_n, min_mv_yi, min_pct, min_turnov
 # 侧边栏
 # ----------------------------------------------------
 with st.sidebar:
-    st.header("1. 回测控制")
+    st.header("1. 回测设置")
     default_date = datetime.now().date()
     end_date = st.date_input("选股截止日期", value=default_date)
     days_back = int(st.number_input("回测天数", value=5))
     
     st.markdown("---")
-    st.header("2. 选股参数 (昨日表现)")
-    TOP_N = st.slider("Top N", 1, 5, 1)
+    st.header("2. 选股 (起爆点特征)")
+    st.info("🎯 核心排序: **MACD增量** (加速度)")
+    TOP_N = 3
+    
     MIN_MV_YI = st.number_input("最低市值 (亿)", 10, 500, 30, 10)
-    MIN_PCT = st.number_input("最低涨幅 (%)", -5, 5, 0, 1, help="设为负数可纳入昨日下跌的股票")
-    MIN_TURNOVER = st.slider("最低换手 (%)", 0.0, 20.0, 3.0)
     
-    st.markdown("---")
-    st.header("3. 买入与风控 (今日操作)")
-    
-    col_open1, col_open2 = st.columns(2)
-    with col_open1:
-        BUY_OPEN_MIN = st.number_input("开盘区间下限(%)", -10.0, 10.0, 2.0, 0.5)
-    with col_open2:
-        BUY_OPEN_MAX = st.number_input("开盘区间上限(%)", -10.0, 10.0, 7.5, 0.5)
+    col_pct1, col_pct2 = st.columns(2)
+    with col_pct1:
+        MIN_PCT = st.number_input("涨幅下限%", 0, 20, 5, 1, help="脱离盘整")
+    with col_pct2:
+        MAX_PCT = st.number_input("涨幅上限%", 0, 20, 19, 1, help="剔除20cm涨停")
         
-    st.caption(f"当前策略：开盘涨幅在 [{BUY_OPEN_MIN}%, {BUY_OPEN_MAX}%] 时买入")
+    st.markdown("---")
+    st.header("3. 交易 (顺势上车)")
     
-    STOP_LOSS = st.slider("止损线 (%)", -20, 0, -8)
+    st.caption("🟢 **买入区间 (确认强势)**")
+    col1, col2 = st.columns(2)
+    with col1: BUY_MIN = st.number_input("开盘Min%", -10.0, 10.0, 0.0, 0.5)
+    with col2: BUY_MAX = st.number_input("开盘Max%", -10.0, 10.0, 4.0, 0.5)
+    
+    st.caption("🛡️ **风控 (T+1/T+2)**")
+    STOP_LOSS = st.number_input("累计跌幅止损%", 1, 20, 5, 1)
 
     st.markdown("---")
     if st.button("🚨 删库重跑"):
-        if os.path.exists(SCORE_DB_FILE):
-            os.remove(SCORE_DB_FILE)
-            st.toast("数据库已清除。", icon="🗑️")
+        if os.path.exists(SCORE_DB_FILE): os.remove(SCORE_DB_FILE)
+        st.toast("缓存已清空", icon="🗑️")
 
 # ---------------------------
 # 主程序
@@ -327,7 +386,7 @@ col_token, col_btn = st.columns([3, 1])
 with col_token:
     TS_TOKEN = st.text_input("🔑 Token", type="password")
 with col_btn:
-    start_btn = st.button("🚀 启动", type="primary", use_container_width=True)
+    start_btn = st.button("🚀 启动V40 (增量版)", type="primary", use_container_width=True)
 
 if start_btn:
     if not TS_TOKEN: st.stop()
@@ -349,7 +408,7 @@ if start_btn:
     dates_to_compute = [d for d in select_dates if str(d) not in existing_dates]
     
     if dates_to_compute:
-        st.write(f"🔄 补全 {len(dates_to_compute)} 天分数...")
+        st.write(f"🔄 计算MACD增量数据...")
         bar = st.progress(0)
         for i, date in enumerate(dates_to_compute):
             scores = batch_compute_scores(date)
@@ -361,7 +420,6 @@ if start_btn:
             bar.progress((i+1)/len(dates_to_compute))
         bar.empty()
     
-    st.write("⚡ 分析中...")
     if os.path.exists(SCORE_DB_FILE):
         df_all = pd.read_csv(SCORE_DB_FILE)
         df_all['Select_Date'] = df_all['Select_Date'].astype(str)
@@ -372,8 +430,7 @@ if start_btn:
             if df_daily.empty: continue
             
             res = apply_strategy_and_backtest(
-                df_daily, TOP_N, MIN_MV_YI, MIN_PCT, MIN_TURNOVER, 
-                STOP_LOSS, BUY_OPEN_MIN, BUY_OPEN_MAX # 传入动态买入区间
+                df_daily, TOP_N, MIN_MV_YI, MIN_PCT, MAX_PCT, BUY_MIN, BUY_MAX, STOP_LOSS
             )
             if res: final_report.extend(res)
         
@@ -381,22 +438,34 @@ if start_btn:
             df_res = pd.DataFrame(final_report)
             trades = df_res[df_res['Signal'].str.contains('BUY', na=False)]
             
-            st.markdown(f"### 📊 策略表现 (开盘[{BUY_OPEN_MIN}%, {BUY_OPEN_MAX}%])")
-            c1, c2, c3, c4 = st.columns(4)
-            avg_d1 = trades['Ret_D1'].mean()
-            avg_d3 = trades['Ret_D3'].mean()
-            win_d3 = (trades['Ret_D3'] > 0).mean() * 100
+            st.markdown(f"### 📊 策略表现 (增量排序 | 买入[{BUY_MIN}%, {BUY_MAX}%])")
             
-            c1.metric("交易次数", f"{len(trades)}")
-            c2.metric("D1 均收", f"{avg_d1:.2f}%")
-            c3.metric("D3 均收", f"{avg_d3:.2f}%")
-            c4.metric("D3 胜率", f"{win_d3:.1f}%")
-            
+            cols = st.columns(3)
+            for i, r in enumerate([1, 2, 3]):
+                rank_trades = trades[trades['Rank'] == r]
+                count = len(rank_trades)
+                if count > 0:
+                    ret_d3 = rank_trades['Ret_D3'].mean()
+                    ret_d5 = rank_trades['Ret_D5'].mean()
+                    win_d5 = (rank_trades['Ret_D5'] > 0).mean() * 100
+                    
+                    color = "red" if ret_d5 > 0 else "green"
+                    cols[i].markdown(f"""
+                    #### 🥇 Rank {r}
+                    - 交易数: **{count}**
+                    - D3均收: {ret_d3:.2f}%
+                    - **D5均收: :{color}[{ret_d5:.2f}%]**
+                    - D5胜率: {win_d5:.1f}%
+                    """)
+                else:
+                    cols[i].markdown(f"#### 🥇 Rank {r}\n- 无交易")
+
+            st.markdown("### 📋 交易明细")
             st.dataframe(
-                df_res[['Trade_Date', 'Code', 'Name', 'Signal', 'Open_Pct', 'Turnover', 'Ret_D1', 'Ret_D2', 'Ret_D3']]
+                df_res[['Trade_Date', 'Rank', 'Code', 'Name', 'Signal', 'Open_Pct', 'Score', 'Status', 'Ret_D3', 'Ret_D5']]
                 .style.applymap(lambda x: 'background-color: #ff4b4b; color: white' if 'BUY' in str(x) else '', subset=['Signal'])
-                .format({'Ret_D1': '{:.2f}%', 'Ret_D2': '{:.2f}%', 'Ret_D3': '{:.2f}%', 'Open_Pct': '{:.2f}%', 'Turnover': '{:.2f}%'}),
+                .format({'Ret_D3': '{:.2f}%', 'Ret_D5': '{:.2f}%', 'Open_Pct': '{:.2f}%', 'Score': '{:.2f}'}),
                 use_container_width=True
             )
         else:
-            st.warning("结果为空。")
+            st.warning("无符合条件的交易")
