@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V31.0 真实波段版 (无未来函数)
+选股王 · V31.1 真实波段版 (修复版)
 策略：双创组合 (688 + 300)
 逻辑修正：
 1. 选股时间：T日收盘后 (使用T日及过去数据选出 Rank 1)。
 2. 买入时间：T+1日开盘 (使用T+1日开盘数据决策)。
 3. 选股池：全市场扫描，不再局限于涨幅前150名。
+4. 修复：修复了日期格式导致的 AttributeError 报错。
 """
 
 import streamlit as st
@@ -18,8 +19,8 @@ import time
 # ---------------------------
 # 页面配置
 # ---------------------------
-st.set_page_config(page_title="V31.0 真实选股台", layout="wide")
-st.title("🛡️ V31.0 真实选股监控台 (去伪存真版)")
+st.set_page_config(page_title="V31.1 真实选股台", layout="wide")
+st.title("🛡️ V31.1 真实选股监控台 (去伪存真版)")
 st.markdown("""
 **策略逻辑 (Swing Trading):**
 * **选股 (T日):** 盘后计算全市场 MACD Score，选出 **Rank 1**。
@@ -64,7 +65,6 @@ def get_trade_days(end_date_str, num_days):
     GLOBAL_CALENDAR = open_cal['cal_date'].tolist()
     
     # 返回用于"选股"的日子 (截止到 end_date 之前的 num_days 个)
-    # 过滤掉 end_date 之后的日子用于回测选股
     past_days = open_cal[open_cal['cal_date'] <= end_date_str]['cal_date'].tolist()
     return past_days[-num_days:]
 
@@ -87,14 +87,10 @@ def get_all_historical_data(select_days_list):
     global GLOBAL_ADJ_FACTOR, GLOBAL_DAILY_RAW, GLOBAL_QFQ_BASE_FACTORS, GLOBAL_CALENDAR
     if not select_days_list: return False
     
-    # 确定数据拉取范围：
-    # 开始：最早选股日往前推 150 天 (计算指标用)
-    # 结束：最晚选股日往后推 20 天 (计算 T+1 买入和 T+N 卖出用)
-    
     first_select_date = min(select_days_list)
     last_select_date = max(select_days_list)
     
-    # 在全局日历中找到 last_select_date 的索引，往后多取 15 个交易日
+    # 在全局日历中找到 last_select_date 的索引，往后多取 15 个交易日用于计算收益
     try:
         last_idx = GLOBAL_CALENDAR.index(last_select_date)
         end_fetch_idx = min(last_idx + 15, len(GLOBAL_CALENDAR) - 1)
@@ -167,17 +163,26 @@ def get_qfq_data(ts_code, start_date, end_date):
     return df.sort_values('trade_date')
 
 # ----------------------------------------------------------------------
-# 评分逻辑 (不变，确保用的是 end_date 之前的数据)
+# 评分逻辑 (已修复日期格式报错)
 # ----------------------------------------------------------------------
 def compute_score(ts_code, current_date):
-    # 取当前日期前120天的数据计算指标
+    # 取当前日期前150天的数据计算指标
     start_date = (datetime.strptime(current_date, "%Y%m%d") - timedelta(days=150)).strftime("%Y%m%d")
     df = get_qfq_data(ts_code, start_date, current_date)
     
     if df.empty or len(df) < 30: return -1
     
-    # 确保最后一行数据的日期就是 current_date (防止停牌股混入)
-    if df.iloc[-1]['trade_date'].strftime('%Y%m%d') != current_date:
+    # 兼容处理：检查最后一行数据的日期
+    last_date = df.iloc[-1]['trade_date']
+    
+    # 统一转换为字符串进行比较
+    if hasattr(last_date, 'strftime'):
+        last_date_str = last_date.strftime('%Y%m%d')
+    else:
+        last_date_str = str(last_date)
+        
+    # 比较日期 (确保用的是当日数据，而不是停牌前的旧数据)
+    if last_date_str != current_date:
         return -1
 
     close = df['close']
@@ -204,18 +209,14 @@ def run_strategy_step(select_date, min_price):
     pool = daily_t[(daily_t['close'] >= min_price) & (daily_t['vol'] > 0)]
     if pool.empty: return None
 
-    # 2. 全市场扫描 Score (不再局限于前150名)
-    # 为了速度，我们使用简单的进度显示
+    # 2. 全市场扫描 Score
     best_score = -9999
     rank1_code = None
     rank1_close_t = 0
     
-    # 候选列表：只计算涨幅非负的？用户要求扩大池子，我们计算全部
-    # 但为了性能，可以剔除跌停板的，保留一点理性
-    # 这里严格按照用户要求：全市场扫描修正
     candidates = pool.index.tolist()
     
-    # 简单的批处理循环
+    # 遍历计算分数
     for code in candidates:
         s = compute_score(code, select_date)
         if s > best_score:
@@ -226,13 +227,12 @@ def run_strategy_step(select_date, min_price):
     if not rank1_code: return None
     
     # 3. 进入 T+1 日买入决策
-    # 找到 select_date 的下一个交易日
     try:
         t_idx = GLOBAL_CALENDAR.index(select_date)
         if t_idx < len(GLOBAL_CALENDAR) - 1:
             buy_date = GLOBAL_CALENDAR[t_idx + 1]
         else:
-            buy_date = None # 已经是最新数据，无法回测明天
+            buy_date = None 
     except ValueError:
         buy_date = None
 
@@ -246,11 +246,13 @@ def run_strategy_step(select_date, min_price):
         try:
             # 获取 T+1 日数据
             d1_raw = GLOBAL_DAILY_RAW.loc[(rank1_code, buy_date)]
-            # 计算开盘涨幅 (相对于 T 日收盘价，或 T+1 的 PreClose)
-            # T+1 的 pre_close 理论上等于 T 的 close
-            # 使用真实数据计算：
-            daily_buy_open = d1_raw['open']
-            daily_buy_pre = d1_raw['pre_close']
+            
+            # 兼容 Series 和 DataFrame (防止重复索引)
+            if isinstance(d1_raw, pd.DataFrame):
+                d1_raw = d1_raw.iloc[0]
+
+            daily_buy_open = float(d1_raw['open'])
+            daily_buy_pre = float(d1_raw['pre_close'])
             
             open_pct = (daily_buy_open / daily_buy_pre - 1) * 100
             
@@ -263,15 +265,11 @@ def run_strategy_step(select_date, min_price):
             else:
                 signal_type = "⚠️ 观望 (T+1开盘太强)"
                 
-        except KeyError:
+        except (KeyError, TypeError):
             signal_type = "❌ 数据缺失 (T+1停牌?)"
 
     # 4. 如果买入，计算收益 (Swing 模式)
     if is_buy and buy_date:
-        # 获取买入后的数据用于卖出
-        # 30系：T+2 开盘卖
-        # 688系：T+6 收盘卖 (策略原意是持仓5天，这里简化逻辑：30系隔日，688持多日)
-        
         # 获取未来数据流
         future_df = get_qfq_data(rank1_code, buy_date, "20991231")
         
@@ -285,7 +283,6 @@ def run_strategy_step(select_date, min_price):
                 if len(future_df) >= 2:
                     sell_price = future_df.iloc[1]['open']
                 elif len(future_df) == 1:
-                    # 还没到 T+2，用当前收盘估算
                     sell_price = future_df.iloc[0]['close'] 
             
             elif rank1_code.startswith('688'):
@@ -294,7 +291,7 @@ def run_strategy_step(select_date, min_price):
                 if len(future_df) >= (hold_days + 1):
                     sell_price = future_df.iloc[hold_days]['close']
                 else:
-                    sell_price = future_df.iloc[-1]['close'] # 拿最新的算
+                    sell_price = future_df.iloc[-1]['close'] 
             
             if sell_price:
                 ret_strategy = (sell_price / buy_price_real - 1) * 100
@@ -338,7 +335,7 @@ if st.button("🚀 开始真实扫描"):
     select_dates = get_trade_days(end_date.strftime("%Y%m%d"), days_back)
     
     if not select_dates: 
-        st.error(f"❌ 无法获取交易日历。")
+        st.error(f"❌ 无法获取交易日历，请检查 Token 或网络。")
         st.stop()
         
     st.info(f"📅 选股日期范围: {select_dates[0]} ~ {select_dates[-1]}")
@@ -409,4 +406,4 @@ if st.button("🚀 开始真实扫描"):
     )
     
     csv = df_res.to_csv().encode('utf-8')
-    st.download_button("📥 下载回测结果 CSV", csv, "v31_real_backtest.csv", "text/csv")
+    st.download_button("📥 下载回测结果 CSV", csv, "v31.1_real_backtest.csv", "text/csv")
