@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V40.1 紧急修复版 (修复日期格式报错)
-修复内容：
-1. 修复 analyze_stock_trend 中日期比对的 AttributeError Bug。
-2. 增强程序的鲁棒性，单只股票数据异常不影响整体运行。
-3. 保持 V40.0 的[MACD增量]起爆点选股逻辑不变。
+选股王 · V41.0 资金接力版 (换手率排序)
+战略转型：
+1. 核心排序：使用 [换手率] (人气/资金) 替代 技术指标。
+   - 逻辑：只做市场资金关注度最高的“换手龙”。
+2. 硬性门槛：量比 > 1.5 (拒绝缩量假涨)。
+3. 基础风控：涨幅 6-16% + 站上20日线。
+4. 买入：[-1%, +3%] 顺势接力。
 """
 
 import streamlit as st
@@ -18,13 +20,13 @@ import gc
 # ---------------------------
 # 页面配置
 # ---------------------------
-st.set_page_config(page_title="V40.1 起爆点战法", layout="wide")
-st.title("🚀 V40.1 起爆点监控台 (修复版)")
+st.set_page_config(page_title="V41.0 资金接力战法", layout="wide")
+st.title("🚀 V41.0 资金接力监控台 (换手率排序)")
 
 # ---------------------------
 # 全局设置
 # ---------------------------
-SCORE_DB_FILE = "v40_macd_delta_db.csv"
+SCORE_DB_FILE = "v41_turnover_db.csv" # 新数据库
 pro = None 
 GLOBAL_ADJ_FACTOR = pd.DataFrame() 
 GLOBAL_DAILY_RAW = pd.DataFrame() 
@@ -64,6 +66,7 @@ def get_trade_days(end_date_str, num_days):
 def fetch_and_cache_daily_data(date):
     daily_df = safe_get('daily', trade_date=date)
     adj_df = safe_get('adj_factor', trade_date=date)
+    # 必须获取量比和换手率
     basic_df = safe_get('daily_basic', trade_date=date, fields='ts_code,circ_mv,turnover_rate,volume_ratio')
     name_df = safe_get('stock_basic', fields='ts_code,name')
     
@@ -144,9 +147,14 @@ def get_qfq_data(ts_code, start_date, end_date):
     return df.reset_index().sort_values('trade_date')
 
 # ----------------------------------------------------------------------
-# 核心算法：MACD 增量计算 (修复版)
+# 核心算法：趋势检查 + 换手率排序
 # ----------------------------------------------------------------------
-def analyze_stock_trend(ts_code, current_date):
+def check_trend_and_get_score(ts_code, current_date):
+    """
+    1. 检查是否站上20日线 (趋势护城河)。
+    2. 检查 MACD 是否大于0 (基本多头)。
+    3. 返回 Score = 换手率 (Turnover)。
+    """
     try:
         start_date = (datetime.strptime(current_date, "%Y%m%d") - timedelta(days=150)).strftime("%Y%m%d")
         df = get_qfq_data(ts_code, start_date, current_date)
@@ -154,47 +162,35 @@ def analyze_stock_trend(ts_code, current_date):
         if df.empty or len(df) < 30: return None
         
         last_row = df.iloc[-1]
-        
-        # --- 修复点：鲁棒的日期比对 ---
         last_date_val = last_row['trade_date']
-        # Tushare通常返回string, 但为了保险起见兼容处理
         last_date_str = last_date_val.strftime('%Y%m%d') if hasattr(last_date_val, 'strftime') else str(last_date_val)
         
         if last_date_str != current_date: return None
 
         close = df['close']
         
-        # 1. 计算 MACD
+        # 计算 20日均线
+        ma20 = close.rolling(window=20).mean()
+        
+        # 计算 MACD (辅助检查)
         ema_fast = close.ewm(span=8, adjust=False).mean()
         ema_slow = close.ewm(span=17, adjust=False).mean()
         diff = ema_fast - ema_slow
         dea = diff.ewm(span=5, adjust=False).mean()
         macd = (diff - dea) * 2
         
-        # 2. 计算 20日均线 (MA20)
-        ma20 = close.rolling(window=20).mean()
-        
-        # 3. 计算 MACD 增量
-        if len(macd) < 2: return None
-        macd_today = macd.iloc[-1]
-        macd_yesterday = macd.iloc[-2]
-        macd_delta = macd_today - macd_yesterday
-        
-        # 条件A: 站上20日线
+        # 条件A: 趋势向上 (收盘价 > 20日线)
         trend_ok = close.iloc[-1] > ma20.iloc[-1]
         
-        # 条件B: MACD 处于金叉发散状态
-        macd_ok = (diff.iloc[-1] > dea.iloc[-1]) and (macd.iloc[-1] > 0)
+        # 条件B: 多头区域 (MACD > 0)
+        macd_ok = macd.iloc[-1] > 0
         
-        # 条件C: 加速 (增量 > 0)
-        accel_ok = macd_delta > 0
-        
-        if trend_ok and macd_ok and accel_ok:
-            return macd_delta * 100
+        if trend_ok and macd_ok:
+            # 如果满足趋势要求，返回 None，分数由外层 Turnover 决定
+            return True
             
         return None
     except Exception:
-        # 单只股票报错不影响整体
         return None
 
 def batch_compute_scores(date):
@@ -210,36 +206,45 @@ def batch_compute_scores(date):
     candidates = pool.index.tolist()
     
     for code in candidates:
-        score = analyze_stock_trend(code, date)
-        if score is not None:
+        # 先做趋势检查
+        if check_trend_and_get_score(code, date):
             row = pool.loc[code]
+            
+            turnover = float(row['turnover_rate']) if 'turnover_rate' in row else 0.0
+            vol_ratio = float(row['volume_ratio']) if 'volume_ratio' in row else 0.0
+            
+            # 核心：Score 直接等于 换手率
+            score = turnover 
+            
             results.append({
                 'Select_Date': date,
                 'Code': code,
-                'Score': score, # MACD增量
+                'Score': score, # 换手率
                 'Name': row['name'] if 'name' in row else code,
                 'Close': float(row['close']),
                 'Pct_Chg': float(row['pct_chg']) if 'pct_chg' in row else 0.0,
                 'Circ_Mv': float(row['circ_mv']) if 'circ_mv' in row else 0.0,
-                'Turnover': float(row['turnover_rate']) if 'turnover_rate' in row else 0.0,
-                'Vol_Ratio': float(row['volume_ratio']) if 'volume_ratio' in row else 0.0
+                'Turnover': turnover,
+                'Vol_Ratio': vol_ratio
             })
     return results
 
 # ----------------------------------------------------------------------
 # 动态筛选与回测
 # ----------------------------------------------------------------------
-def apply_strategy_and_backtest(df_scores, top_n, min_mv_yi, min_pct, max_pct, buy_open_min, buy_open_max, stop_loss_pct):
+def apply_strategy_and_backtest(df_scores, top_n, min_mv_yi, min_pct, max_pct, min_vol_ratio, buy_open_min, buy_open_max, stop_loss_pct):
     min_mv_val = min_mv_yi * 10000
     
+    # 筛选：市值、涨幅、量比
     mask = (df_scores['Circ_Mv'] >= min_mv_val) & \
            (df_scores['Pct_Chg'] >= min_pct) & \
-           (df_scores['Pct_Chg'] <= max_pct)
+           (df_scores['Pct_Chg'] <= max_pct) & \
+           (df_scores['Vol_Ratio'] >= min_vol_ratio) # 新增量比过滤
 
     filtered_df = df_scores[mask].copy()
     if filtered_df.empty: return []
     
-    # 排序：按 MACD增量 (Score)
+    # 排序：按换手率 (Score) 从高到低
     filtered_df = filtered_df.sort_values('Score', ascending=False).head(top_n)
     
     select_date = str(filtered_df.iloc[0]['Select_Date'])
@@ -289,7 +294,6 @@ def apply_strategy_and_backtest(df_scores, top_n, min_mv_yi, min_pct, max_pct, b
                         if not is_stopped and len(future_df) >= 2:
                             if future_df.iloc[1]['open'] <= stop_price: is_stopped = True
                         
-                        # 结算
                         if is_stopped:
                             if len(future_df) >= 2:
                                 sell_price = future_df.iloc[1]['open']
@@ -323,6 +327,7 @@ def apply_strategy_and_backtest(df_scores, top_n, min_mv_yi, min_pct, max_pct, b
             'Name': row['Name'],
             'Signal': signal,
             'Open_Pct': open_pct,
+            'Vol_Ratio': row['Vol_Ratio'],
             'Score': row['Score'],
             'Ret_D3': ret_d3,
             'Ret_D5': ret_d5,
@@ -341,23 +346,25 @@ with st.sidebar:
     days_back = int(st.number_input("回测天数", value=5))
     
     st.markdown("---")
-    st.header("2. 选股 (起爆点特征)")
-    st.info("🎯 核心排序: **MACD增量** (加速度)")
+    st.header("2. 选股 (资金接力)")
+    st.info("🎯 核心排序: **换手率** (人气/资金)")
     TOP_N = 3
     
     MIN_MV_YI = st.number_input("最低市值 (亿)", 10, 500, 30, 10)
     
     col_pct1, col_pct2 = st.columns(2)
-    with col_pct1: MIN_PCT = st.number_input("涨幅下限%", 0, 20, 5, 1)
-    with col_pct2: MAX_PCT = st.number_input("涨幅上限%", 0, 20, 19, 1)
+    with col_pct1: MIN_PCT = st.number_input("涨幅下限%", 0, 20, 6, 1)
+    with col_pct2: MAX_PCT = st.number_input("涨幅上限%", 0, 20, 16, 1)
         
+    MIN_VOL_RATIO = st.number_input("最低量比", 0.0, 10.0, 1.5, 0.1, help="必须放量")
+    
     st.markdown("---")
-    st.header("3. 交易 (顺势上车)")
+    st.header("3. 交易 (接力)")
     
     st.caption("🟢 **买入区间**")
     col1, col2 = st.columns(2)
-    with col1: BUY_MIN = st.number_input("开盘Min%", -10.0, 10.0, 0.0, 0.5)
-    with col2: BUY_MAX = st.number_input("开盘Max%", -10.0, 10.0, 4.0, 0.5)
+    with col1: BUY_MIN = st.number_input("开盘Min%", -10.0, 10.0, -1.0, 0.5)
+    with col2: BUY_MAX = st.number_input("开盘Max%", -10.0, 10.0, 3.0, 0.5)
     
     st.caption("🛡️ **风控**")
     STOP_LOSS = st.number_input("累计跌幅止损%", 1, 20, 5, 1)
@@ -374,7 +381,7 @@ col_token, col_btn = st.columns([3, 1])
 with col_token:
     TS_TOKEN = st.text_input("🔑 Token", type="password")
 with col_btn:
-    start_btn = st.button("🚀 启动V40.1 (修复版)", type="primary", use_container_width=True)
+    start_btn = st.button("🚀 启动V41.0 (资金版)", type="primary", use_container_width=True)
 
 if start_btn:
     if not TS_TOKEN: st.stop()
@@ -396,7 +403,7 @@ if start_btn:
     dates_to_compute = [d for d in select_dates if str(d) not in existing_dates]
     
     if dates_to_compute:
-        st.write(f"🔄 计算MACD增量...")
+        st.write(f"🔄 计算换手率/量比...")
         bar = st.progress(0)
         for i, date in enumerate(dates_to_compute):
             scores = batch_compute_scores(date)
@@ -418,7 +425,7 @@ if start_btn:
             if df_daily.empty: continue
             
             res = apply_strategy_and_backtest(
-                df_daily, TOP_N, MIN_MV_YI, MIN_PCT, MAX_PCT, BUY_MIN, BUY_MAX, STOP_LOSS
+                df_daily, TOP_N, MIN_MV_YI, MIN_PCT, MAX_PCT, MIN_VOL_RATIO, BUY_MIN, BUY_MAX, STOP_LOSS
             )
             if res: final_report.extend(res)
         
@@ -426,7 +433,7 @@ if start_btn:
             df_res = pd.DataFrame(final_report)
             trades = df_res[df_res['Signal'].str.contains('BUY', na=False)]
             
-            st.markdown(f"### 📊 策略表现 (增量排序 | 买入[{BUY_MIN}%, {BUY_MAX}%])")
+            st.markdown(f"### 📊 策略表现 (换手率排序 | 买入[{BUY_MIN}%, {BUY_MAX}%])")
             
             cols = st.columns(3)
             for i, r in enumerate([1, 2, 3]):
