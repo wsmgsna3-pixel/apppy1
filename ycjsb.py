@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V46.0 RSRS趋势锁定版 (吃鱼身战法)
-核心逻辑：
-1. 战略目标：右侧交易，买在趋势起步或1/3处，拒绝山顶。
-2. 核心指标：
-   - RSRS斜率 (Slope)：计算高低点的回归斜率，确认处于上升通道。
-   - 乖离率 (Bias)：股价距离20日线 < 15%，防止买在山顶。
-   - 黄金通道：换手[18,26] + 量比[1.5,3.5] (动力保障)。
-3. 买入战术：红盘确认 [0%, 4%]。
+选股王 · V46.2 RSRS趋势锁定版 (Numpy稳定内核 + 断点续传)
+逻辑架构 (已对齐):
+1. 【大势确认】RSRS斜率 > 0 (Numpy计算)。确保处于右侧上升通道。
+2. 【位置安全】乖离率 < 15%。拒绝山顶，只吃鱼身。
+3. 【动力诊断】换手[18,26] + 量比[1.5,3.5]。剔除死鱼与炸弹。
+4. 【交易确认】开盘[0, 4]。主力红盘表态。
+5. 【工程保障】本地数据仓库技术，崩溃后重启可秒续传。
 """
 
 import streamlit as st
@@ -18,21 +17,27 @@ from datetime import datetime, timedelta
 import os
 import gc
 import time
-from scipy.stats import linregress # 引入科学计算库做回归分析
+import pickle # 用于数据仓库
 
 # ---------------------------
 # 页面配置
 # ---------------------------
-st.set_page_config(page_title="V46.0 RSRS趋势战法", layout="wide")
-st.title("🚀 V46.0 RSRS趋势监控 (吃鱼身战法)")
+st.set_page_config(page_title="V46.2 吃鱼身战法", layout="wide")
+st.title("🚀 V46.2 RSRS趋势监控 (Numpy稳定版)")
 
 # ---------------------------
 # 全局设置
 # ---------------------------
-SCORE_DB_FILE = "v46_rsrs_trend_db.csv" # 新数据库
+SCORE_DB_FILE = "v46_rsrs_trend_db.csv"   # 结果数据库
+CACHE_DIR = "daily_data_cache"            # 本地行情仓库
+
+# 自动创建缓存目录
+if not os.path.exists(CACHE_DIR):
+    os.makedirs(CACHE_DIR)
+
 pro = None 
-GLOBAL_ADJ_FACTOR = pd.DataFrame() 
 GLOBAL_DAILY_RAW = pd.DataFrame() 
+GLOBAL_ADJ_FACTOR = pd.DataFrame()
 GLOBAL_QFQ_BASE_FACTORS = {} 
 GLOBAL_CALENDAR = [] 
 
@@ -52,7 +57,8 @@ def safe_get(func_name, **kwargs):
             else: return pd.DataFrame(columns=['ts_code'])
 
 def get_trade_days(end_date_str, num_days):
-    start_search = (datetime.strptime(end_date_str, "%Y%m%d") - timedelta(days=max(num_days * 5, 120))).strftime("%Y%m%d")
+    # 多取60天用于RSRS预热计算
+    start_search = (datetime.strptime(end_date_str, "%Y%m%d") - timedelta(days=max(num_days * 5, 150))).strftime("%Y%m%d")
     end_search = (datetime.strptime(end_date_str, "%Y%m%d") + timedelta(days=60)).strftime("%Y%m%d")
     
     cal = safe_get('trade_cal', start_date=start_search, end_date=end_search)
@@ -63,16 +69,17 @@ def get_trade_days(end_date_str, num_days):
     GLOBAL_CALENDAR = open_cal['cal_date'].tolist()
     
     past_days = open_cal[open_cal['cal_date'] <= end_date_str]['cal_date'].tolist()
-    return past_days[-num_days:]
+    return past_days[-(num_days + 60):] # 返回包含预热期的时间段
 
 # ----------------------------------------------------------------------
-# 数据下载
+# 数据下载引擎 (断点续传核心)
 # ----------------------------------------------------------------------
-@st.cache_data(ttl=3600*24)
-def fetch_and_cache_daily_data(date):
+def fetch_single_day_data(date):
+    """下载单日数据"""
     try:
         daily_df = safe_get('daily', trade_date=date)
         adj_df = safe_get('adj_factor', trade_date=date)
+        # 获取换手率和量比
         basic_df = safe_get('daily_basic', trade_date=date, fields='ts_code,circ_mv,turnover_rate,volume_ratio')
         name_df = safe_get('stock_basic', fields='ts_code,name')
         
@@ -80,47 +87,61 @@ def fetch_and_cache_daily_data(date):
             daily_df = daily_df[daily_df['ts_code'].str.startswith(('30', '688'))]
             if not basic_df.empty: daily_df = daily_df.merge(basic_df, on='ts_code', how='left')
             if not name_df.empty: daily_df = daily_df.merge(name_df, on='ts_code', how='left')
-
+        
         if not adj_df.empty:
             adj_df = adj_df[adj_df['ts_code'].str.startswith(('30', '688'))]
-            
+
         return {'adj': adj_df, 'daily': daily_df}
-    except: return {'adj': pd.DataFrame(), 'daily': pd.DataFrame()}
-
-def get_all_historical_data(select_days_list):
-    global GLOBAL_ADJ_FACTOR, GLOBAL_DAILY_RAW, GLOBAL_QFQ_BASE_FACTORS, GLOBAL_CALENDAR
-    if not select_days_list: return False
-    
-    first_select_date = min(select_days_list)
-    last_select_date = max(select_days_list)
-    
-    try:
-        last_idx = GLOBAL_CALENDAR.index(last_select_date)
-        end_fetch_idx = min(last_idx + 20, len(GLOBAL_CALENDAR) - 1)
-        end_fetch_date = GLOBAL_CALENDAR[end_fetch_idx]
     except:
-        end_fetch_date = (datetime.now() + timedelta(days=20)).strftime("%Y%m%d")
+        return None
 
-    start_fetch_date = (datetime.strptime(first_select_date, "%Y%m%d") - timedelta(days=150)).strftime("%Y%m%d")
-    cal_range = safe_get('trade_cal', start_date=start_fetch_date, end_date=end_fetch_date, is_open='1')
-    all_dates = cal_range['cal_date'].tolist()
+def load_or_fetch_data(date_list):
+    """
+    智能加载：优先读本地硬盘缓存，没有才下载并存盘。
+    """
+    global GLOBAL_DAILY_RAW, GLOBAL_ADJ_FACTOR, GLOBAL_QFQ_BASE_FACTORS
     
-    st.info(f"⏳ 正在拉取数据 ({start_fetch_date} ~ {end_fetch_date})...")
-
-    adj_list, daily_list = [], []
-    bar = st.progress(0)
+    adj_list = []
+    daily_list = []
     
-    total_steps = len(all_dates)
-    for i, date in enumerate(all_dates):
-        try:
-            cached = fetch_and_cache_daily_data(date)
-            if not cached['adj'].empty: adj_list.append(cached['adj'])
-            if not cached['daily'].empty: daily_list.append(cached['daily'])
-            if i % 20 == 0: bar.progress((i+1)/total_steps)
-        except: continue 
-    bar.empty()
-
+    st.info(f"📂 正在准备数据 ({len(date_list)} 天) - 支持断点续传...")
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for i, date in enumerate(date_list):
+        cache_path = os.path.join(CACHE_DIR, f"{date}.pkl")
+        data_packet = None
+        
+        # 1. 读本地
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, 'rb') as f:
+                    data_packet = pickle.load(f)
+            except: pass
+        
+        # 2. 下云端 (并存本地)
+        if data_packet is None:
+            status_text.text(f"📥 下载并缓存: {date}")
+            data_packet = fetch_single_day_data(date)
+            if data_packet:
+                with open(cache_path, 'wb') as f:
+                    pickle.dump(data_packet, f)
+            else:
+                continue # 下载失败跳过
+        
+        # 3. 汇总
+        if not data_packet['adj'].empty: adj_list.append(data_packet['adj'])
+        if not data_packet['daily'].empty: daily_list.append(data_packet['daily'])
+        
+        if i % 10 == 0: progress_bar.progress((i + 1) / len(date_list))
+    
+    progress_bar.empty()
+    status_text.text("✅ 数据准备完毕，正在构建复权因子...")
+    
     if not adj_list or not daily_list: return False
+    
+    # 合并
     adj_data = pd.concat(adj_list)
     adj_data['adj_factor'] = pd.to_numeric(adj_data['adj_factor'], errors='coerce').fillna(0)
     GLOBAL_ADJ_FACTOR = adj_data.set_index(['ts_code', 'trade_date']).sort_index(level=[0, 1]) 
@@ -132,10 +153,13 @@ def get_all_historical_data(select_days_list):
             daily_raw[col] = pd.to_numeric(daily_raw[col], errors='coerce').astype('float32')
 
     GLOBAL_DAILY_RAW = daily_raw.set_index(['ts_code', 'trade_date']).sort_index(level=[0, 1])
+    
+    # 基准因子
     latest_date_in_data = GLOBAL_ADJ_FACTOR.index.get_level_values('trade_date').max()
     if latest_date_in_data:
         GLOBAL_QFQ_BASE_FACTORS = GLOBAL_ADJ_FACTOR.loc[(slice(None), latest_date_in_data), 'adj_factor'].droplevel(1).to_dict()
-    
+        
+    status_text.empty()
     return True
 
 def get_qfq_data(ts_code, start_date, end_date):
@@ -154,15 +178,11 @@ def get_qfq_data(ts_code, start_date, end_date):
     return df.reset_index().sort_values('trade_date')
 
 # ----------------------------------------------------------------------
-# 核心算法：RSRS 趋势 + 乖离率检查
+# 核心算法：RSRS + 乖离率 (Numpy原生版)
 # ----------------------------------------------------------------------
-def analyze_rsrs_trend(ts_code, current_date, max_bias_pct):
-    """
-    1. 计算 RSRS 斜率：确认处于上升通道 (右侧)。
-    2. 计算 乖离率 (Bias)：股价距离20日线不能太远 (拒绝山顶)。
-    """
+def analyze_rsrs_trend_numpy(ts_code, current_date, max_bias_pct):
     try:
-        # 取18天数据做回归 (经典参数)
+        # 取60天数据
         start_date = (datetime.strptime(current_date, "%Y%m%d") - timedelta(days=60)).strftime("%Y%m%d")
         df = get_qfq_data(ts_code, start_date, current_date)
         if df.empty or len(df) < 20: return None
@@ -171,38 +191,37 @@ def analyze_rsrs_trend(ts_code, current_date, max_bias_pct):
         if last_row['trade_date'].strftime('%Y%m%d') != current_date: return None
 
         close = df['close']
-        high = df['high']
-        low = df['low']
         
-        # 1. 计算 20日均线 & 乖离率 (Bias)
+        # 1. 位置安全检查 (乖离率)
         ma20 = close.rolling(window=20).mean()
         current_ma20 = ma20.iloc[-1]
         current_close = close.iloc[-1]
         
-        # Bias = (收盘 - 均线) / 均线
+        if pd.isna(current_ma20) or current_ma20 == 0: return None
+        
+        # Bias = (收盘 - 20日线) / 20日线
         bias_pct = ((current_close - current_ma20) / current_ma20) * 100
         
-        # 核心过滤：如果乖离率太大(>15%)，说明在山顶，不要买
-        if bias_pct > max_bias_pct: 
-            return None
-        
-        # 核心过滤：必须站上20日线 (右侧基础)
-        if current_close < current_ma20:
-            return None
+        # 逻辑：拒绝山顶
+        if bias_pct > max_bias_pct: return None
+        # 逻辑：必须在生命线上方 (右侧基础)
+        if current_close < current_ma20: return None
 
-        # 2. 计算 RSRS 斜率 (简化版：只看 High 的斜率，代表阻力位的变化)
-        # 取最近 18 天
+        # 2. RSRS 趋势确认 (Numpy Polyfit)
+        # 用最近18天的 High 数据拟合斜率
         recent_df = df.iloc[-18:]
-        x = np.arange(len(recent_df))
+        if len(recent_df) < 18: return None
+        
         y_high = recent_df['high'].values
+        x = np.arange(len(y_high))
         
-        # 线性回归
-        slope, intercept, r_value, p_value, std_err = linregress(x, y_high)
+        # 核心数学：一元线性回归 (deg=1)
+        # 效果等同于 scipy.stats.linregress
+        slope, intercept = np.polyfit(x, y_high, 1)
         
-        # 条件：斜率必须 > 0 (上升通道) 且 R方 > 0.3 (趋势比较明显)
-        # R方在这里不是必须的，只要斜率正即可，放宽一点
+        # 逻辑：斜率必须向上 (趋势起步)
         if slope > 0:
-            return slope # 返回斜率作为强度分数
+            return slope * 10 # 放大系数，方便显示
             
         return None
     except Exception: return None
@@ -221,16 +240,15 @@ def batch_compute_scores(date, max_bias):
         candidates = pool.index.tolist()
         
         for code in candidates:
-            # 传入 max_bias 参数
-            rsrs_slope = analyze_rsrs_trend(code, date, max_bias)
+            # 这里的 RSRS_Slope 是通过 Numpy 算出来的
+            rsrs_slope = analyze_rsrs_trend_numpy(code, date, max_bias)
             
             if rsrs_slope is not None:
                 row = pool.loc[code]
                 turnover = float(row['turnover_rate']) if 'turnover_rate' in row else 0.0
                 vol_ratio = float(row['volume_ratio']) if 'volume_ratio' in row else 0.0
                 
-                # 依然按换手率排序，因为这是短线活力的根本
-                # RSRS 只是门槛 (Pass/Fail)
+                # 双黄金通道核心：RSRS确认趋势后，依然按[换手率]排序，寻找活跃资金
                 score = turnover 
                 
                 results.append({
@@ -249,7 +267,7 @@ def batch_compute_scores(date, max_bias):
     except Exception: return []
 
 # ----------------------------------------------------------------------
-# 动态筛选与回测
+# 回测执行
 # ----------------------------------------------------------------------
 def apply_strategy_and_backtest(df_scores, top_n, min_mv_yi, min_pct, max_pct, min_turnover, max_turnover, min_vol, max_vol, buy_open_min, buy_open_max, stop_loss_pct):
     min_mv_val = min_mv_yi * 10000
@@ -266,7 +284,7 @@ def apply_strategy_and_backtest(df_scores, top_n, min_mv_yi, min_pct, max_pct, m
     filtered_df = df_scores[mask].copy()
     if filtered_df.empty: return []
     
-    # 排序：在符合RSRS趋势的股票里，按换手率降序
+    # 排序：按换手率降序 (人气优先)
     filtered_df = filtered_df.sort_values('Score', ascending=False).head(top_n)
     
     select_date = str(filtered_df.iloc[0]['Select_Date'])
@@ -297,6 +315,7 @@ def apply_strategy_and_backtest(df_scores, top_n, min_mv_yi, min_pct, max_pct, m
                 daily_buy_pre = float(d1_raw['pre_close'])
                 open_pct = (daily_buy_open / daily_buy_pre - 1) * 100
                 
+                # 交易确认：红盘买入
                 if buy_open_min <= open_pct <= buy_open_max:
                     is_buy = True
                     signal = "✅ BUY"
@@ -310,6 +329,7 @@ def apply_strategy_and_backtest(df_scores, top_n, min_mv_yi, min_pct, max_pct, m
                         stop_price = buy_price * (1 - abs(stop_loss_pct)/100)
                         is_stopped = False
                         
+                        # 止损逻辑
                         if future_df.iloc[0]['low'] <= stop_price: is_stopped = True
                         if not is_stopped and len(future_df) >= 2:
                             if future_df.iloc[1]['open'] <= stop_price: is_stopped = True
@@ -367,18 +387,18 @@ with st.sidebar:
     days_back = int(st.number_input("回测天数", value=5))
     
     st.markdown("---")
-    st.header("2. 选股 (RSRS趋势 + 黄金通道)")
-    st.info("📈 **RSRS斜率: 必须向上**")
+    st.header("2. RSRS战法参数")
+    st.info("📈 **趋势核心: 斜率>0 + 拒绝山顶**")
     
     TOP_N = 3
     MIN_MV_YI = st.number_input("最低市值 (亿)", 10, 500, 30, 10)
-    MAX_BIAS = st.number_input("乖离率上限% (拒接高位)", 5, 50, 15, 1, help="价格距离20日线太远视为山顶")
+    MAX_BIAS = st.number_input("乖离率上限% (山顶线)", 5, 50, 15, 1, help="高于此值视为鱼尾，不接")
     
     col_pct1, col_pct2 = st.columns(2)
     with col_pct1: MIN_PCT = st.number_input("涨幅下限%", 0, 20, 6, 1)
     with col_pct2: MAX_PCT = st.number_input("涨幅上限%", 0, 20, 16, 1)
         
-    st.caption("🔥 **黄金通道**")
+    st.caption("🔥 **双黄金通道**")
     col_t1, col_t2 = st.columns(2)
     with col_t1: MIN_TURNOVER = st.number_input("换手Min%", 0.0, 50.0, 18.0, 1.0)
     with col_t2: MAX_TURNOVER = st.number_input("换手Max%", 0.0, 50.0, 26.0, 1.0)
@@ -388,7 +408,7 @@ with st.sidebar:
     with col_v2: MAX_VOL = st.number_input("量比Max", 0.0, 10.0, 3.5, 0.1)
 
     st.markdown("---")
-    st.header("3. 交易 (红盘确认)")
+    st.header("3. 交易执行")
     
     col1, col2 = st.columns(2)
     with col1: BUY_MIN = st.number_input("开盘Min%", -10.0, 10.0, 0.0, 0.5)
@@ -397,9 +417,16 @@ with st.sidebar:
     STOP_LOSS = st.number_input("累计跌幅止损%", 1, 20, 5, 1)
 
     st.markdown("---")
-    if st.button("🚨 删库重跑"):
-        if os.path.exists(SCORE_DB_FILE): os.remove(SCORE_DB_FILE)
-        st.toast("缓存已清空", icon="🗑️")
+    col_del1, col_del2 = st.columns(2)
+    with col_del1:
+        if st.button("🗑️ 清空结果"):
+            if os.path.exists(SCORE_DB_FILE): os.remove(SCORE_DB_FILE)
+            st.toast("已清除计算结果", icon="🧹")
+    with col_del2:
+        if st.button("💣 清空缓存"):
+            import shutil
+            if os.path.exists(CACHE_DIR): shutil.rmtree(CACHE_DIR)
+            st.toast("本地数据已删除", icon="💥")
 
 # ---------------------------
 # 主程序
@@ -408,33 +435,37 @@ col_token, col_btn = st.columns([3, 1])
 with col_token:
     TS_TOKEN = st.text_input("🔑 Token", type="password")
 with col_btn:
-    start_btn = st.button("🚀 启动V46.0 (RSRS版)", type="primary", use_container_width=True)
+    start_btn = st.button("🚀 启动V46.2", type="primary", use_container_width=True)
 
 if start_btn:
     if not TS_TOKEN: st.stop()
     ts.set_token(TS_TOKEN)
     pro = ts.pro_api()
     
-    select_dates = get_trade_days(end_date.strftime("%Y%m%d"), days_back)
-    if not select_dates: st.stop()
+    # 1. 计算日期
+    target_dates = get_trade_days(end_date.strftime("%Y%m%d"), days_back)
+    if not target_dates: st.stop()
     
-    if not get_all_historical_data(select_dates): st.stop()
-
+    # 2. 智能下载 (带断点保护)
+    if not load_or_fetch_data(target_dates): st.stop()
+    
+    # 3. 智能计算 (带结果去重)
     existing_dates = []
     if os.path.exists(SCORE_DB_FILE):
         try:
             df_dates = pd.read_csv(SCORE_DB_FILE, usecols=['Select_Date'])
             existing_dates = df_dates['Select_Date'].astype(str).unique().tolist()
-            st.success(f"📂 跳过 {len(existing_dates)} 天")
         except: pass
     
-    dates_to_compute = [d for d in select_dates if str(d) not in existing_dates]
+    # 只计算真正回测的那几天
+    backtest_dates = target_dates[-days_back:]
+    dates_to_compute = [d for d in backtest_dates if str(d) not in existing_dates]
     
     if dates_to_compute:
-        st.write(f"🔄 补全数据...")
+        st.write(f"🔄 正在计算 ({len(dates_to_compute)}天)...")
         bar = st.progress(0)
         for i, date in enumerate(dates_to_compute):
-            # 传入 MAX_BIAS 参数
+            # 核心调用
             scores = batch_compute_scores(date, MAX_BIAS)
             if scores:
                 df_chunk = pd.DataFrame(scores)
@@ -444,12 +475,13 @@ if start_btn:
             bar.progress((i+1)/len(dates_to_compute))
         bar.empty()
     
+    # 4. 生成报表
     if os.path.exists(SCORE_DB_FILE):
         df_all = pd.read_csv(SCORE_DB_FILE)
         df_all['Select_Date'] = df_all['Select_Date'].astype(str)
         
         final_report = []
-        for date in select_dates:
+        for date in backtest_dates:
             df_daily = df_all[df_all['Select_Date'] == str(date)]
             if df_daily.empty: continue
             
@@ -462,7 +494,7 @@ if start_btn:
             df_res = pd.DataFrame(final_report)
             trades = df_res[df_res['Signal'].str.contains('BUY', na=False)]
             
-            st.markdown(f"### 📊 策略表现 (RSRS趋势 | 拒接高位>{MAX_BIAS}%)")
+            st.markdown(f"### 📊 RSRS稳健表现 (Numpy内核)")
             
             cols = st.columns(3)
             for i, r in enumerate([1, 2, 3]):
