@@ -1,19 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.12.6 趋势实战终极版 (黄金区间+量能鉴别)
+选股王 · V30.12.7 龙头参数实验室版 (统一买入逻辑+RSI起步线)
 ------------------------------------------------
-版本特性 (Trend & Volume Focused):
-1. **核心参数**：
-   - MACD: (8, 17, 5) —— 趋势启动专用
-   - RSI 黄金区间: 70-85 (重仓狙击区)
-   - RSI 入围门槛: > 60
-2. **硬性过滤 (一票否决)**：
-   - **量能铁律**：当日成交量 > 1.2倍 5日均量 (拒绝缩量诱多)
-   - **趋势铁律**：股价必须站上 20日均线
-   - **价格风控**：股价 >= 20.0元, 涨幅 < 19%
-3. **买入执行 (双轨制)**：
-   - **高开**：开盘价 + 1.5%
-   - **低开**：严格限制在 -2% 以内，必须 翻红+0.5% 确认
+版本特性 (Param Lab Edition):
+1. **RSI 策略重构**：
+   - 侧边栏新增 "RSI 起步线" (默认80)：只选强势股，过滤杂毛。
+   - 移除了 "RSI 拦截线"：不再封顶，允许妖股入选。
+2. **买入逻辑统一 (Unified Entry)**：
+   - 废除高低开双轨制。
+   - 统一公式：目标价 = 开盘价 * (1 + 确认涨幅%)
+   - 前置风控：开盘幅度必须 >= 最低开盘幅度 (如 -2%)。
+3. **核心指标**：
+   - MACD (8, 17, 5)：保持敏捷趋势参数。
+   - 移除了硬性量能过滤：防止高位放量骗线。
 ------------------------------------------------
 """
 
@@ -40,13 +39,13 @@ GLOBAL_STOCK_INDUSTRY = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V30.12.6 终极版", layout="wide")
-st.title("选股王 V30.12.6：趋势实战终极版")
+st.set_page_config(page_title="选股王 V30.12.7 实验室", layout="wide")
+st.title("选股王 V30.12.7：龙头参数实验室")
 st.markdown("""
-**🎯 核心战法 (百米赛跑理论)：**
-1. **入围 (10米)**：RSI > 60，MACD (8,17,5) 趋势向上。
-2. **优选 (20-80米)**：**RSI 70-85** 且 **放量 > 1.2倍**。
-3. **避坑**：RSI > 90 不再加分 (防鱼尾)，低开 < -2% 直接放弃。
+**🧪 实验核心逻辑：**
+1. **只看真龙**：通过 **RSI 起步线 (默认80)** 过滤掉跟风杂毛。
+2. **统一买入**：不管高开低开，统一要求 **开盘后涨 1.5%** 确认趋势。
+3. **底线风控**：设定 **最低开盘幅度 (默认-2%)**，太弱的直接不看。
 """)
 
 # ---------------------------
@@ -216,9 +215,9 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
     return df[['open', 'high', 'low', 'close', 'vol']].copy() 
 
 # ---------------------------
-# 实战仿真 (双轨制买入)
+# 实战仿真 (参数化统一买入)
 # ---------------------------
-def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[1, 3, 5]):
+def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead, min_open_pct, confirm_rise_pct):
     d0 = datetime.strptime(selection_date, "%Y%m%d")
     start_future = (d0 + timedelta(days=1)).strftime("%Y%m%d")
     end_future = (d0 + timedelta(days=15)).strftime("%Y%m%d")
@@ -237,21 +236,18 @@ def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[1, 3, 5
     next_high = d1_data['high']
     
     # 1. 计算开盘幅度
-    open_pct = (next_open - d0_qfq_close) / d0_qfq_close
+    open_pct = (next_open - d0_qfq_close) / d0_qfq_close * 100
     
-    # 【新手保护】如果低开超过 -2.0%，直接放弃
-    if open_pct < -0.02: 
+    # 【风控】如果开盘幅度低于设定的最低值 (例如 -2%)，直接放弃
+    if open_pct < min_open_pct: 
         return results 
     
-    # 3. 分叉买入策略
-    if open_pct >= 0:
-        # A. 高开: 强者恒强，开盘价 + 1.5% 追击
-        target_buy_price = next_open * 1.015
-    else:
-        # B. 低开 (-2% ~ 0%): 必须翻红并站稳 +0.5% (确认是洗盘而非出货)
-        target_buy_price = d0_qfq_close * 1.005
+    # 2. 统一买入逻辑 (Unified Entry)
+    # 目标价 = 开盘价 * (1 + 确认涨幅%)
+    # 例如：开盘涨 0%，设认为 1.5%，则需涨到 1.5% 买入
+    target_buy_price = next_open * (1 + confirm_rise_pct / 100.0)
         
-    # 4. 判定是否成交
+    # 3. 判定是否成交
     if next_high < target_buy_price: return results
         
     for n in days_ahead:
@@ -292,7 +288,7 @@ def compute_indicators(ts_code, end_date):
     dea = diff.ewm(span=5, adjust=False).mean()
     res['macd_val'] = ((diff - dea) * 2).iloc[-1]
     
-    # === 量能比 (Vol Ratio) ===
+    # 量能数据 (仅供参考，不硬过滤)
     curr_vol = df['vol'].iloc[-1]
     ma5_vol = df['vol'].rolling(window=5).mean().iloc[-1]
     res['vol_ratio'] = curr_vol / (ma5_vol + 1e-9)
@@ -321,7 +317,7 @@ def get_market_state(trade_date):
 # ---------------------------
 # 核心回测逻辑
 # ---------------------------
-def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, MAX_PREV_PCT, MIN_PRICE):
+def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_MIN, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, MAX_PREV_PCT, MIN_PRICE, MIN_OPEN_PCT, CONFIRM_RISE_PCT):
     global GLOBAL_STOCK_INDUSTRY
     
     market_state = get_market_state(last_trade)
@@ -389,18 +385,18 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         d0_close = ind['last_close']
         d0_rsi = ind.get('rsi_12', 50)
         
-        # === V30.12.6 终极过滤 ===
-        # 1. 门票：RSI 必须 > 60
-        if d0_rsi <= 60: continue
+        # === V30.12.7 核心过滤 (The Dragon Filter) ===
+        # 1. 门槛：RSI 必须 > 设定值 (默认80)
+        # 意思：RSI < 80 的太弱，不要
+        if d0_rsi <= RSI_MIN: continue
         
         # 2. 趋势铁律：股价必须站在20日线之上
         if d0_close < ind['ma20']: continue 
         
-        # 3. 量能铁律：当日成交量必须是5日均量的1.2倍以上 (无量不进)
-        if ind['vol_ratio'] < 1.2: continue 
+        # 3. 量能：不再硬过滤，仅作为参考
 
         if market_state == 'Weak':
-            if d0_rsi > RSI_LIMIT: continue
+            # 弱市中只剔除极度高位的票，防止补跌 (这里可放宽)
             if ind['position_60d'] > 20.0: continue
             
         upper_shadow = (ind['last_high'] - d0_close) / d0_close * 100
@@ -415,7 +411,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
             if win_rate < CHIP_MIN_WIN_RATE: continue
         else: win_rate = 50 
 
-        future = get_future_prices(row.ts_code, last_trade, d0_close)
+        future = get_future_prices(row.ts_code, last_trade, d0_close, [1,3,5], MIN_OPEN_PCT, CONFIRM_RISE_PCT)
         records.append({
             'ts_code': row.ts_code, 'name': row.name, 'Close': row.close, 'Pct_Chg': row.pct_chg,
             'rsi': d0_rsi, 'winner_rate': win_rate, 'macd': ind['macd_val'], 
@@ -435,19 +431,10 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         base_score = r['macd'] * 1000 + (r['net_mf'] / 10000) 
         if r['winner_rate'] > 90: base_score += 1000
         
-        # === 黄金区间评分 (RSI) ===
-        # 70-85：黄金狙击区，重赏 3000分
-        if 70 <= r['rsi'] <= 85:
-            base_score += 3000
-        # 60-70：起步区，鼓励 1000分
-        elif 60 <= r['rsi'] < 70:
-            base_score += 1000
-        # RSI > 85：鱼尾区，不加分 (防止买在山顶)
+        # 鼓励龙头 (RSI越高越好)
+        if r['rsi'] > 90: base_score += 3000
+        elif r['rsi'] > 85: base_score += 1500
             
-        if r['market_state'] == 'Strong':
-            penalty = 0
-            if r['rsi'] > RSI_LIMIT: penalty += 500
-            return base_score - penalty
         return base_score
 
     fdf['Score'] = fdf.apply(dynamic_score, axis=1)
@@ -457,10 +444,21 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V30.12.6 趋势终极版")
+    st.header("V30.12.7 龙头参数实验室")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数", value=30, step=1)
     TOP_BACKTEST = st.number_input("每日优选 TopK", value=5)
+    
+    st.markdown("---")
+    st.subheader("🧪 核心实验参数")
+    
+    # 以前的拦截线，变成了起步线 (Floor)
+    RSI_MIN = st.number_input("RSI 起步线 (最低)", value=80.0, help="低于此值的股票直接忽略。建议80或85。")
+    
+    col_a, col_b = st.columns(2)
+    # 统一买入逻辑参数
+    MIN_OPEN_PCT = col_a.number_input("最低开盘幅度 (%)", value=-2.0, help="低于此开盘价直接放弃")
+    CONFIRM_RISE_PCT = col_b.number_input("买入确认涨幅 (%)", value=1.5, help="在开盘价基础上再涨多少买入")
     
     st.markdown("---")
     st.subheader("💰 基础过滤")
@@ -473,7 +471,6 @@ with st.sidebar:
     st.subheader("⚔️ 风控参数")
     CHIP_MIN_WIN_RATE = st.number_input("最低获利盘 (%)", value=70.0)
     MAX_PREV_PCT = st.number_input("昨日最大涨幅限制 (%)", value=19.0)
-    RSI_LIMIT = st.number_input("RSI 拦截线", value=100.0)
     
     st.markdown("---")
     st.subheader("📊 形态参数")
@@ -487,7 +484,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V30.12.6 回测"):
+if st.button(f"🚀 启动 V30.12.7 回测"):
     trade_days_list = get_trade_days(backtest_date_end.strftime("%Y%m%d"), int(BACKTEST_DAYS))
     
     if not trade_days_list:
@@ -501,7 +498,7 @@ if st.button(f"🚀 启动 V30.12.6 回测"):
     bar = st.progress(0, text="回测引擎流水线启动...")
     
     for i, date in enumerate(trade_days_list):
-        res, err = run_backtest_for_a_day(date, int(TOP_BACKTEST), 100, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, MAX_PREV_PCT, MIN_PRICE)
+        res, err = run_backtest_for_a_day(date, int(TOP_BACKTEST), 100, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_MIN, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, MAX_PREV_PCT, MIN_PRICE, MIN_OPEN_PCT, CONFIRM_RISE_PCT)
         if not res.empty:
             res['Trade_Date'] = date
             results.append(res)
@@ -513,7 +510,7 @@ if st.button(f"🚀 启动 V30.12.6 回测"):
     if results:
         all_res = pd.concat(results)
         
-        st.header("📊 V30.12.6 统计仪表盘")
+        st.header("📊 V30.12.7 统计仪表盘")
         cols = st.columns(3)
         for idx, n in enumerate([1, 3, 5]):
             col_name = f'Return_D{n} (%)'
@@ -523,7 +520,7 @@ if st.button(f"🚀 启动 V30.12.6 回测"):
                 win = (valid[col_name] > 0).mean() * 100
                 cols[idx].metric(f"D+{n} 均益 / 胜率", f"{avg:.2f}% / {win:.1f}%")
         
-        st.subheader("📋 回测清单 (RSI 70-85 优选)")
+        st.subheader("📋 回测清单")
         display_cols = ['Trade_Date','name','ts_code','Close','Pct_Chg',
              'Return_D1 (%)', 'Return_D3 (%)', 'Return_D5 (%)',
                         'rsi','winner_rate','vol_ratio']
