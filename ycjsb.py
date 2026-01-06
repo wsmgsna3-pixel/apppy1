@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V42.1 断点续传版 (防崩溃+自动接续)
-核心修复：
-1. 【断点续传】：启动时自动检测已存数据，跳过已完成日期。崩溃后重启可秒接续。
-2. 【异常隔离】：单日数据拉取失败（网络/接口限制）自动捕获并跳过，不中断整体进程。
-3. 【接口重试】：增加对 Tushare 接口的重试机制，提高稳定性。
+选股王 · V44.0 爆发力战法 (黄金区间+量比排序)
+逻辑重构：
+1. 痛点：Rank 1 总是选到换手率>25%的过热股，导致胜率不如 Rank 3。
+2. 发现：数据回测显示 [18%, 26%] 是换手率的"黄金收益区"。
+3. 策略：
+   - 门槛：换手率锁定在 [18, 26]。
+   - 排序：改为按 [量比] (Vol_Ratio) 降序。
+   - 目的：在最健康的换手区间内，寻找爆发力最强(加速)的龙头。
 """
 
 import streamlit as st
@@ -19,13 +22,13 @@ import time
 # ---------------------------
 # 页面配置
 # ---------------------------
-st.set_page_config(page_title="V42.1 断点续传版", layout="wide")
-st.title("🚀 V42.1 资金接力监控 (防崩溃续传版)")
+st.set_page_config(page_title="V44.0 爆发力战法", layout="wide")
+st.title("🚀 V44.0 爆发力监控 (黄金区间+量比)")
 
 # ---------------------------
 # 全局设置
 # ---------------------------
-SCORE_DB_FILE = "v42_smart_turnover_db.csv" # 数据库文件
+SCORE_DB_FILE = "v44_explosive_vol_db.csv" # 新数据库
 pro = None 
 GLOBAL_ADJ_FACTOR = pd.DataFrame() 
 GLOBAL_DAILY_RAW = pd.DataFrame() 
@@ -34,27 +37,18 @@ GLOBAL_CALENDAR = []
 
 @st.cache_data(ttl=3600*12) 
 def safe_get(func_name, **kwargs):
-    """
-    Tushare 接口安全调用包装器 (带重试机制)
-    """
     global pro
     if pro is None: return pd.DataFrame(columns=['ts_code']) 
     func = getattr(pro, func_name) 
-    
-    # 最多重试 3 次
     for attempt in range(3):
         try:
             df = func(**kwargs)
             if df is None or (isinstance(df, pd.DataFrame) and df.empty):
                 return pd.DataFrame(columns=['ts_code']) 
             return df
-        except Exception as e:
-            if attempt < 2:
-                time.sleep(1) # 歇一秒重试
-                continue
-            else:
-                # 3次都失败，返回空
-                return pd.DataFrame(columns=['ts_code'])
+        except Exception:
+            if attempt < 2: time.sleep(1); continue
+            else: return pd.DataFrame(columns=['ts_code'])
 
 def get_trade_days(end_date_str, num_days):
     start_search = (datetime.strptime(end_date_str, "%Y%m%d") - timedelta(days=max(num_days * 5, 120))).strftime("%Y%m%d")
@@ -75,7 +69,6 @@ def get_trade_days(end_date_str, num_days):
 # ----------------------------------------------------------------------
 @st.cache_data(ttl=3600*24)
 def fetch_and_cache_daily_data(date):
-    # 这一步最容易崩，增加容错
     try:
         daily_df = safe_get('daily', trade_date=date)
         adj_df = safe_get('adj_factor', trade_date=date)
@@ -91,8 +84,7 @@ def fetch_and_cache_daily_data(date):
             adj_df = adj_df[adj_df['ts_code'].str.startswith(('30', '688'))]
             
         return {'adj': adj_df, 'daily': daily_df}
-    except:
-        return {'adj': pd.DataFrame(), 'daily': pd.DataFrame()}
+    except: return {'adj': pd.DataFrame(), 'daily': pd.DataFrame()}
 
 def get_all_historical_data(select_days_list):
     global GLOBAL_ADJ_FACTOR, GLOBAL_DAILY_RAW, GLOBAL_QFQ_BASE_FACTORS, GLOBAL_CALENDAR
@@ -161,19 +153,17 @@ def get_qfq_data(ts_code, start_date, end_date):
     return df.reset_index().sort_values('trade_date')
 
 # ----------------------------------------------------------------------
-# 趋势检查 + 换手率排序
+# 趋势检查
 # ----------------------------------------------------------------------
 def check_trend_and_get_score(ts_code, current_date):
     try:
         start_date = (datetime.strptime(current_date, "%Y%m%d") - timedelta(days=150)).strftime("%Y%m%d")
         df = get_qfq_data(ts_code, start_date, current_date)
-        
         if df.empty or len(df) < 30: return None
         
         last_row = df.iloc[-1]
         last_date_val = last_row['trade_date']
         last_date_str = last_date_val.strftime('%Y%m%d') if hasattr(last_date_val, 'strftime') else str(last_date_val)
-        
         if last_date_str != current_date: return None
 
         close = df['close']
@@ -188,15 +178,11 @@ def check_trend_and_get_score(ts_code, current_date):
         trend_ok = close.iloc[-1] > ma20.iloc[-1]
         macd_ok = macd.iloc[-1] > 0
         
-        if trend_ok and macd_ok:
-            return True
-            
+        if trend_ok and macd_ok: return True
         return None
-    except Exception:
-        return None
+    except Exception: return None
 
 def batch_compute_scores(date):
-    # 增加整体 Try-Catch，确保单日崩溃不影响大局
     try:
         try:
             daily_t = GLOBAL_DAILY_RAW.xs(date, level='trade_date')
@@ -215,13 +201,14 @@ def batch_compute_scores(date):
                 turnover = float(row['turnover_rate']) if 'turnover_rate' in row else 0.0
                 vol_ratio = float(row['volume_ratio']) if 'volume_ratio' in row else 0.0
                 
-                # Score = 换手率
-                score = turnover 
+                # V44.0 核心修正：Score 改为 量比 (Vol_Ratio)
+                # 只有在 filter 阶段过了 Turnover 门槛的票，才会按这个 Score 排序
+                score = vol_ratio 
                 
                 results.append({
                     'Select_Date': date,
                     'Code': code,
-                    'Score': score,
+                    'Score': score, # 注意：现在 Score 是 量比
                     'Name': row['name'] if 'name' in row else code,
                     'Close': float(row['close']),
                     'Pct_Chg': float(row['pct_chg']) if 'pct_chg' in row else 0.0,
@@ -230,26 +217,25 @@ def batch_compute_scores(date):
                     'Vol_Ratio': vol_ratio
                 })
         return results
-    except Exception as e:
-        print(f"Error computing {date}: {e}")
-        return []
+    except Exception: return []
 
 # ----------------------------------------------------------------------
-# 动态筛选与回测
+# 动态筛选与回测 (黄金区间 + 量比排序)
 # ----------------------------------------------------------------------
-def apply_strategy_and_backtest(df_scores, top_n, min_mv_yi, min_pct, max_pct, min_vol_ratio, max_turnover, buy_open_min, buy_open_max, stop_loss_pct):
+def apply_strategy_and_backtest(df_scores, top_n, min_mv_yi, min_pct, max_pct, min_turnover, max_turnover, buy_open_min, buy_open_max, stop_loss_pct):
     min_mv_val = min_mv_yi * 10000
     
+    # 1. 黄金区间筛选 (Turnover: 18% ~ 26%)
     mask = (df_scores['Circ_Mv'] >= min_mv_val) & \
            (df_scores['Pct_Chg'] >= min_pct) & \
            (df_scores['Pct_Chg'] <= max_pct) & \
-           (df_scores['Vol_Ratio'] >= min_vol_ratio) & \
-           (df_scores['Turnover'] <= max_turnover)
+           (df_scores['Turnover'] >= min_turnover) & \
+           (df_scores['Turnover'] <= max_turnover) # --- 核心改动：严格锁定区间 ---
 
     filtered_df = df_scores[mask].copy()
     if filtered_df.empty: return []
     
-    # 换手率排序
+    # 2. 排序：在黄金区间内，按 量比 (Score) 降序
     filtered_df = filtered_df.sort_values('Score', ascending=False).head(top_n)
     
     select_date = str(filtered_df.iloc[0]['Select_Date'])
@@ -349,9 +335,8 @@ with st.sidebar:
     days_back = int(st.number_input("回测天数", value=5))
     
     st.markdown("---")
-    st.header("2. 选股 (资金特征)")
-    st.info("🎯 排序: **换手率**")
-    st.warning("🔥 上限: **剔除过热**")
+    st.header("2. 选股 (爆发力)")
+    st.info("🎯 排序: **量比 (Vol_Ratio)**")
     
     TOP_N = 3
     MIN_MV_YI = st.number_input("最低市值 (亿)", 10, 500, 30, 10)
@@ -360,15 +345,17 @@ with st.sidebar:
     with col_pct1: MIN_PCT = st.number_input("涨幅下限%", 0, 20, 6, 1)
     with col_pct2: MAX_PCT = st.number_input("涨幅上限%", 0, 20, 16, 1)
         
-    MIN_VOL_RATIO = st.number_input("最低量比", 0.0, 10.0, 1.5, 0.1)
-    MAX_TURNOVER = st.slider("换手率上限 (过热线) %", 20.0, 60.0, 33.0)
+    st.caption("🔥 **换手率黄金区间**")
+    col_t1, col_t2 = st.columns(2)
+    with col_t1: MIN_TURNOVER = st.number_input("换手Min%", 0.0, 50.0, 18.0, 1.0, help="低于18%不够活跃")
+    with col_t2: MAX_TURNOVER = st.number_input("换手Max%", 0.0, 50.0, 26.0, 1.0, help="高于26%容易过热")
     
     st.markdown("---")
-    st.header("3. 交易 (接力)")
+    st.header("3. 交易 (红盘确认)")
     
     col1, col2 = st.columns(2)
-    with col1: BUY_MIN = st.number_input("开盘Min%", -10.0, 10.0, -1.0, 0.5)
-    with col2: BUY_MAX = st.number_input("开盘Max%", -10.0, 10.0, 3.0, 0.5)
+    with col1: BUY_MIN = st.number_input("开盘Min%", -10.0, 10.0, 0.0, 0.5)
+    with col2: BUY_MAX = st.number_input("开盘Max%", -10.0, 10.0, 4.0, 0.5)
     
     STOP_LOSS = st.number_input("累计跌幅止损%", 1, 20, 5, 1)
 
@@ -384,7 +371,7 @@ col_token, col_btn = st.columns([3, 1])
 with col_token:
     TS_TOKEN = st.text_input("🔑 Token", type="password")
 with col_btn:
-    start_btn = st.button("🚀 启动V42.1 (续传版)", type="primary", use_container_width=True)
+    start_btn = st.button("🚀 启动V44.0 (爆发力)", type="primary", use_container_width=True)
 
 if start_btn:
     if not TS_TOKEN: st.stop()
@@ -394,51 +381,31 @@ if start_btn:
     select_dates = get_trade_days(end_date.strftime("%Y%m%d"), days_back)
     if not select_dates: st.stop()
     
-    # 1. 预先加载数据到内存
     if not get_all_historical_data(select_dates): st.stop()
 
-    # 2. 检查断点 (Checkpoint)
     existing_dates = []
     if os.path.exists(SCORE_DB_FILE):
         try:
-            # 读取已跑过的日期
             df_dates = pd.read_csv(SCORE_DB_FILE, usecols=['Select_Date'])
             existing_dates = df_dates['Select_Date'].astype(str).unique().tolist()
-            st.success(f"📂 检测到历史进度，自动跳过 {len(existing_dates)} 天")
+            st.success(f"📂 跳过 {len(existing_dates)} 天")
         except: pass
     
-    # 3. 过滤出真正需要跑的日期
     dates_to_compute = [d for d in select_dates if str(d) not in existing_dates]
     
     if dates_to_compute:
-        st.write(f"🔄 正在补全剩余 {len(dates_to_compute)} 天数据 (含自动容错)...")
-        status_text = st.empty()
+        st.write(f"🔄 补全数据...")
         bar = st.progress(0)
-        
         for i, date in enumerate(dates_to_compute):
-            status_text.text(f"正在计算: {date} ...")
-            
-            # 这里即使报错也不会崩溃，会返回空列表
             scores = batch_compute_scores(date)
-            
             if scores:
                 df_chunk = pd.DataFrame(scores)
                 need_header = not os.path.exists(SCORE_DB_FILE)
-                # 立即存入 CSV，形成新的断点
                 df_chunk.to_csv(SCORE_DB_FILE, mode='a', header=need_header, index=False)
-            else:
-                # 如果没算出来，可能是因为那天没开盘或者报错跳过了
-                # 不做处理，继续下一天
-                pass
-            
-            # 释放内存，防止跑太久崩内存
             if i % 10 == 0: gc.collect()
             bar.progress((i+1)/len(dates_to_compute))
-        
-        status_text.text("✅ 计算完成！")
         bar.empty()
     
-    # 4. 读取完整数据进行回测
     if os.path.exists(SCORE_DB_FILE):
         df_all = pd.read_csv(SCORE_DB_FILE)
         df_all['Select_Date'] = df_all['Select_Date'].astype(str)
@@ -449,7 +416,7 @@ if start_btn:
             if df_daily.empty: continue
             
             res = apply_strategy_and_backtest(
-                df_daily, TOP_N, MIN_MV_YI, MIN_PCT, MAX_PCT, MIN_VOL_RATIO, MAX_TURNOVER, BUY_MIN, BUY_MAX, STOP_LOSS
+                df_daily, TOP_N, MIN_MV_YI, MIN_PCT, MAX_PCT, MIN_TURNOVER, MAX_TURNOVER, BUY_MIN, BUY_MAX, STOP_LOSS
             )
             if res: final_report.extend(res)
         
@@ -457,7 +424,7 @@ if start_btn:
             df_res = pd.DataFrame(final_report)
             trades = df_res[df_res['Signal'].str.contains('BUY', na=False)]
             
-            st.markdown(f"### 📊 策略表现 (上限:{MAX_TURNOVER}% | 买入[{BUY_MIN}%, {BUY_MAX}%])")
+            st.markdown(f"### 📊 策略表现 (换手[{MIN_TURNOVER}%,{MAX_TURNOVER}%] | 量比排序)")
             
             cols = st.columns(3)
             for i, r in enumerate([1, 2, 3]):
