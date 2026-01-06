@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V44.0 爆发力战法 (黄金区间+量比排序)
-逻辑重构：
-1. 痛点：Rank 1 总是选到换手率>25%的过热股，导致胜率不如 Rank 3。
-2. 发现：数据回测显示 [18%, 26%] 是换手率的"黄金收益区"。
-3. 策略：
-   - 门槛：换手率锁定在 [18, 26]。
-   - 排序：改为按 [量比] (Vol_Ratio) 降序。
-   - 目的：在最健康的换手区间内，寻找爆发力最强(加速)的龙头。
+选股王 · V46.0 RSRS趋势锁定版 (吃鱼身战法)
+核心逻辑：
+1. 战略目标：右侧交易，买在趋势起步或1/3处，拒绝山顶。
+2. 核心指标：
+   - RSRS斜率 (Slope)：计算高低点的回归斜率，确认处于上升通道。
+   - 乖离率 (Bias)：股价距离20日线 < 15%，防止买在山顶。
+   - 黄金通道：换手[18,26] + 量比[1.5,3.5] (动力保障)。
+3. 买入战术：红盘确认 [0%, 4%]。
 """
 
 import streamlit as st
@@ -18,17 +18,18 @@ from datetime import datetime, timedelta
 import os
 import gc
 import time
+from scipy.stats import linregress # 引入科学计算库做回归分析
 
 # ---------------------------
 # 页面配置
 # ---------------------------
-st.set_page_config(page_title="V44.0 爆发力战法", layout="wide")
-st.title("🚀 V44.0 爆发力监控 (黄金区间+量比)")
+st.set_page_config(page_title="V46.0 RSRS趋势战法", layout="wide")
+st.title("🚀 V46.0 RSRS趋势监控 (吃鱼身战法)")
 
 # ---------------------------
 # 全局设置
 # ---------------------------
-SCORE_DB_FILE = "v44_explosive_vol_db.csv" # 新数据库
+SCORE_DB_FILE = "v46_rsrs_trend_db.csv" # 新数据库
 pro = None 
 GLOBAL_ADJ_FACTOR = pd.DataFrame() 
 GLOBAL_DAILY_RAW = pd.DataFrame() 
@@ -153,36 +154,60 @@ def get_qfq_data(ts_code, start_date, end_date):
     return df.reset_index().sort_values('trade_date')
 
 # ----------------------------------------------------------------------
-# 趋势检查
+# 核心算法：RSRS 趋势 + 乖离率检查
 # ----------------------------------------------------------------------
-def check_trend_and_get_score(ts_code, current_date):
+def analyze_rsrs_trend(ts_code, current_date, max_bias_pct):
+    """
+    1. 计算 RSRS 斜率：确认处于上升通道 (右侧)。
+    2. 计算 乖离率 (Bias)：股价距离20日线不能太远 (拒绝山顶)。
+    """
     try:
-        start_date = (datetime.strptime(current_date, "%Y%m%d") - timedelta(days=150)).strftime("%Y%m%d")
+        # 取18天数据做回归 (经典参数)
+        start_date = (datetime.strptime(current_date, "%Y%m%d") - timedelta(days=60)).strftime("%Y%m%d")
         df = get_qfq_data(ts_code, start_date, current_date)
-        if df.empty or len(df) < 30: return None
+        if df.empty or len(df) < 20: return None
         
         last_row = df.iloc[-1]
-        last_date_val = last_row['trade_date']
-        last_date_str = last_date_val.strftime('%Y%m%d') if hasattr(last_date_val, 'strftime') else str(last_date_val)
-        if last_date_str != current_date: return None
+        if last_row['trade_date'].strftime('%Y%m%d') != current_date: return None
 
         close = df['close']
+        high = df['high']
+        low = df['low']
+        
+        # 1. 计算 20日均线 & 乖离率 (Bias)
         ma20 = close.rolling(window=20).mean()
+        current_ma20 = ma20.iloc[-1]
+        current_close = close.iloc[-1]
         
-        ema_fast = close.ewm(span=8, adjust=False).mean()
-        ema_slow = close.ewm(span=17, adjust=False).mean()
-        diff = ema_fast - ema_slow
-        dea = diff.ewm(span=5, adjust=False).mean()
-        macd = (diff - dea) * 2
+        # Bias = (收盘 - 均线) / 均线
+        bias_pct = ((current_close - current_ma20) / current_ma20) * 100
         
-        trend_ok = close.iloc[-1] > ma20.iloc[-1]
-        macd_ok = macd.iloc[-1] > 0
+        # 核心过滤：如果乖离率太大(>15%)，说明在山顶，不要买
+        if bias_pct > max_bias_pct: 
+            return None
         
-        if trend_ok and macd_ok: return True
+        # 核心过滤：必须站上20日线 (右侧基础)
+        if current_close < current_ma20:
+            return None
+
+        # 2. 计算 RSRS 斜率 (简化版：只看 High 的斜率，代表阻力位的变化)
+        # 取最近 18 天
+        recent_df = df.iloc[-18:]
+        x = np.arange(len(recent_df))
+        y_high = recent_df['high'].values
+        
+        # 线性回归
+        slope, intercept, r_value, p_value, std_err = linregress(x, y_high)
+        
+        # 条件：斜率必须 > 0 (上升通道) 且 R方 > 0.3 (趋势比较明显)
+        # R方在这里不是必须的，只要斜率正即可，放宽一点
+        if slope > 0:
+            return slope # 返回斜率作为强度分数
+            
         return None
     except Exception: return None
 
-def batch_compute_scores(date):
+def batch_compute_scores(date, max_bias):
     try:
         try:
             daily_t = GLOBAL_DAILY_RAW.xs(date, level='trade_date')
@@ -196,46 +221,52 @@ def batch_compute_scores(date):
         candidates = pool.index.tolist()
         
         for code in candidates:
-            if check_trend_and_get_score(code, date):
+            # 传入 max_bias 参数
+            rsrs_slope = analyze_rsrs_trend(code, date, max_bias)
+            
+            if rsrs_slope is not None:
                 row = pool.loc[code]
                 turnover = float(row['turnover_rate']) if 'turnover_rate' in row else 0.0
                 vol_ratio = float(row['volume_ratio']) if 'volume_ratio' in row else 0.0
                 
-                # V44.0 核心修正：Score 改为 量比 (Vol_Ratio)
-                # 只有在 filter 阶段过了 Turnover 门槛的票，才会按这个 Score 排序
-                score = vol_ratio 
+                # 依然按换手率排序，因为这是短线活力的根本
+                # RSRS 只是门槛 (Pass/Fail)
+                score = turnover 
                 
                 results.append({
                     'Select_Date': date,
                     'Code': code,
-                    'Score': score, # 注意：现在 Score 是 量比
+                    'Score': score,
                     'Name': row['name'] if 'name' in row else code,
                     'Close': float(row['close']),
                     'Pct_Chg': float(row['pct_chg']) if 'pct_chg' in row else 0.0,
                     'Circ_Mv': float(row['circ_mv']) if 'circ_mv' in row else 0.0,
                     'Turnover': turnover,
-                    'Vol_Ratio': vol_ratio
+                    'Vol_Ratio': vol_ratio,
+                    'RSRS_Slope': rsrs_slope
                 })
         return results
     except Exception: return []
 
 # ----------------------------------------------------------------------
-# 动态筛选与回测 (黄金区间 + 量比排序)
+# 动态筛选与回测
 # ----------------------------------------------------------------------
-def apply_strategy_and_backtest(df_scores, top_n, min_mv_yi, min_pct, max_pct, min_turnover, max_turnover, buy_open_min, buy_open_max, stop_loss_pct):
+def apply_strategy_and_backtest(df_scores, top_n, min_mv_yi, min_pct, max_pct, min_turnover, max_turnover, min_vol, max_vol, buy_open_min, buy_open_max, stop_loss_pct):
     min_mv_val = min_mv_yi * 10000
     
-    # 1. 黄金区间筛选 (Turnover: 18% ~ 26%)
+    # 黄金通道过滤
     mask = (df_scores['Circ_Mv'] >= min_mv_val) & \
            (df_scores['Pct_Chg'] >= min_pct) & \
            (df_scores['Pct_Chg'] <= max_pct) & \
            (df_scores['Turnover'] >= min_turnover) & \
-           (df_scores['Turnover'] <= max_turnover) # --- 核心改动：严格锁定区间 ---
+           (df_scores['Turnover'] <= max_turnover) & \
+           (df_scores['Vol_Ratio'] >= min_vol) & \
+           (df_scores['Vol_Ratio'] <= max_vol)
 
     filtered_df = df_scores[mask].copy()
     if filtered_df.empty: return []
     
-    # 2. 排序：在黄金区间内，按 量比 (Score) 降序
+    # 排序：在符合RSRS趋势的股票里，按换手率降序
     filtered_df = filtered_df.sort_values('Score', ascending=False).head(top_n)
     
     select_date = str(filtered_df.iloc[0]['Select_Date'])
@@ -318,6 +349,7 @@ def apply_strategy_and_backtest(df_scores, top_n, min_mv_yi, min_pct, max_pct, m
             'Open_Pct': open_pct,
             'Vol_Ratio': row['Vol_Ratio'],
             'Turnover': row['Turnover'],
+            'RSRS_Slope': row['RSRS_Slope'],
             'Ret_D3': ret_d3,
             'Ret_D5': ret_d5,
             'Status': status
@@ -335,21 +367,26 @@ with st.sidebar:
     days_back = int(st.number_input("回测天数", value=5))
     
     st.markdown("---")
-    st.header("2. 选股 (爆发力)")
-    st.info("🎯 排序: **量比 (Vol_Ratio)**")
+    st.header("2. 选股 (RSRS趋势 + 黄金通道)")
+    st.info("📈 **RSRS斜率: 必须向上**")
     
     TOP_N = 3
     MIN_MV_YI = st.number_input("最低市值 (亿)", 10, 500, 30, 10)
+    MAX_BIAS = st.number_input("乖离率上限% (拒接高位)", 5, 50, 15, 1, help="价格距离20日线太远视为山顶")
     
     col_pct1, col_pct2 = st.columns(2)
     with col_pct1: MIN_PCT = st.number_input("涨幅下限%", 0, 20, 6, 1)
     with col_pct2: MAX_PCT = st.number_input("涨幅上限%", 0, 20, 16, 1)
         
-    st.caption("🔥 **换手率黄金区间**")
+    st.caption("🔥 **黄金通道**")
     col_t1, col_t2 = st.columns(2)
-    with col_t1: MIN_TURNOVER = st.number_input("换手Min%", 0.0, 50.0, 18.0, 1.0, help="低于18%不够活跃")
-    with col_t2: MAX_TURNOVER = st.number_input("换手Max%", 0.0, 50.0, 26.0, 1.0, help="高于26%容易过热")
+    with col_t1: MIN_TURNOVER = st.number_input("换手Min%", 0.0, 50.0, 18.0, 1.0)
+    with col_t2: MAX_TURNOVER = st.number_input("换手Max%", 0.0, 50.0, 26.0, 1.0)
     
+    col_v1, col_v2 = st.columns(2)
+    with col_v1: MIN_VOL = st.number_input("量比Min", 0.0, 10.0, 1.5, 0.1)
+    with col_v2: MAX_VOL = st.number_input("量比Max", 0.0, 10.0, 3.5, 0.1)
+
     st.markdown("---")
     st.header("3. 交易 (红盘确认)")
     
@@ -371,7 +408,7 @@ col_token, col_btn = st.columns([3, 1])
 with col_token:
     TS_TOKEN = st.text_input("🔑 Token", type="password")
 with col_btn:
-    start_btn = st.button("🚀 启动V44.0 (爆发力)", type="primary", use_container_width=True)
+    start_btn = st.button("🚀 启动V46.0 (RSRS版)", type="primary", use_container_width=True)
 
 if start_btn:
     if not TS_TOKEN: st.stop()
@@ -397,7 +434,8 @@ if start_btn:
         st.write(f"🔄 补全数据...")
         bar = st.progress(0)
         for i, date in enumerate(dates_to_compute):
-            scores = batch_compute_scores(date)
+            # 传入 MAX_BIAS 参数
+            scores = batch_compute_scores(date, MAX_BIAS)
             if scores:
                 df_chunk = pd.DataFrame(scores)
                 need_header = not os.path.exists(SCORE_DB_FILE)
@@ -416,7 +454,7 @@ if start_btn:
             if df_daily.empty: continue
             
             res = apply_strategy_and_backtest(
-                df_daily, TOP_N, MIN_MV_YI, MIN_PCT, MAX_PCT, MIN_TURNOVER, MAX_TURNOVER, BUY_MIN, BUY_MAX, STOP_LOSS
+                df_daily, TOP_N, MIN_MV_YI, MIN_PCT, MAX_PCT, MIN_TURNOVER, MAX_TURNOVER, MIN_VOL, MAX_VOL, BUY_MIN, BUY_MAX, STOP_LOSS
             )
             if res: final_report.extend(res)
         
@@ -424,7 +462,7 @@ if start_btn:
             df_res = pd.DataFrame(final_report)
             trades = df_res[df_res['Signal'].str.contains('BUY', na=False)]
             
-            st.markdown(f"### 📊 策略表现 (换手[{MIN_TURNOVER}%,{MAX_TURNOVER}%] | 量比排序)")
+            st.markdown(f"### 📊 策略表现 (RSRS趋势 | 拒接高位>{MAX_BIAS}%)")
             
             cols = st.columns(3)
             for i, r in enumerate([1, 2, 3]):
