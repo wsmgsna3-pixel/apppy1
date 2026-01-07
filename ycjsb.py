@@ -1,17 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.12.9 完美统计版
+选股王 · V30.12.10 黄金狙击终极版
 ------------------------------------------------
-版本特性 (Perfect Stats Edition):
-1. **仪表盘升级**：
-   - 新增 "交易次数" 显示，直观判断样本量。
-   - 格式：均益% / 胜率% (成交N次)。
-2. **默认参数调优**：
-   - 昨日最大涨幅默认设为 7.0% (弱转强/断板反包逻辑)。
-   - 旨在兼顾高胜率与合理的出手频率。
-3. **核心逻辑保持**：
-   - 纯净无未来函数。
-   - 严格的开盘及盘中买入确认。
+版本特性 (Golden Sniper Edition):
+1. **黄金参数固化**：
+   - RSI > 90.0 (只做顶级妖股)
+   - 昨日最大涨幅 < 19.0% (放开连板限制，拥抱龙头)
+   - 最低开盘 > -2.0% (允许深蹲起跳，增加容错)
+   - Top 4 (剔除无效的 Rank 5)
+2. **仪表盘优化**：
+   - 显示 D+1, D+3, D+5 的交易次数，直观判断信号频率。
+3. **策略心法**：
+   - 10%-20% 利润锁仓，>20% 止盈，加速持有，减速离场。
 ------------------------------------------------
 """
 
@@ -38,13 +38,13 @@ GLOBAL_STOCK_INDUSTRY = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V30.12.9 完美统计版", layout="wide")
-st.title("选股王 V30.12.9：完美统计版")
+st.set_page_config(page_title="选股王 V30.12.10 黄金狙击版", layout="wide")
+st.title("选股王 V30.12.10：黄金狙击终极版 🏆")
 st.markdown("""
-**🏆 策略核心逻辑 (弱转强 + 狙击手)：**
-1. **RSI > 85**：锁定主升浪趋势。
-2. **昨日涨幅 < 7%**：拒绝高潮接盘，只做蓄势待发。
-3. **Open > 1.0%**：竞价确认主力意图。
+**🔥 黄金战法 (RSI 90 + Top4)：**
+1. **只做真妖**：RSI > 90，资金情绪极致。
+2. **包容万象**：允许连板 (昨涨<19%)，允许低开 (>-2%)。
+3. **卖出铁律**：浮盈10-20%锁仓，>20%止盈，加速留减速跑。
 """)
 
 # ---------------------------
@@ -237,7 +237,7 @@ def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead, min_ope
     # 1. 计算开盘幅度
     open_pct = (next_open - d0_qfq_close) / d0_qfq_close * 100
     
-    # 【风控】如果开盘幅度低于设定的最低值 (例如 -2%)，直接放弃
+    # 【风控】黄金参数：最低开盘幅度 (如 -2%)
     if open_pct < min_open_pct: 
         return results 
     
@@ -383,8 +383,8 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         d0_close = ind['last_close']
         d0_rsi = ind.get('rsi_12', 50)
         
-        # === V30.12.9 核心过滤 ===
-        # 1. 门槛：RSI 必须 > 设定值 (默认85)
+        # === V30.12.10 黄金过滤 ===
+        # 1. 门槛：RSI 必须 > 设定值 (黄金版默认90)
         if d0_rsi <= RSI_MIN: continue
         
         # 2. 趋势铁律：股价必须站在20日线之上
@@ -439,24 +439,28 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V30.12.9 完美统计版")
+    st.header("V30.12.10 黄金狙击版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
-    BACKTEST_DAYS = st.number_input("分析天数", value=30, step=1)
-    TOP_BACKTEST = st.number_input("每日优选 TopK", value=5)
+    
+    # === 黄金参数默认值固化 ===
+    BACKTEST_DAYS = st.number_input("分析天数", value=200, step=1, help="默认200天，覆盖中期周期")
+    TOP_BACKTEST = st.number_input("每日优选 TopK", value=4, help="只看前4名，剔除尾部")
     
     st.markdown("---")
-    st.subheader("🧪 核心实战参数")
+    st.subheader("🏆 黄金核心参数")
     
-    RSI_MIN = st.number_input("RSI 起步线 (最低)", value=85.0, help="建议85或90")
+    # 默认值改为 90.0
+    RSI_MIN = st.number_input("RSI 起步线 (最低)", value=90.0, help="黄金参数：90.0，只做真妖股")
     
     col_a, col_b = st.columns(2)
-    MIN_OPEN_PCT = col_a.number_input("最低开盘幅度 (%)", value=1.0, help="低于此开盘价直接放弃")
-    CONFIRM_RISE_PCT = col_b.number_input("买入确认涨幅 (%)", value=1.5, help="在开盘价基础上再涨多少买入")
+    # 默认值改为 -2.0
+    MIN_OPEN_PCT = col_a.number_input("最低开盘幅度 (%)", value=-2.0, help="黄金参数：-2.0，容错低开深蹲")
+    CONFIRM_RISE_PCT = col_b.number_input("买入确认涨幅 (%)", value=1.5, help="盘中确认信号")
     
     st.markdown("---")
     st.subheader("⚔️ 风控参数")
-    # 默认值调整为 7.0%，更贴近“拒绝高潮，只做蓄势”的实战逻辑
-    MAX_PREV_PCT = st.number_input("昨日最大涨幅限制 (%)", value=7.0, help="建议设为5-7之间，过滤昨日涨停股")
+    # 默认值改为 19.0
+    MAX_PREV_PCT = st.number_input("昨日最大涨幅限制 (%)", value=19.0, help="黄金参数：19.0，放开连板限制")
     
     CHIP_MIN_WIN_RATE = st.number_input("最低获利盘 (%)", value=70.0)
     
@@ -479,7 +483,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V30.12.9 回测"):
+if st.button(f"🚀 启动 V30.12.10 狙击"):
     trade_days_list = get_trade_days(backtest_date_end.strftime("%Y%m%d"), int(BACKTEST_DAYS))
     
     if not trade_days_list:
@@ -508,7 +512,9 @@ if st.button(f"🚀 启动 V30.12.9 回测"):
         # === Rank计算 ===
         all_res['Rank'] = all_res.groupby('Trade_Date').cumcount() + 1
         
-        st.header("📊 V30.12.9 统计仪表盘")
+        st.header("📊 V30.12.10 黄金统计仪表盘")
+        st.markdown(f"**回测参数：** Top{TOP_BACKTEST} | RSI>{RSI_MIN} | Open>{MIN_OPEN_PCT}% | 昨涨<{MAX_PREV_PCT}%")
+        
         cols = st.columns(3)
         for idx, n in enumerate([1, 3, 5]):
             col_name = f'Return_D{n} (%)'
@@ -522,7 +528,7 @@ if st.button(f"🚀 启动 V30.12.9 回测"):
             else:
                 cols[idx].metric(f"D+{n} 均益 / 胜率", "无成交")
         
-        st.subheader("📋 回测清单")
+        st.subheader("📋 回测清单 (Top 4)")
         display_cols = ['Trade_Date','Rank','name','ts_code','Close','Score', 'Pct_Chg',
              'Return_D1 (%)', 'Return_D3 (%)', 'Return_D5 (%)',
                         'rsi','winner_rate','vol_ratio']
@@ -535,7 +541,7 @@ if st.button(f"🚀 启动 V30.12.9 回测"):
         st.download_button(
             label="📥 下载回测结果 (CSV)",
             data=csv,
-            file_name=f"{datetime.now().strftime('%Y-%m-%d_%H-%M')}_simulation_export.csv",
+            file_name=f"{datetime.now().strftime('%Y-%m-%d_%H-%M')}_golden_sniper.csv",
             mime="text/csv",
         )
     else:
