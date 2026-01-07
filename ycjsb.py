@@ -1,17 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.12.8 冠军实战版
+选股王 · V30.12.9 完美统计版
 ------------------------------------------------
-版本特性 (Champion Edition):
-1. **默认参数固化**：
-   - RSI 起步线默认为 85.0 (黄金区间)。
-   - 最低开盘幅度默认为 1.0% (竞价强势)。
-2. **可视化增强**：
-   - 回测详情表新增 'Rank' (排名) 和 'Score' (评分) 列。
-   - 方便一眼识别 "Rank 3" 等关键位置。
+版本特性 (Perfect Stats Edition):
+1. **仪表盘升级**：
+   - 新增 "交易次数" 显示，直观判断样本量。
+   - 格式：均益% / 胜率% (成交N次)。
+2. **默认参数调优**：
+   - 昨日最大涨幅默认设为 7.0% (弱转强/断板反包逻辑)。
+   - 旨在兼顾高胜率与合理的出手频率。
 3. **核心逻辑保持**：
-   - 统一买入：Open + 1.5% 确认。
-   - 移除硬性量能过滤，允许缩量连板。
+   - 纯净无未来函数。
+   - 严格的开盘及盘中买入确认。
 ------------------------------------------------
 """
 
@@ -38,13 +38,13 @@ GLOBAL_STOCK_INDUSTRY = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V30.12.8 实战版", layout="wide")
-st.title("选股王 V30.12.8：冠军实战版")
+st.set_page_config(page_title="选股王 V30.12.9 完美统计版", layout="wide")
+st.title("选股王 V30.12.9：完美统计版")
 st.markdown("""
-**🏆 实战核心策略：**
-1. **RSI > 85**：锁定主升浪核心。
-2. **Open > 1.0%**：确认竞价抢筹意愿。
-3. **关注 Rank 1 & 3**：根据回测数据，第一名和第三名往往表现最佳。
+**🏆 策略核心逻辑 (弱转强 + 狙击手)：**
+1. **RSI > 85**：锁定主升浪趋势。
+2. **昨日涨幅 < 7%**：拒绝高潮接盘，只做蓄势待发。
+3. **Open > 1.0%**：竞价确认主力意图。
 """)
 
 # ---------------------------
@@ -375,6 +375,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
             ind_code = GLOBAL_STOCK_INDUSTRY.get(row.ts_code)
             if ind_code and (ind_code not in strong_industry_codes): continue
         
+        # === 核心参数应用：昨日最大涨幅 ===
         if row.pct_chg > MAX_PREV_PCT: continue
 
         ind = compute_indicators(row.ts_code, last_trade)
@@ -382,7 +383,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         d0_close = ind['last_close']
         d0_rsi = ind.get('rsi_12', 50)
         
-        # === V30.12.8 核心过滤 ===
+        # === V30.12.9 核心过滤 ===
         # 1. 门槛：RSI 必须 > 设定值 (默认85)
         if d0_rsi <= RSI_MIN: continue
         
@@ -438,7 +439,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V30.12.8 冠军实战版")
+    st.header("V30.12.9 完美统计版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数", value=30, step=1)
     TOP_BACKTEST = st.number_input("每日优选 TopK", value=5)
@@ -446,13 +447,18 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("🧪 核心实战参数")
     
-    # 修改默认值为 85
     RSI_MIN = st.number_input("RSI 起步线 (最低)", value=85.0, help="建议85或90")
     
     col_a, col_b = st.columns(2)
-    # 修改默认值为 1.0
     MIN_OPEN_PCT = col_a.number_input("最低开盘幅度 (%)", value=1.0, help="低于此开盘价直接放弃")
     CONFIRM_RISE_PCT = col_b.number_input("买入确认涨幅 (%)", value=1.5, help="在开盘价基础上再涨多少买入")
+    
+    st.markdown("---")
+    st.subheader("⚔️ 风控参数")
+    # 默认值调整为 7.0%，更贴近“拒绝高潮，只做蓄势”的实战逻辑
+    MAX_PREV_PCT = st.number_input("昨日最大涨幅限制 (%)", value=7.0, help="建议设为5-7之间，过滤昨日涨停股")
+    
+    CHIP_MIN_WIN_RATE = st.number_input("最低获利盘 (%)", value=70.0)
     
     st.markdown("---")
     st.subheader("💰 基础过滤")
@@ -460,12 +466,7 @@ with st.sidebar:
     MIN_PRICE = col1.number_input("最低股价", value=20.0)
     MIN_MV = col2.number_input("最小市值(亿)", value=50.0)
     MAX_MV = st.number_input("最大市值(亿)", value=1000.0)
-    
-    st.markdown("---")
-    st.subheader("⚔️ 风控参数")
-    CHIP_MIN_WIN_RATE = st.number_input("最低获利盘 (%)", value=70.0)
-    MAX_PREV_PCT = st.number_input("昨日最大涨幅限制 (%)", value=19.0)
-    
+
     st.markdown("---")
     st.subheader("📊 形态参数")
     SECTOR_THRESHOLD = st.number_input("板块涨幅 (%)", value=1.5)
@@ -478,7 +479,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V30.12.8 回测"):
+if st.button(f"🚀 启动 V30.12.9 回测"):
     trade_days_list = get_trade_days(backtest_date_end.strftime("%Y%m%d"), int(BACKTEST_DAYS))
     
     if not trade_days_list:
@@ -504,27 +505,28 @@ if st.button(f"🚀 启动 V30.12.8 回测"):
     if results:
         all_res = pd.concat(results)
         
-        # === 新增：计算排名 Rank ===
-        # 数据已经按 Score 降序排列，直接按 Date 分组计数即可
+        # === Rank计算 ===
         all_res['Rank'] = all_res.groupby('Trade_Date').cumcount() + 1
         
-        st.header("📊 V30.12.8 统计仪表盘")
+        st.header("📊 V30.12.9 统计仪表盘")
         cols = st.columns(3)
         for idx, n in enumerate([1, 3, 5]):
             col_name = f'Return_D{n} (%)'
             valid = all_res.dropna(subset=[col_name]) 
             if not valid.empty:
+                count = len(valid) # 统计交易次数
                 avg = valid[col_name].mean()
                 win = (valid[col_name] > 0).mean() * 100
-                cols[idx].metric(f"D+{n} 均益 / 胜率", f"{avg:.2f}% / {win:.1f}%")
+                # 显示均益、胜率和成交次数
+                cols[idx].metric(f"D+{n} 均益 / 胜率 (交易次数)", f"{avg:.2f}% / {win:.1f}% ({count}次)")
+            else:
+                cols[idx].metric(f"D+{n} 均益 / 胜率", "无成交")
         
         st.subheader("📋 回测清单")
-        # 修改展示列：加入 Rank 和 Score，方便一眼看出
         display_cols = ['Trade_Date','Rank','name','ts_code','Close','Score', 'Pct_Chg',
              'Return_D1 (%)', 'Return_D3 (%)', 'Return_D5 (%)',
                         'rsi','winner_rate','vol_ratio']
         
-        # 按照日期降序，且日期内按Rank升序排列
         sorted_res = all_res[display_cols].sort_values(['Trade_Date', 'Rank'], ascending=[False, True])
         
         st.dataframe(sorted_res, use_container_width=True)
