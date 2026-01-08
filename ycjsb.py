@@ -1,17 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V30.12.11 净化战神版
+选股王 · V30.12.12 终极狙击版 (Final Sniper Edition)
 ------------------------------------------------
-版本特性 (Purified God of War Edition):
-1. **智能净化 (新特性)**：
-   - 🚫 **剔除老妖**：过去 20 天累计涨幅 > 100% 的股票，虽强但危，直接拉黑。
-   - 🚫 **剔除一字**：当日缩量一字板 (换手<2% 且 H=L)，无法交易，直接拉黑。
-   - 效果：让 Rank 1-4 全部变为“刚启动、能买进、有换手”的新龙。
+版本特性:
+1. **参数终极固化**：
+   - RSI > 90.0 (核心引擎，不可降级)
+   - 开盘幅度 > -3.0% (深蹲极限，性价比之王)
+   - Top 4 (头部效应)
+   
+2. **双重净化系统**：
+   - 🚫 去老妖：过去20天涨幅 > 100% 者剔除。
+   - 🚫 去一字：缩量一字板 (换手<2%) 者剔除。
 
-2. **黄金参数固化**：
-   - RSI > 90.0 (只做顶级妖股)
-   - Top 4 (剔除尾部)
-   - 最低开盘 > -2.0% (容错深蹲)
+3. **实战纪律 (显示在侧边栏)**：
+   - 买入：开盘价 + 1.5% 触发。
+   - 止损：盘中 -5% / 收盘 -3%。
+   - 止盈：10-20% 锁仓，>20% 止盈一半。
 ------------------------------------------------
 """
 
@@ -38,13 +42,14 @@ GLOBAL_STOCK_INDUSTRY = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V30.12.11 净化战神版", layout="wide")
-st.title("选股王 V30.12.11：净化战神版 🛡️")
+st.set_page_config(page_title="选股王 V30.12.12 终极狙击版", layout="wide")
+st.title("选股王 V30.12.12：终极狙击版 🎯")
 st.markdown("""
-**🔥 净化战法 (智能去妖 + RSI 90)：**
-1. **只做新龙**：自动剔除 20 天涨翻倍的老妖股，拒绝接盘。
-2. **拒绝一字**：自动剔除缩量一字板，确保只选能买进的换手龙。
-3. **黄金买点**：RSI > 90 + 低开容错，Rank 2 优先。
+**🔥 您的实战军规 (已固化)：**
+1. **只做真龙**：RSI > 90，非妖不看。
+2. **精准狙击**：开盘 > -3%，给妖股深蹲的机会。
+3. **拒绝杂音**：自动剔除老妖和一字板，只选能买进的新龙。
+4. **买卖铁律**：开盘+1.5%买入，破-3%止损，>20%止盈。
 """)
 
 # ---------------------------
@@ -237,7 +242,7 @@ def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead, min_ope
     # 1. 计算开盘幅度
     open_pct = (next_open - d0_qfq_close) / d0_qfq_close * 100
     
-    # 【风控】黄金参数：最低开盘幅度 (如 -2%)
+    # 【风控】黄金参数：最低开盘幅度 (固化为 -3%)
     if open_pct < min_open_pct: 
         return results 
     
@@ -387,31 +392,28 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         d0_rsi = ind.get('rsi_12', 50)
         
         # === 黄金过滤 ===
-        # 1. 门槛：RSI 必须 > 设定值 (黄金版默认90)
+        # 1. 门槛：RSI 必须 > 设定值 (黄金版固化90)
         if d0_rsi <= RSI_MIN: continue
         
         # 2. 趋势铁律：股价必须站在20日线之上
         if d0_close < ind['ma20']: continue 
         
-        # === 🚨【新增】净化过滤器 1：剔除缩量一字板 ===
-        # 逻辑：如果涨幅 > 9% 且 换手率 < 2% 且 High == Low，说明是无法买入的一字板，且开板即可能见顶
+        # === 🚨【净化 1】剔除缩量一字板 ===
+        # 逻辑：涨幅 > 9% 且 换手率 < 2% 且 High == Low
         if row.pct_chg > 9.0 and row.turnover_rate < 2.0:
-            # 判断是否High=Low (一字)
-            # row.high 和 row.low 来自合并后的数据
             if abs(row.high - row.low) < 0.01:
-                continue # 剔除一字板
+                continue 
 
-        # === 🚨【新增】净化过滤器 2：剔除老妖 (20天涨幅 > 100%) ===
-        # 逻辑：获取过去20个交易日的数据，计算累计涨幅
+        # === 🚨【净化 2】剔除翻倍老妖 ===
+        # 逻辑：20天涨幅 > 100%
         hist_20 = get_qfq_data_v4_optimized_final(row.ts_code, start_date=start_date_20, end_date=last_trade)
-        if not hist_20.empty and len(hist_20) >= 15: # 至少要有15天数据
-            # 取最近20条
+        if not hist_20.empty and len(hist_20) >= 15:
             recent_20 = hist_20.tail(20)
             first_close = recent_20.iloc[0]['close']
             curr_close = recent_20.iloc[-1]['close']
             if first_close > 0:
                 acc_ret = (curr_close - first_close) / first_close * 100
-                if acc_ret > 100.0: continue # 剔除翻倍老妖
+                if acc_ret > 100.0: continue 
 
         # 3. 弱市高位保护
         if market_state == 'Weak':
@@ -448,11 +450,9 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         # 基础分
         base_score = r['macd'] * 1000 + (r['net_mf'] / 10000) 
         if r['winner_rate'] > 90: base_score += 1000
-        
-        # 鼓励龙头 (RSI越高越好)
+        # 鼓励龙头
         if r['rsi'] > 90: base_score += 3000
         elif r['rsi'] > 85: base_score += 1500
-            
         return base_score
 
     fdf['Score'] = fdf.apply(dynamic_score, axis=1)
@@ -462,29 +462,26 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V30.12.11 净化战神版")
+    st.header("V30.12.12 终极狙击版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     
     # === 黄金参数默认值固化 ===
-    BACKTEST_DAYS = st.number_input("分析天数", value=200, step=1, help="默认200天，覆盖中期周期")
-    TOP_BACKTEST = st.number_input("每日优选 TopK", value=4, help="只看前4名，剔除尾部")
+    BACKTEST_DAYS = st.number_input("分析天数", value=200, step=1, help="默认200天")
+    TOP_BACKTEST = st.number_input("每日优选 TopK", value=4, help="只看前4名")
     
     st.markdown("---")
     st.subheader("🏆 黄金核心参数")
     
-    # 默认值改为 90.0
-    RSI_MIN = st.number_input("RSI 起步线 (最低)", value=90.0, help="黄金参数：90.0，只做真妖股")
+    # 固化默认值
+    RSI_MIN = st.number_input("RSI 起步线 (最低)", value=90.0, help="黄金参数：90.0")
     
     col_a, col_b = st.columns(2)
-    # 默认值改为 -2.0
-    MIN_OPEN_PCT = col_a.number_input("最低开盘幅度 (%)", value=-2.0, help="黄金参数：-2.0，容错低开深蹲")
-    CONFIRM_RISE_PCT = col_b.number_input("买入确认涨幅 (%)", value=1.5, help="盘中确认信号")
+    MIN_OPEN_PCT = col_a.number_input("最低开盘幅度 (%)", value=-3.0, help="黄金参数：-3.0")
+    CONFIRM_RISE_PCT = col_b.number_input("买入确认涨幅 (%)", value=1.5)
     
     st.markdown("---")
     st.subheader("⚔️ 风控参数")
-    # 默认值改为 19.0
-    MAX_PREV_PCT = st.number_input("昨日最大涨幅限制 (%)", value=19.0, help="黄金参数：19.0，放开连板限制")
-    
+    MAX_PREV_PCT = st.number_input("昨日最大涨幅限制 (%)", value=19.0)
     CHIP_MIN_WIN_RATE = st.number_input("最低获利盘 (%)", value=70.0)
     
     st.markdown("---")
@@ -506,7 +503,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V30.12.11 净化"):
+if st.button(f"🚀 启动 V30.12.12 终极"):
     trade_days_list = get_trade_days(backtest_date_end.strftime("%Y%m%d"), int(BACKTEST_DAYS))
     
     if not trade_days_list:
@@ -535,18 +532,17 @@ if st.button(f"🚀 启动 V30.12.11 净化"):
         # === Rank计算 ===
         all_res['Rank'] = all_res.groupby('Trade_Date').cumcount() + 1
         
-        st.header("📊 V30.12.11 净化版统计仪表盘")
-        st.markdown(f"**回测参数：** Top{TOP_BACKTEST} | RSI>{RSI_MIN} | 去妖+去一字")
+        st.header("📊 V30.12.12 终极统计仪表盘")
+        st.markdown(f"**核心参数：** RSI>90 | 开盘>-3% | Top4 | 净化版")
         
         cols = st.columns(3)
         for idx, n in enumerate([1, 3, 5]):
             col_name = f'Return_D{n} (%)'
             valid = all_res.dropna(subset=[col_name]) 
             if not valid.empty:
-                count = len(valid) # 统计交易次数
+                count = len(valid) 
                 avg = valid[col_name].mean()
                 win = (valid[col_name] > 0).mean() * 100
-                # 显示均益、胜率和成交次数
                 cols[idx].metric(f"D+{n} 均益 / 胜率 (交易次数)", f"{avg:.2f}% / {win:.1f}% ({count}次)")
             else:
                 cols[idx].metric(f"D+{n} 均益 / 胜率", "无成交")
@@ -564,8 +560,8 @@ if st.button(f"🚀 启动 V30.12.11 净化"):
         st.download_button(
             label="📥 下载回测结果 (CSV)",
             data=csv,
-            file_name=f"{datetime.now().strftime('%Y-%m-%d_%H-%M')}_purified_sniper.csv",
+            file_name=f"{datetime.now().strftime('%Y-%m-%d_%H-%M')}_final_sniper.csv",
             mime="text/csv",
         )
     else:
-        st.warning("⚠️ 没有选出任何股票 (可能是市场太弱，所有妖股均被净化规则拦截)。")
+        st.warning("⚠️ 没有选出任何股票 (严格净化后无标的)。")
