@@ -47,7 +47,7 @@ GLOBAL_STOCK_INDUSTRY = {}
 # 页面设置
 # ---------------------------
 st.set_page_config(page_title="选股王 V30.12.12 终极狙击版", layout="wide")
-st.title("选股王 V30.12.12：终极狙击版 🎯")
+st.title("主力")
 st.markdown("""
 **🔥 您的实战军规 (已固化)：**
 1. **只做真龙**：RSI > 90，非妖不看。
