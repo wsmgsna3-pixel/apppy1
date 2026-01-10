@@ -16,6 +16,9 @@
    - 买入：开盘价 + 1.5% 触发。
    - 止损：盘中 -5% / 收盘 -3%。
    - 止盈：10-20% 锁仓，>20% 止盈一半。
+
+4. **[新增] 断点续传**：
+   - 自动实时存档，防止网络中断丢失进度。
 ------------------------------------------------
 """
 
@@ -27,6 +30,7 @@ from datetime import datetime, timedelta
 import warnings
 import time
 import concurrent.futures 
+import os # 新增：用于文件操作
 
 warnings.filterwarnings("ignore")
 
@@ -469,6 +473,10 @@ with st.sidebar:
     BACKTEST_DAYS = st.number_input("分析天数", value=200, step=1, help="默认200天")
     TOP_BACKTEST = st.number_input("每日优选 TopK", value=4, help="只看前4名")
     
+    # [新增] 断点续传 Checkbox
+    USE_RESUME = st.checkbox("📂 开启断点续传 (防断网/崩溃)", value=True, help="勾选后，每跑完一天会自动存档。如果中断，下次启动会自动跳过已完成的日期。")
+    CHECKPOINT_FILE = "v30_12_12_checkpoint.csv"
+    
     st.markdown("---")
     st.subheader("🏆 黄金核心参数")
     
@@ -513,22 +521,56 @@ if st.button(f"🚀 启动 V30.12.12 终极"):
     if not get_all_historical_data(trade_days_list):
         st.stop()
         
-    results = []
+    # --- 断点续传逻辑准备 ---
+    processed_dates = set()
+    if USE_RESUME and os.path.exists(CHECKPOINT_FILE):
+        try:
+            # 只读 Trade_Date 列来判断进度，速度快
+            df_check = pd.read_csv(CHECKPOINT_FILE, usecols=['Trade_Date'], dtype={'Trade_Date':str})
+            processed_dates = set(df_check['Trade_Date'].tolist())
+            st.success(f"📂 检测到存档文件，包含 {len(processed_dates)} 个有数据的交易日。正在续传...")
+        except:
+            st.warning("⚠️ 存档文件可能已损坏，将重新开始。")
+    elif not USE_RESUME and os.path.exists(CHECKPOINT_FILE):
+        # 如果用户取消勾选续传，则删除旧文件重新跑
+        os.remove(CHECKPOINT_FILE)
+        st.info("🗑️ 已删除旧存档，重新开始计算。")
+    # -----------------------
+
+    results = [] # 依然保留这个空列表，防止逻辑报错，实际上主要靠文件读取
     bar = st.progress(0, text="回测引擎流水线启动...")
     
     for i, date in enumerate(trade_days_list):
+        # [续传核心逻辑]：如果日期已经在存档里，直接跳过
+        if date in processed_dates:
+             bar.progress((i+1)/len(trade_days_list), text=f"⏭️ 跳过已完成: {date}")
+             continue
+
         res, err = run_backtest_for_a_day(date, int(TOP_BACKTEST), 100, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_MIN, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, MAX_PREV_PCT, MIN_PRICE, MIN_OPEN_PCT, CONFIRM_RISE_PCT)
+        
         if not res.empty:
             res['Trade_Date'] = date
-            results.append(res)
+            
+            # [实时存档]：追加写入 CSV
+            try:
+                write_header = not os.path.exists(CHECKPOINT_FILE)
+                res.to_csv(CHECKPOINT_FILE, mode='a', header=write_header, index=False, encoding='utf-8-sig')
+            except Exception as e:
+                pass # 忽略极罕见的写入冲突，不影响主流程
         
         bar.progress((i+1)/len(trade_days_list), text=f"正在分析第 {i+1} 天: {date}")
         
     bar.empty()
     
-    if results:
-        all_res = pd.concat(results)
-        
+    # 最终结果加载：直接从 CSV 读取完整数据 (包含之前的存档 + 刚刚跑的)
+    if os.path.exists(CHECKPOINT_FILE):
+        all_res = pd.read_csv(CHECKPOINT_FILE, dtype={'ts_code':str, 'Trade_Date':str})
+        # 再次过滤，确保结果只包含本次设定日期范围内的数据 (防止存档里有几年前的旧数据干扰)
+        all_res = all_res[all_res['Trade_Date'].isin(trade_days_list)]
+    else:
+        all_res = pd.DataFrame() # 没有任何结果
+
+    if not all_res.empty:
         # === Rank计算 ===
         all_res['Rank'] = all_res.groupby('Trade_Date').cumcount() + 1
         
