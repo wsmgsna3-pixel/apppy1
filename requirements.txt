@@ -4,3 +4,4 @@ numpy
 tushare
 joblib
 scipy
+tenacity
