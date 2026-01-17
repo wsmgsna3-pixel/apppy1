@@ -1,252 +1,181 @@
+import streamlit as st
 import tushare as ts
 import pandas as pd
 import time
 import datetime
 from tenacity import retry, stop_after_attempt, wait_fixed
 
-# ================= 1. 安全配置与工具函数 =================
+# ================= 1. 页面基础配置 =================
+st.set_page_config(page_title="A股短线狙击", page_icon="📈")
 
-def get_user_token():
-    """
-    安全获取用户Token，不保存到文件
-    """
-    print("="*50)
-    token = input("请输入您的 Tushare Token (输入后回车): ").strip()
-    if len(token) < 20:
-        print("错误: Token 长度看起来不对，请重新运行程序。")
-        exit()
-    return token
+st.title("📈 A股周线潜伏+日线突击策略")
+st.caption("专为 10000 积分用户优化的移动端版本")
 
+# ================= 2. 侧边栏：安全配置 =================
+with st.sidebar:
+    st.header("⚙️ 参数设置")
+    # 使用 type="password" 隐藏 Token，安全且不落地
+    my_token = st.text_input("请输入 Tushare Token", type="password", key="token_input")
+    
+    # 为了防止手机端运行时间过长，增加一个测试数量限制
+    scan_limit = st.slider("扫描股票数量 (测试用)", 50, 5000, 200, help="全市场约5000只，建议先用200只测试")
+    
+    st.info("提示：手机端运行请保持屏幕常亮，或使用 Streamlit Cloud 部署。")
+
+# ================= 3. 核心逻辑函数 =================
+
+# 自动获取最近交易日
 def get_real_trade_date(pro):
-    """
-    自动识别最近的一个交易日
-    如果是周六(今天)，会自动定位到本周五
-    """
     today = datetime.datetime.now().strftime('%Y%m%d')
+    # 向前找20天
+    start_check = (datetime.datetime.now() - datetime.timedelta(days=20)).strftime('%Y%m%d')
     try:
-        # 获取包含今天在内的过去20天交易日历
-        start_check = (datetime.datetime.now() - datetime.timedelta(days=20)).strftime('%Y%m%d')
         df = pro.trade_cal(exchange='', start_date=start_check, end_date=today, is_open='1')
-        
-        if df.empty:
-            print("错误: 无法获取交易日历，请检查网络。")
-            exit()
-            
-        # 取最后一个日期，即为最近的交易日
-        real_date = df['cal_date'].values[-1]
-        print(f"系统检测: 今天是 {today}，最近的有效交易日是 【{real_date}】")
-        return real_date
-    except Exception as e:
-        print(f"获取交易日历失败: {e}")
-        exit()
+        return df['cal_date'].values[-1]
+    except:
+        return today
 
-# 重试装饰器：用于不稳定的网络请求
+# 重试机制装饰器
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(1))
 def fetch_chips_data(pro, ts_code, trade_date):
-    """单独封装筹码接口，便于重试"""
     return pro.cyq_perf(ts_code=ts_code, start_date=trade_date, end_date=trade_date)
 
-# ================= 2. 策略核心逻辑 =================
+# 缓存基础数据，避免每次点击按钮都重新下载
+@st.cache_data(ttl=3600)
+def get_basic_pool(_pro, trade_date):
+    # 获取基础列表
+    df = _pro.stock_basic(exchange='', list_status='L', fields='ts_code,symbol,name,list_date')
+    # 剔除ST
+    df = df[~df['name'].str.contains('ST')]
+    df = df[~df['name'].str.contains('退')]
+    # 剔除次新股
+    limit_date = pd.to_datetime(trade_date) - pd.Timedelta(days=180)
+    df = df[pd.to_datetime(df['list_date']) < limit_date]
+    return df['ts_code'].tolist()
 
-class StrategyRunner:
-    def __init__(self, token):
-        self.ts = ts
-        self.ts.set_token(token)
-        try:
-            self.pro = self.ts.pro_api()
-        except Exception as e:
-            print(f"Token 无效或连接失败: {e}")
-            exit()
-            
-        self.trade_date = get_real_trade_date(self.pro)
-        
-    def get_basic_pool(self):
-        """
-        第一步：初筛 (剔除ST、新股)
-        """
-        print(f"\n正在初始化股票池 (日期基准: {self.trade_date})...")
-        try:
-            # 这里的 fields 加上 list_date 用于过滤新股
-            df = self.pro.stock_basic(exchange='', list_status='L', 
-                                    fields='ts_code,symbol,name,area,industry,list_date')
-            
-            # 1. 剔除ST
-            df = df[~df['name'].str.contains('ST')]
-            df = df[~df['name'].str.contains('退')]
-            
-            # 2. 剔除上市不满 6 个月的次新股 (数据太少，技术面不稳定)
-            # 将 list_date 转为 datetime 对象
-            df['list_date'] = pd.to_datetime(df['list_date'])
-            # 计算半年前的时间点
-            limit_date = pd.to_datetime(self.trade_date) - pd.Timedelta(days=180)
-            df = df[df['list_date'] < limit_date]
-            
-            codes = df['ts_code'].tolist()
-            print(f"基础过滤完成，剩余 {len(codes)} 只标的等待扫描。")
-            return codes
-        except Exception as e:
-            print(f"获取基础数据失败: {e}")
-            return []
+# 策略逻辑封装
+class MobileStrategy:
+    def __init__(self, pro, trade_date):
+        self.pro = pro
+        self.trade_date = trade_date
 
     def check_weekly_low(self, ts_code):
-        """
-        第二步：周线逻辑 (判断相对低位)
-        """
         try:
-            # 获取最近 60 周数据
             df = self.pro.weekly(ts_code=ts_code, end_date=self.trade_date, limit=60)
-            if df is None or len(df) < 50: 
-                return False
+            if df is None or len(df) < 50: return False
             
-            # 简单有效的相对位置算法：(当前价 - 50周最低) / (50周最高 - 50周最低)
-            # 这种算法不需要复权因子也能大致判断区间
-            last_close = df.iloc[0]['close'] # 最近一周收盘价
-            period_high = df['high'].max()
-            period_low = df['low'].min()
+            # 计算位置
+            last_close = df.iloc[0]['close']
+            p_high = df['high'].max()
+            p_low = df['low'].min()
             
-            if period_high == period_low: return False # 防止除以0
+            if p_high == p_low: return False
+            pos = (last_close - p_low) / (p_high - p_low)
             
-            position = (last_close - period_low) / (period_high - period_low)
-            
-            # 判定标准：处于过去一年价格区间的底部 30% 以内
-            if position <= 0.30:
-                return True
-            return False
-            
-        except Exception:
-            # 任何报错都视为不符合，继续下一个
+            # 只要底部 35%
+            return pos <= 0.35
+        except:
             return False
 
     def check_daily_trigger(self, ts_code):
-        """
-        第三步：日线买入信号
-        """
         try:
-            # 获取最近 10 个交易日的数据，用于判断趋势
             df = self.pro.daily(ts_code=ts_code, end_date=self.trade_date, limit=10)
-            if df is None or len(df) < 5: 
-                return False
+            if df is None or len(df) < 5: return False
             
-            # 数据是按日期倒序的 (index 0 是最新一天)
             today = df.iloc[0]
+            # 涨幅 2% - 8%
+            if not (2.0 < today['pct_chg'] < 8.0): return False
             
-            # 1. 涨幅过滤：最近一天涨幅 > 2% (有资金点火) 且 < 8% (不追高/不追涨停)
-            if not (2.0 < today['pct_chg'] < 8.0):
-                return False
+            # 量比 > 1.2
+            avg_vol = df.iloc[1:6]['vol'].mean()
+            if avg_vol == 0 or today['vol'] < 1.2 * avg_vol: return False
             
-            # 2. 量能过滤：量比 > 1.2 (简化版，今日量 > 5日均量 * 1.2)
-            # 注意：DataFrame切片 [1:6] 代表过去5天
-            avg_vol_5 = df.iloc[1:6]['vol'].mean()
-            if avg_vol_5 == 0: return False
-            
-            if today['vol'] < 1.2 * avg_vol_5:
-                return False
-                
             return True
-            
-        except Exception:
+        except:
             return False
 
-    def check_chips_structure(self, ts_code):
-        """
-        第四步：筹码验证 (最耗时，放在最后)
-        """
+    def check_chips(self, ts_code):
         try:
-            # 调用带重试机制的函数
             df = fetch_chips_data(self.pro, ts_code, self.trade_date)
+            if df is None or df.empty: return False
             
-            if df is None or df.empty: 
-                return False
-            
-            row = df.iloc[0]
-            winner_rate = row['winner_rate'] # 获利比例
-            
-            # 逻辑：
-            # 1. 极度缩量跌无可跌 (winner_rate < 5%) -> 反弹一触即发
-            # 2. 或者底部吸筹结束，刚突破 (50% < winner_rate < 80%)
-            # 这里为了安全，我们选获利盘比较干净的，或者刚起步的
-            
+            winner_rate = df.iloc[0]['winner_rate']
+            # 获利盘极少(超跌) 或 筹码密集突破(50-85)
             if winner_rate < 15 or (50 < winner_rate < 85):
                 return True
-                
             return False
-            
-        except Exception:
-            # 网络实在不行就跳过
+        except:
             return False
 
-    def run(self):
-        codes = self.get_basic_pool()
-        if not codes: return
-        
-        candidates = []
-        print("\n=== 开始执行选股策略 (按 Ctrl+C 可中止) ===")
-        
-        # 计数器
-        checked_count = 0
-        
-        # 建议：为了演示速度，这里可以先切片 codes[:200] 测试
-        # 实盘请去掉 [:200]
-        # target_pool = codes  # 全量
-        target_pool = codes[:200] # 测试用，只跑前200个
-        
-        total = len(target_pool)
-        
-        for ts_code in target_pool:
-            checked_count += 1
-            # 打印进度条效果 (每20个打印一次)
-            if checked_count % 20 == 0:
-                print(f"进度: {checked_count}/{total} ...")
-                
-            # --- 漏斗筛选法 ---
-            
-            # 1. 周线不合格，直接 pass (最快)
-            if not self.check_weekly_low(ts_code):
-                continue
-                
-            # 2. 日线没信号，直接 pass
-            if not self.check_daily_trigger(ts_code):
-                continue
-                
-            # 3. 筹码验证 (最慢，最后做)
-            # 打印一下，表示进入决赛圈了
-            print(f"正在验证筹码: {ts_code} ...", end="") 
-            if self.check_chips_structure(ts_code):
-                print("【命中！】")
-                candidates.append(ts_code)
-            else:
-                print(" 筹码结构一般")
-                
-        print("\n" + "="*50)
-        print(f"选股完成！日期：{self.trade_date}")
-        print(f"最终入选股票 ({len(candidates)}只):")
-        print(candidates)
-        print("="*50)
-        
-        # 简单的保存结果
-        if candidates:
-            with open(f'result_{self.trade_date}.txt', 'w') as f:
-                f.write(','.join(candidates))
-            print(f"结果已保存至 result_{self.trade_date}.txt")
+# ================= 4. 主运行区 =================
 
-# ================= 3. 程序入口 =================
-
-if __name__ == "__main__":
-    try:
-        # 1. 输入Token
-        my_token = get_user_token()
-        
-        # 2. 初始化策略
-        strategy = StrategyRunner(my_token)
-        
-        # 3. 运行
-        strategy.run()
-        
-    except KeyboardInterrupt:
-        print("\n程序已手动中止。")
-    except Exception as e:
-        print(f"\n程序发生未知错误: {e}")
-        import traceback
-        traceback.print_exc()
+if st.button("🚀 开始选股", type="primary"):
+    if not my_token:
+        st.error("请先在左侧侧边栏输入 Tushare Token！")
+        st.stop()
     
-    input("\n按回车键退出...")
+    # 初始化连接
+    status_box = st.status("正在初始化...", expanded=True)
+    try:
+        ts.set_token(my_token)
+        pro = ts.pro_api()
+        trade_date = get_real_trade_date(pro)
+        status_box.write(f"📅 交易日基准: **{trade_date}**")
+        
+        # 获取股票池
+        status_box.write("正在获取全市场股票池...")
+        full_codes = get_basic_pool(pro, trade_date)
+        
+        # 截取用户设定的数量
+        target_pool = full_codes[:scan_limit]
+        status_box.write(f"🔍 目标扫描数量: {len(target_pool)} 只")
+        
+    except Exception as e:
+        status_box.update(label="初始化失败", state="error")
+        st.error(f"连接失败，请检查Token或网络: {e}")
+        st.stop()
+
+    # 开始循环
+    strategy = MobileStrategy(pro, trade_date)
+    candidates = []
+    
+    # 进度条
+    progress_bar = st.progress(0)
+    
+    status_box.write("⏳ 正在扫描中，请稍候...")
+    
+    for i, code in enumerate(target_pool):
+        # 更新进度条
+        progress = (i + 1) / len(target_pool)
+        progress_bar.progress(progress)
+        
+        # 漏斗筛选
+        if not strategy.check_weekly_low(code): continue
+        if not strategy.check_daily_trigger(code): continue
+        
+        # 只有前两步通过，才显示日志并查筹码
+        status_box.write(f"正在验证筹码: {code} ...")
+        
+        if strategy.check_chips(code):
+            candidates.append(code)
+            st.toast(f"🎉 发现目标: {code}") # 手机弹出提示
+    
+    status_box.update(label="扫描完成！", state="complete", expanded=False)
+    
+    # 结果展示
+    st.divider()
+    if candidates:
+        st.success(f"✅ 选股完成！共发现 {len(candidates)} 只标的")
+        
+        # 获取股票名称方便查看
+        if len(candidates) > 0:
+            df_res = pro.stock_basic(ts_code=','.join(candidates), fields='ts_code,name,industry')
+            st.dataframe(df_res, use_container_width=True)
+            
+            st.code(','.join(candidates), language="text") # 方便复制
+    else:
+        st.warning("本次扫描未发现符合条件的股票，建议调整参数或扩大扫描范围。")
+
+else:
+    # 初始状态提示
+    st.info("👈 请在左侧输入 Token，然后点击上方“开始选股”按钮。")
