@@ -2,14 +2,19 @@ import streamlit as st
 import tushare as ts
 import pandas as pd
 import datetime
+import os
 import time
 from tenacity import retry, stop_after_attempt, wait_fixed
 
 # ================= 1. 页面配置 =================
-st.set_page_config(page_title="A股狙击系统(公平版)", page_icon="⚖️", layout="wide")
+st.set_page_config(page_title="周线选股(防崩溃版)", page_icon="🛡️", layout="wide")
 
-st.title("⚖️ A股狙击系统：解决大市值权重偏差")
-st.markdown("### 核心升级：增加“换手率排序”，让大小盘股公平竞技")
+st.title("🛡️ A股周线选股系统 (支持断点续传)")
+st.caption("每扫描一只股票都会自动存档，崩溃后重新运行即可接着跑")
+
+# 定义缓存文件路径
+CACHE_FILE = "scan_checkpoint.csv"     # 存放已完成的结果
+PROGRESS_FILE = "scan_progress.txt"    # 存放进度（当前日期|当前股票代码）
 
 # ================= 2. 侧边栏：参数设置 =================
 with st.sidebar:
@@ -17,14 +22,8 @@ with st.sidebar:
     my_token = st.text_input("Tushare Token", type="password", key="token", help="请输入10000积分Token")
     
     st.divider()
-    st.subheader("⚖️ 排序逻辑 (关键修改)")
-    # 【新增】排序方式选择
-    sort_method = st.radio(
-        "优先筛选标准", 
-        ["按换手率 (活跃度优先)", "按成交额 (资金流优先)"],
-        index=0,
-        help="【换手率】适合抓妖股，消除市值差异；【成交额】适合抓大票龙头。"
-    )
+    st.subheader("⚖️ 排序逻辑")
+    sort_method = st.radio("优先筛选标准", ["按换手率 (活跃度优先)", "按成交额 (资金流优先)"], index=0)
     
     st.divider()
     st.subheader("🛠️ 策略开关")
@@ -58,7 +57,14 @@ with st.sidebar:
         max_p = st.number_input("最高价", value=300.0)
         max_mv = st.number_input("最大市值(亿)", value=1000.0)
 
-# ================= 3. 核心逻辑 =================
+    # 清除缓存按钮
+    st.divider()
+    if st.button("🗑️ 清除历史缓存/重新开始"):
+        if os.path.exists(CACHE_FILE): os.remove(CACHE_FILE)
+        if os.path.exists(PROGRESS_FILE): os.remove(PROGRESS_FILE)
+        st.toast("已清除缓存，下次将重新开始！")
+
+# ================= 3. 核心工具函数 =================
 
 def get_trade_cal(pro, start, end):
     df = pro.trade_cal(exchange='', start_date=start, end_date=end, is_open='1')
@@ -68,45 +74,61 @@ def get_trade_cal(pro, start, end):
 def fetch_chips_safe(pro, ts_code, trade_date):
     return pro.cyq_perf(ts_code=ts_code, start_date=trade_date, end_date=trade_date)
 
-# 【核心修改】支持动态排序字段
-def get_sorted_pool(_pro, trade_date, _min_p, _max_p, _min_mv, _max_mv, _sort_method):
-    
-    # 1. 基础表
-    df_basic = _pro.stock_basic(exchange='', list_status='L', fields='ts_code,name,list_date')
-    df_basic = df_basic[~df_basic['name'].str.contains('ST|退')]
-    df_basic = df_basic[~df_basic['ts_code'].str.contains('\.BJ')] 
-    limit_date = pd.to_datetime(trade_date) - pd.Timedelta(days=180)
-    df_basic = df_basic[pd.to_datetime(df_basic['list_date']) < limit_date]
-    
-    # 2. 行情表
-    # 获取成交额(amount)用于资金流排序，获取换手率(turnover_rate)用于活跃度排序
-    df_daily = _pro.daily(trade_date=trade_date, fields='ts_code,close,amount')
-    df_basic_daily = _pro.daily_basic(trade_date=trade_date, fields='ts_code,circ_mv,turnover_rate')
-    
-    if df_daily.empty or df_basic_daily.empty: return pd.DataFrame()
-    
-    # 合并
-    df_merge = pd.merge(df_basic, df_daily, on='ts_code')
-    df_merge = pd.merge(df_merge, df_basic_daily, on='ts_code')
-    
-    # 3. 硬性过滤
-    cond = (
-        (df_merge['close'] >= _min_p) & 
-        (df_merge['close'] <= _max_p) &
-        (df_merge['circ_mv'] >= _min_mv * 10000) & 
-        (df_merge['circ_mv'] <= _max_mv * 10000)
-    )
-    pool = df_merge[cond]
-    
-    # 4. 【关键修改】动态排序
-    if "换手率" in _sort_method:
-        # 按换手率倒序：50亿的小票如果换手高，会排在最前面！
-        pool = pool.sort_values('turnover_rate', ascending=False)
+# 保存单条结果到CSV（追加模式）
+def save_result_to_csv(item):
+    df = pd.DataFrame([item])
+    # 如果文件不存在，写入表头；如果存在，不写表头直接追加
+    if not os.path.exists(CACHE_FILE):
+        df.to_csv(CACHE_FILE, index=False, encoding='utf-8-sig')
     else:
-        # 按成交额倒序：大票有天然优势
-        pool = pool.sort_values('amount', ascending=False)
-    
-    return pool
+        df.to_csv(CACHE_FILE, mode='a', header=False, index=False, encoding='utf-8-sig')
+
+# 保存进度
+def save_progress(date_str, code_str):
+    with open(PROGRESS_FILE, 'w') as f:
+        f.write(f"{date_str},{code_str}")
+
+# 读取进度
+def load_progress():
+    if os.path.exists(PROGRESS_FILE):
+        with open(PROGRESS_FILE, 'r') as f:
+            content = f.read().strip()
+            if content:
+                return content.split(',')
+    return None, None
+
+def get_sorted_pool(_pro, trade_date, _min_p, _max_p, _min_mv, _max_mv, _sort_method):
+    try:
+        df_basic = _pro.stock_basic(exchange='', list_status='L', fields='ts_code,name,list_date')
+        df_basic = df_basic[~df_basic['name'].str.contains('ST|退')]
+        df_basic = df_basic[~df_basic['ts_code'].str.contains('\.BJ')] 
+        limit_date = pd.to_datetime(trade_date) - pd.Timedelta(days=180)
+        df_basic = df_basic[pd.to_datetime(df_basic['list_date']) < limit_date]
+        
+        df_daily = _pro.daily(trade_date=trade_date, fields='ts_code,close,amount')
+        df_basic_daily = _pro.daily_basic(trade_date=trade_date, fields='ts_code,circ_mv,turnover_rate')
+        
+        if df_daily.empty or df_basic_daily.empty: return pd.DataFrame()
+        
+        df_merge = pd.merge(df_basic, df_daily, on='ts_code')
+        df_merge = pd.merge(df_merge, df_basic_daily, on='ts_code')
+        
+        cond = (
+            (df_merge['close'] >= _min_p) & 
+            (df_merge['close'] <= _max_p) &
+            (df_merge['circ_mv'] >= _min_mv * 10000) & 
+            (df_merge['circ_mv'] <= _max_mv * 10000)
+        )
+        pool = df_merge[cond]
+        
+        if "换手率" in _sort_method:
+            pool = pool.sort_values('turnover_rate', ascending=False)
+        else:
+            pool = pool.sort_values('amount', ascending=False)
+        
+        return pool
+    except Exception as e:
+        return pd.DataFrame()
 
 class StrategyRunner:
     def __init__(self, pro, trade_date):
@@ -185,7 +207,13 @@ def calc_returns(pro, ts_code, buy_date):
 
 # ================= 4. 主程序 =================
 
-if st.button("🚀 启动策略", type="primary"):
+# 检查是否有上次的进度
+last_date, last_code = load_progress()
+start_msg = "🚀 启动策略"
+if last_date:
+    start_msg = f"🔄 检测到异常退出 ({last_date})，点击继续"
+
+if st.button(start_msg, type="primary"):
     if not my_token:
         st.error("请先输入Token")
         st.stop()
@@ -197,40 +225,67 @@ if st.button("🚀 启动策略", type="primary"):
     if not trade_dates:
         st.error("日期范围内无交易日")
         st.stop()
-        
-    st.info(f"📅 扫描区间: {trade_dates[0]} ~ {trade_dates[-1]} ({len(trade_dates)}天)")
     
-    all_results = []
+    # 显示结果容器
+    result_container = st.container()
     
-    main_progress = st.progress(0)
+    # 如果有缓存文件，先读取展示
+    if os.path.exists(CACHE_FILE):
+        try:
+            existing_df = pd.read_csv(CACHE_FILE)
+            with result_container:
+                st.success(f"📂 已加载历史缓存数据：{len(existing_df)} 条")
+                st.dataframe(existing_df, height=300)
+        except:
+            pass
+
     status_box = st.status("正在初始化...", expanded=True)
-    log_area = st.empty() 
+    log_area = st.empty()
     
-    for i, t_date in enumerate(trade_dates):
-        status_box.write(f"📂 [{i+1}/{len(trade_dates)}] 正在加载 {t_date} 数据...")
-        main_progress.progress(i / len(trade_dates))
+    # --- 寻找断点位置 ---
+    start_date_idx = 0
+    if last_date and last_date in trade_dates:
+        start_date_idx = trade_dates.index(last_date)
+        status_box.write(f"🔄 恢复进度：跳过 {last_date} 之前的所有日期...")
+
+    # --- 日期循环 ---
+    for i in range(start_date_idx, len(trade_dates)):
+        t_date = trade_dates[i]
         
-        # 传入新的排序参数
+        status_box.write(f"📂 [{i+1}/{len(trade_dates)}] 正在加载 {t_date} 数据...")
+        
         pool = get_sorted_pool(pro, t_date, min_p, max_p, min_mv, max_mv, sort_method)
         if pool.empty: continue
         
         target_codes = pool['ts_code'].tolist()[:scan_limit]
-        status_box.write(f"🔍 {t_date}: 初筛合格 {len(pool)} 只，扫描头部 {len(target_codes)} 只 ({sort_method})...")
         
+        # --- 寻找当天内的断点 ---
+        start_code_idx = 0
+        if last_code and t_date == last_date:
+            if last_code in target_codes:
+                start_code_idx = target_codes.index(last_code) + 1 # 从下一只开始
+                status_box.write(f"🔄 {t_date}: 跳过已完成的 {start_code_idx} 只股票，继续扫描...")
+        
+        # --- 股票循环 ---
         runner = StrategyRunner(pro, t_date)
         
-        for code in target_codes:
+        for j in range(start_code_idx, len(target_codes)):
+            code = target_codes[j]
+            
+            # 【关键】每扫描一只，就更新一下进度文件
+            save_progress(t_date, code)
+            
+            # 策略检查
             if not runner.check_weekly(code): continue
             if not runner.check_daily(code): continue
             
             is_match = runner.check_chips_or_alternative(code, use_chips)
             
             stock_name = pool[pool['ts_code']==code]['name'].values[0]
-            log_area.text(f"正在验证: {stock_name} ({code}) -> 筹码/指标值: {runner.last_chips_value}")
+            log_area.text(f"[{j+1}/{len(target_codes)}] 正在验证: {stock_name} ({code}) -> {runner.last_chips_value}")
             
             if is_match:
                 ret = calc_returns(pro, code, t_date)
-                # 获取该股票的换手率和成交额数据用于展示
                 row = pool[pool['ts_code']==code].iloc[0]
                 
                 item = {
@@ -239,34 +294,31 @@ if st.button("🚀 启动策略", type="primary"):
                     "名称": stock_name,
                     "价格": row['close'],
                     "市值(亿)": round(row['circ_mv']/10000, 2),
-                    "换手率%": row.get('turnover_rate', 0), # 新增展示
-                    "成交额(千)": row.get('amount', 0),    # 新增展示
+                    "换手率%": row.get('turnover_rate', 0),
+                    "成交额(千)": row.get('amount', 0),
                     "筹码/指标": runner.last_chips_value, 
                     "T+1": ret['T+1'],
                     "T+3": ret['T+3'],
                     "T+5": ret['T+5']
                 }
-                all_results.append(item)
-                st.toast(f"✅ 命中: {stock_name}")
                 
-    main_progress.progress(100)
-    status_box.update(label="扫描完成", state="complete", expanded=False)
+                # 【关键】发现一只，存一只！
+                save_result_to_csv(item)
+                st.toast(f"✅ 命中: {stock_name}")
+        
+        # 当天跑完，重置code进度，防止影响下一天
+        last_code = None 
+
+    status_box.update(label="全部扫描完成！", state="complete", expanded=False)
     
-    if all_results:
-        res_df = pd.DataFrame(all_results)
-        st.success(f"🎉 扫描结束，共发现 {len(res_df)} 个买点")
+    # 最终结果展示
+    if os.path.exists(CACHE_FILE):
+        final_df = pd.read_csv(CACHE_FILE)
+        st.success(f"🎉 任务结束！累计发现 {len(final_df)} 个买点")
+        st.dataframe(final_df.style.background_gradient(subset=['T+1'], cmap='RdYlGn', vmin=-5, vmax=5))
         
-        win_df = res_df.dropna(subset=['T+1'])
-        if not win_df.empty:
-            win_rate = len(win_df[win_df['T+1']>0]) / len(win_df) * 100
-            st.metric("T+1 胜率", f"{win_rate:.1f}%")
+        # 清除进度文件，因为已经全部跑完了
+        if os.path.exists(PROGRESS_FILE): os.remove(PROGRESS_FILE)
         
-        st.dataframe(
-            res_df.style.background_gradient(subset=['T+1'], cmap='RdYlGn', vmin=-5, vmax=5),
-            column_order=["日期", "名称", "代码", "换手率%", "T+1", "T+3", "T+5", "筹码/指标"],
-            use_container_width=True
-        )
-        
-        st.download_button("📥 下载详细CSV", res_df.to_csv(index=False).encode('utf-8-sig'), "report.csv")
-    else:
-        st.warning("未找到符合条件的股票。")
+        with open(CACHE_FILE, "rb") as f:
+            st.download_button("📥 下载最终CSV", f, "final_report.csv")
