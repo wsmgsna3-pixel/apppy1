@@ -7,14 +7,14 @@ import time
 from tenacity import retry, stop_after_attempt, wait_fixed
 
 # ================= 1. 页面配置 =================
-st.set_page_config(page_title="周线选股Turbo(智能版)", page_icon="⚡️", layout="wide")
+st.set_page_config(page_title="周线选股Turbo(稳健版)", page_icon="⚡️", layout="wide")
 
 st.title("⚡️ A股周线选股 Turbo：智能缓存版")
-st.markdown("### 核心升级：智能识别已跑过的日期，拒绝重复劳动")
+st.markdown("### 核心升级：修复绘图库缺失问题，确保手机端稳定运行")
 
 # 文件路径
 CACHE_FILE = "scan_result_turbo.csv"     # 存结果
-HISTORY_FILE = "scan_history_turbo.txt"  # 存已扫描过的所有日期（含无结果的日期）
+HISTORY_FILE = "scan_history_turbo.txt"  # 存已扫描过的所有日期
 
 # ================= 2. 侧边栏：参数设置 =================
 with st.sidebar:
@@ -26,7 +26,6 @@ with st.sidebar:
     mode = st.radio("运行模式", ["单日扫描", "区间回测"], index=0)
     
     if mode == "单日扫描":
-        # 智能默认日期：如果有昨天的数据就默认昨天
         default_date = datetime.date.today() - datetime.timedelta(days=1)
         if datetime.date.today().weekday() == 0:
             default_date = datetime.date.today() - datetime.timedelta(days=3)
@@ -34,7 +33,6 @@ with st.sidebar:
         start_date_str = selected_date.strftime('%Y%m%d')
         end_date_str = start_date_str
     else:
-        # 默认给您设置好20250901
         default_start = datetime.date(2025, 9, 1)
         c1, c2 = st.columns(2)
         with c1: d1 = st.date_input("开始", default_start)
@@ -78,24 +76,18 @@ def save_result_to_csv(item):
     else:
         df.to_csv(CACHE_FILE, mode='a', header=False, index=False, encoding='utf-8-sig')
 
-# 【新增】记录“已扫描日期”（无论是否有结果，只要跑过就记下来）
 def mark_date_as_scanned(date_str):
     with open(HISTORY_FILE, 'a') as f:
         f.write(date_str + "\n")
 
-# 【新增】检查日期是否已扫描过
 def is_date_scanned(date_str):
-    # 1. 先查结果文件里有没有（最稳）
     if os.path.exists(CACHE_FILE):
         try:
             df = pd.read_csv(CACHE_FILE)
-            # 确保日期列按字符串对比
             if str(date_str) in df['日期'].astype(str).values:
                 return True
         except:
             pass
-            
-    # 2. 再查历史记录文件（防止那一天没结果被重复跑）
     if os.path.exists(HISTORY_FILE):
         with open(HISTORY_FILE, 'r') as f:
             scanned_dates = f.read().splitlines()
@@ -103,7 +95,7 @@ def is_date_scanned(date_str):
                 return True
     return False
 
-# --- 批量获取数据的核心 ---
+# --- 批量获取 ---
 def batch_get_weekly(pro, codes, trade_date):
     try:
         chunk_size = 50
@@ -138,7 +130,7 @@ def batch_get_daily(pro, codes, trade_date):
     except:
         return pd.DataFrame()
 
-# ================= 4. 内存筛选逻辑 =================
+# ================= 4. 内存筛选 =================
 
 def filter_weekly_batch(df_weekly_all, trade_date):
     valid_codes = []
@@ -238,27 +230,23 @@ if st.button("🚀 启动/继续", type="primary"):
     status_box = st.status("正在启动...", expanded=True)
     log_area = st.empty()
 
-    # --- 日期循环 ---
     for i, t_date in enumerate(trade_dates):
-        
-        # 【核心修改】先检查：这一天是不是已经在缓存里了？
+        # 智能跳过逻辑
         if is_date_scanned(t_date):
-            status_box.write(f"⚡️ {t_date} 已在缓存中，自动跳过扫描...")
+            status_box.write(f"⚡️ {t_date} 已在缓存中，自动跳过...")
             progress_bar.progress((i+1)/len(trade_dates))
-            continue # 直接进入下一天
+            continue
             
         status_box.write(f"📆 [{i+1}/{len(trade_dates)}] 正在扫描 {t_date} (批量模式) ...")
         progress_bar.progress((i)/len(trade_dates))
         
-        # ... 以下是扫描逻辑 ...
         pool = get_sorted_pool(pro, t_date, min_p, max_p, min_mv, max_mv)
         if pool.empty: 
-            mark_date_as_scanned(t_date) # 即使没票，也要标记“我跑过这天了”
+            mark_date_as_scanned(t_date)
             continue
             
         target_codes = pool['ts_code'].tolist()[:scan_limit]
         
-        # 批量周线
         df_weekly_all = batch_get_weekly(pro, target_codes, t_date)
         valid_weekly_codes = filter_weekly_batch(df_weekly_all, t_date)
         
@@ -266,7 +254,6 @@ if st.button("🚀 启动/继续", type="primary"):
             mark_date_as_scanned(t_date)
             continue
             
-        # 批量日线
         df_daily_all = batch_get_daily(pro, valid_weekly_codes, t_date)
         valid_daily_map = filter_daily_batch(df_daily_all, valid_weekly_codes, t_date)
         
@@ -309,22 +296,21 @@ if st.button("🚀 启动/继续", type="primary"):
                 save_result_to_csv(item)
                 log_area.text(f"✅ {t_date} 命中: {row['name']} (得分{total_score})")
 
-        # 【核心】标记这天跑完了
         mark_date_as_scanned(t_date)
 
     progress_bar.progress(100)
     status_box.update(label="处理完成！", state="complete", expanded=False)
     
-    # ================= 仪表盘展示 =================
+    # ================= 仪表盘 =================
     if os.path.exists(CACHE_FILE):
         try:
             df_all = pd.read_csv(CACHE_FILE)
             
-            # 【重要】如果是单日扫描模式，只展示那一天的数据
+            # 单日模式只看当天
             if mode == "单日扫描":
                 df_all = df_all[df_all['日期'].astype(str) == start_date_str]
                 if df_all.empty:
-                    st.warning(f"{start_date_str} 扫描完成，未发现符合条件的股票。")
+                    st.warning(f"{start_date_str} 未发现符合条件的股票。")
                     st.stop()
 
             # 排序
@@ -337,7 +323,6 @@ if st.button("🚀 启动/继续", type="primary"):
                 
             top_5 = df_sorted.head(5)
             
-            # 计算
             t3_avg = top_5['T+3'].mean() if 'T+3' in top_5 else 0
             win_count = len(top_5[top_5['T+3'] > 0]) if 'T+3' in top_5 else 0
             win_rate = win_count / len(top_5) * 100 if len(top_5) > 0 else 0
@@ -349,7 +334,8 @@ if st.button("🚀 启动/继续", type="primary"):
                 k1.metric("Top5 平均T+3收益", f"{t3_avg:.2f}%")
                 k2.metric("Top5 T+3胜率", f"{win_rate:.0f}%")
                 
-                st.dataframe(df_sorted.style.background_gradient(subset=['综合得分'], cmap='Oranges'), use_container_width=True)
+                # 【修改处】移除了 .style.background_gradient，防止报错
+                st.dataframe(df_sorted, use_container_width=True)
                 
                 with open(CACHE_FILE, "rb") as f:
                     st.download_button("📥 下载完整CSV", f, "turbo_result.csv")
