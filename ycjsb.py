@@ -7,19 +7,23 @@ import time
 from tenacity import retry, stop_after_attempt, wait_fixed
 
 # ================= 1. 页面配置 =================
-st.set_page_config(page_title="周线选股Turbo(稳健版)", page_icon="⚡️", layout="wide")
+st.set_page_config(page_title="周线选股Turbo(定制版)", page_icon="⚡️", layout="wide")
 
-st.title("⚡️ A股周线选股 Turbo：智能缓存版")
-st.markdown("### 核心升级：修复绘图库缺失问题，确保手机端稳定运行")
+st.title("⚡️ A股周线选股 Turbo：定制版")
+st.markdown("### 核心功能：批量极速回测 | 智能缓存 | 全周期战报")
 
 # 文件路径
 CACHE_FILE = "scan_result_turbo.csv"     # 存结果
 HISTORY_FILE = "scan_history_turbo.txt"  # 存已扫描过的所有日期
 
-# ================= 2. 侧边栏：参数设置 =================
+# ================= 2. 主界面：Token输入 =================
+# 【修改点1】Token 移至主界面，方便输入
+st.info("👇 请在下方输入您的 Tushare Token (10000积分以上)")
+my_token = st.text_input("Tushare Token", type="password", key="token_main", placeholder="在此粘贴 Token...")
+
+# ================= 3. 侧边栏：参数设置 =================
 with st.sidebar:
-    st.header("⚙️ 核心控制台")
-    my_token = st.text_input("Tushare Token", type="password", key="token", help="请输入10000积分Token")
+    st.header("⚙️ 参数控制台")
     
     st.divider()
     st.subheader("🗓️ 模式选择")
@@ -43,14 +47,17 @@ with st.sidebar:
     st.divider()
     st.subheader("⚖️ 筛选标准")
     sort_method = st.radio("排名依据", ["按综合得分 (推荐)", "按换手率", "按成交额"], index=0)
-    scan_limit = st.slider("初筛活跃股数量", 200, 5000, 500)
+    
+    # 【修改点3】步长 step=50，方便手机滑动
+    scan_limit = st.slider("初筛活跃股数量", 200, 5000, 500, step=50, help="每次增减50个，按成交额倒序选取")
     
     col_p1, col_p2 = st.columns(2)
     with col_p1:
-        min_p = st.number_input("最低价", value=5.0)
+        # 【修改点2】默认最低价调整为 10.0
+        min_p = st.number_input("最低价(元)", value=10.0)
         min_mv = st.number_input("最小市值(亿)", value=30.0)
     with col_p2:
-        max_p = st.number_input("最高价", value=300.0)
+        max_p = st.number_input("最高价(元)", value=300.0)
         max_mv = st.number_input("最大市值(亿)", value=2000.0)
 
     st.divider()
@@ -59,7 +66,7 @@ with st.sidebar:
         if os.path.exists(HISTORY_FILE): os.remove(HISTORY_FILE)
         st.toast("缓存已清空，一切重新开始！")
 
-# ================= 3. 核心工具函数 =================
+# ================= 4. 核心工具函数 =================
 
 def get_trade_cal(pro, start, end):
     df = pro.trade_cal(exchange='', start_date=start, end_date=end, is_open='1')
@@ -130,7 +137,7 @@ def batch_get_daily(pro, codes, trade_date):
     except:
         return pd.DataFrame()
 
-# ================= 4. 内存筛选 =================
+# ================= 5. 内存筛选 =================
 
 def filter_weekly_batch(df_weekly_all, trade_date):
     valid_codes = []
@@ -210,11 +217,11 @@ def calc_returns(pro, ts_code, buy_date):
         pass
     return res
 
-# ================= 5. 主程序 =================
+# ================= 6. 主程序 =================
 
 if st.button("🚀 启动/继续", type="primary"):
     if not my_token:
-        st.error("请先输入Token")
+        st.error("🚨 错误：请在上方输入 Token！")
         st.stop()
         
     ts.set_token(my_token)
@@ -222,12 +229,12 @@ if st.button("🚀 启动/继续", type="primary"):
     trade_dates = get_trade_cal(pro, start_date_str, end_date_str)
     
     if not trade_dates:
-        st.error("该时间段无交易日")
+        st.error("❌ 该时间段无交易日")
         st.stop()
         
     dashboard_placeholder = st.empty()
     progress_bar = st.progress(0)
-    status_box = st.status("正在启动...", expanded=True)
+    status_box = st.status("正在启动极速引擎...", expanded=True)
     log_area = st.empty()
 
     for i, t_date in enumerate(trade_dates):
@@ -240,6 +247,7 @@ if st.button("🚀 启动/继续", type="primary"):
         status_box.write(f"📆 [{i+1}/{len(trade_dates)}] 正在扫描 {t_date} (批量模式) ...")
         progress_bar.progress((i)/len(trade_dates))
         
+        # 1. 基础池
         pool = get_sorted_pool(pro, t_date, min_p, max_p, min_mv, max_mv)
         if pool.empty: 
             mark_date_as_scanned(t_date)
@@ -247,6 +255,7 @@ if st.button("🚀 启动/继续", type="primary"):
             
         target_codes = pool['ts_code'].tolist()[:scan_limit]
         
+        # 2. 批量周线
         df_weekly_all = batch_get_weekly(pro, target_codes, t_date)
         valid_weekly_codes = filter_weekly_batch(df_weekly_all, t_date)
         
@@ -254,11 +263,13 @@ if st.button("🚀 启动/继续", type="primary"):
             mark_date_as_scanned(t_date)
             continue
             
+        # 3. 批量日线
         df_daily_all = batch_get_daily(pro, valid_weekly_codes, t_date)
         valid_daily_map = filter_daily_batch(df_daily_all, valid_weekly_codes, t_date)
         
         final_survivors = list(valid_daily_map.keys())
         
+        # 4. 查筹码 (少数幸存者)
         for code in final_survivors:
             df_chips = fetch_chips_safe(pro, code, t_date)
             win_rate = 0
@@ -274,6 +285,7 @@ if st.button("🚀 启动/继续", type="primary"):
                 row = pool[pool['ts_code']==code].iloc[0]
                 turn = row.get('turnover_rate', 0)
                 
+                # 打分
                 s1 = win_rate * 0.4
                 s2 = min(vol_ratio, 5.0) * 20
                 s3 = min(turn, 20) * 0.5
@@ -299,18 +311,17 @@ if st.button("🚀 启动/继续", type="primary"):
         mark_date_as_scanned(t_date)
 
     progress_bar.progress(100)
-    status_box.update(label="处理完成！", state="complete", expanded=False)
+    status_box.update(label="🚀 处理完成！", state="complete", expanded=False)
     
-    # ================= 仪表盘 =================
+    # ================= 7. 仪表盘展示 =================
     if os.path.exists(CACHE_FILE):
         try:
             df_all = pd.read_csv(CACHE_FILE)
             
-            # 单日模式只看当天
             if mode == "单日扫描":
                 df_all = df_all[df_all['日期'].astype(str) == start_date_str]
                 if df_all.empty:
-                    st.warning(f"{start_date_str} 未发现符合条件的股票。")
+                    st.warning(f"{start_date_str} 扫描完成，未发现符合条件的股票。")
                     st.stop()
 
             # 排序
@@ -323,18 +334,27 @@ if st.button("🚀 启动/继续", type="primary"):
                 
             top_5 = df_sorted.head(5)
             
-            t3_avg = top_5['T+3'].mean() if 'T+3' in top_5 else 0
-            win_count = len(top_5[top_5['T+3'] > 0]) if 'T+3' in top_5 else 0
-            win_rate = win_count / len(top_5) * 100 if len(top_5) > 0 else 0
+            # 【修改点4】展示全周期胜率
+            def get_metrics(df, col):
+                if col not in df: return 0, 0
+                avg = df[col].mean()
+                win = (len(df[df[col] > 0]) / len(df) * 100) if len(df) > 0 else 0
+                return avg, win
+
+            t1_avg, t1_win = get_metrics(top_5, 'T+1')
+            t3_avg, t3_win = get_metrics(top_5, 'T+3')
+            t5_avg, t5_win = get_metrics(top_5, 'T+5')
             
             with dashboard_placeholder.container():
                 st.divider()
-                st.markdown(f"## 📊 战报 (日期: {start_date_str} - {end_date_str})")
-                k1, k2 = st.columns(2)
-                k1.metric("Top5 平均T+3收益", f"{t3_avg:.2f}%")
-                k2.metric("Top5 T+3胜率", f"{win_rate:.0f}%")
+                st.markdown(f"## 📊 全周期战报 (日期: {start_date_str} - {end_date_str})")
                 
-                # 【修改处】移除了 .style.background_gradient，防止报错
+                k1, k2, k3 = st.columns(3)
+                k1.metric("T+1 平均收益", f"{t1_avg:.2f}%", f"胜率 {t1_win:.0f}%")
+                k2.metric("T+3 平均收益", f"{t3_avg:.2f}%", f"胜率 {t3_win:.0f}%", delta_color="normal")
+                k3.metric("T+5 平均收益", f"{t5_avg:.2f}%", f"胜率 {t5_win:.0f}%")
+                
+                # 【修改点5】朴素表格，无颜色，防报错
                 st.dataframe(df_sorted, use_container_width=True)
                 
                 with open(CACHE_FILE, "rb") as f:
