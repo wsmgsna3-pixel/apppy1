@@ -7,14 +7,14 @@ import time
 from tenacity import retry, stop_after_attempt, wait_fixed
 
 # ================= 1. 页面配置 =================
-st.set_page_config(page_title="完美突破策略", page_icon="💎", layout="wide")
+st.set_page_config(page_title="潜伏底突破ProMax", page_icon="🚀", layout="wide")
 
-st.title("💎 A股完美突破系统 (Perfect Breakout)")
-st.markdown("### 核心升级：剔除天量/上影线 + 锁定实体大阳 + 黄金量比")
+st.title("🚀 A股潜伏底突破系统 (Pro Max)")
+st.markdown("### 策略内核：D1止损回测 + 黄金量比3.0 + 完美形态 + 龙头战法")
 
 # 文件路径
-CACHE_FILE = "scan_result_perfect.csv"
-HISTORY_FILE = "scan_history_perfect.txt"
+CACHE_FILE = "scan_result_promax.csv"
+HISTORY_FILE = "scan_history_promax.txt"
 
 # ================= 2. 主界面：Token输入 =================
 st.info("👇 请在下方输入您的 Tushare Token")
@@ -45,16 +45,20 @@ with st.sidebar:
 
     st.divider()
     st.subheader("🎯 筛选标准")
+    st.caption("已锁定：每日仅取综合得分Top 1")
     
-    scan_limit = st.slider("初筛活跃股数量", 200, 5000, 1000, step=50)
+    # 默认参数优化：前200名活跃股
+    scan_limit = st.slider("初筛活跃股数量", 100, 1000, 200, step=50, help="建议200，只看核心资产")
     
     col_p1, col_p2 = st.columns(2)
     with col_p1:
-        min_p = st.number_input("最低价(元)", value=8.0)
+        # 默认参数优化：最低价20元
+        min_p = st.number_input("最低价(元)", value=20.0)
         min_mv = st.number_input("最小市值(亿)", value=30.0)
     with col_p2:
         max_p = st.number_input("最高价(元)", value=300.0)
-        max_mv = st.number_input("最大市值(亿)", value=2000.0)
+        # 默认参数优化：最大市值1000亿
+        max_mv = st.number_input("最大市值(亿)", value=1000.0)
 
     st.divider()
     if st.button("🗑️ 彻底清除所有缓存"):
@@ -117,15 +121,9 @@ def batch_get_daily(pro, codes, trade_date):
     except:
         return pd.DataFrame()
 
-# ================= 5. 完美突破逻辑 (Perfect Breakout) =================
+# ================= 5. 核心筛选与打分逻辑 =================
 
 def filter_perfect_batch(df_daily_all, trade_date):
-    """
-    逻辑升级：
-    1. 趋势：Close > MA60
-    2. 真突破：创60日新高 + 量比(2.0-5.0) + 涨幅>4%
-    3. 形态：实体饱满 (收盘价接近最高价，拒绝长上影)
-    """
     results = {}
     if df_daily_all.empty: return {}
     
@@ -142,42 +140,36 @@ def filter_perfect_batch(df_daily_all, trade_date):
         past_59 = recent_60.iloc[:-1]
         if past_59.empty: continue
         
-        # 1. 趋势验证
+        # 1. 趋势：站上60日线
         ma60 = recent_60['close'].mean()
         if today['close'] < ma60: continue
         
-        # 2. 突破验证 (新高)
+        # 2. 突破：创60日收盘新高
         max_past_close = past_59['close'].max()
         if today['close'] <= max_past_close: continue
         
-        # 3. 爆发力 (涨幅)
-        # 涨幅 > 4.5% (力度要够)
-        if not (4.5 < today['pct_chg'] < 10.5): continue
+        # 3. 涨幅：力度够 (>4.0%)
+        if not (4.0 < today['pct_chg'] < 10.5): continue
         
-        # 4. 形态验证 (拒绝避雷针)
-        # 收盘价必须处于当日振幅的顶端 80% 区域
-        # 逻辑：(Close - Low) / (High - Low) > 0.8
+        # 4. 形态：光头阳线 (上影线 < 20%)
         high = today['high']
         low = today['low']
         close = today['close']
-        
         if high != low:
-            pos_in_candle = (close - low) / (high - low)
-            if pos_in_candle < 0.8: continue # 上影线太长，抛压大，不要
+            pos = (close - low) / (high - low)
+            if pos < 0.8: continue 
         
-        # 5. 量能验证 (拒绝天量)
+        # 5. 量能：拒绝微量，拒绝天量
         v_ma5 = past_59['vol'].tail(5).mean()
         if v_ma5 == 0: continue
         vol_ratio = today['vol'] / v_ma5
         
-        if vol_ratio < 2.0: continue # 量不够
-        # 注意：这里我们不直接过滤大倍量，而是在打分时惩罚
+        if vol_ratio < 2.0: continue
         
-        # 计算潜伏期涨幅
+        # 潜伏期涨幅限制 (0-40%)
         start_price = past_59.iloc[0]['close']
         end_price = past_59.iloc[-1]['close']
         period_chg = (end_price - start_price) / start_price
-        
         if not (0 < period_chg < 0.40): continue
         
         results[code] = {
@@ -191,14 +183,12 @@ def filter_perfect_batch(df_daily_all, trade_date):
 
 def get_sorted_pool(_pro, trade_date, _min_p, _max_p, _min_mv, _max_mv):
     try:
-        # 基础过滤
         df_basic = _pro.stock_basic(exchange='', list_status='L', fields='ts_code,name,list_date,market')
         df_basic = df_basic[~df_basic['name'].str.contains('ST|退')]
         df_basic = df_basic[~df_basic['ts_code'].str.contains('\.BJ')]
         limit_date = pd.to_datetime(trade_date) - pd.Timedelta(days=180)
         df_basic = df_basic[pd.to_datetime(df_basic['list_date']) < limit_date]
         
-        # 成交额初筛
         df_daily = _pro.daily(trade_date=trade_date, fields='ts_code,amount')
         df_basic_daily = _pro.daily_basic(trade_date=trade_date, fields='ts_code,circ_mv')
         
@@ -226,16 +216,33 @@ def calc_returns(pro, ts_code, buy_date):
         if df.empty or len(df) < 2: return res
         df = df.sort_values('trade_date').reset_index(drop=True)
         base = df.iloc[0]['close']
-        if len(df) > 1: res['T+1'] = round((df.iloc[1]['close'] - base)/base*100, 2)
-        if len(df) > 3: res['T+3'] = round((df.iloc[3]['close'] - base)/base*100, 2)
-        if len(df) > 5: res['T+5'] = round((df.iloc[5]['close'] - base)/base*100, 2)
+        
+        # T+1 是必须计算的
+        t1_ret = round((df.iloc[1]['close'] - base)/base*100, 2) if len(df) > 1 else None
+        res['T+1'] = t1_ret
+        
+        # === 核心逻辑：D1 止损回测 ===
+        # 只有当 T+1 > 0 (第一天赚钱了)，才允许持有到 T+3, T+5
+        # 如果 T+1 <= 0，后面的收益直接按 T+1 的亏损值填充（模拟止损）
+        
+        if t1_ret is not None:
+            if t1_ret > 0:
+                # 赚钱了，继续拿
+                if len(df) > 3: res['T+3'] = round((df.iloc[3]['close'] - base)/base*100, 2)
+                if len(df) > 5: res['T+5'] = round((df.iloc[5]['close'] - base)/base*100, 2)
+            else:
+                # 亏钱了，直接止损
+                # T+3 和 T+5 的结果就是 T+1 的结果（因为已经卖了）
+                res['T+3'] = t1_ret
+                res['T+5'] = t1_ret
+                
     except:
         pass
     return res
 
 # ================= 6. 主程序 =================
 
-if st.button("🚀 启动完美突破扫描", type="primary"):
+if st.button("🚀 启动ProMax扫描", type="primary"):
     if not my_token:
         st.error("🚨 请输入 Token！")
         st.stop()
@@ -250,7 +257,7 @@ if st.button("🚀 启动完美突破扫描", type="primary"):
         
     dashboard_placeholder = st.empty()
     progress_bar = st.progress(0)
-    status_box = st.status("正在寻找完美形态...", expanded=True)
+    status_box = st.status("正在执行深度扫描...", expanded=True)
     log_area = st.empty()
 
     for i, t_date in enumerate(trade_dates):
@@ -273,9 +280,8 @@ if st.button("🚀 启动完美突破扫描", type="primary"):
         # 2. 批量日线
         df_daily_all = batch_get_daily(pro, target_codes, t_date)
         
-        # 3. 核心筛选：Perfect Breakout
+        # 3. 核心筛选
         valid_map = filter_perfect_batch(df_daily_all, t_date)
-        
         survivors = list(valid_map.keys())
         daily_candidates = []
         
@@ -283,44 +289,41 @@ if st.button("🚀 启动完美突破扫描", type="primary"):
             # 查筹码
             df_chips = fetch_chips_safe(pro, code, t_date)
             win_rate = 0
-            
             if df_chips is not None and not df_chips.empty:
                 win_rate = df_chips.iloc[0]['winner_rate']
             
-            # 获利盘门槛 > 60%
-            if win_rate > 60:
+            # 获利盘门槛 > 70%
+            if win_rate > 70:
                 vol_ratio = valid_map[code]['vol_ratio']
-                period_chg = valid_map[code]['period_chg']
                 
                 # 获取换手率
                 df_basic = pro.daily_basic(ts_code=code, trade_date=t_date, fields='turnover_rate')
                 turn = 0
                 if not df_basic.empty: turn = df_basic.iloc[0]['turnover_rate']
                 
-                # === 核心：新打分公式 ===
+                # === 新打分公式 (瞄准甜点区) ===
                 
-                # 1. 量比分 (黄金区间 2.0-4.0)
-                # 如果量比 > 5.0，反而扣分！(防止天量假突破)
-                if vol_ratio <= 4.0:
-                    score_vol = vol_ratio * 10 # 最高40分
-                else:
-                    score_vol = 40 - (vol_ratio - 4.0) * 10 # 超过越多，扣得越狠
-                    if score_vol < 0: score_vol = 0
+                # 1. 量比分：瞄准 3.0
+                # 距离3.0越近分越高，每偏离0.1扣1分
+                diff_vol = abs(vol_ratio - 3.0)
+                score_vol = 40 - (diff_vol * 10)
+                if score_vol < 0: score_vol = 0
                 
                 # 2. 筹码分
-                score_chip = win_rate * 0.4 # 最高40分
+                score_chip = win_rate * 0.4
                 
-                # 3. 换手分 (活跃度奖励)
-                # 换手 5%-15% 是最好的
-                score_turn = 0
-                if 5 <= turn <= 15:
-                    score_turn = 20
-                elif turn > 15:
-                    score_turn = 10
+                # 3. 换手分：瞄准 15%
+                # 距离15%越近分越高
+                # 如果 > 40% (死亡换手)，直接扣分
+                if turn > 40:
+                    score_turn = 0
+                else:
+                    diff_turn = abs(turn - 15)
+                    score_turn = 20 - diff_turn # 偏离1%扣1分
+                    if score_turn < 0: score_turn = 0
                 
                 total_score = round(score_vol + score_chip + score_turn, 1)
                 
-                # 获取名称
                 row = pool[pool['ts_code']==code].iloc[0]
                 
                 daily_candidates.append({
@@ -334,21 +337,21 @@ if st.button("🚀 启动完美突破扫描", type="primary"):
                     "ts_code": code
                 })
         
-        # 5. Top 5
+        # 5. Top 1
         if daily_candidates:
             daily_candidates.sort(key=lambda x: x["综合得分"], reverse=True)
-            top_5_today = daily_candidates[:5]
+            top_1_today = daily_candidates[:1]
             
-            for item in top_5_today:
+            for item in top_1_today:
                 ret = calc_returns(pro, item['ts_code'], t_date)
                 item['T+1'] = ret['T+1']
                 item['T+3'] = ret['T+3']
                 item['T+5'] = ret['T+5']
                 del item['ts_code']
                 
-                log_area.text(f"💎 {t_date} 擒龙: {item['名称']} (得分{item['综合得分']} 量比{item['量比']})")
+                log_area.text(f"👑 {t_date} 冠军: {item['名称']} (得分{item['综合得分']})")
             
-            save_result_to_csv(top_5_today)
+            save_result_to_csv(top_1_today)
         
         mark_date_as_scanned(t_date)
 
@@ -363,13 +366,11 @@ if st.button("🚀 启动完美突破扫描", type="primary"):
             if mode == "单日扫描":
                 df_all = df_all[df_all['日期'].astype(str) == start_date_str]
                 if df_all.empty:
-                    st.warning(f"{start_date_str} 未发现完美突破股。")
+                    st.warning(f"{start_date_str} 未发现冠军股。")
                     st.stop()
             
-            df_sorted = df_all.sort_values("综合得分", ascending=False)
-            
-            # 只看Top 1
-            top_1 = df_sorted.groupby('日期').head(1)
+            # 按日期降序展示
+            df_all = df_all.sort_values("日期", ascending=False)
             
             def get_metrics(df, col):
                 valid_df = df.dropna(subset=[col])
@@ -378,24 +379,23 @@ if st.button("🚀 启动完美突破扫描", type="primary"):
                 win = (len(valid_df[valid_df[col] > 0]) / len(valid_df) * 100)
                 return avg, win
 
-            t1_avg, t1_win = get_metrics(top_1, 'T+1')
-            t3_avg, t3_win = get_metrics(top_1, 'T+3')
-            t5_avg, t5_win = get_metrics(top_1, 'T+5')
+            t1_avg, t1_win = get_metrics(df_all, 'T+1')
+            t3_avg, t3_win = get_metrics(df_all, 'T+3')
+            t5_avg, t5_win = get_metrics(df_all, 'T+5')
             
             with dashboard_placeholder.container():
                 st.divider()
-                st.markdown(f"## 💎 完美突破战报 (日期: {start_date_str})")
-                st.caption("统计口径：仅统计每日得分第一名 (Top 1)")
+                st.markdown(f"## 👑 冠军战报 (含 D1 止损策略)")
                 
                 k1, k2, k3 = st.columns(3)
-                k1.metric("Top1 T+1 收益", f"{t1_avg:.2f}%", f"胜率 {t1_win:.1f}%")
-                k2.metric("Top1 T+3 收益", f"{t3_avg:.2f}%", f"胜率 {t3_win:.1f}%", delta_color="normal")
-                k3.metric("Top1 T+5 收益", f"{t5_avg:.2f}%", f"胜率 {t5_win:.1f}%")
+                k1.metric("T+1 平均收益", f"{t1_avg:.2f}%", f"胜率 {t1_win:.1f}%")
+                k2.metric("T+3 平均收益", f"{t3_avg:.2f}%", f"胜率 {t3_win:.1f}%", delta_color="normal")
+                k3.metric("T+5 平均收益", f"{t5_avg:.2f}%", f"胜率 {t5_win:.1f}%")
                 
-                st.markdown("### 🏆 每日冠军 (Top 1)")
-                st.dataframe(top_1.sort_values('日期', ascending=False).head(10), use_container_width=True)
+                st.markdown("### 📜 历史战绩")
+                st.dataframe(df_all, use_container_width=True)
                 
                 with open(CACHE_FILE, "rb") as f:
-                    st.download_button("📥 下载完整CSV", f, "perfect_result.csv")
+                    st.download_button("📥 下载完整战报", f, "promax_result.csv")
         except Exception as e:
             st.error(f"读取结果出错: {e}")
