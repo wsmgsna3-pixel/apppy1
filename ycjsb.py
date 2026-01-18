@@ -7,14 +7,14 @@ import time
 from tenacity import retry, stop_after_attempt, wait_fixed
 
 # ================= 1. 页面配置 =================
-st.set_page_config(page_title="潜伏底突破Final", page_icon="🏆", layout="wide")
+st.set_page_config(page_title="暴力突破(大道至简)", page_icon="🔥", layout="wide")
 
-st.title("🏆 A股潜伏底突破系统 (终极修正版)")
-st.markdown("### 策略内核：黄金量比3.0 + 综合打分Top1 + D1止损风控")
+st.title("🔥 A股潜伏底·暴力突破系统")
+st.markdown("### 策略内核：Top500活跃股 + 涨幅优先 + 潜伏底结构")
 
 # 文件路径
-CACHE_FILE = "scan_result_final_v2.csv"
-HISTORY_FILE = "scan_history_final_v2.txt"
+CACHE_FILE = "scan_result_impulse.csv"
+HISTORY_FILE = "scan_history_impulse.txt"
 
 # ================= 2. 主界面：Token输入 =================
 st.info("👇 请在下方输入您的 Tushare Token")
@@ -45,10 +45,9 @@ with st.sidebar:
 
     st.divider()
     st.subheader("🎯 筛选标准")
-    st.caption("✅ 已强制按【综合得分】排名，拒绝高量比陷阱")
+    st.caption("✅ 逻辑回归：不搞复杂打分，谁涨得猛买谁")
     
-    # 【修正】默认范围设为 500 (平衡点)
-    scan_limit = st.slider("初筛活跃股数量", 200, 2000, 500, step=50, help="500是兼顾龙头与妖股的最佳平衡点")
+    scan_limit = st.slider("初筛活跃股数量", 200, 2000, 500, step=50, help="默认500，核心资产池")
     
     col_p1, col_p2 = st.columns(2)
     with col_p1:
@@ -119,9 +118,9 @@ def batch_get_daily(pro, codes, trade_date):
     except:
         return pd.DataFrame()
 
-# ================= 5. 核心筛选与打分逻辑 =================
+# ================= 5. 极简筛选逻辑 =================
 
-def filter_perfect_batch(df_daily_all, trade_date):
+def filter_impulse_batch(df_daily_all, trade_date):
     results = {}
     if df_daily_all.empty: return {}
     
@@ -146,10 +145,11 @@ def filter_perfect_batch(df_daily_all, trade_date):
         max_past_close = past_59['close'].max()
         if today['close'] <= max_past_close: continue
         
-        # 3. 涨幅：力度够 (>4.0%)
-        if not (4.0 < today['pct_chg'] < 10.5): continue
+        # 3. 涨幅：必须大阳线 (>4.5%)
+        # 既然是暴力突破，力度必须大
+        if today['pct_chg'] < 4.5: continue
         
-        # 4. 形态：光头阳线 (上影线 < 20%)
+        # 4. 形态：光头阳线 (拒绝上影线)
         high = today['high']
         low = today['low']
         close = today['close']
@@ -157,18 +157,19 @@ def filter_perfect_batch(df_daily_all, trade_date):
             pos = (close - low) / (high - low)
             if pos < 0.8: continue 
         
-        # 5. 量能：拒绝微量，拒绝天量
+        # 5. 量能：只要倍量就行 (>2.0)
+        # 不再惩罚高量比，因为有时候妖股就是天量
         v_ma5 = past_59['vol'].tail(5).mean()
         if v_ma5 == 0: continue
         vol_ratio = today['vol'] / v_ma5
         
         if vol_ratio < 2.0: continue
         
-        # 潜伏期涨幅限制 (0-40%)
+        # 潜伏期涨幅限制
         start_price = past_59.iloc[0]['close']
         end_price = past_59.iloc[-1]['close']
         period_chg = (end_price - start_price) / start_price
-        if not (0 < period_chg < 0.40): continue
+        if not (0 < period_chg < 0.45): continue # 稍微放宽到45%
         
         results[code] = {
             'vol_ratio': round(vol_ratio, 2), 
@@ -215,18 +216,9 @@ def calc_returns(pro, ts_code, buy_date):
         df = df.sort_values('trade_date').reset_index(drop=True)
         base = df.iloc[0]['close']
         
-        t1_ret = round((df.iloc[1]['close'] - base)/base*100, 2) if len(df) > 1 else None
-        res['T+1'] = t1_ret
-        
-        # === D1 止损逻辑 ===
-        if t1_ret is not None:
-            if t1_ret > 0:
-                if len(df) > 3: res['T+3'] = round((df.iloc[3]['close'] - base)/base*100, 2)
-                if len(df) > 5: res['T+5'] = round((df.iloc[5]['close'] - base)/base*100, 2)
-            else:
-                # 严格止损
-                res['T+3'] = t1_ret
-                res['T+5'] = t1_ret
+        if len(df) > 1: res['T+1'] = round((df.iloc[1]['close'] - base)/base*100, 2)
+        if len(df) > 3: res['T+3'] = round((df.iloc[3]['close'] - base)/base*100, 2)
+        if len(df) > 5: res['T+5'] = round((df.iloc[5]['close'] - base)/base*100, 2)
                 
     except:
         pass
@@ -234,7 +226,7 @@ def calc_returns(pro, ts_code, buy_date):
 
 # ================= 6. 主程序 =================
 
-if st.button("🚀 启动终极扫描", type="primary"):
+if st.button("🚀 启动暴力扫描", type="primary"):
     if not my_token:
         st.error("🚨 请输入 Token！")
         st.stop()
@@ -249,7 +241,7 @@ if st.button("🚀 启动终极扫描", type="primary"):
         
     dashboard_placeholder = st.empty()
     progress_bar = st.progress(0)
-    status_box = st.status("正在执行深度扫描...", expanded=True)
+    status_box = st.status("正在执行暴力扫描...", expanded=True)
     log_area = st.empty()
 
     for i, t_date in enumerate(trade_dates):
@@ -273,7 +265,7 @@ if st.button("🚀 启动终极扫描", type="primary"):
         df_daily_all = batch_get_daily(pro, target_codes, t_date)
         
         # 3. 核心筛选
-        valid_map = filter_perfect_batch(df_daily_all, t_date)
+        valid_map = filter_impulse_batch(df_daily_all, t_date)
         survivors = list(valid_map.keys())
         daily_candidates = []
         
@@ -287,35 +279,11 @@ if st.button("🚀 启动终极扫描", type="primary"):
             # 获利盘门槛 > 70%
             if win_rate > 70:
                 vol_ratio = valid_map[code]['vol_ratio']
+                pct_chg = valid_map[code]['pct_chg']
                 
-                df_basic = pro.daily_basic(ts_code=code, trade_date=t_date, fields='turnover_rate')
-                turn = 0
-                if not df_basic.empty: turn = df_basic.iloc[0]['turnover_rate']
-                
-                # === 打分公式 (必须严格执行3.0黄金点) ===
-                
-                # 量比分: 3.0为满分，5.0以上开始重罚
-                if vol_ratio <= 5.0:
-                    # 距离3.0越近分越高
-                    diff_vol = abs(vol_ratio - 3.0)
-                    score_vol = 40 - (diff_vol * 10) # 3.0得40分，4.0得30分，2.0得30分
-                else:
-                    # 超过5.0，每多1.0扣10分
-                    score_vol = 20 - (vol_ratio - 5.0) * 10
-                
-                if score_vol < 0: score_vol = 0
-                
-                score_chip = win_rate * 0.4
-                
-                # 换手分: 15%为满分，>40%为0分
-                if turn > 40:
-                    score_turn = 0
-                else:
-                    diff_turn = abs(turn - 15)
-                    score_turn = 20 - diff_turn
-                    if score_turn < 0: score_turn = 0
-                
-                total_score = round(score_vol + score_chip + score_turn, 1)
+                # === 核心修改：只看涨幅 (力度) ===
+                # 谁涨得猛，谁就是主力意图最坚决的
+                total_score = pct_chg 
                 
                 row = pool[pool['ts_code']==code].iloc[0]
                 
@@ -323,14 +291,13 @@ if st.button("🚀 启动终极扫描", type="primary"):
                     "日期": t_date,
                     "代码": code,
                     "名称": row['name'],
-                    "综合得分": total_score,
+                    "综合得分": total_score, # 这里其实就是涨幅
                     "量比": vol_ratio,
                     "获利盘%": round(win_rate, 1),
-                    "换手率%": turn,
                     "ts_code": code
                 })
         
-        # 5. Top 1 (强制按得分排序)
+        # 5. Top 1 (按涨幅排序)
         if daily_candidates:
             daily_candidates.sort(key=lambda x: x["综合得分"], reverse=True)
             top_1_today = daily_candidates[:1]
@@ -342,7 +309,7 @@ if st.button("🚀 启动终极扫描", type="primary"):
                 item['T+5'] = ret['T+5']
                 del item['ts_code']
                 
-                log_area.text(f"👑 {t_date} 冠军: {item['名称']} (得分{item['综合得分']} 量比{item['量比']})")
+                log_area.text(f"🔥 {t_date} 暴力王: {item['名称']} (涨幅{item['综合得分']}% 量比{item['量比']})")
             
             save_result_to_csv(top_1_today)
         
@@ -359,7 +326,7 @@ if st.button("🚀 启动终极扫描", type="primary"):
             if mode == "单日扫描":
                 df_all = df_all[df_all['日期'].astype(str) == start_date_str]
                 if df_all.empty:
-                    st.warning(f"{start_date_str} 未发现冠军股。")
+                    st.warning(f"{start_date_str} 未发现。")
                     st.stop()
             
             df_all = df_all.sort_values("日期", ascending=False)
@@ -377,18 +344,18 @@ if st.button("🚀 启动终极扫描", type="primary"):
             
             with dashboard_placeholder.container():
                 st.divider()
-                st.markdown(f"## 🏆 冠军战报 (黄金量比+D1风控)")
-                st.caption("策略：默认Top 500活跃股 | 按综合得分排序 | D1止损")
+                st.markdown(f"## 🔥 暴力战报 (Top500 + 涨幅优先)")
+                st.caption("策略：移除D1止损，移除打分公式，纯粹看涨幅力度")
                 
                 k1, k2, k3 = st.columns(3)
                 k1.metric("T+1 平均收益", f"{t1_avg:.2f}%", f"胜率 {t1_win:.1f}%")
                 k2.metric("T+3 平均收益", f"{t3_avg:.2f}%", f"胜率 {t3_win:.1f}%", delta_color="normal")
                 k3.metric("T+5 平均收益", f"{t5_avg:.2f}%", f"胜率 {t5_win:.1f}%")
                 
-                st.markdown("### 📜 历史战绩")
+                st.markdown("### 🏆 每日暴力王")
                 st.dataframe(df_all, use_container_width=True)
                 
                 with open(CACHE_FILE, "rb") as f:
-                    st.download_button("📥 下载战报", f, "final_result.csv")
+                    st.download_button("📥 下载战报", f, "impulse_result.csv")
         except Exception as e:
             st.error(f"读取结果出错: {e}")
