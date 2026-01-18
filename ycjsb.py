@@ -45,19 +45,19 @@ with st.sidebar:
 
     st.divider()
     st.subheader("🎯 筛选标准")
-    st.caption("已锁定：每日仅取综合得分Top 1")
     
-    # 默认参数优化：前200名活跃股
-    scan_limit = st.slider("初筛活跃股数量", 100, 1000, 200, step=50, help="建议200，只看核心资产")
+    # 【修复】加回排名依据，默认设为“按量比”，追求爆发力
+    sort_method = st.radio("排名依据", ["按综合得分 (稳健)", "按量比 (爆发力)"], index=1)
+    
+    # 【修改】默认范围调回 800
+    scan_limit = st.slider("初筛活跃股数量", 200, 3000, 800, step=50, help="为了抓妖股，范围建议设大一点(800)")
     
     col_p1, col_p2 = st.columns(2)
     with col_p1:
-        # 默认参数优化：最低价20元
         min_p = st.number_input("最低价(元)", value=20.0)
         min_mv = st.number_input("最小市值(亿)", value=30.0)
     with col_p2:
         max_p = st.number_input("最高价(元)", value=300.0)
-        # 默认参数优化：最大市值1000亿
         max_mv = st.number_input("最大市值(亿)", value=1000.0)
 
     st.divider()
@@ -217,22 +217,15 @@ def calc_returns(pro, ts_code, buy_date):
         df = df.sort_values('trade_date').reset_index(drop=True)
         base = df.iloc[0]['close']
         
-        # T+1 是必须计算的
         t1_ret = round((df.iloc[1]['close'] - base)/base*100, 2) if len(df) > 1 else None
         res['T+1'] = t1_ret
         
-        # === 核心逻辑：D1 止损回测 ===
-        # 只有当 T+1 > 0 (第一天赚钱了)，才允许持有到 T+3, T+5
-        # 如果 T+1 <= 0，后面的收益直接按 T+1 的亏损值填充（模拟止损）
-        
+        # === D1 止损逻辑 ===
         if t1_ret is not None:
             if t1_ret > 0:
-                # 赚钱了，继续拿
                 if len(df) > 3: res['T+3'] = round((df.iloc[3]['close'] - base)/base*100, 2)
                 if len(df) > 5: res['T+5'] = round((df.iloc[5]['close'] - base)/base*100, 2)
             else:
-                # 亏钱了，直接止损
-                # T+3 和 T+5 的结果就是 T+1 的结果（因为已经卖了）
                 res['T+3'] = t1_ret
                 res['T+5'] = t1_ret
                 
@@ -296,30 +289,26 @@ if st.button("🚀 启动ProMax扫描", type="primary"):
             if win_rate > 70:
                 vol_ratio = valid_map[code]['vol_ratio']
                 
-                # 获取换手率
                 df_basic = pro.daily_basic(ts_code=code, trade_date=t_date, fields='turnover_rate')
                 turn = 0
                 if not df_basic.empty: turn = df_basic.iloc[0]['turnover_rate']
                 
-                # === 新打分公式 (瞄准甜点区) ===
+                # === 打分公式 ===
                 
-                # 1. 量比分：瞄准 3.0
-                # 距离3.0越近分越高，每偏离0.1扣1分
-                diff_vol = abs(vol_ratio - 3.0)
-                score_vol = 40 - (diff_vol * 10)
-                if score_vol < 0: score_vol = 0
+                # 量比分
+                if vol_ratio <= 5.0: # 放宽到5.0
+                    score_vol = vol_ratio * 10
+                else:
+                    score_vol = 50 - (vol_ratio - 5.0) * 10
+                    if score_vol < 0: score_vol = 0
                 
-                # 2. 筹码分
                 score_chip = win_rate * 0.4
                 
-                # 3. 换手分：瞄准 15%
-                # 距离15%越近分越高
-                # 如果 > 40% (死亡换手)，直接扣分
                 if turn > 40:
                     score_turn = 0
                 else:
                     diff_turn = abs(turn - 15)
-                    score_turn = 20 - diff_turn # 偏离1%扣1分
+                    score_turn = 20 - diff_turn
                     if score_turn < 0: score_turn = 0
                 
                 total_score = round(score_vol + score_chip + score_turn, 1)
@@ -337,9 +326,15 @@ if st.button("🚀 启动ProMax扫描", type="primary"):
                     "ts_code": code
                 })
         
-        # 5. Top 1
+        # 5. Top 1 (支持按量比排序)
         if daily_candidates:
-            daily_candidates.sort(key=lambda x: x["综合得分"], reverse=True)
+            if "量比" in sort_method:
+                # 按量比降序
+                daily_candidates.sort(key=lambda x: x["量比"], reverse=True)
+            else:
+                # 按综合得分降序
+                daily_candidates.sort(key=lambda x: x["综合得分"], reverse=True)
+                
             top_1_today = daily_candidates[:1]
             
             for item in top_1_today:
@@ -349,7 +344,7 @@ if st.button("🚀 启动ProMax扫描", type="primary"):
                 item['T+5'] = ret['T+5']
                 del item['ts_code']
                 
-                log_area.text(f"👑 {t_date} 冠军: {item['名称']} (得分{item['综合得分']})")
+                log_area.text(f"👑 {t_date} 冠军: {item['名称']} (得分{item['综合得分']} 量比{item['量比']})")
             
             save_result_to_csv(top_1_today)
         
@@ -369,7 +364,6 @@ if st.button("🚀 启动ProMax扫描", type="primary"):
                     st.warning(f"{start_date_str} 未发现冠军股。")
                     st.stop()
             
-            # 按日期降序展示
             df_all = df_all.sort_values("日期", ascending=False)
             
             def get_metrics(df, col):
@@ -385,14 +379,14 @@ if st.button("🚀 启动ProMax扫描", type="primary"):
             
             with dashboard_placeholder.container():
                 st.divider()
-                st.markdown(f"## 👑 冠军战报 (含 D1 止损策略)")
+                st.markdown(f"## 👑 冠军战报 (含 D1 止损)")
                 
                 k1, k2, k3 = st.columns(3)
                 k1.metric("T+1 平均收益", f"{t1_avg:.2f}%", f"胜率 {t1_win:.1f}%")
                 k2.metric("T+3 平均收益", f"{t3_avg:.2f}%", f"胜率 {t3_win:.1f}%", delta_color="normal")
                 k3.metric("T+5 平均收益", f"{t5_avg:.2f}%", f"胜率 {t5_win:.1f}%")
                 
-                st.markdown("### 📜 历史战绩")
+                st.markdown("### 🏆 每日冠军 (Top 1)")
                 st.dataframe(df_all, use_container_width=True)
                 
                 with open(CACHE_FILE, "rb") as f:
