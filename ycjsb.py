@@ -7,14 +7,14 @@ import time
 from tenacity import retry, stop_after_attempt, wait_fixed
 
 # ================= 1. 页面配置 =================
-st.set_page_config(page_title="潜伏底突破ProMax", page_icon="🚀", layout="wide")
+st.set_page_config(page_title="潜伏底突破Final", page_icon="🏆", layout="wide")
 
-st.title("🚀 A股潜伏底突破系统 (Pro Max)")
-st.markdown("### 策略内核：D1止损回测 + 黄金量比3.0 + 完美形态 + 龙头战法")
+st.title("🏆 A股潜伏底突破系统 (终极修正版)")
+st.markdown("### 策略内核：黄金量比3.0 + 综合打分Top1 + D1止损风控")
 
 # 文件路径
-CACHE_FILE = "scan_result_promax.csv"
-HISTORY_FILE = "scan_history_promax.txt"
+CACHE_FILE = "scan_result_final_v2.csv"
+HISTORY_FILE = "scan_history_final_v2.txt"
 
 # ================= 2. 主界面：Token输入 =================
 st.info("👇 请在下方输入您的 Tushare Token")
@@ -45,12 +45,10 @@ with st.sidebar:
 
     st.divider()
     st.subheader("🎯 筛选标准")
+    st.caption("✅ 已强制按【综合得分】排名，拒绝高量比陷阱")
     
-    # 【修复】加回排名依据，默认设为“按量比”，追求爆发力
-    sort_method = st.radio("排名依据", ["按综合得分 (稳健)", "按量比 (爆发力)"], index=1)
-    
-    # 【修改】默认范围调回 800
-    scan_limit = st.slider("初筛活跃股数量", 200, 3000, 800, step=50, help="为了抓妖股，范围建议设大一点(800)")
+    # 【修正】默认范围设为 500 (平衡点)
+    scan_limit = st.slider("初筛活跃股数量", 200, 2000, 500, step=50, help="500是兼顾龙头与妖股的最佳平衡点")
     
     col_p1, col_p2 = st.columns(2)
     with col_p1:
@@ -226,6 +224,7 @@ def calc_returns(pro, ts_code, buy_date):
                 if len(df) > 3: res['T+3'] = round((df.iloc[3]['close'] - base)/base*100, 2)
                 if len(df) > 5: res['T+5'] = round((df.iloc[5]['close'] - base)/base*100, 2)
             else:
+                # 严格止损
                 res['T+3'] = t1_ret
                 res['T+5'] = t1_ret
                 
@@ -235,7 +234,7 @@ def calc_returns(pro, ts_code, buy_date):
 
 # ================= 6. 主程序 =================
 
-if st.button("🚀 启动ProMax扫描", type="primary"):
+if st.button("🚀 启动终极扫描", type="primary"):
     if not my_token:
         st.error("🚨 请输入 Token！")
         st.stop()
@@ -293,17 +292,22 @@ if st.button("🚀 启动ProMax扫描", type="primary"):
                 turn = 0
                 if not df_basic.empty: turn = df_basic.iloc[0]['turnover_rate']
                 
-                # === 打分公式 ===
+                # === 打分公式 (必须严格执行3.0黄金点) ===
                 
-                # 量比分
-                if vol_ratio <= 5.0: # 放宽到5.0
-                    score_vol = vol_ratio * 10
+                # 量比分: 3.0为满分，5.0以上开始重罚
+                if vol_ratio <= 5.0:
+                    # 距离3.0越近分越高
+                    diff_vol = abs(vol_ratio - 3.0)
+                    score_vol = 40 - (diff_vol * 10) # 3.0得40分，4.0得30分，2.0得30分
                 else:
-                    score_vol = 50 - (vol_ratio - 5.0) * 10
-                    if score_vol < 0: score_vol = 0
+                    # 超过5.0，每多1.0扣10分
+                    score_vol = 20 - (vol_ratio - 5.0) * 10
+                
+                if score_vol < 0: score_vol = 0
                 
                 score_chip = win_rate * 0.4
                 
+                # 换手分: 15%为满分，>40%为0分
                 if turn > 40:
                     score_turn = 0
                 else:
@@ -326,15 +330,9 @@ if st.button("🚀 启动ProMax扫描", type="primary"):
                     "ts_code": code
                 })
         
-        # 5. Top 1 (支持按量比排序)
+        # 5. Top 1 (强制按得分排序)
         if daily_candidates:
-            if "量比" in sort_method:
-                # 按量比降序
-                daily_candidates.sort(key=lambda x: x["量比"], reverse=True)
-            else:
-                # 按综合得分降序
-                daily_candidates.sort(key=lambda x: x["综合得分"], reverse=True)
-                
+            daily_candidates.sort(key=lambda x: x["综合得分"], reverse=True)
             top_1_today = daily_candidates[:1]
             
             for item in top_1_today:
@@ -379,17 +377,18 @@ if st.button("🚀 启动ProMax扫描", type="primary"):
             
             with dashboard_placeholder.container():
                 st.divider()
-                st.markdown(f"## 👑 冠军战报 (含 D1 止损)")
+                st.markdown(f"## 🏆 冠军战报 (黄金量比+D1风控)")
+                st.caption("策略：默认Top 500活跃股 | 按综合得分排序 | D1止损")
                 
                 k1, k2, k3 = st.columns(3)
                 k1.metric("T+1 平均收益", f"{t1_avg:.2f}%", f"胜率 {t1_win:.1f}%")
                 k2.metric("T+3 平均收益", f"{t3_avg:.2f}%", f"胜率 {t3_win:.1f}%", delta_color="normal")
                 k3.metric("T+5 平均收益", f"{t5_avg:.2f}%", f"胜率 {t5_win:.1f}%")
                 
-                st.markdown("### 🏆 每日冠军 (Top 1)")
+                st.markdown("### 📜 历史战绩")
                 st.dataframe(df_all, use_container_width=True)
                 
                 with open(CACHE_FILE, "rb") as f:
-                    st.download_button("📥 下载完整战报", f, "promax_result.csv")
+                    st.download_button("📥 下载战报", f, "final_result.csv")
         except Exception as e:
             st.error(f"读取结果出错: {e}")
