@@ -62,7 +62,6 @@ def safe_get(func_name, **kwargs):
     try:
         for _ in range(3):
             try:
-                # 修复点：这里之前有格式乱码，已清理
                 if kwargs.get('is_index'):
                     df = pro.index_daily(**kwargs)
                 else:
@@ -357,7 +356,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         mf = mf_raw[['ts_code','net_mf_amount']].rename(columns={'net_mf_amount':'net_mf'})
         df = df.merge(mf, on='ts_code', how='left')
     else:
-        # 如果资金流缺失，不要静默失败，给个标记但继续运行
         df['net_mf'] = 0 
     
     for col in ['net_mf', 'turnover_rate', 'circ_mv', 'amount']:
@@ -368,7 +366,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     df = df[~df['name'].str.contains('ST|退', na=False)]
     df = df[~df['ts_code'].str.startswith('92')]
     
-    # === 使用侧边栏配置的价格限制 (默认10元) ===
+    # === 使用侧边栏配置的价格限制 ===
     df = df[(df['close'] >= MIN_PRICE) & (df['close'] <= 2000.0)]
     
     df = df[(df['circ_mv_billion'] >= MIN_MV) & (df['circ_mv_billion'] <= MAX_MV)]
@@ -396,7 +394,10 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         # 基础风控
         if market_state == 'Weak':
             if d0_rsi > RSI_LIMIT: continue
-            if d0_close < ind['ma20'] or ind['position_60d'] > 20.0: continue
+            # [🔥 解除封印关键修改] 
+            # 删除了 "or ind['position_60d'] > 20.0"，不再强制抄底
+            if d0_close < ind['ma20']: continue 
+            
         if d0_close < ind['ma60']: continue
         
         upper_shadow = (ind['last_high'] - d0_close) / d0_close * 100
@@ -406,7 +407,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
             body_pos = (d0_close - ind['last_low']) / range_len
             if body_pos < MIN_BODY_POS: continue
 
-        # 筹码风控 (使用 UI 配置的值, 默认 70)
+        # 筹码风控
         win_rate = chip_dict.get(row.ts_code, None)
         if win_rate is not None:
             if win_rate < CHIP_MIN_WIN_RATE: continue
@@ -455,7 +456,6 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("💰 基础过滤")
     col1, col2 = st.columns(2)
-    # [修改点 1] 最低股价默认 10.0
     MIN_PRICE = col1.number_input("最低股价", value=10.0, help="厌恶低价股，默认设为10元")
     MIN_MV = col2.number_input("最小市值(亿)", value=50.0)
     MAX_MV = st.number_input("最大市值(亿)", value=1000.0)
@@ -463,23 +463,20 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("⚔️ 核心风控参数")
     
-    # [修改点 2] 筹码获利盘默认 70.0
     CHIP_MIN_WIN_RATE = st.number_input("最低获利盘 (%)", value=70.0, 
-                                      help="设为70以激活科创板妖股。低于此比例直接剔除")
+                                     help="设为70以激活科创板妖股。低于此比例直接剔除")
     
     # 20CM 铁血风控
     MAX_PREV_PCT = st.number_input("昨日最大涨幅限制 (%)", value=19.0, 
                                  help="⭐ 核心风控：定死19.0，精准剔除20CM涨停的深套股")
     
     RSI_LIMIT = st.number_input("RSI 拦截线 (建议100)", value=100.0, 
-                              help="设为100表示不拦截。")
+                               help="设为100表示不拦截。")
     
     st.markdown("---")
     st.subheader("📊 形态参数")
     SECTOR_THRESHOLD = st.number_input("板块涨幅 (%)", value=1.5)
-    # [修改点 3] 上影线默认 5.0
     MAX_UPPER_SHADOW = st.number_input("上影线 (%)", value=5.0, help="最佳平衡点")
-    # [修改点 4] 实体位置默认 0.6
     MIN_BODY_POS = st.number_input("实体位置", value=0.6, help="0.6表示允许适当下影线")
     MAX_TURNOVER_RATE = st.number_input("换手率 (%)", value=20.0)
 
