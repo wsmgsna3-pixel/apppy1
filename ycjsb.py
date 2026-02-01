@@ -3,229 +3,242 @@ import tushare as ts
 import pandas as pd
 import time
 from datetime import datetime, timedelta
+import os
 
 # ==========================================
 # Streamlit 页面配置
 # ==========================================
-st.set_page_config(page_title="鹰眼·诊断模式", layout="wide")
+st.set_page_config(page_title="鹰眼·Pro (缓存加速版)", layout="wide")
 
-st.title("🦅 鹰眼·假摔猎杀 (全量诊断版)")
+st.title("🦅 鹰眼·假摔猎杀 Pro (缓存加速+智能优选)")
 st.markdown("""
-**调试模式说明：**
-此版本移除了所有数量限制，并增加了实时日志。
-如果仍然选不出股，请尝试降低侧边栏的【获利盘阈值】。
+**升级说明：**
+1. **硬盘缓存**：数据拉取一次后自动存入硬盘。修改参数或重启后，直接读取缓存，**秒级回测且不耗积分**。
+2. **智能优选**：候选股过多时，优先扫描**成交额最大**的前 N 只（主力战场），拒绝扫描垃圾股。
 """)
 
 # ==========================================
-# 1. 侧边栏：参数全开放
+# 1. 缓存化数据获取函数 (核心升级)
 # ==========================================
-with st.sidebar:
-    st.header("⚙️ 核心参数调节")
-    
-    user_token = st.text_input("Tushare Token (必填):", type="password")
-    
-    # 增加参数滑块，方便调试
-    shadow_threshold = st.slider("上影线长度阈值 (%)", min_value=1.0, max_value=10.0, value=3.0, step=0.5)
-    profit_threshold = st.slider("筹码获利盘阈值 (%)", min_value=50, max_value=99, value=80, step=5)
-    
-    st.markdown("---")
-    st.markdown("### 回测区间")
-    default_start = datetime.now() - timedelta(days=14) # 默认只跑最近两周，太久会很慢
-    default_end = datetime.now()
-    
-    start_date = st.date_input("开始日期", default_start)
-    end_date = st.date_input("结束日期", default_end)
-    
-    run_btn = st.button("🚀 启动全量扫描")
+# 使用 persist="disk" 实现断点续传和缓存，缓存文件保存在 .streamlit/cache 中
 
-# ==========================================
-# 2. 策略逻辑函数 (带诊断输出)
-# ==========================================
-def run_diagnostic_strategy(token, s_date, e_date, shadow_limit, profit_limit):
-    s_str = s_date.strftime('%Y%m%d')
-    e_str = e_date.strftime('%Y%m%d')
-    
-    # 初始化
+@st.cache_data(persist="disk", show_spinner=False)
+def get_cached_daily(token, date_str):
+    """缓存日线数据，避免重复拉取"""
     try:
         ts.set_token(token)
         pro = ts.pro_api()
-        # 测试连通性
-        pro.daily(trade_date=s_str, limit=1)
+        df = pro.daily(trade_date=date_str)
+        # 同时拉取基础信息用于过滤
+        df_basic = pro.stock_basic(exchange='', list_status='L', fields='ts_code,name,market')
+        if df.empty: return pd.DataFrame()
+        return pd.merge(df, df_basic, on='ts_code')
     except Exception as e:
-        st.error(f"Token 连接失败: {e}")
         return pd.DataFrame()
 
-    # 进度与日志区
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    log_area = st.expander("📜 实时扫描日志 (点击展开)", expanded=True)
+@st.cache_data(persist="disk", show_spinner=False)
+def get_cached_cyq(token, code, date_str):
+    """缓存单个股票的筹码数据，这是最耗时的一步"""
+    try:
+        ts.set_token(token)
+        pro = ts.pro_api()
+        # 注意：这里可能会因为频率限制报错，外部需要处理重试
+        df = pro.cyq_perf(ts_code=code, trade_date=date_str)
+        return df
+    except:
+        return pd.DataFrame()
+
+# ==========================================
+# 2. 侧边栏设置
+# ==========================================
+with st.sidebar:
+    st.header("⚙️ 参数控制台")
+    
+    # Token 输入
+    user_token = st.text_input("Tushare Token (自动缓存):", type="password")
+    
+    st.subheader("🔍 筛选阈值 (随时调整，秒级生效)")
+    shadow_threshold = st.slider("上影线长度 (%)", 1.0, 10.0, 3.0, 0.5)
+    profit_threshold = st.slider("筹码获利盘 (%)", 0, 99, 50, 5, help="如果全军覆没，请尝试降低此值")
+    scan_limit = st.slider("每日最大扫描数 (只)", 10, 200, 50, 10, help="优先扫描成交额最大的前N只")
+    
+    st.subheader("📅 回测区间")
+    default_start = datetime.now() - timedelta(days=10)
+    default_end = datetime.now()
+    start_date = st.date_input("开始日期", default_start)
+    end_date = st.date_input("结束日期", default_end)
+    
+    run_btn = st.button("🚀 启动/刷新回测")
+    
+    if st.button("🧹 清除所有缓存数据"):
+        st.cache_data.clear()
+        st.success("缓存已清除！")
+
+# ==========================================
+# 3. 策略主逻辑
+# ==========================================
+def run_strategy():
+    # 初始化接口
+    ts.set_token(user_token)
+    pro = ts.pro_api()
     
     # 获取日历
+    s_str = start_date.strftime('%Y%m%d')
+    e_str = end_date.strftime('%Y%m%d')
     try:
         cal = pro.trade_cal(exchange='', start_date=s_str, end_date=e_str, is_open='1')
         trade_days = cal['cal_date'].tolist()
     except:
-        st.error("无法获取交易日历，请检查日期范围或网络。")
-        return pd.DataFrame()
+        st.error("日期获取失败，请检查Token或网络")
+        return
 
-    if len(trade_days) < 2:
-        st.warning("交易日不足 2 天，无法回测次日表现。")
-        return pd.DataFrame()
-
-    trade_log = []
+    log_container = st.container()
+    progress_bar = st.progress(0)
     
-    # 遍历每一天
+    results = []
     total_days = len(trade_days) - 1
     
+    if total_days < 1:
+        st.warning("回测区间太短，需要至少2个交易日")
+        return
+
+    with log_container:
+        st.write("### 📜 实时扫描日志")
+        
     for i in range(total_days):
         date_today = trade_days[i]
-        date_tomorrow = trade_days[i+1]
+        date_next = trade_days[i+1]
         
-        progress = (i + 1) / total_days
-        progress_bar.progress(progress)
-        status_text.text(f"正在深度分析: {date_today} ...")
+        progress_bar.progress((i + 1) / total_days)
         
-        # --- A. 形态初筛 ---
-        try:
-            df_today = pro.daily(trade_date=date_today)
-            df_basic = pro.stock_basic(exchange='', list_status='L', fields='ts_code,name,market')
-            df_today = pd.merge(df_today, df_basic, on='ts_code')
-            
-            # 过滤掉 ST 和 北交所
-            df_today = df_today[~df_today['name'].str.contains('ST')]
-            df_today = df_today[~df_today['market'].str.contains('北交所')]
-            
-        except Exception as e:
-            log_area.write(f"❌ {date_today} 行情数据获取失败: {e}")
-            continue
-
-        # 形态计算
-        candidates = []
-        for idx, row in df_today.iterrows():
-            if row['close'] == 0 or row['pre_close'] == 0: continue
-            
-            body_top = max(row['open'], row['close'])
-            upper_shadow = (row['high'] - body_top) / row['pre_close'] * 100
-            pct_chg = row['pct_chg']
-            
-            # 使用用户设定的阈值
-            if upper_shadow > shadow_limit and -3 < pct_chg < 8:
-                candidates.append(row['ts_code'])
+        # --- 1. 获取日线 (读取缓存) ---
+        df_today = get_cached_daily(user_token, date_today)
         
-        # 日志输出初筛结果
-        if len(candidates) == 0:
-            log_area.write(f"📅 {date_today}: 无股票符合【长上影 > {shadow_limit}%】形态")
-            continue
-        else:
-            log_area.write(f"📅 {date_today}: 初筛发现 {len(candidates)} 只形态股，开始筹码测谎...")
-
-        # --- B. 筹码测谎 (全量检查，无 [:30] 限制) ---
-        real_targets = []
-        
-        # 批量处理技巧：虽然cyq_perf只能单只取，但我们可以在这里加个简单的限流保护
-        # 为了不让页面卡死太久，我们设定单日最大扫描数，如果太多则只取前50个（毕竟Streamlit有超时限制）
-        # 但这次我们稍微放宽点
-        scan_limit = 50 
-        scan_list = candidates[:scan_limit] 
-        
-        if len(candidates) > scan_limit:
-            log_area.write(f"⚠️ {date_today} 候选过多 ({len(candidates)}只)，仅扫描前 {scan_limit} 只以防超时...")
-
-        pass_chip_count = 0
-        
-        for code in scan_list:
-            try:
-                # 核心：调用筹码接口
-                # 注意：高频调用可能会偶尔失败，需要容错
-                df_cyq = pro.cyq_perf(ts_code=code, trade_date=date_today)
-                
-                if df_cyq.empty: 
-                    continue
-                
-                profit_rate = df_cyq.iloc[0]['profit_rate']
-                
-                if profit_rate > profit_limit:
-                    real_targets.append(code)
-                    pass_chip_count += 1
-                    # 打印一条发现日志
-                    log_area.write(f"  --> ✅ 发现猎物 {code}: 获利盘 {profit_rate:.1f}%")
-                
-                # 极速限流：10000积分每分钟300次，理论上不用sleep太久，但保险起见
-                # time.sleep(0.05) 
-                
-            except Exception as e:
-                # 可以在这里打印 API 错误，排查是不是权限问题
-                # log_area.write(f"API Error on {code}: {e}")
-                continue
-        
-        if pass_chip_count == 0:
-            log_area.write(f"  --> ❌ 全军覆没：没有股票的获利盘 > {profit_limit}%")
+        if df_today.empty:
+            with log_container:
+                st.write(f"⚠️ {date_today}: 无行情数据")
             continue
             
-        # --- C. 次日验证 ---
-        try:
-            df_next = pro.daily(trade_date=date_tomorrow, ts_code=','.join(real_targets))
-        except:
+        # 简单过滤
+        df_today = df_today[~df_today['name'].str.contains('ST')]
+        
+        # --- 2. 形态初筛 ---
+        # 向量化计算，速度更快
+        df_today['body_top'] = df_today[['open', 'close']].max(axis=1)
+        df_today['upper_shadow'] = (df_today['high'] - df_today['body_top']) / df_today['pre_close'] * 100
+        
+        # 筛选符合形态的
+        mask_shape = (df_today['upper_shadow'] > shadow_threshold) & \
+                     (df_today['pct_chg'] > -3) & (df_today['pct_chg'] < 8)
+        
+        candidates_df = df_today[mask_shape].copy()
+        
+        count_raw = len(candidates_df)
+        if count_raw == 0:
+            with log_container:
+                st.write(f"📅 {date_today}: 无形态符合股票")
             continue
             
-        for idx, row_next in df_next.iterrows():
-            code = row_next['ts_code']
-            stock_name = df_basic[df_basic['ts_code'] == code]['name'].values[0] if not df_basic.empty else code
+        # --- 3. 智能优选 (关键修改) ---
+        # 按【成交额 amount】降序排列，优先看主力资金活跃的票
+        candidates_df = candidates_df.sort_values(by='amount', ascending=False)
+        
+        # 截取前 N 只
+        target_list = candidates_df.head(scan_limit)['ts_code'].tolist()
+        
+        with log_container:
+            st.write(f"📅 {date_today}: 发现 {count_raw} 只形态股。**智能优选成交额最大的 {len(target_list)} 只进行深度扫描...**")
+        
+        # --- 4. 筹码测谎 (读取缓存) ---
+        passed_codes = []
+        profits_list = [] # 用于统计市场情绪
+        
+        # 进度显示的占位符
+        scan_status = st.empty()
+        
+        for idx, code in enumerate(target_list):
+            scan_status.text(f"正在扫描: {date_today} - {code} ({idx+1}/{len(target_list)})")
+            
+            # 调用缓存函数
+            df_cyq = get_cached_cyq(user_token, code, date_today)
+            
+            if not df_cyq.empty:
+                profit = df_cyq.iloc[0]['profit_rate']
+                profits_list.append(profit)
+                
+                if profit > profit_threshold:
+                    passed_codes.append(code)
+                    # 实时打印命中信息
+                    stock_name = candidates_df[candidates_df['ts_code']==code]['name'].values[0]
+                    with log_container:
+                        st.write(f"&nbsp;&nbsp;&nbsp;&nbsp;✅ **命中**: {stock_name} ({code}) - 获利盘: {profit:.1f}%")
+        
+        scan_status.empty()
+        
+        # 市场情绪反馈
+        if profits_list:
+            avg_profit = sum(profits_list) / len(profits_list)
+            if not passed_codes:
+                with log_container:
+                    st.write(f"&nbsp;&nbsp;&nbsp;&nbsp;❌ **全军覆没** (该批次平均获利盘仅为: {avg_profit:.1f}%，市场环境极差)")
+        
+        if not passed_codes:
+            continue
+            
+        # --- 5. 次日验证 (读取缓存) ---
+        # 批量获取次日数据
+        df_next = get_cached_daily(user_token, date_next)
+        if df_next.empty: continue
+        
+        for code in passed_codes:
+            row_next = df_next[df_next['ts_code'] == code]
+            if row_next.empty: continue
+            
+            open_T1 = row_next.iloc[0]['open']
+            close_T1 = row_next.iloc[0]['close']
             
             # T日收盘价
-            close_T = df_today[df_today['ts_code'] == code]['close'].values[0]
+            close_T = candidates_df[candidates_df['ts_code'] == code]['close'].values[0]
+            stock_name = candidates_df[candidates_df['ts_code'] == code]['name'].values[0]
             
-            # T+1 开盘价
-            open_T1 = row_next['open']
-            
-            # 必须高开
+            # 必须高开 (弱转强)
             if open_T1 > close_T:
-                close_T1 = row_next['close']
                 profit_pct = (close_T1 - open_T1) / open_T1 * 100
                 
-                trade_log.append({
+                results.append({
                     '信号日期': date_today,
                     '代码': code,
                     '名称': stock_name,
+                    'T日获利盘': f"{profits_list[target_list.index(code)]:.1f}%",
                     '买入价': open_T1,
-                    '当日收益(%)': round(profit_pct, 2),
-                    '触发原因': f"影线>{shadow_limit}%, 获利>{profit_limit}%"
+                    '当日收益': round(profit_pct, 2)
                 })
 
     progress_bar.empty()
-    status_text.text("全量诊断完成。")
-    return pd.DataFrame(trade_log)
+    
+    # --- 6. 结果展示 ---
+    if results:
+        df_res = pd.DataFrame(results)
+        st.success(f"🎉 扫描完成！共发现 {len(df_res)} 次机会")
+        
+        # 统计面板
+        wins = df_res[df_res['当日收益'] > 0]
+        win_rate = len(wins) / len(df_res) * 100
+        
+        c1, c2, c3 = st.columns(3)
+        c1.metric("总胜率", f"{win_rate:.1f}%")
+        c2.metric("平均收益", f"{df_res['当日收益'].mean():.2f}%")
+        c3.metric("累计收益", f"{df_res['当日收益'].sum():.2f}%")
+        
+        st.dataframe(df_res.style.applymap(lambda x: f'color: {"red" if x>0 else "green"}', subset=['当日收益']), use_container_width=True)
+    else:
+        st.warning("本次扫描未发现符合条件的标的。请尝试：1. 降低获利盘阈值；2. 扩大日期范围。")
 
 # ==========================================
-# 3. 运行入口
+# 启动入口
 # ==========================================
 if run_btn:
     if not user_token:
-        st.error("请先输入 Token！")
+        st.error("请先输入 Token")
     else:
-        with st.spinner('正在进行全量诊断扫描...'):
-            df_res = run_diagnostic_strategy(user_token, start_date, end_date, shadow_threshold, profit_threshold)
-            
-        if not df_res.empty:
-            st.success(f"诊断完成！共选出 {len(df_res)} 次交易机会")
-            
-            # 指标计算
-            wins = df_res[df_res['当日收益(%)'] > 0]
-            win_rate = len(wins) / len(df_res) * 100
-            
-            col1, col2 = st.columns(2)
-            col1.metric("胜率 (Win Rate)", f"{win_rate:.1f}%")
-            col2.metric("总收益 (Total)", f"{df_res['当日收益(%)'].sum():.1f}%")
-            
-            def color_profit(val):
-                return f'color: {"red" if val > 0 else "green"}'
-            
-            st.dataframe(df_res.style.applymap(color_profit, subset=['当日收益(%)']))
-        else:
-            st.warning("⚠️ 依然没有结果。")
-            st.info("""
-            **排查建议：**
-            1. 请查看上方的【实时扫描日志】，确认 '初筛发现' 的数量是否为 0？
-            2. 如果初筛有数据，但筹码全军覆没，请尝试将【获利盘阈值】调低至 60% 或 50%。
-            3. 确保您测试的日期不是全市场暴跌的日期（那时大家都亏钱，获利盘自然低）。
-            """)
+        run_strategy()
