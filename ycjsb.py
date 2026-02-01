@@ -8,21 +8,16 @@ import os
 # ==========================================
 # Streamlit 页面配置
 # ==========================================
-st.set_page_config(page_title="鹰眼·Pro (稳健修复版)", layout="wide")
+st.set_page_config(page_title="鹰眼·调试版", layout="wide")
 
-st.title("🦅 鹰眼·假摔猎杀 Pro (稳健修复版)")
-st.markdown("""
-**修复说明：**
-增加了对 Tushare 返回数据的健壮性检查，解决了 KeyError 报错。
-如果运行出现问题，**请先点击左侧的“🧹 清除所有缓存数据”按钮**。
-""")
+st.title("🦅 鹰眼·假摔猎杀 (深度调试版)")
+st.error("⚠️ 调试重点：此版本会显示 Tushare 返回的真实错误信息，且强制降速以防封禁。")
 
 # ==========================================
-# 1. 缓存化数据获取函数
+# 1. 缓存化数据获取 (带错误透传)
 # ==========================================
 @st.cache_data(persist="disk", show_spinner=False)
 def get_cached_daily(token, date_str):
-    """缓存日线数据"""
     try:
         ts.set_token(token)
         pro = ts.pro_api()
@@ -33,215 +28,135 @@ def get_cached_daily(token, date_str):
     except Exception:
         return pd.DataFrame()
 
-@st.cache_data(persist="disk", show_spinner=False)
-def get_cached_cyq(token, code, date_str):
-    """缓存筹码数据"""
+# ⚠️ 注意：这里去掉了 silent error，为了看清真相
+def get_cyq_debug(token, code, date_str):
     try:
         ts.set_token(token)
         pro = ts.pro_api()
-        # 注意：Tushare 接口可能会因为无数据返回空 DF，这是正常的
+        # 强制休眠，防止触发每分钟频次限制
+        time.sleep(0.25) 
         df = pro.cyq_perf(ts_code=code, trade_date=date_str)
-        return df
-    except Exception:
-        return pd.DataFrame()
+        return df, None # Data, Error
+    except Exception as e:
+        return pd.DataFrame(), str(e) # Empty, Error Message
 
 # ==========================================
-# 2. 侧边栏设置
+# 2. 侧边栏
 # ==========================================
 with st.sidebar:
     st.header("⚙️ 参数控制台")
-    
     user_token = st.text_input("Tushare Token (必填):", type="password")
     
-    st.subheader("🔍 筛选阈值")
-    shadow_threshold = st.slider("上影线长度 (%)", 1.0, 10.0, 3.0, 0.5)
-    profit_threshold = st.slider("筹码获利盘 (%)", 0, 99, 50, 5)
-    scan_limit = st.slider("每日最大扫描数", 10, 200, 50, 10)
+    st.info("💡 建议：由于筹码数据计算滞后，请尽量回测 **3天前** 的数据。")
     
-    st.subheader("📅 回测区间")
-    default_start = datetime.now() - timedelta(days=10)
-    default_end = datetime.now()
+    # 默认回测半个月前的数据，避开滞后区
+    default_start = datetime.now() - timedelta(days=20)
+    default_end = datetime.now() - timedelta(days=5)
+    
     start_date = st.date_input("开始日期", default_start)
     end_date = st.date_input("结束日期", default_end)
     
-    st.markdown("---")
-    run_btn = st.button("🚀 启动/刷新回测")
+    profit_threshold = st.slider("筹码获利盘 (%)", 0, 99, 50, 5)
+    scan_limit = st.slider("每日扫描数", 10, 50, 20, 5, help="调试期间建议设小一点，比如20")
     
-    # 增加清除缓存按钮的显眼提示
-    if st.button("🧹 清除所有缓存数据 (修复报错用)"):
+    run_btn = st.button("🚀 启动调试扫描")
+    
+    if st.button("🧹 清除缓存"):
         st.cache_data.clear()
-        st.success("缓存已清除！请重新点击启动。")
+        st.success("缓存已清除")
 
 # ==========================================
-# 3. 策略主逻辑 (已修复 KeyError)
+# 3. 主逻辑
 # ==========================================
-def run_strategy():
+def run_debug():
     ts.set_token(user_token)
     pro = ts.pro_api()
     
     s_str = start_date.strftime('%Y%m%d')
     e_str = end_date.strftime('%Y%m%d')
+    
     try:
         cal = pro.trade_cal(exchange='', start_date=s_str, end_date=e_str, is_open='1')
         trade_days = cal['cal_date'].tolist()
-    except:
-        st.error("日期获取失败，请检查Token或网络")
+    except Exception as e:
+        st.error(f"日历获取失败: {e}")
         return
 
-    log_container = st.container()
-    progress_bar = st.progress(0)
+    log_area = st.container()
     
-    results = []
-    total_days = len(trade_days) - 1
-    
-    if total_days < 1:
-        st.warning("回测区间太短，请选择更长的时间段。")
+    if len(trade_days) < 2:
+        st.warning("交易日不足")
         return
 
-    with log_container:
-        st.write("### 📜 实时扫描日志")
-        
-    for i in range(total_days):
+    # 循环
+    for i in range(len(trade_days)-1):
         date_today = trade_days[i]
-        date_next = trade_days[i+1]
         
-        progress_bar.progress((i + 1) / total_days)
-        
-        # --- 1. 获取日线 ---
+        # 1. 获取日线
         df_today = get_cached_daily(user_token, date_today)
-        
-        if df_today.empty:
-            continue
-            
+        if df_today.empty: continue
         df_today = df_today[~df_today['name'].str.contains('ST')]
         
-        # --- 2. 形态初筛 ---
+        # 2. 筛选形态
         df_today['body_top'] = df_today[['open', 'close']].max(axis=1)
         df_today['upper_shadow'] = (df_today['high'] - df_today['body_top']) / df_today['pre_close'] * 100
+        mask = (df_today['upper_shadow'] > 3.0) & (df_today['pct_chg'] > -3) & (df_today['pct_chg'] < 8)
         
-        mask_shape = (df_today['upper_shadow'] > shadow_threshold) & \
-                     (df_today['pct_chg'] > -3) & (df_today['pct_chg'] < 8)
+        candidates = df_today[mask].sort_values(by='amount', ascending=False)
+        targets = candidates.head(scan_limit)['ts_code'].tolist()
         
-        candidates_df = df_today[mask_shape].copy()
-        
-        if len(candidates_df) == 0:
-            with log_container:
-                st.write(f"📅 {date_today}: 无形态符合股票")
-            continue
+        with log_area:
+            st.write(f"📅 **{date_today}**: 初筛 {len(candidates)} 只，尝试获取前 {len(targets)} 只筹码...")
             
-        # --- 3. 智能优选 ---
-        candidates_df = candidates_df.sort_values(by='amount', ascending=False)
-        target_list = candidates_df.head(scan_limit)['ts_code'].tolist()
-        
-        with log_container:
-            st.write(f"📅 {date_today}: 初筛 {len(candidates_df)} 只，深度扫描前 {len(target_list)} 只热门股...")
-        
-        # --- 4. 筹码测谎 (修复报错点) ---
-        passed_codes = []
-        profits_list = [] 
-        
-        scan_status = st.empty()
-        
-        for idx, code in enumerate(target_list):
-            scan_status.text(f"扫描进度: {date_today} - {idx+1}/{len(target_list)}")
+            success_count = 0
+            empty_count = 0
+            error_msg = ""
             
-            df_cyq = get_cached_cyq(user_token, code, date_today)
+            # 3. 逐个获取筹码 (不使用缓存函数，直接调用 debug 函数)
+            debug_progress = st.empty()
             
-            # === 核心修复: 增加列名检查 ===
-            # 只有当 DataFrame 不为空，且包含 'profit_rate' 列时才读取
-            if not df_cyq.empty and 'profit_rate' in df_cyq.columns:
-                try:
-                    profit = df_cyq.iloc[0]['profit_rate']
-                    
-                    # 确保 profit 是数字
-                    if pd.isna(profit): continue
-                    
-                    profits_list.append(profit)
-                    
-                    if profit > profit_threshold:
-                        passed_codes.append(code)
-                        stock_name = candidates_df[candidates_df['ts_code']==code]['name'].values[0]
-                        with log_container:
-                            st.write(f"&nbsp;&nbsp;&nbsp;&nbsp;✅ **发现**: {stock_name} | 获利盘: {profit:.1f}%")
-                except Exception:
-                    continue
-            else:
-                # 如果没有数据，或者数据缺失列，直接跳过，不报错
-                continue
-        
-        scan_status.empty()
-        
-        # 统计
-        if profits_list:
-            avg_profit = sum(profits_list) / len(profits_list)
-            if not passed_codes:
-                with log_container:
-                    st.write(f"&nbsp;&nbsp;&nbsp;&nbsp;❌ 未通过 (市场平均获利盘: {avg_profit:.1f}%)")
-        else:
-             with log_container:
-                st.write(f"&nbsp;&nbsp;&nbsp;&nbsp;⚠️ 无有效筹码数据 (可能是Token权限或数据缺失)")
-        
-        if not passed_codes:
-            continue
-            
-        # --- 5. 次日验证 ---
-        df_next = get_cached_daily(user_token, date_next)
-        if df_next.empty: continue
-        
-        for code in passed_codes:
-            row_next = df_next[df_next['ts_code'] == code]
-            if row_next.empty: continue
-            
-            open_T1 = row_next.iloc[0]['open']
-            close_T1 = row_next.iloc[0]['close']
-            
-            close_T = candidates_df[candidates_df['ts_code'] == code]['close'].values[0]
-            stock_name = candidates_df[candidates_df['ts_code'] == code]['name'].values[0]
-            
-            if open_T1 > close_T:
-                profit_pct = (close_T1 - open_T1) / open_T1 * 100
+            for idx, code in enumerate(targets):
+                debug_progress.text(f"请求中: {code} ({idx+1}/{len(targets)})")
                 
-                # 记录获利盘数据，防止 index error
-                try:
-                     # 找到该代码在 target_list 中的位置，再取 profits_list
-                     # 这种对应关系在复杂逻辑下可能不稳，改用直接存储
-                     # 简单处理：这里不显示具体获利盘数字了，或者在上面 loop 里存 dict
-                     display_profit = "High"
-                except:
-                    display_profit = "High"
+                # 调用接口
+                df_cyq, error = get_cyq_debug(user_token, code, date_today)
+                
+                if error:
+                    # 捕获到了真实的报错！
+                    st.error(f"❌ 接口报错 ({code}): {error}")
+                    error_msg = error
+                    break # 报错直接停止，不用再跑了
+                
+                if df_cyq.empty:
+                    empty_count += 1
+                else:
+                    # 有数据！
+                    if 'profit_rate' in df_cyq.columns:
+                        p = df_cyq.iloc[0]['profit_rate']
+                        success_count += 1
+                        if p > profit_threshold:
+                            name = candidates[candidates['ts_code']==code]['name'].values[0]
+                            st.write(f"&nbsp;&nbsp;&nbsp;&nbsp;✅ {name}: 获利盘 {p:.2f}%")
+                    else:
+                        st.warning(f"⚠️ {code} 返回了数据但没有 profit_rate 列")
+            
+            debug_progress.empty()
+            
+            # 诊断总结
+            if error_msg:
+                st.stop() # 停止运行
+            elif success_count > 0:
+                st.info(f"✅ {date_today} 测试通过: 成功获取 {success_count} 条，空数据 {empty_count} 条")
+            else:
+                st.warning(f"⚠️ {date_today} 全军覆没: 请求了 {len(targets)} 次，全部返回空数据。")
+                st.markdown("""
+                **可能原因分析：**
+                1. **数据滞后**：Tushare 后台还没计算出这一天的筹码（最可能）。
+                2. **权限问题**：虽然不太像，但如果 20 天前的数据也这样，就是权限问题。
+                """)
 
-                results.append({
-                    '信号日期': date_today,
-                    '代码': code,
-                    '名称': stock_name,
-                    '买入价': open_T1,
-                    '当日收益(%)': round(profit_pct, 2)
-                })
-
-    progress_bar.empty()
-    
-    # --- 6. 结果展示 ---
-    if results:
-        df_res = pd.DataFrame(results)
-        st.success(f"🎉 扫描完成！共发现 {len(df_res)} 次机会")
-        
-        wins = df_res[df_res['当日收益(%)'] > 0]
-        win_rate = len(wins) / len(df_res) * 100
-        
-        c1, c2, c3 = st.columns(3)
-        c1.metric("总胜率", f"{win_rate:.1f}%")
-        c2.metric("平均收益", f"{df_res['当日收益(%)'].mean():.2f}%")
-        c3.metric("累计收益", f"{df_res['当日收益(%)'].sum():.2f}%")
-        
-        st.dataframe(df_res.style.applymap(lambda x: f'color: {"red" if x>0 else "green"}', subset=['当日收益(%)']), use_container_width=True)
-    else:
-        st.warning("本次扫描未发现符合条件的标的。")
-
-# ==========================================
-# 启动入口
-# ==========================================
 if run_btn:
     if not user_token:
-        st.error("请先输入 Token")
+        st.error("请输入 Token")
     else:
-        run_strategy()
+        run_debug()
