@@ -8,13 +8,17 @@ import os
 # ==========================================
 # Streamlit 页面配置
 # ==========================================
-st.set_page_config(page_title="鹰眼·调试版", layout="wide")
+st.set_page_config(page_title="鹰眼·资金背离版", layout="wide")
 
-st.title("🦅 鹰眼·假摔猎杀 (深度调试版)")
-st.error("⚠️ 调试重点：此版本会显示 Tushare 返回的真实错误信息，且强制降速以防封禁。")
+st.title("🦅 鹰眼·主力假摔 (资金背离版)")
+st.markdown("""
+**策略核心升级：**
+放弃不稳定的筹码数据，改用 **10000积分专属的 `moneyflow` (个股资金流向)**。
+**寻找背离：** 股价收出长上影线（看似出货），但主力资金（特大单+大单）却是**净买入**的股票。
+""")
 
 # ==========================================
-# 1. 缓存化数据获取 (带错误透传)
+# 1. 缓存化数据获取 (资金流向版)
 # ==========================================
 @st.cache_data(persist="disk", show_spinner=False)
 def get_cached_daily(token, date_str):
@@ -25,20 +29,20 @@ def get_cached_daily(token, date_str):
         df_basic = pro.stock_basic(exchange='', list_status='L', fields='ts_code,name,market')
         if df.empty: return pd.DataFrame()
         return pd.merge(df, df_basic, on='ts_code')
-    except Exception:
+    except:
         return pd.DataFrame()
 
-# ⚠️ 注意：这里去掉了 silent error，为了看清真相
-def get_cyq_debug(token, code, date_str):
+@st.cache_data(persist="disk", show_spinner=False)
+def get_moneyflow(token, code, date_str):
+    """获取个股资金流向，替代不稳定的筹码接口"""
     try:
         ts.set_token(token)
         pro = ts.pro_api()
-        # 强制休眠，防止触发每分钟频次限制
-        time.sleep(0.25) 
-        df = pro.cyq_perf(ts_code=code, trade_date=date_str)
-        return df, None # Data, Error
-    except Exception as e:
-        return pd.DataFrame(), str(e) # Empty, Error Message
+        # moneyflow 接口非常稳定
+        df = pro.moneyflow(ts_code=code, trade_date=date_str)
+        return df
+    except:
+        return pd.DataFrame()
 
 # ==========================================
 # 2. 侧边栏
@@ -47,116 +51,169 @@ with st.sidebar:
     st.header("⚙️ 参数控制台")
     user_token = st.text_input("Tushare Token (必填):", type="password")
     
-    st.info("💡 建议：由于筹码数据计算滞后，请尽量回测 **3天前** 的数据。")
+    st.subheader("🔍 形态与资金阈值")
+    shadow_threshold = st.slider("上影线长度 (%)", 1.0, 10.0, 3.0, 0.5)
+    # 资金背离的强度：主力净买入额（万元）
+    net_buy_threshold = st.slider("主力净买入至少 (万元)", 100, 5000, 500, 100, help="虽然K线难看，但主力必须净买入超过此金额")
     
-    # 默认回测半个月前的数据，避开滞后区
-    default_start = datetime.now() - timedelta(days=20)
-    default_end = datetime.now() - timedelta(days=5)
+    scan_limit = st.slider("每日扫描热门股数", 20, 200, 100, 10)
     
+    st.subheader("📅 回测区间")
+    # 资金流数据通常T+1早上更新，回测最近的也没问题
+    default_start = datetime.now() - timedelta(days=14)
+    default_end = datetime.now()
     start_date = st.date_input("开始日期", default_start)
     end_date = st.date_input("结束日期", default_end)
     
-    profit_threshold = st.slider("筹码获利盘 (%)", 0, 99, 50, 5)
-    scan_limit = st.slider("每日扫描数", 10, 50, 20, 5, help="调试期间建议设小一点，比如20")
-    
-    run_btn = st.button("🚀 启动调试扫描")
+    run_btn = st.button("🚀 启动背离扫描")
     
     if st.button("🧹 清除缓存"):
         st.cache_data.clear()
         st.success("缓存已清除")
 
 # ==========================================
-# 3. 主逻辑
+# 3. 策略主逻辑
 # ==========================================
-def run_debug():
+def run_strategy():
     ts.set_token(user_token)
     pro = ts.pro_api()
     
     s_str = start_date.strftime('%Y%m%d')
     e_str = end_date.strftime('%Y%m%d')
-    
     try:
         cal = pro.trade_cal(exchange='', start_date=s_str, end_date=e_str, is_open='1')
         trade_days = cal['cal_date'].tolist()
-    except Exception as e:
-        st.error(f"日历获取失败: {e}")
+    except:
+        st.error("日期获取失败")
         return
 
     log_area = st.container()
+    progress_bar = st.progress(0)
+    results = []
     
-    if len(trade_days) < 2:
-        st.warning("交易日不足")
+    total_days = len(trade_days) - 1
+    if total_days < 1:
+        st.warning("回测区间过短")
         return
 
-    # 循环
-    for i in range(len(trade_days)-1):
+    with log_area:
+        st.write("### 📜 资金背离扫描日志")
+
+    for i in range(total_days):
         date_today = trade_days[i]
+        date_next = trade_days[i+1]
+        progress_bar.progress((i+1)/total_days)
         
         # 1. 获取日线
         df_today = get_cached_daily(user_token, date_today)
         if df_today.empty: continue
         df_today = df_today[~df_today['name'].str.contains('ST')]
         
-        # 2. 筛选形态
+        # 2. 形态初筛 (射击之星)
         df_today['body_top'] = df_today[['open', 'close']].max(axis=1)
         df_today['upper_shadow'] = (df_today['high'] - df_today['body_top']) / df_today['pre_close'] * 100
-        mask = (df_today['upper_shadow'] > 3.0) & (df_today['pct_chg'] > -3) & (df_today['pct_chg'] < 8)
         
-        candidates = df_today[mask].sort_values(by='amount', ascending=False)
+        # 筛选：长上影，且成交量不能太小（资金流分析需要量）
+        mask = (df_today['upper_shadow'] > shadow_threshold) & \
+               (df_today['pct_chg'] > -4) & (df_today['pct_chg'] < 8)
+        
+        candidates = df_today[mask].copy()
+        
+        if len(candidates) == 0:
+            with log_area:
+                st.write(f"📅 {date_today}: 无形态符合股票")
+            continue
+            
+        # 智能排序：按成交额排序
+        candidates = candidates.sort_values(by='amount', ascending=False)
         targets = candidates.head(scan_limit)['ts_code'].tolist()
         
         with log_area:
-            st.write(f"📅 **{date_today}**: 初筛 {len(candidates)} 只，尝试获取前 {len(targets)} 只筹码...")
+            st.write(f"📅 {date_today}: 形态初筛 {len(candidates)} 只，正在透视前 {len(targets)} 只资金流向...")
+        
+        passed_codes = []
+        
+        # 3. 资金测谎 (MoneyFlow)
+        for code in targets:
+            df_mf = get_moneyflow(user_token, code, date_today)
             
-            success_count = 0
-            empty_count = 0
-            error_msg = ""
-            
-            # 3. 逐个获取筹码 (不使用缓存函数，直接调用 debug 函数)
-            debug_progress = st.empty()
-            
-            for idx, code in enumerate(targets):
-                debug_progress.text(f"请求中: {code} ({idx+1}/{len(targets)})")
+            if not df_mf.empty:
+                # 核心字段：
+                # buy_lg_vol: 大单买入量
+                # buy_elg_vol: 特大单买入量
+                # net_mf_vol: 净流入量 (单位：手) -> 我们要转成金额近似值
+                # net_mf_amount: 净流入额 (单位：万元) -> 这个最直接！
                 
-                # 调用接口
-                df_cyq, error = get_cyq_debug(user_token, code, date_today)
+                row = df_mf.iloc[0]
+                net_amount = row['net_mf_amount'] # 主力净流入金额(万元)
                 
-                if error:
-                    # 捕获到了真实的报错！
-                    st.error(f"❌ 接口报错 ({code}): {error}")
-                    error_msg = error
-                    break # 报错直接停止，不用再跑了
+                # === 变态逻辑 ===
+                # K线难看(上影线)，散户在跑，但主力净流入 > 500万 (或者你设定的阈值)
+                if net_amount > net_buy_threshold:
+                    passed_codes.append({
+                        'code': code,
+                        'net_amount': net_amount
+                    })
+                    
+                    stock_name = candidates[candidates['ts_code']==code]['name'].values[0]
+                    with log_area:
+                        st.write(f"&nbsp;&nbsp;&nbsp;&nbsp;💰 **背离发现**: {stock_name} | 上影线: {candidates[candidates['ts_code']==code]['upper_shadow'].values[0]:.1f}% | **主力净买: {net_amount:.0f}万元**")
+
+        if not passed_codes:
+            with log_area:
+                st.write("&nbsp;&nbsp;&nbsp;&nbsp;❌ 本日无资金背离标的 (主力也在跑)")
+            continue
+            
+        # 4. 次日验证
+        df_next = get_cached_daily(user_token, date_next)
+        if df_next.empty: continue
+        
+        for item in passed_codes:
+            code = item['code']
+            net_amt = item['net_amount']
+            
+            row_next = df_next[df_next['ts_code'] == code]
+            if row_next.empty: continue
+            
+            open_T1 = row_next.iloc[0]['open']
+            close_T1 = row_next.iloc[0]['close']
+            
+            # T日收盘价
+            close_T = candidates[candidates['ts_code'] == code]['close'].values[0]
+            stock_name = candidates[candidates['ts_code'] == code]['name'].values[0]
+            
+            # 必须高开 (弱转强)
+            if open_T1 > close_T:
+                profit_pct = (close_T1 - open_T1) / open_T1 * 100
                 
-                if df_cyq.empty:
-                    empty_count += 1
-                else:
-                    # 有数据！
-                    if 'profit_rate' in df_cyq.columns:
-                        p = df_cyq.iloc[0]['profit_rate']
-                        success_count += 1
-                        if p > profit_threshold:
-                            name = candidates[candidates['ts_code']==code]['name'].values[0]
-                            st.write(f"&nbsp;&nbsp;&nbsp;&nbsp;✅ {name}: 获利盘 {p:.2f}%")
-                    else:
-                        st.warning(f"⚠️ {code} 返回了数据但没有 profit_rate 列")
-            
-            debug_progress.empty()
-            
-            # 诊断总结
-            if error_msg:
-                st.stop() # 停止运行
-            elif success_count > 0:
-                st.info(f"✅ {date_today} 测试通过: 成功获取 {success_count} 条，空数据 {empty_count} 条")
-            else:
-                st.warning(f"⚠️ {date_today} 全军覆没: 请求了 {len(targets)} 次，全部返回空数据。")
-                st.markdown("""
-                **可能原因分析：**
-                1. **数据滞后**：Tushare 后台还没计算出这一天的筹码（最可能）。
-                2. **权限问题**：虽然不太像，但如果 20 天前的数据也这样，就是权限问题。
-                """)
+                results.append({
+                    '日期': date_today,
+                    '代码': code,
+                    '名称': stock_name,
+                    '主力净买(万)': int(net_amt),
+                    '买入价': open_T1,
+                    '当日收益(%)': round(profit_pct, 2)
+                })
+
+    progress_bar.empty()
+    
+    # 5. 结果展示
+    if results:
+        df_res = pd.DataFrame(results)
+        st.success(f"🎉 扫描完成！发现 {len(df_res)} 次主力骗线机会")
+        
+        c1, c2, c3 = st.columns(3)
+        wins = df_res[df_res['当日收益(%)'] > 0]
+        c1.metric("胜率", f"{len(wins)/len(df_res)*100:.1f}%")
+        c2.metric("平均收益", f"{df_res['当日收益(%)'].mean():.2f}%")
+        c3.metric("总收益", f"{df_res['当日收益(%)'].sum():.2f}%")
+        
+        st.dataframe(df_res.style.applymap(lambda x: f'color: {"red" if x>0 else "green"}', subset=['当日收益(%)']), use_container_width=True)
+    else:
+        st.warning("未发现符合条件的标的。请尝试降低【主力净买入】阈值。")
 
 if run_btn:
     if not user_token:
         st.error("请输入 Token")
     else:
-        run_debug()
+        run_strategy()
