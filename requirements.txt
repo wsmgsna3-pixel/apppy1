@@ -5,3 +5,4 @@ tushare
 joblib
 scipy
 tenacity
+yfinance
