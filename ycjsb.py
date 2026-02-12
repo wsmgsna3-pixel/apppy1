@@ -41,7 +41,7 @@ GLOBAL_STOCK_INDUSTRY = {}
 # 页面设置
 # ---------------------------
 st.set_page_config(page_title="选股王 V30.12.3 实战版", layout="wide")
-st.title("主力")
+st.title("选股王 V30.12.3：最终实战定制版")
 st.markdown("""
 **🎯 实战铁律 (Top 3 策略)：**
 1. **只看前三**：Rank 1 (妖股博弈), Rank 2-3 (稳健大肉). 放弃 Rank 4-5.
@@ -442,7 +442,11 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         return base_score
 
     fdf['Score'] = fdf.apply(dynamic_score, axis=1)
-    return fdf.sort_values('Score', ascending=False).head(TOP_BACKTEST), None
+    # === 修改开始：增加排名显示 ===
+    final_df = fdf.sort_values('Score', ascending=False).head(TOP_BACKTEST)
+    final_df['Rank'] = range(1, len(final_df) + 1)
+    return final_df, None
+    # === 修改结束 ===
 
 # ---------------------------
 # UI 及 主程序
@@ -522,10 +526,11 @@ if st.button(f"🚀 启动 V30.12.3 实战版回测"):
                 cols[idx].metric(f"D+{n} 均益 / 胜率", f"{avg:.2f}% / {win:.1f}%")
         
         st.subheader("📋 回测清单")
-        display_cols = ['Trade_Date','name','ts_code','Close','Pct_Chg',
+        display_cols = ['Rank','Trade_Date','name','ts_code','Close','Pct_Chg',
              'Return_D1 (%)', 'Return_D3 (%)', 'Return_D5 (%)',
                         'rsi','winner_rate','Sector_Boost']
-        st.dataframe(all_res[display_cols].sort_values('Trade_Date', ascending=False), use_container_width=True)
+        # 按日期降序，同一天按排名升序
+        st.dataframe(all_res[display_cols].sort_values(['Trade_Date', 'Rank'], ascending=[False, True]), use_container_width=True)
         
         csv = all_res.to_csv(index=False).encode('utf-8-sig')
         st.download_button(
