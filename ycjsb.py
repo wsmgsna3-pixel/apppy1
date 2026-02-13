@@ -12,29 +12,36 @@ warnings.filterwarnings("ignore")
 # 1. 页面配置与全局设置
 # ==========================================
 st.set_page_config(page_title="三日成妖·极速回测版", layout="wide")
-st.title("⚡ 三日成妖·极速回测系统 (Vectorized High-Performance)")
+st.title("⚡ 三日成妖·极速回测系统 (稳定修复版)")
 st.markdown("""
-**性能优化说明：**
-借鉴 `zl1` 策略架构，采用 **"全市场数据预加载 + 向量化计算"** 模式。
-- **旧版**：50天 × 3000股 = 150,000次 计算。
-- **新版**：50次 数据拉取 -> 内存瞬间匹配。
-**速度提升约 100 倍。**
+**版本说明：**
+- 已修复 API 调用频率过高导致的报错。
+- 采用 **"全市场数据预加载 + 向量化计算"** 模式。
+- 速度提升约 100 倍，且更稳定。
 """)
 
 # ==========================================
-# 2. 核心数据引擎 (借鉴 zl1 架构)
+# 2. 核心数据引擎 (带重试与限流)
 # ==========================================
 @st.cache_data(persist="disk", show_spinner=False)
 def get_trade_cal(token, start_date, end_date):
+    """获取交易日历 (带重试)"""
     ts.set_token(token)
     pro = ts.pro_api()
-    df = pro.trade_cal(exchange='SSE', start_date=start_date, end_date=end_date, is_open='1')
-    return df['cal_date'].tolist()
+    for attempt in range(3):
+        try:
+            df = pro.trade_cal(exchange='SSE', start_date=start_date, end_date=end_date, is_open='1')
+            if not df.empty:
+                return df['cal_date'].tolist()
+            time.sleep(0.5)
+        except:
+            time.sleep(1)
+    return []
 
 @st.cache_data(persist="disk", show_spinner=False)
 def fetch_all_market_data_by_date(token, date_list):
     """
-    批量拉取全市场数据 (核心加速环节)
+    批量拉取全市场数据 (核心加速环节 + 限流保护)
     """
     ts.set_token(token)
     pro = ts.pro_api()
@@ -47,14 +54,20 @@ def fetch_all_market_data_by_date(token, date_list):
     
     for i, date in enumerate(date_list):
         try:
+            # === 核心修复：每次请求前暂停 0.08 秒，防止 QPS 超限 ===
+            time.sleep(0.08)
+            
             # 一次性拉取当天所有股票
             df = pro.daily(trade_date=date)
+            
             # 只保留核心字段减小内存
             if not df.empty:
                 df = df[['ts_code', 'trade_date', 'open', 'high', 'low', 'close', 'pre_close', 'vol', 'amount', 'pct_chg']]
                 data_list.append(df)
-        except:
-            time.sleep(1) # 报错稍微停一下
+        except Exception as e:
+            # 如果报错，多休息一下再继续
+            time.sleep(1)
+            print(f"日期 {date} 获取失败: {e}")
             
         if (i+1) % 5 == 0:
             bar.progress((i+1)/total, text=f"加载数据: {date} ({i+1}/{total})")
@@ -72,14 +85,34 @@ def fetch_all_market_data_by_date(token, date_list):
 
 @st.cache_data(persist="disk", show_spinner=False)
 def get_stock_basics(token):
+    """
+    获取基础信息 (带重试机制，防止 API 报错)
+    """
     ts.set_token(token)
     pro = ts.pro_api()
-    df = pro.stock_basic(exchange='', list_status='L', fields='ts_code,name,market,list_date')
-    # 剔除 ST 和 北交所
-    df = df[~df['name'].str.contains('ST')]
-    df = df[~df['market'].str.contains('北交')]
-    df = df[~df['ts_code'].str.contains('BJ')]
-    return df
+    
+    # 重试 3 次，每次失败休息 1 秒
+    for attempt in range(3):
+        try:
+            time.sleep(0.5) # 请求前先休息一下
+            # 获取全市场股票列表
+            df = pro.stock_basic(exchange='', list_status='L', fields='ts_code,name,market,list_date')
+            
+            # 如果获取成功，开始过滤
+            if not df.empty:
+                # 剔除 ST
+                df = df[~df['name'].str.contains('ST')]
+                # 剔除 北交所
+                df = df[~df['market'].str.contains('北交')]
+                df = df[~df['ts_code'].str.contains('BJ')]
+                return df
+                
+        except Exception as e:
+            print(f"API 请求失败 (尝试 {attempt+1}/3): {e}")
+            time.sleep(1)
+            
+    st.error("无法获取股票基础列表。可能是 Tushare 接口繁忙，请稍后再试。")
+    return pd.DataFrame()
 
 # ==========================================
 # 3. 向量化信号计算 (速度的核心)
@@ -153,19 +186,24 @@ def run_fast_backtest():
     
     cal_dates = get_trade_cal(user_token, start_dt.strftime('%Y%m%d'), end_str)
     if not cal_dates:
-        st.error("获取日历失败")
+        st.error("获取日历失败，请检查Token")
         return
 
     # 2. 数据加载 (Bulk Load)
     df_all = fetch_all_market_data_by_date(user_token, cal_dates)
     if df_all.empty:
-        st.error("数据加载失败")
+        st.error("数据加载失败，请检查网络或Token")
         return
         
     st.success(f"数据加载完成！内存中共有 {len(df_all):,} 条 K线数据。")
 
     # 3. 基础信息匹配 (用于分板块涨幅限制)
     df_basic = get_stock_basics(user_token)
+    if df_basic.empty:
+        st.warning("基础信息获取失败，将跳过板块区分。")
+        # 构造一个空的 DataFrame 防止后面报错
+        df_basic = pd.DataFrame(columns=['ts_code', 'name', 'market'])
+    
     # 只保留基础表里有的股票 (剔除了ST/北交所)
     df_all = df_all[df_all['ts_code'].isin(df_basic['ts_code'])]
     
@@ -198,10 +236,6 @@ def run_fast_backtest():
     st.write(f"⚡ 信号计算完成，共发现 {len(df_signals)} 个买点，正在计算收益...")
 
     # 6. 收益计算 (Look-ahead Vectorized)
-    # 我们需要看每行信号的 D+1, D+3... 收益
-    # 这里的难点是，怎么快速找到 D+N 的价格？
-    # 简单方法：再用一次 merge 或者 shift，但由于不是连续日期，这里用小循环处理信号即可 (因为信号数量通常不多，几百个而已)
-    
     trades = []
     # 把全量数据做成索引，方便快速查找
     # 优化：只保留需要的列
@@ -275,7 +309,7 @@ def run_fast_backtest():
     
     if trades:
         df_res = pd.DataFrame(trades)
-        st.success(f"🎉 回测全部完成！耗时仅需几秒。共交易 {len(df_res)} 笔。")
+        st.success(f"🎉 回测全部完成！共交易 {len(df_res)} 笔。")
         
         cols = st.columns(5)
         days = ['D+1', 'D+3', 'D+5', 'D+7', 'D+10']
