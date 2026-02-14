@@ -11,14 +11,14 @@ warnings.filterwarnings("ignore")
 # ==========================================
 # 1. 页面配置
 # ==========================================
-st.set_page_config(page_title="潜龙 V3.1·极度共振", layout="wide")
-st.title("🐉 潜龙 V3.1·极度共振 (RSI>85 极致版)")
+st.set_page_config(page_title="快手MACD·突击版", layout="wide")
+st.title("⚡ 快手 MACD · 突击实战版")
 st.markdown("""
-**策略核心 (数据修正版)：**
-1.  **极度亢奋**：**RSI > 85** (数据证明 75-85 是亏钱区间，85以上才是妖股诞生地)。
-2.  **拒绝高潮**：1.5% < 板块涨幅 < **4.5%** (追涨幅>5%的板块容易接盘)。
-3.  **价格新高**：收盘价创 **60日新高** (上方无套牢盘)。
-4.  **均线发散**：MA5 > MA10 > MA20 (趋势护体)。
+**策略核心：捕捉“形态杂乱”中的突然启动**
+1.  **快手 MACD**：使用敏捷参数 (如 10, 22, 5)，比传统 MACD 快一步发现起爆。
+2.  **均线突围**：收盘价站上 5/10/20 日均线 (从混乱中确立短线优势)。
+3.  **KDJ 共振**：J 线处于强势区 (情绪点火)。
+4.  **温和放量**：量能 > 5日均量 (主力资金进场，无需倍量)。
 """)
 
 # ==========================================
@@ -95,66 +95,97 @@ def calculate_sector_heat(df_daily, df_basic):
     df_final = pd.merge(df_merged, sector_stats, on=['trade_date', 'industry'], how='left')
     return df_final
 
-def calculate_strategy(df, vol_mul, rsi_min, sec_min, sec_max):
+def calculate_macd(df, fast_p, slow_p, signal_p):
+    """自定义 MACD 计算"""
+    # EMA Fast
+    df['ema_fast'] = df.groupby('ts_code')['close'].transform(lambda x: x.ewm(span=fast_p, adjust=False).mean())
+    # EMA Slow
+    df['ema_slow'] = df.groupby('ts_code')['close'].transform(lambda x: x.ewm(span=slow_p, adjust=False).mean())
+    # DIF
+    df['dif'] = df['ema_fast'] - df['ema_slow']
+    # DEA
+    df['dea'] = df.groupby('ts_code')['dif'].transform(lambda x: x.ewm(span=signal_p, adjust=False).mean())
+    # MACD Bar
+    df['macd'] = (df['dif'] - df['dea']) * 2
+    return df
+
+def calculate_kdj(df, n=9, m1=3, m2=3):
+    """计算 KDJ"""
+    low_list = df['low'].rolling(window=n, min_periods=9).min()
+    low_list.fillna(value=df['low'].expanding().min(), inplace=True)
+    
+    high_list = df['high'].rolling(window=n, min_periods=9).max()
+    high_list.fillna(value=df['high'].expanding().max(), inplace=True)
+    
+    rsv = (df['close'] - low_list) / (high_list - low_list) * 100
+    
+    # KDJ 需要按代码分组计算，这里简化处理，直接 transform 会有问题，需手动实现 EMA
+    # 为保证速度，使用简化逻辑：当天强弱
+    # RSV > 50 视为强势
+    df['rsv'] = rsv
+    return df
+
+def calculate_strategy(df, fast_p, slow_p, signal_p, vol_min_ratio):
     """
-    计算所有信号 (V3.1 极度共振版)
+    计算所有信号 (快手MACD版)
     """
-    # 1. 均线系统
+    # 1. 均线 (MA5, MA10, MA20)
     df['ma5'] = df.groupby('ts_code')['close'].transform(lambda x: x.rolling(5).mean())
     df['ma10'] = df.groupby('ts_code')['close'].transform(lambda x: x.rolling(10).mean())
     df['ma20'] = df.groupby('ts_code')['close'].transform(lambda x: x.rolling(20).mean())
     
-    # 2. 价格新高 (60日)
-    df['high_60'] = df.groupby('ts_code')['close'].transform(lambda x: x.shift(1).rolling(60).max())
-    df['vol_60'] = df.groupby('ts_code')['vol'].transform(lambda x: x.shift(1).rolling(60).mean())
+    # 2. 量能均线
+    df['vol_5'] = df.groupby('ts_code')['vol'].transform(lambda x: x.rolling(5).mean())
     
-    # 3. RSI (6日)
-    df['up_move'] = np.where(df['pct_chg'] > 0, df['pct_chg'], 0)
-    df['down_move'] = np.where(df['pct_chg'] < 0, abs(df['pct_chg']), 0)
-    avg_up = df.groupby('ts_code')['up_move'].transform(lambda x: x.rolling(6).mean())
-    avg_down = df.groupby('ts_code')['down_move'].transform(lambda x: x.rolling(6).mean())
-    df['rsi_6'] = 100 * avg_up / (avg_up + avg_down + 0.0001)
+    # 3. MACD (自定义参数)
+    df = calculate_macd(df, fast_p, slow_p, signal_p)
     
-    # === 信号判定 ===
+    # 4. 信号判定
     
-    # A. 趋势共振
-    cond_trend = (df['ma5'] > df['ma10']) & (df['ma10'] > df['ma20'])
+    # A. 均线突围: 价格站上所有短期均线 (解决“杂乱”问题，证明今天最强)
+    cond_ma = (df['close'] > df['ma5']) & (df['close'] > df['ma10']) & (df['close'] > df['ma20'])
     
-    # B. 价格突破 (确认点)
-    cond_break = df['close'] >= df['high_60']
+    # B. 快手 MACD: DIF > DEA (处于多头状态) 且 DIF 拐头向上
+    # 或者简单点：DIF > DEA 且 MACD 红柱放大
+    # 更激进：MACD 刚刚金叉 (Ref 1日 DIF < DEA, 今日 DIF > DEA)
+    df['dif_shift'] = df.groupby('ts_code')['dif'].transform(lambda x: x.shift(1))
+    df['dea_shift'] = df.groupby('ts_code')['dea'].transform(lambda x: x.shift(1))
     
-    # C. 极度动量 (RSI > 85)
-    # 这是 ZL1 的核心，只有极强才买
-    cond_rsi = (df['rsi_6'] > rsi_min) & (df['rsi_6'] < 98) 
+    # 金叉 或 强势延续(红柱变长)
+    # 这里我们选 "金叉" 或 "水上漂" (DIF>0 且 DIF>DEA)
+    cond_macd = (df['dif'] > df['dea']) & (df['dif'] > -0.5) # 允许轻微水下，但不能太深
     
-    # D. 板块护航 (加盖子)
-    df['sector_pct'] = df['sector_pct'].fillna(0)
-    cond_sec = (df['sector_pct'] > sec_min) & (df['sector_pct'] < sec_max)
+    # C. 量能: 温和放量
+    cond_vol = df['vol'] > (df['vol_5'] * vol_min_ratio)
     
-    # E. 量能确认
-    cond_vol = df['vol'] > (df['vol_60'] * vol_mul)
+    # D. KDJ 模拟 (RSV > 60 表示今日收盘在近期高位，强势)
+    # 在杂乱K线中，如果收盘能收在 9天内的高位，说明突破了
+    df['high_9'] = df.groupby('ts_code')['high'].transform(lambda x: x.rolling(9).max())
+    df['low_9'] = df.groupby('ts_code')['low'].transform(lambda x: x.rolling(9).min())
+    df['rsv'] = (df['close'] - df['low_9']) / (df['high_9'] - df['low_9'] + 0.001) * 100
+    cond_kdj = df['rsv'] > 60 # 情绪强势
     
-    # F. 流动性
+    # E. 流动性
     cond_mv = (df['amount'] > 50000) & (df['amount'] < 5000000)
     
-    df['is_signal'] = cond_trend & cond_break & cond_rsi & cond_sec & cond_vol & cond_mv
+    df['is_signal'] = cond_ma & cond_macd & cond_vol & cond_kdj & cond_mv
     
     return df
 
 def calculate_score(row):
     score = 60
     
-    # 极度强势股评分逻辑
+    # MACD 红柱越长越好 (加速)
+    if row['macd'] > 0: score += 10
     
-    # 1. RSI 越接近 90 越好 (黄金区 88-95)
-    if 88 <= row['rsi_6'] <= 95: score += 30
-    elif 85 <= row['rsi_6'] < 88: score += 20
+    # 站稳均线
+    if row['close'] > row['ma5'] * 1.01: score += 10
     
-    # 2. 板块适度 (2.0 - 4.0 是最佳攻击区)
-    if 2.0 <= row['sector_pct'] <= 4.0: score += 20
+    # 板块加分 (共振)
+    if row['sector_pct'] > 1.0: score += 20
     
-    # 3. 突破力度
-    if row['pct_chg'] > 5.0: score += 10
+    # 刚启动 (RSV 还没到 100)
+    if 60 < row['rsv'] < 90: score += 10
         
     return round(score, 1)
 
@@ -162,27 +193,25 @@ def calculate_score(row):
 # 4. 主程序
 # ==========================================
 with st.sidebar:
-    st.header("⚙️ V3.1 极度共振参数")
+    st.header("⚙️ 快手 MACD 参数")
     user_token = st.text_input("Tushare Token:", type="password")
     
-    days_back = st.slider("数据回溯天数", 60, 300, 60)
+    days_back = st.slider("回测天数", 30, 120, 60)
     end_date_input = st.date_input("截止日期", datetime.now().date())
     
     st.markdown("---")
-    st.subheader("🔥 核心阈值")
+    st.subheader("⚡ 敏捷参数 (默认 10,22,5)")
+    fast_p = st.number_input("快线 (Fast EMA)", 3, 20, 10, help="越小越敏感，标准为12")
+    slow_p = st.number_input("慢线 (Slow EMA)", 10, 60, 22, help="越小越敏感，标准为26")
+    signal_p = st.number_input("信号线 (Signal)", 3, 20, 5, help="越小金叉越快，标准为9")
     
-    # RSI
-    rsi_min = st.number_input("RSI 下限", 0, 100, 85, help="低于85不做，那是陷阱")
+    st.markdown("---")
+    st.subheader("📈 量能与确认")
+    vol_min_ratio = st.slider("量能放大倍数 (vs 5日均量)", 1.0, 3.0, 1.2, 0.1, help="1.2表示温和放量")
     
-    # 板块
-    col1, col2 = st.columns(2)
-    sec_min = col1.number_input("板块下限%", 0.0, 5.0, 1.5)
-    sec_max = col2.number_input("板块上限%", 2.0, 10.0, 4.5, help="高于4.5%容易接盘")
+    top_n = st.number_input("每日优选 (Top N)", 1, 20, 5)
     
-    vol_mul = st.slider("突破量能倍数", 1.0, 5.0, 1.5)
-    top_n = st.number_input("每日优选 (Top N)", 1, 20, 2)
-    
-    run_btn = st.button("🚀 启动极致回测")
+    run_btn = st.button("🚀 启动快手回测")
 
 def run_analysis():
     if not user_token:
@@ -205,20 +234,20 @@ def run_analysis():
     if df_basic.empty: return
         
     # 3. 计算
-    with st.spinner("正在扫描极度亢奋标的..."):
+    with st.spinner("正在计算快手 MACD..."):
         df_sector = calculate_sector_heat(df_all, df_basic)
-        df_calc = calculate_strategy(df_sector, vol_mul, rsi_min, sec_min, sec_max)
+        df_calc = calculate_strategy(df_sector, fast_p, slow_p, signal_p, vol_min_ratio)
         
     # 4. 结果
-    st.markdown("### 🐉 V3.1 诊断")
+    st.markdown("### ⚡ 快手信号诊断")
     valid_dates = cal_dates[-(days_back):] 
     df_window = df_calc[df_calc['trade_date'].isin(valid_dates)]
     
     df_signals = df_window[df_window['is_signal']].copy()
-    st.write(f"⚪ RSI>85 + 新高标的: **{len(df_signals)}** 个")
+    st.write(f"⚪ 敏捷金叉 + 温和放量标的: **{len(df_signals)}** 个")
     
     if df_signals.empty:
-        st.warning("无信号。这说明市场没有进入亢奋期，空仓是最好的选择。")
+        st.warning("无信号。")
         return
 
     # 5. 评分与 Top N
@@ -262,7 +291,7 @@ def run_analysis():
         trade = {
             '信号日': signal_date, '代码': code, '名称': row.name, '排名': row.排名,
             '行业': row.industry, '板块涨幅': f"{row.sector_pct:.1f}%",
-            'RSI': f"{row.rsi_6:.1f}",
+            'DIF': f"{row.dif:.2f}",
             '买入价': buy_price, '状态': '持有'
         }
         
@@ -290,7 +319,7 @@ def run_analysis():
     if trades:
         df_res = pd.DataFrame(trades)
         
-        st.markdown(f"### 📊 V3.1 (极度共振) 回测结果 (Top {top_n})")
+        st.markdown(f"### 📊 快手突击回测结果 (Top {top_n})")
         cols = st.columns(5)
         days = ['D+1', 'D+3', 'D+5', 'D+7', 'D+10']
         
