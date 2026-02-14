@@ -11,14 +11,14 @@ warnings.filterwarnings("ignore")
 # ==========================================
 # 1. 页面配置
 # ==========================================
-st.set_page_config(page_title="潜龙 V4·MACD共振", layout="wide")
-st.title("⚡ 潜龙 V4·MACD 趋势共振 (水上漂战法)")
+st.set_page_config(page_title="潜龙 V5·双核驱动", layout="wide")
+st.title("🐉 潜龙 V5·双核驱动 (MACD空中加油 + RSI极值)")
 st.markdown("""
-**策略核心：拒绝垃圾股，只做“水上漂”**
-1.  **水上金叉**：**DIF > 0** (必须在0轴上方，确保多头主控，过滤90%垃圾)。
-2.  **趋势护体**：**MA20 > MA60** (中期趋势向上，不做下跌反弹)。
-3.  **高位起爆**：收盘价 > **60日区间的80%分位** (拒绝抄底，只做主升)。
-4.  **快手MACD**：10, 22, 5 (敏捷参数，快人一步)。
+**策略核心：集大成之作 (去粗取精)**
+1.  **极值筛选**：**RSI > 80** (继承 V3.1 的暴利基因，过滤 99% 杂毛)。
+2.  **空中加油**：**MACD 红柱放大** 或 **DIF 拒绝死叉** (比普通金叉更强的加速信号)。
+3.  **结构突破**：**收盘价创 60日新高** (必须解放全人类)。
+4.  **板块共振**：1.5% < 板块涨幅 < 4.5% (拒绝冷门，也拒绝接盘)。
 """)
 
 # ==========================================
@@ -95,8 +95,8 @@ def calculate_sector_heat(df_daily, df_basic):
     df_final = pd.merge(df_merged, sector_stats, on=['trade_date', 'industry'], how='left')
     return df_final
 
-def calculate_macd(df, fast_p, slow_p, signal_p):
-    """自定义 MACD"""
+def calculate_macd(df, fast_p=12, slow_p=26, signal_p=9):
+    """标准 MACD"""
     df['ema_fast'] = df.groupby('ts_code')['close'].transform(lambda x: x.ewm(span=fast_p, adjust=False).mean())
     df['ema_slow'] = df.groupby('ts_code')['close'].transform(lambda x: x.ewm(span=slow_p, adjust=False).mean())
     df['dif'] = df['ema_fast'] - df['ema_slow']
@@ -104,70 +104,69 @@ def calculate_macd(df, fast_p, slow_p, signal_p):
     df['macd'] = (df['dif'] - df['dea']) * 2
     return df
 
-def calculate_strategy(df, fast_p, slow_p, signal_p, vol_min_ratio):
+def calculate_strategy(df, vol_mul, rsi_min, sec_min, sec_max):
     """
-    计算所有信号 (V4 MACD 趋势共振版)
+    计算所有信号 (V5 双核驱动)
     """
-    # 1. 均线系统 (必须多头)
-    df['ma5'] = df.groupby('ts_code')['close'].transform(lambda x: x.rolling(5).mean())
-    df['ma10'] = df.groupby('ts_code')['close'].transform(lambda x: x.rolling(10).mean())
-    df['ma20'] = df.groupby('ts_code')['close'].transform(lambda x: x.rolling(20).mean())
-    df['ma60'] = df.groupby('ts_code')['close'].transform(lambda x: x.rolling(60).mean())
+    # 1. 结构: 60日新高
+    df['high_60'] = df.groupby('ts_code')['close'].transform(lambda x: x.shift(1).rolling(60).max())
+    df['vol_60'] = df.groupby('ts_code')['vol'].transform(lambda x: x.shift(1).rolling(60).mean())
     
-    # 2. 结构位置 (近60天高低点)
-    df['high_60'] = df.groupby('ts_code')['high'].transform(lambda x: x.shift(1).rolling(60).max())
-    df['low_60'] = df.groupby('ts_code')['low'].transform(lambda x: x.shift(1).rolling(60).min())
+    # 2. 动量: RSI (6日)
+    df['up_move'] = np.where(df['pct_chg'] > 0, df['pct_chg'], 0)
+    df['down_move'] = np.where(df['pct_chg'] < 0, abs(df['pct_chg']), 0)
+    avg_up = df.groupby('ts_code')['up_move'].transform(lambda x: x.rolling(6).mean())
+    avg_down = df.groupby('ts_code')['down_move'].transform(lambda x: x.rolling(6).mean())
+    df['rsi_6'] = 100 * avg_up / (avg_up + avg_down + 0.0001)
     
-    # 3. MACD
-    df = calculate_macd(df, fast_p, slow_p, signal_p)
-    
-    # 4. 量能
-    df['vol_5'] = df.groupby('ts_code')['vol'].transform(lambda x: x.rolling(5).mean())
+    # 3. 趋势: MACD
+    df = calculate_macd(df)
+    # 计算 MACD 变化 (判断空中加油)
+    df['macd_prev'] = df.groupby('ts_code')['macd'].transform(lambda x: x.shift(1))
     
     # === 信号判定 (严苛过滤) ===
     
-    # A. 水上漂 (核心核心核心)
-    # DIF > 0 意味着价格在长期均线之上，属于多头市场
-    cond_water = df['dif'] > 0
+    # A. 核心1: 极度亢奋 (RSI > 80)
+    # 这是把 9000 个 降到 200 个的关键
+    cond_rsi = (df['rsi_6'] > rsi_min) & (df['rsi_6'] < 98)
     
-    # B. MACD 攻击形态
-    # 刚刚金叉 (DIF 上穿 DEA) 或者 空中加油 (DIF 不死叉反身向上)
-    # 这里用简单的强势判定: DIF > DEA 且 MACD 红柱
-    cond_macd = (df['dif'] > df['dea']) & (df['macd'] > 0)
+    # B. 核心2: MACD 加速 (空中加油)
+    # 逻辑: DIF > 0 (水上) 且 (MACD刚翻红 或 MACD红柱变长)
+    cond_macd_pos = df['dif'] > 0
+    cond_macd_acc = (df['macd'] > 0) & (df['macd'] > df['macd_prev']) # 红柱放大
+    cond_macd = cond_macd_pos & cond_macd_acc
     
-    # C. 趋势护体
-    # 中期趋势必须向上 (MA20 > MA60)
-    cond_trend = df['ma20'] > df['ma60']
+    # C. 核心3: 价格新高 (确认突破)
+    cond_break = df['close'] >= df['high_60']
     
-    # D. 高位起爆 (拒绝抄底)
-    # 当前价必须位于过去60天震荡区间的 上方 20% 区域
-    # 公式: (Close - Low60) / (High60 - Low60) > 0.8
-    # 这意味着股票非常强，准备突破或已经突破
-    position_ratio = (df['close'] - df['low_60']) / (df['high_60'] - df['low_60'] + 0.001)
-    cond_pos = position_ratio > 0.8
+    # D. 板块护航
+    df['sector_pct'] = df['sector_pct'].fillna(0)
+    cond_sec = (df['sector_pct'] > sec_min) & (df['sector_pct'] < sec_max)
     
-    # E. 温和放量
-    cond_vol = df['vol'] > (df['vol_5'] * vol_min_ratio)
+    # E. 量能确认
+    cond_vol = df['vol'] > (df['vol_60'] * vol_mul)
     
     # F. 流动性
     cond_mv = (df['amount'] > 50000) & (df['amount'] < 5000000)
     
-    df['is_signal'] = cond_water & cond_macd & cond_trend & cond_pos & cond_vol & cond_mv
+    df['is_signal'] = cond_rsi & cond_macd & cond_break & cond_sec & cond_vol & cond_mv
     
     return df
 
 def calculate_score(row):
     score = 60
     
-    # MACD 越强越好
-    if row['macd'] > 0: score += 10
+    # 双核评分
     
-    # 均线多头排列
-    if row['ma5'] > row['ma10'] > row['ma20']: score += 20
+    # 1. RSI 越接近 90 越好
+    if 85 <= row['rsi_6'] <= 95: score += 30
+    elif 80 <= row['rsi_6'] < 85: score += 15
     
-    # 板块加分
-    if row['sector_pct'] > 1.5: score += 20
-    elif row['sector_pct'] > 0.8: score += 10
+    # 2. MACD 越强越好 (DIF高位加速)
+    if row['dif'] > 0.5: score += 10
+    
+    # 3. 板块适中
+    if 2.0 <= row['sector_pct'] <= 4.0: score += 10
         
     return round(score, 1)
 
@@ -175,24 +174,27 @@ def calculate_score(row):
 # 4. 主程序
 # ==========================================
 with st.sidebar:
-    st.header("⚙️ V4 MACD共振参数")
+    st.header("⚙️ V5 双核驱动参数")
     user_token = st.text_input("Tushare Token:", type="password")
     
     days_back = st.slider("回测天数", 30, 120, 60)
     end_date_input = st.date_input("截止日期", datetime.now().date())
     
     st.markdown("---")
-    st.subheader("⚡ 敏捷参数 (默认 10,22,5)")
+    st.subheader("🔥 核心阈值 (严苛)")
+    
+    # RSI
+    rsi_min = st.number_input("RSI 下限", 0, 100, 80, help="V3.1验证过的暴利门槛")
+    
+    # 板块
     col1, col2 = st.columns(2)
-    fast_p = col1.number_input("快线", 3, 20, 10)
-    slow_p = col2.number_input("慢线", 10, 60, 22)
-    signal_p = st.number_input("信号线", 3, 20, 5)
+    sec_min = col1.number_input("板块下限%", 0.0, 5.0, 1.5)
+    sec_max = col2.number_input("板块上限%", 2.0, 10.0, 4.5)
     
-    st.markdown("---")
-    vol_min_ratio = st.slider("量能放大倍数", 1.0, 3.0, 1.2, 0.1)
-    top_n = st.number_input("每日优选 (Top N)", 1, 20, 2, help="建议 Top 2")
+    vol_mul = st.slider("突破量能倍数", 1.0, 5.0, 1.5)
+    top_n = st.number_input("每日优选 (Top N)", 1, 20, 2)
     
-    run_btn = st.button("🚀 启动水上漂回测")
+    run_btn = st.button("🚀 启动双核回测")
 
 def run_analysis():
     if not user_token:
@@ -215,20 +217,20 @@ def run_analysis():
     if df_basic.empty: return
         
     # 3. 计算
-    with st.spinner("正在筛选水上漂标的..."):
+    with st.spinner("正在筛选 RSI+MACD 双强标的..."):
         df_sector = calculate_sector_heat(df_all, df_basic)
-        df_calc = calculate_strategy(df_sector, fast_p, slow_p, signal_p, vol_min_ratio)
+        df_calc = calculate_strategy(df_sector, vol_mul, rsi_min, sec_min, sec_max)
         
     # 4. 结果
-    st.markdown("### ⚡ V4 诊断")
+    st.markdown("### 🐉 V5 诊断")
     valid_dates = cal_dates[-(days_back):] 
     df_window = df_calc[df_calc['trade_date'].isin(valid_dates)]
     
     df_signals = df_window[df_window['is_signal']].copy()
-    st.write(f"⚪ 水上金叉 + 趋势共振标的: **{len(df_signals)}** 个")
+    st.write(f"⚪ RSI>80 + MACD加速 + 新高标的: **{len(df_signals)}** 个")
     
     if df_signals.empty:
-        st.warning("无信号。")
+        st.warning("无信号。市场情绪不足。")
         return
 
     # 5. 评分与 Top N
@@ -272,7 +274,7 @@ def run_analysis():
         trade = {
             '信号日': signal_date, '代码': code, '名称': row.name, '排名': row.排名,
             '行业': row.industry, '板块涨幅': f"{row.sector_pct:.1f}%",
-            'DIF': f"{row.dif:.2f}",
+            'RSI': f"{row.rsi_6:.1f}",
             '买入价': buy_price, '状态': '持有'
         }
         
@@ -300,7 +302,7 @@ def run_analysis():
     if trades:
         df_res = pd.DataFrame(trades)
         
-        st.markdown(f"### 📊 V4 (水上漂) 回测结果 (Top {top_n})")
+        st.markdown(f"### 📊 V5 (双核) 回测结果 (Top {top_n})")
         cols = st.columns(5)
         days = ['D+1', 'D+3', 'D+5', 'D+7', 'D+10']
         
