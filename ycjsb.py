@@ -11,14 +11,14 @@ warnings.filterwarnings("ignore")
 # ==========================================
 # 1. 页面配置
 # ==========================================
-st.set_page_config(page_title="潜龙 V13·半路截杀", layout="wide")
-st.title("🐉 潜龙 V13·半路截杀 (强板块+中位起爆)")
+st.set_page_config(page_title="潜龙 V14·点火者", layout="wide")
+st.title("🐉 潜龙 V14·点火者 (黄金板块+硬核龙头)")
 st.markdown("""
-**策略核心：拒绝接盘，半路截杀**
-1.  **顶级战场**：锁定 **涨幅前 3 名** 的板块 (资金风口)。
-2.  **中位起爆**：**3% < 涨幅 < 8%** (不追涨停，只抓"刚提裤子"的)。
-3.  **资金攻击**：**量比 > 2.0** (资金流入速度极快)。
-4.  **市值优势**：**市值 < 150亿** (船小好掉头，翻倍基因)。
+**策略核心：在"还没高潮"的板块里，抓"最硬"的龙头**
+1.  **黄金板块**：**2.0% < 板块涨幅 < 3.5%** (V3.1 数据验证过的暴利温区，拒绝 >4% 的高潮板块)。
+2.  **硬核龙头**：**当日涨幅 > 9.5%** (必须是涨停或 20cm 大阳，拒绝跟风杂毛)。
+3.  **资金点火**：**量比 > 1.5** (主力资金大举进攻)。
+4.  **趋势护航**：**RSI > 70** (姿态高昂)。
 """)
 
 # ==========================================
@@ -51,7 +51,7 @@ def fetch_all_market_data_by_date(token, date_list):
             time.sleep(0.05)
             # 获取日线
             df = pro.daily(trade_date=date)
-            # 获取指标(换手率、量比、市值)
+            # 获取指标
             df_basic = pro.daily_basic(trade_date=date, fields='ts_code,turnover_rate,volume_ratio,circ_mv')
             
             if not df.empty and not df_basic.empty:
@@ -87,9 +87,9 @@ def get_stock_basics(token):
 # ==========================================
 # 3. 核心计算
 # ==========================================
-def calculate_strategy(df_all, df_basic, top_k_sector):
+def calculate_strategy(df_all, df_basic, sec_min, sec_max):
     """
-    V13 核心逻辑: Top Sector -> Mid Stock -> High Vol
+    V14 核心逻辑: Golden Sector -> Top Leader
     """
     # 1. 预处理
     if 'industry' not in df_all.columns:
@@ -97,7 +97,7 @@ def calculate_strategy(df_all, df_basic, top_k_sector):
     else:
         df_merged = df_all.copy()
     
-    # 辅助指标：RSI (6日)
+    # 辅助指标: RSI
     df_merged['up_move'] = np.where(df_merged['pct_chg'] > 0, df_merged['pct_chg'], 0)
     df_merged['down_move'] = np.where(df_merged['pct_chg'] < 0, abs(df_merged['pct_chg']), 0)
     avg_up = df_merged.groupby('ts_code')['up_move'].transform(lambda x: x.rolling(6).mean())
@@ -113,88 +113,91 @@ def calculate_strategy(df_all, df_basic, top_k_sector):
         
         if daily_data.empty: continue
         
-        # === Step 1: 决出板块前三名 ===
+        # === Step 1: 筛选黄金板块 (温热区) ===
         sector_stats = daily_data.groupby('industry').agg({
             'pct_chg': 'mean',
             'ts_code': 'count',
             'amount': 'sum'
         }).reset_index()
         
-        # 过滤微型板块
+        # 过滤小板块
         sector_stats = sector_stats[(sector_stats['ts_code'] > 5) & (sector_stats['amount'] > 100000)]
         
-        # 排序取 Top K (Top 3)
-        top_sectors = sector_stats.sort_values('pct_chg', ascending=False).head(top_k_sector)
-        top_sector_names = top_sectors['industry'].tolist()
+        # 关键: 2.0% < 板块涨幅 < 3.5%
+        # 这个区间代表资金进场了，但还没疯狂，还可以进
+        golden_sectors = sector_stats[(sector_stats['pct_chg'] > sec_min) & (sector_stats['pct_chg'] < sec_max)]
+        golden_sector_names = golden_sectors['industry'].tolist()
         
-        if not top_sector_names: continue
+        if not golden_sector_names: continue
         
-        # === Step 2: 在强板块里找“半路龙” ===
-        for sec_name in top_sector_names:
-            sec_data = daily_data[daily_data['industry'] == sec_name].copy()
-            sec_gain = top_sectors[top_sectors['industry'] == sec_name]['pct_chg'].values[0]
+        # === Step 2: 在黄金板块里找"硬核龙头" ===
+        candidates = daily_data[daily_data['industry'].isin(golden_sector_names)].copy()
+        
+        # 1. 必须是涨停板 (或 > 9.5%) - 绝对的领头羊
+        winners = candidates[candidates['pct_chg'] > 9.5]
+        
+        if winners.empty: continue
+        
+        # 2. 资金点火: 量比 > 1.5
+        winners = winners[winners['volume_ratio'] > 1.5]
+        
+        # 3. 趋势护航: RSI > 70
+        winners = winners[winners['rsi_6'] > 70]
+        
+        # 4. 换手率 > 3% (拒绝一字)
+        winners = winners[winners['turnover_rate'] > 3.0]
+        
+        if winners.empty: continue
+        
+        # 每天取最强的 Top 2 (按量比和RSI综合)
+        winners['score'] = winners['volume_ratio'] + (winners['rsi_6'] / 10)
+        top_picks = winners.sort_values('score', ascending=False).head(2)
+        
+        for _, row in top_picks.iterrows():
+            # 获取该股所在板块的实际涨幅
+            sec_gain = sector_stats[sector_stats['industry'] == row['industry']]['pct_chg'].values[0]
             
-            # 板块必须够强 (>1.5%)
-            if sec_gain < 1.5: continue
-            
-            # === Step 3: 个股筛选 (中位起爆) ===
-            # 1. 涨幅区间: 3% < x < 8% (不追涨停，不做弱势)
-            candidates = sec_data[(sec_data['pct_chg'] > 3.0) & (sec_data['pct_chg'] < 8.0)]
-            
-            # 2. 资金攻击: 量比 > 2.0 (且换手率>3%，过滤无量)
-            candidates = candidates[(candidates['volume_ratio'] > 2.0) & (candidates['turnover_rate'] > 3.0)]
-            
-            # 3. 市值筛选: 流通市值 < 150亿 (或总市值) -> 这里用 circ_mv (万)
-            # 150亿 = 1500000 万
-            # 很多数据源 circ_mv 单位是万元
-            candidates = candidates[candidates['circ_mv'] < 1500000]
-            
-            # 4. RSI 辅助: 趋势不能太差 (RSI > 60)
-            candidates = candidates[candidates['rsi_6'] > 60]
-            
-            if candidates.empty: continue
-            
-            # 优中选优: 按量比排序，取前 2 名
-            top_picks = candidates.sort_values('volume_ratio', ascending=False).head(2)
-
-            for _, row in top_picks.iterrows():
-                results.append({
-                    'ts_code': row['ts_code'],
-                    'trade_date': curr_date,
-                    'name': row['name'],
-                    'industry': sec_name,
-                    'sector_pct': sec_gain,
-                    'pct_chg': row['pct_chg'],
-                    'vol_ratio': row['volume_ratio'],
-                    'rsi': row['rsi_6'],
-                    'close': row['close'],
-                    'is_signal': True
-                })
+            results.append({
+                'ts_code': row['ts_code'],
+                'trade_date': curr_date,
+                'name': row['name'],
+                'industry': row['industry'],
+                'sector_pct': sec_gain,
+                'pct_chg': row['pct_chg'],
+                'vol_ratio': row['volume_ratio'],
+                'close': row['close'],
+                'is_signal': True
+            })
             
     return pd.DataFrame(results)
 
 def calculate_score(row):
-    # 评分逻辑：量比权重最大 (代表攻击力度)
+    # 评分: 板块涨幅适中最好(2.5-3.0)，个股越强越好
     score = 60
-    score += row['vol_ratio'] * 5
-    score += row['pct_chg'] * 2
+    # 奖励黄金板块
+    if 2.5 <= row['sector_pct'] <= 3.2: score += 20
+    # 奖励大长腿
+    if row['pct_chg'] > 15.0: score += 20
+    
     return round(score, 1)
 
 # ==========================================
 # 4. 主程序
 # ==========================================
 with st.sidebar:
-    st.header("⚙️ V13 半路截杀参数")
+    st.header("⚙️ V14 点火者参数")
     user_token = st.text_input("Tushare Token:", type="password")
     
     days_back = st.slider("回测天数", 30, 120, 60)
     end_date_input = st.date_input("截止日期", datetime.now().date())
     
     st.markdown("---")
-    st.subheader("🔥 筛选标准")
-    top_k_sector = st.number_input("锁定板块前几名?", 1, 5, 3)
+    st.subheader("🔥 黄金温区")
+    col1, col2 = st.columns(2)
+    sec_min = col1.number_input("板块下限%", 0.0, 5.0, 2.0, help="确保有热度")
+    sec_max = col2.number_input("板块上限%", 2.0, 10.0, 3.5, help="拒绝高潮")
     
-    run_btn = st.button("🚀 启动 V13 回测")
+    run_btn = st.button("🚀 启动点火回测")
 
 def run_analysis():
     if not user_token:
@@ -217,11 +220,11 @@ def run_analysis():
     if df_basic.empty: return
         
     # 3. 计算
-    with st.spinner("正在寻找中位起爆点..."):
-        df_calc = calculate_strategy(df_all, df_basic, top_k_sector)
+    with st.spinner("正在寻找风口上的点火者..."):
+        df_calc = calculate_strategy(df_all, df_basic, sec_min, sec_max)
         
     # 4. 结果
-    st.markdown("### 🐉 V13 诊断 (强板块+中位起爆)")
+    st.markdown("### 🐉 V14 诊断 (黄金板块+硬核龙头)")
     
     if df_calc.empty:
         st.warning("无信号。")
@@ -231,11 +234,11 @@ def run_analysis():
     valid_dates = cal_dates[-(days_back):] 
     df_signals = df_calc[df_calc['trade_date'].isin(valid_dates)].copy()
     
-    st.write(f"⚪ 捕获中位攻击手: **{len(df_signals)}** 个")
+    st.write(f"⚪ 捕获点火者: **{len(df_signals)}** 个")
 
     # 5. 评分与 Top N
     df_signals['潜龙分'] = df_signals.apply(calculate_score, axis=1)
-    df_signals = df_signals.sort_values(['trade_date', 'vol_ratio'], ascending=[True, False])
+    df_signals = df_signals.sort_values(['trade_date', '潜龙分'], ascending=[True, False])
     
     # 6. 回测
     price_lookup = df_all[['ts_code', 'trade_date', 'open', 'close', 'low', 'pre_close']].set_index(['ts_code', 'trade_date'])
@@ -300,7 +303,7 @@ def run_analysis():
     if trades:
         df_res = pd.DataFrame(trades)
         
-        st.markdown(f"### 📊 V13 (半路截杀) 回测结果")
+        st.markdown(f"### 📊 V14 (点火者) 回测结果")
         cols = st.columns(5)
         days = ['D+1', 'D+3', 'D+5', 'D+7', 'D+10']
         
@@ -314,7 +317,7 @@ def run_analysis():
                     cols[idx].metric(f"{d} 胜率", f"{win_rate:.1f}%")
                     cols[idx].metric(f"{d} 均收", f"{avg_ret:.2f}%")
         
-        st.dataframe(df_res.sort_values(['信号日', '量比'], ascending=[False, False]), use_container_width=True)
+        st.dataframe(df_res.sort_values(['信号日'], ascending=False), use_container_width=True)
     else:
         st.warning("无交易")
 
