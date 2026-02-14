@@ -12,15 +12,15 @@ warnings.filterwarnings("ignore")
 # ==========================================
 # 1. 页面配置
 # ==========================================
-st.set_page_config(page_title="潜龙 V25·潜伏者", layout="wide")
-st.title("🐉 潜龙 V25·潜伏者 (抓启动、吃鱼头)")
+st.set_page_config(page_title="潜龙 V26·天网", layout="wide")
+st.title("🐉 潜龙 V26·天网 (宽网捕鱼+RSI锁定)")
 st.markdown("""
-**策略核心：彻底解决"信号滞后"问题，买在起涨点**
-1.  **位置低**：股价必须处于 **近60日区间的 85% 以下** (拒绝山顶接盘)。
-2.  **第一枪**：寻找长期横盘后的 **首根大阳线** (涨幅 > 7%)。
-3.  **资金入场**：量比 > 1.3 + 换手 > 1.5% (参考翻倍股 DNA)。
-4.  **市值兼容**：**30亿 - 800亿** (全覆盖)。
-5.  **目标**：比您原来的主力策略 **提前 5-10 天** 发出买入信号。
+**策略核心：放宽物理门槛，收紧能量门槛**
+1.  **形态宽容**：**涨幅 > 4.5%** 即可 (包容慢牛启动)。
+2.  **位置宽容**：取消"低位85%"限制，只要 **股价 > MA20** (趋势向上) 且 **未破位** 均可。
+3.  **能量锁定 (RSI)**：**RSI(6) > 60** (确保处于攻击状态，参考 DNA)。
+4.  **资金门槛**：**量比 > 1.1** (极低门槛，包容大盘股)。
+5.  **目标**：宁可错杀一千 (多抓信号)，绝不放过一个 (覆盖所有12真龙)。
 """)
 
 DATA_FILE = "market_data_store.csv"
@@ -60,7 +60,7 @@ def sync_market_data(token, start_date, end_date):
         for i, date in enumerate(missing_dates):
             try:
                 df_daily = pro.daily(trade_date=date)
-                df_basic = pro.daily_basic(trade_date=date, fields='ts_code,turnover_rate,volume_ratio,circ_mv')
+                df_basic = pro.daily_basic(trade_date=date, fields='ts_code,turnover_rate,volume_ratio,circ_mv,pe,pb')
                 if not df_daily.empty and not df_basic.empty:
                     df_merged = pd.merge(df_daily, df_basic, on='ts_code', how='left')
                     df_merged['trade_date'] = str(date)
@@ -92,7 +92,7 @@ def sync_market_data(token, start_date, end_date):
         return pd.DataFrame(), "无数据"
 
 # ==========================================
-# 3. 策略逻辑 (抓启动点)
+# 3. 策略逻辑 (V26 天网)
 # ==========================================
 def calculate_strategy(df_all, df_info):
     if 'industry' not in df_all.columns:
@@ -100,44 +100,45 @@ def calculate_strategy(df_all, df_info):
     else:
         df = df_all.copy()
     
-    # 计算均线 (用于趋势参考)
-    df['ma10'] = df.groupby('ts_code')['close'].transform(lambda x: x.rolling(10).mean())
+    # 计算 RSI (6日)
+    def calc_rsi(x):
+        delta = x.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(6).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(6).mean()
+        rs = gain / (loss + 0.001)
+        return 100 - (100 / (1 + rs))
+    
+    df['rsi_6'] = df.groupby('ts_code')['close'].transform(calc_rsi)
     df['ma20'] = df.groupby('ts_code')['close'].transform(lambda x: x.rolling(20).mean())
+    df['ma10'] = df.groupby('ts_code')['close'].transform(lambda x: x.rolling(10).mean())
     
-    # === 1. 位置相对较低 (核心改动) ===
-    # 计算近 60 天的最高价
-    df['high_60'] = df.groupby('ts_code')['high'].transform(lambda x: x.rolling(60).max())
-    # 当前收盘价 < 60日最高价的 85% (或者是突破日，允许稍微高一点，但不能翻倍了才买)
-    # 或者逻辑反过来：我们要买的是突破，所以可能刚好创新高。
-    # 修正逻辑：我们找的是"首板"。即前几天没大涨。
+    # === 1. 宽网形态 (涨幅 > 4.5%) ===
+    # 包容所有中阳线启动
+    cond_up = df['pct_chg'] > 4.5
     
-    # 计算过去 5 天的累计涨幅
-    df['pct_5d'] = df.groupby('ts_code')['pct_chg'].transform(lambda x: x.rolling(5).sum())
-    # 启动前比较安静：过去5天累计涨幅 < 15% (排除已经连板的妖股)
-    cond_quiet = (df['pct_5d'] - df['pct_chg']) < 15.0
-    
-    # === 2. 启动第一枪 (首板/大阳) ===
-    # 涨幅 > 7.0% (大阳线)
-    cond_launch = df['pct_chg'] > 7.0
-    
-    # === 3. 资金 DNA ===
-    cond_mv = (df['circ_mv'] >= 30*10000) & (df['circ_mv'] <= 800*10000)
-    cond_vol = df['volume_ratio'] > 1.3
-    cond_turn = df['turnover_rate'] > 1.5
-    
-    # === 4. 趋势支撑 ===
-    # 至少在生命线上，不能是空头下跌中的反抽
+    # === 2. 趋势底线 (股价 > MA20) ===
+    # 只要在生命线上方，不管位置高低
     cond_trend = df['close'] > df['ma20']
     
+    # === 3. 能量锁定 (RSI > 60) ===
+    # 确保处于攻击状态 (DNA 显示翻倍股启动时 RSI 都在 60-80)
+    cond_rsi = df['rsi_6'] > 60
+    
+    # === 4. 极低资金门槛 ===
+    # 量比 > 1.1 (只要不缩量太厉害就行，包容大盘股)
+    cond_vol = df['volume_ratio'] > 1.1
+    # 市值 30-800亿
+    cond_mv = (df['circ_mv'] >= 30*10000) & (df['circ_mv'] <= 800*10000)
+    
     # 综合信号
-    df['is_signal'] = cond_quiet & cond_launch & cond_mv & cond_vol & cond_turn & cond_trend
+    df['is_signal'] = cond_up & cond_trend & cond_rsi & cond_vol & cond_mv
     
     return df
 
 # ==========================================
-# 4. 回测逻辑 (MA10 拿住主升浪)
+# 4. 回测逻辑 (MA10 趋势止盈)
 # ==========================================
-def run_backtest_start(df_signals, df_all, cal_dates):
+def run_backtest_skynet(df_signals, df_all, cal_dates):
     df_lookup = df_all.copy()
     if 'ma10' not in df_lookup.columns:
          df_lookup['ma10'] = df_lookup.groupby('ts_code')['close'].transform(lambda x: x.rolling(10).mean())
@@ -161,7 +162,7 @@ def run_backtest_start(df_signals, df_all, cal_dates):
         if (code, d1_date) not in price_lookup.index: continue
         d1_data = price_lookup.loc[(code, d1_date)]
         
-        # 铁门槛
+        # 铁门槛: 拒绝恶意低开
         open_pct = (d1_data['open'] - d1_data['pre_close']) / d1_data['pre_close'] * 100
         if open_pct < -2.0: continue
         
@@ -174,8 +175,7 @@ def run_backtest_start(df_signals, df_all, cal_dates):
         # D+1 止损
         d1_ret = (d1_data['close'] - buy_price) / buy_price
         
-        # 抓启动点的风险在于"假突破"，所以止损要坚决
-        if d1_ret < -0.04: # 亏 4% 就跑
+        if d1_ret < -0.05: # 亏 5% 就跑
              trade['状态'] = 'D+1止损'
              trade['D+1'] = round(d1_ret * 100, 2)
              for n in range(1, 10): trade[f"D+{n+1}"] = round(d1_ret * 100, 2)
@@ -183,7 +183,7 @@ def run_backtest_start(df_signals, df_all, cal_dates):
             trade['D+1'] = round(d1_ret * 100, 2)
             triggered = False
             
-            # 趋势跟踪: 破 MA10 止盈 (一旦抓对，就吃到底)
+            # 趋势跟踪: 破 MA10 止盈
             for n in range(1, 10):
                 if n >= len(future_dates): break
                 f_date = future_dates[n]
@@ -208,22 +208,23 @@ def run_backtest_start(df_signals, df_all, cal_dates):
 # 5. 主程序
 # ==========================================
 with st.sidebar:
-    st.header("⚙️ V25 潜伏者")
+    st.header("⚙️ V26 天网")
     user_token = st.text_input("Tushare Token:", type="password")
     
     days_back = st.slider("回测天数", 30, 150, 60)
     end_date_input = st.date_input("截止日期", datetime.now().date())
     
     st.markdown("---")
-    st.info("🎯 核心逻辑")
+    st.info("🕸️ 天网参数")
     st.markdown("""
-    * **位置**: 近5天未大涨 (排除鱼尾)
-    * **启动**: 首根大阳线 (>7%)
-    * **DNA**: 参考自选股参数
+    * **涨幅**: > 4.5% (中阳)
+    * **RSI**: > 60 (攻击态)
+    * **量比**: > 1.1 (微放量)
+    * **位置**: 不限 (MA20上方)
     """)
-    top_n = st.number_input("每日优选 (Top N)", 1, 10, 5) # 稍微放宽，因为是抓启动
+    top_n = st.number_input("每日优选 (Top N)", 1, 20, 10) # 扩大到 Top 10，防止漏网
     
-    run_btn = st.button("🚀 启动抓鱼头")
+    run_btn = st.button("🚀 启动天网")
 
 if run_btn:
     if not user_token:
@@ -240,7 +241,7 @@ if run_btn:
             df_all = res
             st.success(f"✅ 数据加载: {len(df_all):,} 行")
             
-            with st.spinner("寻找启动点..."):
+            with st.spinner("撒网捕鱼..."):
                 df_calc = calculate_strategy(df_all, df_info)
                 
             cal_dates = sorted(df_calc['trade_date'].unique())
@@ -248,23 +249,22 @@ if run_btn:
             
             df_signals = df_calc[(df_calc['trade_date'].isin(valid_dates)) & (df_calc['is_signal'])].copy()
             
-            # 排序: 抓启动，优先看谁跳得高 (涨幅大) 且 量比大 (资金凶)
-            # 综合评分 = 涨幅 * 量比
-            df_signals['score'] = df_signals['pct_chg'] * df_signals['volume_ratio']
-            df_signals = df_signals.sort_values(['trade_date', 'score'], ascending=[True, False])
+            # 排序: 既然是宽网，我们优先看"启动力度"
+            # RSI 越高，说明攻击欲望越强
+            df_signals = df_signals.sort_values(['trade_date', 'rsi_6'], ascending=[True, False])
             
             df_signals['排名'] = df_signals.groupby('trade_date').cumcount() + 1
             df_top = df_signals[df_signals['排名'] <= top_n].copy()
             
-            st.write(f"⚪ 潜伏信号: **{len(df_top)}** 个")
+            st.write(f"⚪ 天网信号: **{len(df_top)}** 个")
             
             if not df_top.empty:
-                df_res = run_backtest_start(df_top, df_calc, cal_dates)
+                df_res = run_backtest_skynet(df_top, df_calc, cal_dates)
                 
                 if not df_res.empty:
                     st.success(f"🎯 成交单数: **{len(df_res)}**")
                     
-                    st.markdown(f"### 📊 V25 回测 (首板启动/鱼头策略)")
+                    st.markdown(f"### 📊 V26 回测 (宽网+RSI)")
                     cols = st.columns(5)
                     days = ['D+1', 'D+3', 'D+5', 'D+7', 'D+10']
                     for idx, d in enumerate(days):
