@@ -12,15 +12,15 @@ warnings.filterwarnings("ignore")
 # ==========================================
 # 1. 页面配置
 # ==========================================
-st.set_page_config(page_title="潜龙 V26·天网", layout="wide")
-st.title("🐉 潜龙 V26·天网 (宽网捕鱼+RSI锁定)")
+st.set_page_config(page_title="潜龙 V27·天罗地网", layout="wide")
+st.title("🐉 潜龙 V27·天罗地网 (极低门槛+全域扫描)")
 st.markdown("""
-**策略核心：放宽物理门槛，收紧能量门槛**
-1.  **形态宽容**：**涨幅 > 4.5%** 即可 (包容慢牛启动)。
-2.  **位置宽容**：取消"低位85%"限制，只要 **股价 > MA20** (趋势向上) 且 **未破位** 均可。
-3.  **能量锁定 (RSI)**：**RSI(6) > 60** (确保处于攻击状态，参考 DNA)。
-4.  **资金门槛**：**量比 > 1.1** (极低门槛，包容大盘股)。
-5.  **目标**：宁可错杀一千 (多抓信号)，绝不放过一个 (覆盖所有12真龙)。
+**策略核心：为了抓到最后 7 条鱼，拆除所有多余门槛**
+1.  **RSI 松绑**：**RSI(6) > 45** (包容底部挖坑后的反转)。
+2.  **量能豁免**：**取消量比/换手限制** (包容强庄缩量板)。
+3.  **趋势底线**：**股价 > MA5** (超短线强势即可，不求站稳 MA20)。
+4.  **唯一硬指标**：**当日涨幅 > 4.5%** (必须有赚钱效应)。
+5.  **目标**：无死角覆盖所有启动形态。
 """)
 
 DATA_FILE = "market_data_store.csv"
@@ -60,7 +60,7 @@ def sync_market_data(token, start_date, end_date):
         for i, date in enumerate(missing_dates):
             try:
                 df_daily = pro.daily(trade_date=date)
-                df_basic = pro.daily_basic(trade_date=date, fields='ts_code,turnover_rate,volume_ratio,circ_mv,pe,pb')
+                df_basic = pro.daily_basic(trade_date=date, fields='ts_code,turnover_rate,volume_ratio,circ_mv')
                 if not df_daily.empty and not df_basic.empty:
                     df_merged = pd.merge(df_daily, df_basic, on='ts_code', how='left')
                     df_merged['trade_date'] = str(date)
@@ -92,7 +92,7 @@ def sync_market_data(token, start_date, end_date):
         return pd.DataFrame(), "无数据"
 
 # ==========================================
-# 3. 策略逻辑 (V26 天网)
+# 3. 策略逻辑 (天罗地网)
 # ==========================================
 def calculate_strategy(df_all, df_info):
     if 'industry' not in df_all.columns:
@@ -109,36 +109,32 @@ def calculate_strategy(df_all, df_info):
         return 100 - (100 / (1 + rs))
     
     df['rsi_6'] = df.groupby('ts_code')['close'].transform(calc_rsi)
-    df['ma20'] = df.groupby('ts_code')['close'].transform(lambda x: x.rolling(20).mean())
+    df['ma5'] = df.groupby('ts_code')['close'].transform(lambda x: x.rolling(5).mean())
     df['ma10'] = df.groupby('ts_code')['close'].transform(lambda x: x.rolling(10).mean())
     
-    # === 1. 宽网形态 (涨幅 > 4.5%) ===
-    # 包容所有中阳线启动
+    # === 1. 唯一硬指标 (涨幅 > 4.5%) ===
     cond_up = df['pct_chg'] > 4.5
     
-    # === 2. 趋势底线 (股价 > MA20) ===
-    # 只要在生命线上方，不管位置高低
-    cond_trend = df['close'] > df['ma20']
+    # === 2. 趋势底线 (站上 MA5) ===
+    # 只要站上 5日线，就是短线强势，不管 MA20/MA60
+    cond_trend = df['close'] > df['ma5']
     
-    # === 3. 能量锁定 (RSI > 60) ===
-    # 确保处于攻击状态 (DNA 显示翻倍股启动时 RSI 都在 60-80)
-    cond_rsi = df['rsi_6'] > 60
+    # === 3. RSI 极低门槛 (> 45) ===
+    # 只要不是极度超卖，都算正常
+    cond_rsi = df['rsi_6'] > 45
     
-    # === 4. 极低资金门槛 ===
-    # 量比 > 1.1 (只要不缩量太厉害就行，包容大盘股)
-    cond_vol = df['volume_ratio'] > 1.1
-    # 市值 30-800亿
+    # === 4. 市值全覆盖 (30-800亿) ===
     cond_mv = (df['circ_mv'] >= 30*10000) & (df['circ_mv'] <= 800*10000)
     
-    # 综合信号
-    df['is_signal'] = cond_up & cond_trend & cond_rsi & cond_vol & cond_mv
+    # 综合信号 (无量比/换手限制)
+    df['is_signal'] = cond_up & cond_trend & cond_rsi & cond_mv
     
     return df
 
 # ==========================================
 # 4. 回测逻辑 (MA10 趋势止盈)
 # ==========================================
-def run_backtest_skynet(df_signals, df_all, cal_dates):
+def run_backtest_dragnet(df_signals, df_all, cal_dates):
     df_lookup = df_all.copy()
     if 'ma10' not in df_lookup.columns:
          df_lookup['ma10'] = df_lookup.groupby('ts_code')['close'].transform(lambda x: x.rolling(10).mean())
@@ -162,7 +158,7 @@ def run_backtest_skynet(df_signals, df_all, cal_dates):
         if (code, d1_date) not in price_lookup.index: continue
         d1_data = price_lookup.loc[(code, d1_date)]
         
-        # 铁门槛: 拒绝恶意低开
+        # 铁门槛
         open_pct = (d1_data['open'] - d1_data['pre_close']) / d1_data['pre_close'] * 100
         if open_pct < -2.0: continue
         
@@ -208,23 +204,23 @@ def run_backtest_skynet(df_signals, df_all, cal_dates):
 # 5. 主程序
 # ==========================================
 with st.sidebar:
-    st.header("⚙️ V26 天网")
+    st.header("⚙️ V27 天罗地网")
     user_token = st.text_input("Tushare Token:", type="password")
     
     days_back = st.slider("回测天数", 30, 150, 60)
     end_date_input = st.date_input("截止日期", datetime.now().date())
     
     st.markdown("---")
-    st.info("🕸️ 天网参数")
+    st.info("🕸️ 极低门槛")
     st.markdown("""
-    * **涨幅**: > 4.5% (中阳)
-    * **RSI**: > 60 (攻击态)
-    * **量比**: > 1.1 (微放量)
-    * **位置**: 不限 (MA20上方)
+    * **涨幅**: > 4.5%
+    * **RSI**: > 45 (放宽)
+    * **量比**: 不限
+    * **趋势**: > MA5 (放宽)
     """)
-    top_n = st.number_input("每日优选 (Top N)", 1, 20, 10) # 扩大到 Top 10，防止漏网
+    top_n = st.number_input("每日优选 (Top N)", 1, 50, 20) # 扩大到 Top 20，确保覆盖
     
-    run_btn = st.button("🚀 启动天网")
+    run_btn = st.button("🚀 启动地网")
 
 if run_btn:
     if not user_token:
@@ -241,7 +237,7 @@ if run_btn:
             df_all = res
             st.success(f"✅ 数据加载: {len(df_all):,} 行")
             
-            with st.spinner("撒网捕鱼..."):
+            with st.spinner("全域扫描..."):
                 df_calc = calculate_strategy(df_all, df_info)
                 
             cal_dates = sorted(df_calc['trade_date'].unique())
@@ -249,22 +245,23 @@ if run_btn:
             
             df_signals = df_calc[(df_calc['trade_date'].isin(valid_dates)) & (df_calc['is_signal'])].copy()
             
-            # 排序: 既然是宽网，我们优先看"启动力度"
-            # RSI 越高，说明攻击欲望越强
-            df_signals = df_signals.sort_values(['trade_date', 'rsi_6'], ascending=[True, False])
+            # 排序: 既然门槛这么低，信号会很多。怎么排序？
+            # 翻倍股的特征是"强"。我们按涨幅排序。
+            # 涨得越猛，越像龙。
+            df_signals = df_signals.sort_values(['trade_date', 'pct_chg'], ascending=[True, False])
             
             df_signals['排名'] = df_signals.groupby('trade_date').cumcount() + 1
             df_top = df_signals[df_signals['排名'] <= top_n].copy()
             
-            st.write(f"⚪ 天网信号: **{len(df_top)}** 个")
+            st.write(f"⚪ 覆盖信号: **{len(df_top)}** 个")
             
             if not df_top.empty:
-                df_res = run_backtest_skynet(df_top, df_calc, cal_dates)
+                df_res = run_backtest_dragnet(df_top, df_calc, cal_dates)
                 
                 if not df_res.empty:
                     st.success(f"🎯 成交单数: **{len(df_res)}**")
                     
-                    st.markdown(f"### 📊 V26 回测 (宽网+RSI)")
+                    st.markdown(f"### 📊 V27 回测 (全覆盖版)")
                     cols = st.columns(5)
                     days = ['D+1', 'D+3', 'D+5', 'D+7', 'D+10']
                     for idx, d in enumerate(days):
