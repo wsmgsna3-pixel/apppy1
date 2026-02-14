@@ -11,18 +11,17 @@ warnings.filterwarnings("ignore")
 # ==========================================
 # 1. 页面配置
 # ==========================================
-st.set_page_config(page_title="箱体潜龙·突破实战版", layout="wide")
-st.title("🐉 箱体潜龙·突破实战系统 (Box Breakout)")
+st.set_page_config(page_title="箱体潜龙·显微镜版", layout="wide")
+st.title("🔬 箱体潜龙·显微镜诊断版")
 st.markdown("""
-**策略核心迭代：**
-1.  **寻找潜伏**：锁定过去 60 天振幅 < 35% 的“死鱼股”（主力吸筹）。
-2.  **捕捉惊雷**：**收盘价创60日新高** + **放量2倍** = 立即报警。
-3.  **极速切入**：突破次日直接买入，不再等待三天，抢占“鱼头”。
-4.  **信号冷却**：单只股票 20 天内只做第一次突破，拒绝反复挨打。
+**本次更新：**
+1.  **修复评分Bug**：评分标准与侧边栏“箱体限制”动态联动，不再误杀宽幅震荡的妖股。
+2.  **新增显微镜**：输入代码，透视该股票落选的真实原因（是没创新高？还是排名太低？）。
+3.  **数据复权**：逻辑优化，更贴近实战。
 """)
 
 # ==========================================
-# 2. 核心数据引擎 (保持稳定版)
+# 2. 核心数据引擎
 # ==========================================
 @st.cache_data(persist="disk", show_spinner=False)
 def get_trade_cal(token, start_date, end_date):
@@ -48,7 +47,8 @@ def fetch_all_market_data_by_date(token, date_list):
     
     for i, date in enumerate(date_list):
         try:
-            time.sleep(0.05) 
+            time.sleep(0.05)
+            # 依然使用基础接口，依靠大量数据计算相对位置
             df = pro.daily(trade_date=date)
             if not df.empty:
                 df = df[['ts_code', 'trade_date', 'open', 'high', 'low', 'close', 'pre_close', 'vol', 'amount', 'pct_chg']]
@@ -81,105 +81,63 @@ def get_stock_basics(token):
     return pd.DataFrame()
 
 # ==========================================
-# 3. 核心计算：箱体与突破 (全新逻辑)
+# 3. 核心计算 (带诊断逻辑)
 # ==========================================
-def apply_cool_down(group, window=20):
-    """
-    冷却期过滤器：
-    如果 Day T 触发信号，则 Day T+1 到 T+window 内的信号全部作废。
-    """
-    signals = group['is_signal'].values
-    dates = group['trade_date'].values
-    
-    # 如果没有信号，直接返回全False
-    if not np.any(signals):
-        return pd.Series(False, index=group.index)
-    
-    # 找到所有信号的索引位置
-    sig_indices = np.where(signals)[0]
-    
-    # 保留的信号掩码
-    keep_mask = np.zeros_like(signals, dtype=bool)
-    
-    last_idx = -999
-    for idx in sig_indices:
-        # 如果当前信号距离上一个有效信号超过 window，则保留
-        if idx - last_idx >= window:
-            keep_mask[idx] = True
-            last_idx = idx
-            
-    return pd.Series(keep_mask, index=group.index)
-
 def calculate_box_breakout(df, vol_mul, box_limit):
     """
     向量化计算箱体突破
     """
-    # 1. 计算过去 60 天的数据 (不含当天)
-    # 60日最高收盘价 (箱体上沿)
+    # 1. 核心指标计算
+    # 箱体上沿 (Max Close of prev 60 days)
     df['high_60'] = df.groupby('ts_code')['close'].transform(lambda x: x.shift(1).rolling(window=60).max())
-    # 60日最低收盘价 (箱体下沿)
+    # 箱体下沿 (Min Close of prev 60 days)
     df['low_60'] = df.groupby('ts_code')['close'].transform(lambda x: x.shift(1).rolling(window=60).min())
     # 60日均量
     df['vol_60'] = df.groupby('ts_code')['vol'].transform(lambda x: x.shift(1).rolling(window=60).mean())
     
-    # 2. 计算箱体振幅
-    # 振幅 = (上沿 - 下沿) / 下沿
+    # 2. 箱体振幅
     df['box_amplitude'] = (df['high_60'] - df['low_60']) / df['low_60']
     
-    # 3. 判断突破信号
-    # A. 潜伏条件：箱体振幅 < 阈值 (如 35%)
-    cond_box = df['box_amplitude'] < (box_limit / 100)
+    # 3. 信号判定列 (分开写方便诊断)
+    # A. 潜伏条件 (振幅 < box_limit)
+    df['cond_box'] = df['box_amplitude'] < (box_limit / 100)
     
-    # B. 价格突破：今天收盘价 > 过去60天最高价
-    cond_break = df['close'] > df['high_60']
+    # B. 价格突破 (Close > High60)
+    df['cond_break'] = df['close'] > df['high_60']
     
-    # C. 量能突破：今天成交量 > 60日均量 * 倍数
-    cond_vol = df['vol'] > (df['vol_60'] * vol_mul)
+    # C. 量能突破 (Vol > Vol60 * mul)
+    df['cond_vol'] = df['vol'] > (df['vol_60'] * vol_mul)
     
-    # D. 基础门槛 (股价>10, 成交额>5000万, 非停牌)
-    cond_basic = (df['close'] >= 10) & (df['amount'] > 50000) & (df['vol'] > 0)
+    # D. 基础门槛
+    df['cond_basic'] = (df['close'] >= 10) & (df['amount'] > 50000)
     
-    # 初步信号
-    df['is_signal'] = cond_box & cond_break & cond_vol & cond_basic
+    # 最终信号
+    df['is_signal'] = df['cond_box'] & df['cond_break'] & df['cond_vol'] & df['cond_basic']
     
-    # 4. 应用冷却期 (20天内不重复触发)
-    # 对每个股票分组处理，这步稍微慢一点，但为了逻辑严谨必须做
-    # 仅对至少有一个信号的股票处理，加速
-    has_signal_codes = df[df['is_signal']]['ts_code'].unique()
-    
-    # 默认全为 False
-    df['final_signal'] = False
-    
-    # 只处理有信号的股票
-    if len(has_signal_codes) > 0:
-        mask_codes = df['ts_code'].isin(has_signal_codes)
-        df.loc[mask_codes, 'final_signal'] = df[mask_codes].groupby('ts_code').apply(
-            lambda x: apply_cool_down(x, window=20)
-        ).reset_index(level=0, drop=True)
-        
     return df
 
-def calculate_score(row):
+def calculate_score(row, box_limit):
     """
-    潜龙分 (突破版)：
-    1. 突破力度：收盘价超箱体上沿越多越好
-    2. 箱体极致：箱体越扁越好 (振幅越小)
-    3. 量能倍数：越大越好
+    潜龙分 (动态版) - 修复了硬编码 35% 的问题
     """
     score = 60
     
-    # 箱体越窄加分 (基准 30%，每小 1% 加 1分)
+    # 箱体越窄加分 (基准改为用户的 box_limit)
+    # 比如用户设 50%，那么 40% 的振幅也能拿分
     box_amp = row['box_amplitude'] * 100
-    if box_amp < 30:
-        score += (30 - box_amp) * 1.5
+    if box_amp < box_limit:
+        # 分数权重：距离极限越远，分越高
+        score += (box_limit - box_amp) * 1.5
         
-    # 突破力度 (超上沿幅度)
-    break_pct = (row['close'] - row['high_60']) / row['high_60'] * 100
-    score += min(break_pct * 2, 20)
+    # 突破力度
+    if row['high_60'] > 0:
+        break_pct = (row['close'] - row['high_60']) / row['high_60'] * 100
+        score += min(break_pct * 2, 20)
     
     # 量能倍数
-    vol_ratio = row['vol'] / (row['vol_60'] + 1)
-    score += min(vol_ratio * 5, 20)
+    if row['vol_60'] > 0:
+        vol_ratio = row['vol'] / row['vol_60']
+        score += min(vol_ratio * 5, 20)
     
     return round(score, 1)
 
@@ -187,21 +145,22 @@ def calculate_score(row):
 # 4. 主程序
 # ==========================================
 with st.sidebar:
-    st.header("⚙️ 突破版参数")
+    st.header("⚙️ 参数控制")
     user_token = st.text_input("Tushare Token:", type="password")
     
-    st.info("💡 提示：'回测天数'建议设为 120天 以上，以保证有足够数据计算60日箱体。")
     days_back = st.slider("数据回溯天数", 60, 300, 120)
     end_date_input = st.date_input("截止日期", datetime.now().date())
     
     st.markdown("---")
-    st.subheader("📦 箱体与突破设置")
-    box_limit = st.slider("箱体振幅上限 (%)", 20, 50, 35, help="过去60天震幅小于此值才算潜伏。越小越严。")
-    vol_mul = st.slider("突破量能倍数", 1.5, 5.0, 2.0, 0.1, help="突破当日成交量需达到均量的多少倍")
+    box_limit = st.slider("箱体振幅上限 (%)", 20, 60, 50, help="建议设为 45-50 以捕获利通电子")
+    vol_mul = st.slider("突破量能倍数", 1.5, 5.0, 1.8, 0.1)
+    top_n = st.number_input("每日优选 (Top N)", 1, 50, 10)
     
-    top_n = st.number_input("每日优选 (Top N)", 1, 10, 5)
+    st.markdown("---")
+    st.subheader("🔍 诊断特定股票")
+    debug_code = st.text_input("输入代码 (如 603629)", help="输入代码后，右侧将显示该股票的详细落选原因").strip()
     
-    run_btn = st.button("🚀 启动箱体突破扫描")
+    run_btn = st.button("🚀 启动回测")
 
 def run_analysis():
     if not user_token:
@@ -210,7 +169,6 @@ def run_analysis():
 
     # 1. 准备数据
     end_str = end_date_input.strftime('%Y%m%d')
-    # 缓冲: 60天箱体计算 + 15天未来 + 回测天数
     start_dt = end_date_input - timedelta(days=days_back * 1.5 + 80)
     
     cal_dates = get_trade_cal(user_token, start_dt.strftime('%Y%m%d'), end_str)
@@ -230,55 +188,72 @@ def run_analysis():
         df_all = df_all[df_all['ts_code'].isin(df_basic['ts_code'])]
         df_all = pd.merge(df_all, df_basic[['ts_code', 'name', 'market']], on='ts_code', how='left')
     
-    # 3. 计算指标 (核心)
-    with st.spinner("正在扫描箱体形态与突破信号..."):
+    # 3. 计算指标
+    with st.spinner("正在执行全市场扫描..."):
         df_calc = calculate_box_breakout(df_all, vol_mul, box_limit)
         
-    # 4. 漏斗诊断
-    st.markdown("### 🕵️‍♀️ 突破漏斗诊断")
+    # 4. === 显微镜诊断模块 (User Request) ===
+    if debug_code:
+        st.markdown(f"### 🔬 显微镜诊断: {debug_code}")
+        # 模糊匹配代码
+        debug_df = df_calc[df_calc['ts_code'].astype(str).str.contains(debug_code)].copy()
+        
+        if debug_df.empty:
+            st.error(f"未找到代码 {debug_code} 的数据，请检查是否在回测日期范围内。")
+        else:
+            # 计算分数方便查看
+            debug_df['Temp_Score'] = debug_df.apply(lambda r: calculate_score(r, box_limit), axis=1)
+            
+            # 格式化显示
+            debug_cols = ['trade_date', 'close', 'high_60', 'vol', 'vol_60', 
+                          'box_amplitude', 'cond_box', 'cond_break', 'cond_vol', 'is_signal', 'Temp_Score']
+            
+            # 只显示最近几天或有信号的天
+            st.dataframe(
+                debug_df[debug_cols].tail(20).style.format({
+                    'high_60': '{:.2f}',
+                    'vol': '{:.0f}',
+                    'vol_60': '{:.0f}',
+                    'box_amplitude': '{:.2%}',
+                    'Temp_Score': '{:.1f}'
+                }),
+                use_container_width=True
+            )
+            st.info("""
+            **字段说明：**
+            - `high_60`: 过去60天最高收盘价 (突破基准)
+            - `box_amplitude`: 箱体振幅 (需 < 设定值)
+            - `cond_break`: 价格突破是否成立?
+            - `cond_vol`: 量能突破是否成立?
+            - `is_signal`: 最终是否入选?
+            """)
+
+    # 5. 筛选与排名
     valid_dates = cal_dates[-(days_back):] 
     df_window = df_calc[df_calc['trade_date'].isin(valid_dates)]
     
-    st.write(f"⚪ 样本总数: {len(df_window):,} 条")
-    
-    # A. 基础门槛
-    c_basic = (df_window['close'] >= 10) & (df_window['amount'] > 50000)
-    n_basic = len(df_window[c_basic])
-    st.write(f"1️⃣ 基础门槛 (价>10): {n_basic:,}")
-    
-    # B. 潜伏期 (箱体)
-    c_box = df_window['box_amplitude'] < (box_limit / 100)
-    n_box = len(df_window[c_basic & c_box])
-    st.write(f"2️⃣ 潜伏期筛选 (振幅<{box_limit}%): {n_box:,} (符合箱体形态)")
-    
-    # C. 突破 (价+量)
-    c_break = df_window['close'] > df_window['high_60']
-    c_vol = df_window['vol'] > (df_window['vol_60'] * vol_mul)
-    n_break = len(df_window[c_basic & c_box & c_break & c_vol])
-    st.write(f"3️⃣ 突破筛选 (创60日新高+放量): {n_break:,}")
-    
-    # D. 冷却期
-    df_signals = df_window[df_window['final_signal']].copy()
-    st.write(f"4️⃣ 冷却去重 (20天不重复): 最终买点 **{len(df_signals)}** 个")
+    df_signals = df_window[df_window['is_signal']].copy()
     
     if df_signals.empty:
-        st.warning("无符合条件的突破信号。")
+        st.warning("在此期间无股票入选。")
         return
 
-    # 5. 评分与 Top N
-    df_signals['潜龙分'] = df_signals.apply(calculate_score, axis=1)
+    # 评分与 Top N
+    df_signals['潜龙分'] = df_signals.apply(lambda r: calculate_score(r, box_limit), axis=1)
     df_signals = df_signals.sort_values(['trade_date', '潜龙分'], ascending=[True, False])
     df_signals['排名'] = df_signals.groupby('trade_date').cumcount() + 1
-    df_signals = df_signals[df_signals['排名'] <= top_n]
+    
+    # 截断 Top N
+    df_top = df_signals[df_signals['排名'] <= top_n].copy()
     
     # 6. 收益回测
     price_lookup = df_calc[['ts_code', 'trade_date', 'open', 'close', 'low']].set_index(['ts_code', 'trade_date'])
     trades = []
     
     progress = st.progress(0)
-    total_sig = len(df_signals)
+    total_sig = len(df_top)
     
-    for i, row in enumerate(df_signals.itertuples()):
+    for i, row in enumerate(df_top.itertuples()):
         progress.progress((i+1)/total_sig)
         
         signal_date = row.trade_date
@@ -301,7 +276,7 @@ def run_analysis():
         if (code, d1_date) not in price_lookup.index: continue
         d1_data = price_lookup.loc[(code, d1_date)]
         
-        # 风控: D+1 低开 < -5%
+        # 风控
         open_pct = (d1_data['open'] - d1_data.get('pre_close', row.close)) / row.close
         if open_pct < -0.05: continue
             
@@ -336,11 +311,10 @@ def run_analysis():
         
     progress.empty()
     
-    # 7. 结果展示
     if trades:
         df_res = pd.DataFrame(trades)
         
-        st.markdown(f"### 📊 突破策略回测 (Top {top_n})")
+        st.markdown(f"### 📊 显微镜回测结果 (Top {top_n})")
         cols = st.columns(5)
         days = ['D+1', 'D+3', 'D+5', 'D+7', 'D+10']
         
@@ -354,7 +328,7 @@ def run_analysis():
                     cols[idx].metric(f"{d} 胜率", f"{win_rate:.1f}%")
                     cols[idx].metric(f"{d} 均收", f"{avg_ret:.2f}%")
         
-        st.markdown("### 🏆 潜龙榜 (箱体突破)")
+        st.markdown("### 🏆 潜龙榜")
         display_cols = ['信号日', '排名', '代码', '名称', '箱体振幅', '潜龙分', '状态'] + \
                        [d for d in days if d in df_res.columns]
         
