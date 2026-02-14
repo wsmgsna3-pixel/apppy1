@@ -11,14 +11,14 @@ warnings.filterwarnings("ignore")
 # ==========================================
 # 1. 页面配置
 # ==========================================
-st.set_page_config(page_title="潜龙·稳赢实战版", layout="wide")
-st.title("🛡️ 潜龙·稳赢实战系统 (高胜率优化版)")
+st.set_page_config(page_title="潜龙·吸筹实战版", layout="wide")
+st.title("🐉 潜龙·吸筹实战系统 (红肥绿瘦 + 板块共振)")
 st.markdown("""
-**本次升级目标：大幅降低止损率，提升实战胜率。**
-1.  **趋势护体**：MA5 > MA10 > MA20 > MA60 (只做多头排列)。
-2.  **拒绝追高**：RSI < 80 (防止买在山顶)。
-3.  **乖离控制**：股价偏离 MA5 不超过 8% (防回撤)。
-4.  **板块共振**：保留行业热度筛选。
+**本次升级目标：只做主力“偷偷吃货”的股票 (120天 < 100只)**
+1.  **红肥绿瘦**：过去60天，阳线量/阴线量 > 1.3 (主力吸筹铁证)。
+2.  **RSI 抬头**：RSI(6) > 50 且 < 85 (拒绝弱势，拒绝过热)。
+3.  **箱体压缩**：10% < 振幅 < 40% (洗盘充分)。
+4.  **板块共振**：行业涨幅 > 1.0% (借势起飞)。
 """)
 
 # ==========================================
@@ -81,7 +81,7 @@ def get_stock_basics(token):
     return pd.DataFrame()
 
 # ==========================================
-# 3. 核心计算：板块 + 形态 + 安全锁
+# 3. 核心计算：吸筹 + 共振
 # ==========================================
 def calculate_rsi(series, period=6):
     delta = series.diff()
@@ -102,35 +102,40 @@ def calculate_sector_heat(df_daily, df_basic):
     df_final = pd.merge(df_merged, sector_stats, on=['trade_date', 'industry'], how='left')
     return df_final
 
-def calculate_strategy(df, vol_mul, box_min, box_max, rsi_limit):
+def calculate_strategy(df, vol_mul, box_min, box_max, vr_threshold, rsi_min, rsi_max):
     """
-    计算所有信号 (含安全锁)
+    计算所有信号 (吸筹核心)
     """
-    # 1. 基础指标计算 (均线 + RSI + 箱体)
-    # 使用 transform 计算为了保持行数不变
-    # 注意：Rolling 需要按 ts_code 分组
-    
-    # 均线
-    df['ma5'] = df.groupby('ts_code')['close'].transform(lambda x: x.rolling(window=5).mean())
-    df['ma10'] = df.groupby('ts_code')['close'].transform(lambda x: x.rolling(window=10).mean())
-    df['ma20'] = df.groupby('ts_code')['close'].transform(lambda x: x.rolling(window=20).mean())
-    df['ma60'] = df.groupby('ts_code')['close'].transform(lambda x: x.rolling(window=60).mean())
-    
-    # RSI (6日)
-    # 这里用自定义函数稍显复杂，为速度考虑，使用简化算法
-    # 或者直接用 pandas_ta，但为了环境兼容性，手写简单版
-    # 这里的 RSI 计算可能较慢，改用简单的涨跌幅代理或直接跳过复杂的RSI，用乖离率替代
-    # 既然要高胜率，乖离率(Bias)其实比RSI更直接
-    df['bias5'] = (df['close'] - df['ma5']) / df['ma5'] * 100
-    
-    # 箱体指标
+    # 1. 基础指标
     df['high_60'] = df.groupby('ts_code')['close'].transform(lambda x: x.shift(1).rolling(window=60).max())
     df['low_60'] = df.groupby('ts_code')['close'].transform(lambda x: x.shift(1).rolling(window=60).min())
     df['vol_60'] = df.groupby('ts_code')['vol'].transform(lambda x: x.shift(1).rolling(window=60).mean())
     df['box_amplitude'] = (df['high_60'] - df['low_60']) / df['low_60']
     
-    # 2. 信号判定
-    # A. 振幅区间 (10% ~ 45%)
+    # 2. 吸筹指标 (红肥绿瘦)
+    # 阳线量: 收盘价 > 开盘价 (或 pct_chg > 0)
+    # 这里用 pct_chg > 0 更准确反映多头意愿
+    df['vol_up'] = np.where(df['pct_chg'] > 0, df['vol'], 0)
+    df['vol_down'] = np.where(df['pct_chg'] <= 0, df['vol'], 0)
+    
+    # 滚动60天求和
+    df['sum_vol_up'] = df.groupby('ts_code')['vol_up'].transform(lambda x: x.rolling(window=60).sum())
+    df['sum_vol_down'] = df.groupby('ts_code')['vol_down'].transform(lambda x: x.rolling(window=60).sum())
+    
+    # 吸筹比率 (VR进化版)
+    df['accumulation_ratio'] = df['sum_vol_up'] / (df['sum_vol_down'] + 1) # +1 防除零
+    
+    # 3. RSI 指标 (简单算法)
+    # 用 pct_chg 近似 RSI 趋势
+    # 这里为了速度，我们用 6日涨幅均值 vs 跌幅均值 近似 RSI
+    df['up_move'] = np.where(df['pct_chg'] > 0, df['pct_chg'], 0)
+    df['down_move'] = np.where(df['pct_chg'] < 0, abs(df['pct_chg']), 0)
+    avg_up = df.groupby('ts_code')['up_move'].transform(lambda x: x.rolling(6).mean())
+    avg_down = df.groupby('ts_code')['down_move'].transform(lambda x: x.rolling(6).mean())
+    df['rsi_6'] = 100 * avg_up / (avg_up + avg_down + 0.0001)
+    
+    # 4. 信号判定
+    # A. 振幅区间 (10% ~ 40%)
     cond_box = (df['box_amplitude'] > (box_min/100)) & (df['box_amplitude'] < (box_max/100))
     
     # B. 价格突破 (创60日新高)
@@ -142,39 +147,31 @@ def calculate_strategy(df, vol_mul, box_min, box_max, rsi_limit):
     # D. 流动性筛选
     cond_mv = (df['amount'] > 50000) & (df['amount'] < 5000000)
     
-    # === E. 安全锁 (高胜率核心) ===
-    # 1. 均线多头排列 (趋势向上)
-    cond_trend = (df['ma5'] > df['ma10']) & (df['ma10'] > df['ma20']) & (df['ma20'] > df['ma60'])
+    # E. 吸筹筛选 (核心!)
+    cond_acc = df['accumulation_ratio'] > vr_threshold
     
-    # 2. 乖离率控制 (防止飞太高)
-    # 偏离 MA5 不超过 8% (RSI > 80 通常意味着乖离率很大)
-    cond_safe = df['bias5'] < 8.0 
+    # F. RSI 筛选 (拒绝弱势，拒绝过热)
+    cond_rsi = (df['rsi_6'] > rsi_min) & (df['rsi_6'] < rsi_max)
     
-    # 3. 拒绝长上影线 (说明抛压重)
-    # 上影线长度 = (High - Max(Open, Close)) / Close
-    upper_shadow = (df['high'] - df[['open', 'close']].max(axis=1)) / df['close']
-    cond_solid = upper_shadow < 0.03 # 上影线小于 3%
-    
-    df['is_signal_base'] = cond_box & cond_break & cond_vol & cond_mv & cond_trend & cond_safe & cond_solid
+    df['is_signal_base'] = cond_box & cond_break & cond_vol & cond_mv & cond_acc & cond_rsi
     
     return df
 
 def calculate_score(row):
     score = 60
     
+    # 吸筹分 (权重最大)
+    acc = row['accumulation_ratio']
+    if acc > 2.0: score += 25
+    elif acc > 1.5: score += 15
+    
     # 振幅分
     amp = row['box_amplitude'] * 100
-    if 20 <= amp <= 35: score += 20
-    elif 10 <= amp < 20: score += 10
+    if 15 <= amp <= 35: score += 15
     
     # 板块分
     if row['sector_pct'] > 0:
-        score += min(row['sector_pct'] * 5, 30)
-        
-    # 趋势分 (MA5 离 MA60 越远说明趋势越强，但也越危险，这里适度加分)
-    trend_strength = (row['ma5'] - row['ma60']) / row['ma60']
-    if 0.05 < trend_strength < 0.2: # 趋势刚启动
-        score += 10
+        score += min(row['sector_pct'] * 5, 20)
         
     return round(score, 1)
 
@@ -182,24 +179,29 @@ def calculate_score(row):
 # 4. 主程序
 # ==========================================
 with st.sidebar:
-    st.header("⚙️ 稳赢版参数")
+    st.header("⚙️ 吸筹版参数")
     user_token = st.text_input("Tushare Token:", type="password")
     
     days_back = st.slider("数据回溯天数", 60, 300, 120)
     end_date_input = st.date_input("截止日期", datetime.now().date())
     
     st.markdown("---")
-    st.subheader("🛡️ 安全与筛选")
+    st.subheader("🔍 核心滤网")
     col1, col2 = st.columns(2)
-    box_min = col1.number_input("振幅下限%", 5, 20, 15)
-    box_max = col2.number_input("振幅上限%", 30, 60, 45)
+    box_min = col1.number_input("振幅下限%", 5, 20, 10)
+    box_max = col2.number_input("振幅上限%", 30, 60, 40)
+    
+    vr_threshold = st.slider("吸筹比率 (阳量/阴量)", 1.0, 3.0, 1.3, 0.1, help=">1.3表示主力买多卖少")
+    
+    rsi_min = st.number_input("RSI下限", 0, 100, 50)
+    rsi_max = st.number_input("RSI上限", 0, 100, 85)
     
     vol_mul = st.slider("突破量能倍数", 1.5, 5.0, 1.8, 0.1)
-    sector_min_rise = st.slider("板块最低涨幅 (%)", 0.0, 3.0, 0.8, 0.1, help="降低到 0.8% 以兼容更多情况")
+    sector_min_rise = st.slider("板块最低涨幅 (%)", 0.0, 3.0, 1.0, 0.1)
     
-    top_n = st.number_input("每日优选 (Top N)", 1, 50, 10)
+    top_n = st.number_input("每日优选 (Top N)", 1, 50, 5)
     
-    run_btn = st.button("🚀 启动稳赢回测")
+    run_btn = st.button("🚀 启动吸筹回测")
 
 def run_analysis():
     if not user_token:
@@ -231,13 +233,12 @@ def run_analysis():
     with st.spinner("正在计算板块热度..."):
         df_sector = calculate_sector_heat(df_all, df_basic)
     
-    # 4. 计算策略信号 (含安全锁)
-    with st.spinner("正在执行多重安全检查..."):
-        # RSI 限制暂时用 乖离率 < 8% 替代，效果更好且快
-        df_calc = calculate_strategy(df_sector, vol_mul, box_min, box_max, 80)
+    # 4. 计算策略信号 (含吸筹逻辑)
+    with st.spinner("正在分析主力吸筹行为..."):
+        df_calc = calculate_strategy(df_sector, vol_mul, box_min, box_max, vr_threshold, rsi_min, rsi_max)
         
     # 5. 漏斗诊断
-    st.markdown("### 🛡️ 稳赢漏斗诊断")
+    st.markdown("### 🔍 吸筹漏斗诊断")
     valid_dates = cal_dates[-(days_back):] 
     df_window = df_calc[df_calc['trade_date'].isin(valid_dates)]
     
@@ -249,16 +250,15 @@ def run_analysis():
     n_base = len(df_window[c_base])
     st.write(f"1️⃣ 基础形态筛选: {n_base:,}")
     
-    # 安全锁筛选
-    c_trend = (df_window['ma5'] > df_window['ma10']) & (df_window['ma20'] > df_window['ma60'])
-    c_safe = (df_window['bias5'] < 8.0) & (df_window['high'] - df_window[['open','close']].max(axis=1))/df_window['close'] < 0.03
-    n_safe = len(df_window[c_base & c_trend & c_safe])
-    st.write(f"2️⃣ 安全锁 (多头排列 + 拒绝追高): {n_safe:,} (剔除了一半风险)")
+    # 吸筹筛选
+    c_acc = df_window['accumulation_ratio'] > vr_threshold
+    n_acc = len(df_window[c_base & c_acc])
+    st.write(f"2️⃣ 主力吸筹筛选 (VR > {vr_threshold}): {n_acc:,} (剔除了杂毛)")
     
     # 最终信号
     df_window['is_signal'] = df_window['is_signal_base'] & (df_window['sector_pct'] > sector_min_rise)
     df_signals = df_window[df_window['is_signal']].copy()
-    st.write(f"3️⃣ 最终买点 (含板块共振): **{len(df_signals)}** 个")
+    st.write(f"3️⃣ 最终买点 (含共振+突破): **{len(df_signals)}** 个")
     
     if df_signals.empty:
         st.warning("无符合条件的信号。")
@@ -293,6 +293,7 @@ def run_analysis():
             trades.append({
                 '信号日': signal_date, '代码': code, '名称': row.name, '排名': row.排名,
                 '行业': row.industry, '板块涨幅': f"{row.sector_pct:.1f}%",
+                '吸筹比率': f"{row.accumulation_ratio:.2f}",
                 '潜龙分': row.潜龙分, '状态': '等待开盘'
             })
             continue
@@ -311,6 +312,7 @@ def run_analysis():
         trade = {
             '信号日': signal_date, '代码': code, '名称': row.name, '排名': row.排名,
             '行业': row.industry, '板块涨幅': f"{row.sector_pct:.1f}%",
+            '吸筹比率': f"{row.accumulation_ratio:.2f}",
             '潜龙分': row.潜龙分, '买入价': buy_price, '状态': '持有'
         }
         
@@ -339,7 +341,7 @@ def run_analysis():
     if trades:
         df_res = pd.DataFrame(trades)
         
-        st.markdown(f"### 📊 稳赢回测结果 (Top {top_n})")
+        st.markdown(f"### 📊 吸筹回测结果 (Top {top_n})")
         cols = st.columns(5)
         days = ['D+1', 'D+3', 'D+5', 'D+7', 'D+10']
         
@@ -353,8 +355,8 @@ def run_analysis():
                     cols[idx].metric(f"{d} 胜率", f"{win_rate:.1f}%")
                     cols[idx].metric(f"{d} 均收", f"{avg_ret:.2f}%")
         
-        st.markdown("### 🏆 潜龙榜 (含行业数据)")
-        display_cols = ['信号日', '排名', '代码', '名称', '行业', '板块涨幅', '潜龙分', '状态'] + \
+        st.markdown("### 🏆 吸筹潜龙榜 (含吸筹比率)")
+        display_cols = ['信号日', '排名', '代码', '名称', '行业', '板块涨幅', '吸筹比率', '潜龙分', '状态'] + \
                        [d for d in days if d in df_res.columns]
         
         st.dataframe(
