@@ -12,15 +12,17 @@ warnings.filterwarnings("ignore")
 # ==========================================
 # 1. 页面配置
 # ==========================================
-st.set_page_config(page_title="潜龙 V27·天罗地网", layout="wide")
-st.title("🐉 潜龙 V27·天罗地网 (极低门槛+全域扫描)")
+st.set_page_config(page_title="潜龙 V28·神射手", layout="wide")
+st.title("🐉 潜龙 V28·神射手 (蓄势补漏+RSI精选)")
 st.markdown("""
-**策略核心：为了抓到最后 7 条鱼，拆除所有多余门槛**
-1.  **RSI 松绑**：**RSI(6) > 45** (包容底部挖坑后的反转)。
-2.  **量能豁免**：**取消量比/换手限制** (包容强庄缩量板)。
-3.  **趋势底线**：**股价 > MA5** (超短线强势即可，不求站稳 MA20)。
-4.  **唯一硬指标**：**当日涨幅 > 4.5%** (必须有赚钱效应)。
-5.  **目标**：无死角覆盖所有启动形态。
+**策略核心：从"撒网"转为"狙击"**
+1.  **双模启动 (补漏 5 只慢牛)**：
+    * ⚡ **爆发模式**：单日涨幅 > 4.5% (V27逻辑)。
+    * 🔋 **蓄势模式**：**3日累计涨幅 > 9%** 且 **创20日新高** (专抓利通电子/宏和科技类慢牛)。
+2.  **RSI 优选 (解决信号过多)**：
+    * 不再随机买入，而是按 **RSI 强度** 降序排列。
+    * 优先买入 **RSI 高 (60-85)** 的品种，只取每日 **Top 3**。
+3.  **趋势护航**：股价必须在 **MA5** 之上。
 """)
 
 DATA_FILE = "market_data_store.csv"
@@ -92,7 +94,7 @@ def sync_market_data(token, start_date, end_date):
         return pd.DataFrame(), "无数据"
 
 # ==========================================
-# 3. 策略逻辑 (天罗地网)
+# 3. 策略逻辑 (双模启动)
 # ==========================================
 def calculate_strategy(df_all, df_info):
     if 'industry' not in df_all.columns:
@@ -100,7 +102,8 @@ def calculate_strategy(df_all, df_info):
     else:
         df = df_all.copy()
     
-    # 计算 RSI (6日)
+    # === 指标计算 ===
+    # RSI (6日)
     def calc_rsi(x):
         delta = x.diff()
         gain = (delta.where(delta > 0, 0)).rolling(6).mean()
@@ -112,29 +115,41 @@ def calculate_strategy(df_all, df_info):
     df['ma5'] = df.groupby('ts_code')['close'].transform(lambda x: x.rolling(5).mean())
     df['ma10'] = df.groupby('ts_code')['close'].transform(lambda x: x.rolling(10).mean())
     
-    # === 1. 唯一硬指标 (涨幅 > 4.5%) ===
-    cond_up = df['pct_chg'] > 4.5
+    # 3日累计涨幅
+    df['pct_3d'] = df.groupby('ts_code')['pct_chg'].transform(lambda x: x.rolling(3).sum())
+    # 20日最高价 (用于判断新高)
+    df['high_20'] = df.groupby('ts_code')['high'].transform(lambda x: x.rolling(20).max())
     
-    # === 2. 趋势底线 (站上 MA5) ===
-    # 只要站上 5日线，就是短线强势，不管 MA20/MA60
+    # === 1. 启动模式 ===
+    # A模式: 单日爆发 (V27)
+    cond_mode_a = df['pct_chg'] > 4.5
+    
+    # B模式: 蓄势突破 (补漏)
+    # 3天涨9% + 且今日收盘价接近20日新高(>98%)
+    cond_mode_b = (df['pct_3d'] > 9.0) & (df['close'] >= df['high_20'] * 0.98)
+    
+    cond_start = cond_mode_a | cond_mode_b
+    
+    # === 2. 基础门槛 ===
+    # 趋势: 站上MA5 (强势底线)
     cond_trend = df['close'] > df['ma5']
-    
-    # === 3. RSI 极低门槛 (> 45) ===
-    # 只要不是极度超卖，都算正常
+    # RSI: > 45 (非超卖)
     cond_rsi = df['rsi_6'] > 45
-    
-    # === 4. 市值全覆盖 (30-800亿) ===
+    # 市值: 30-800亿
     cond_mv = (df['circ_mv'] >= 30*10000) & (df['circ_mv'] <= 800*10000)
     
-    # 综合信号 (无量比/换手限制)
-    df['is_signal'] = cond_up & cond_trend & cond_rsi & cond_mv
+    # 综合信号
+    df['is_signal'] = cond_start & cond_trend & cond_rsi & cond_mv
+    
+    # 标记模式
+    df['mode'] = np.where(cond_mode_a, 'A:爆发', 'B:蓄势')
     
     return df
 
 # ==========================================
 # 4. 回测逻辑 (MA10 趋势止盈)
 # ==========================================
-def run_backtest_dragnet(df_signals, df_all, cal_dates):
+def run_backtest_sniper(df_signals, df_all, cal_dates):
     df_lookup = df_all.copy()
     if 'ma10' not in df_lookup.columns:
          df_lookup['ma10'] = df_lookup.groupby('ts_code')['close'].transform(lambda x: x.rolling(10).mean())
@@ -165,13 +180,14 @@ def run_backtest_dragnet(df_signals, df_all, cal_dates):
         buy_price = d1_data['open']
         trade = {
             '信号日': signal_date, '代码': code, '名称': row.name, 
-            '行业': row.industry, '买入价': buy_price, '开盘涨幅': f"{open_pct:.2f}%", '状态': '持有'
+            '行业': row.industry, '买入价': buy_price, '模式': row.mode,
+            '开盘涨幅': f"{open_pct:.2f}%", '状态': '持有'
         }
         
         # D+1 止损
         d1_ret = (d1_data['close'] - buy_price) / buy_price
         
-        if d1_ret < -0.05: # 亏 5% 就跑
+        if d1_ret < -0.05:
              trade['状态'] = 'D+1止损'
              trade['D+1'] = round(d1_ret * 100, 2)
              for n in range(1, 10): trade[f"D+{n+1}"] = round(d1_ret * 100, 2)
@@ -204,23 +220,22 @@ def run_backtest_dragnet(df_signals, df_all, cal_dates):
 # 5. 主程序
 # ==========================================
 with st.sidebar:
-    st.header("⚙️ V27 天罗地网")
+    st.header("⚙️ V28 神射手")
     user_token = st.text_input("Tushare Token:", type="password")
     
     days_back = st.slider("回测天数", 30, 150, 60)
     end_date_input = st.date_input("截止日期", datetime.now().date())
     
     st.markdown("---")
-    st.info("🕸️ 极低门槛")
+    st.info("🎯 优选策略")
     st.markdown("""
-    * **涨幅**: > 4.5%
-    * **RSI**: > 45 (放宽)
-    * **量比**: 不限
-    * **趋势**: > MA5 (放宽)
+    * **排序**: 按 RSI(6) 降序
+    * **逻辑**: 优先买入攻击性最强的品种
+    * **补漏**: 包含3日累计大涨的慢牛
     """)
-    top_n = st.number_input("每日优选 (Top N)", 1, 50, 20) # 扩大到 Top 20，确保覆盖
+    top_n = st.number_input("每日优选 (Top N)", 1, 10, 3) # 收缩到 Top 3
     
-    run_btn = st.button("🚀 启动地网")
+    run_btn = st.button("🚀 启动狙击")
 
 if run_btn:
     if not user_token:
@@ -237,7 +252,7 @@ if run_btn:
             df_all = res
             st.success(f"✅ 数据加载: {len(df_all):,} 行")
             
-            with st.spinner("全域扫描..."):
+            with st.spinner("神射手瞄准中..."):
                 df_calc = calculate_strategy(df_all, df_info)
                 
             cal_dates = sorted(df_calc['trade_date'].unique())
@@ -245,23 +260,22 @@ if run_btn:
             
             df_signals = df_calc[(df_calc['trade_date'].isin(valid_dates)) & (df_calc['is_signal'])].copy()
             
-            # 排序: 既然门槛这么低，信号会很多。怎么排序？
-            # 翻倍股的特征是"强"。我们按涨幅排序。
-            # 涨得越猛，越像龙。
-            df_signals = df_signals.sort_values(['trade_date', 'pct_chg'], ascending=[True, False])
+            # === 核心排序逻辑 ===
+            # 按 RSI 降序排列 (优先选 70-80 的强攻击形态)
+            df_signals = df_signals.sort_values(['trade_date', 'rsi_6'], ascending=[True, False])
             
             df_signals['排名'] = df_signals.groupby('trade_date').cumcount() + 1
             df_top = df_signals[df_signals['排名'] <= top_n].copy()
             
-            st.write(f"⚪ 覆盖信号: **{len(df_top)}** 个")
+            st.write(f"⚪ 狙击信号: **{len(df_top)}** 个 (每日 Top {top_n})")
             
             if not df_top.empty:
-                df_res = run_backtest_dragnet(df_top, df_calc, cal_dates)
+                df_res = run_backtest_sniper(df_top, df_calc, cal_dates)
                 
                 if not df_res.empty:
                     st.success(f"🎯 成交单数: **{len(df_res)}**")
                     
-                    st.markdown(f"### 📊 V27 回测 (全覆盖版)")
+                    st.markdown(f"### 📊 V28 回测 (RSI优选 Top{top_n})")
                     cols = st.columns(5)
                     days = ['D+1', 'D+3', 'D+5', 'D+7', 'D+10']
                     for idx, d in enumerate(days):
