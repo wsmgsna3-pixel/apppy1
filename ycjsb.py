@@ -11,14 +11,14 @@ warnings.filterwarnings("ignore")
 # ==========================================
 # 1. 页面配置
 # ==========================================
-st.set_page_config(page_title="潜龙 V5·双核驱动", layout="wide")
-st.title("🐉 潜龙 V5·双核驱动 (MACD空中加油 + RSI极值)")
+st.set_page_config(page_title="潜龙 V6·天梯战法", layout="wide")
+st.title("🐉 潜龙 V6·天梯战法 (双RSI + 悬空形态)")
 st.markdown("""
-**策略核心：集大成之作 (去粗取精)**
-1.  **极值筛选**：**RSI > 80** (继承 V3.1 的暴利基因，过滤 99% 杂毛)。
-2.  **空中加油**：**MACD 红柱放大** 或 **DIF 拒绝死叉** (比普通金叉更强的加速信号)。
-3.  **结构突破**：**收盘价创 60日新高** (必须解放全人类)。
-4.  **板块共振**：1.5% < 板块涨幅 < 4.5% (拒绝冷门，也拒绝接盘)。
+**策略核心：只做“贴线飞行”的真龙**
+1.  **RSI双锁**：RSI(6)>85 且 **RSI(12)>70** (过滤单日诈尸，锁定持续强势)。
+2.  **悬空形态**：**最低价 > MA5** (极强特征，回踩不破线)。
+3.  **拒绝分歧**：**上影线 < 2%** (主力控盘严密，尾盘不杀跌)。
+4.  **结构突破**：创 60日新高。
 """)
 
 # ==========================================
@@ -95,78 +95,81 @@ def calculate_sector_heat(df_daily, df_basic):
     df_final = pd.merge(df_merged, sector_stats, on=['trade_date', 'industry'], how='left')
     return df_final
 
-def calculate_macd(df, fast_p=12, slow_p=26, signal_p=9):
-    """标准 MACD"""
-    df['ema_fast'] = df.groupby('ts_code')['close'].transform(lambda x: x.ewm(span=fast_p, adjust=False).mean())
-    df['ema_slow'] = df.groupby('ts_code')['close'].transform(lambda x: x.ewm(span=slow_p, adjust=False).mean())
-    df['dif'] = df['ema_fast'] - df['ema_slow']
-    df['dea'] = df.groupby('ts_code')['dif'].transform(lambda x: x.ewm(span=signal_p, adjust=False).mean())
-    df['macd'] = (df['dif'] - df['dea']) * 2
-    return df
+def calculate_rsi(series, period):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
 
-def calculate_strategy(df, vol_mul, rsi_min, sec_min, sec_max):
+def calculate_strategy(df, vol_mul, rsi6_min, rsi12_min, sec_min, sec_max):
     """
-    计算所有信号 (V5 双核驱动)
+    计算所有信号 (V6 天梯版)
     """
-    # 1. 结构: 60日新高
+    # 1. 均线
+    df['ma5'] = df.groupby('ts_code')['close'].transform(lambda x: x.rolling(5).mean())
+    df['ma10'] = df.groupby('ts_code')['close'].transform(lambda x: x.rolling(10).mean())
+    df['ma20'] = df.groupby('ts_code')['close'].transform(lambda x: x.rolling(20).mean())
+    
+    # 2. 新高
     df['high_60'] = df.groupby('ts_code')['close'].transform(lambda x: x.shift(1).rolling(60).max())
     df['vol_60'] = df.groupby('ts_code')['vol'].transform(lambda x: x.shift(1).rolling(60).mean())
     
-    # 2. 动量: RSI (6日)
+    # 3. 双 RSI (关键改动)
+    # 使用近似算法以提高速度，保持与前序版本一致性，或者用更精确的 rolling mean
     df['up_move'] = np.where(df['pct_chg'] > 0, df['pct_chg'], 0)
     df['down_move'] = np.where(df['pct_chg'] < 0, abs(df['pct_chg']), 0)
-    avg_up = df.groupby('ts_code')['up_move'].transform(lambda x: x.rolling(6).mean())
-    avg_down = df.groupby('ts_code')['down_move'].transform(lambda x: x.rolling(6).mean())
-    df['rsi_6'] = 100 * avg_up / (avg_up + avg_down + 0.0001)
     
-    # 3. 趋势: MACD
-    df = calculate_macd(df)
-    # 计算 MACD 变化 (判断空中加油)
-    df['macd_prev'] = df.groupby('ts_code')['macd'].transform(lambda x: x.shift(1))
+    # RSI 6
+    avg_up6 = df.groupby('ts_code')['up_move'].transform(lambda x: x.rolling(6).mean())
+    avg_down6 = df.groupby('ts_code')['down_move'].transform(lambda x: x.rolling(6).mean())
+    df['rsi_6'] = 100 * avg_up6 / (avg_up6 + avg_down6 + 0.0001)
     
-    # === 信号判定 (严苛过滤) ===
+    # RSI 12 (衡量中期持续性)
+    avg_up12 = df.groupby('ts_code')['up_move'].transform(lambda x: x.rolling(12).mean())
+    avg_down12 = df.groupby('ts_code')['down_move'].transform(lambda x: x.rolling(12).mean())
+    df['rsi_12'] = 100 * avg_up12 / (avg_up12 + avg_down12 + 0.0001)
     
-    # A. 核心1: 极度亢奋 (RSI > 80)
-    # 这是把 9000 个 降到 200 个的关键
-    cond_rsi = (df['rsi_6'] > rsi_min) & (df['rsi_6'] < 98)
+    # === 信号判定 (天梯过滤) ===
     
-    # B. 核心2: MACD 加速 (空中加油)
-    # 逻辑: DIF > 0 (水上) 且 (MACD刚翻红 或 MACD红柱变长)
-    cond_macd_pos = df['dif'] > 0
-    cond_macd_acc = (df['macd'] > 0) & (df['macd'] > df['macd_prev']) # 红柱放大
-    cond_macd = cond_macd_pos & cond_macd_acc
+    # A. RSI 双锁 (过滤一日游)
+    cond_rsi = (df['rsi_6'] > rsi6_min) & (df['rsi_12'] > rsi12_min)
     
-    # C. 核心3: 价格新高 (确认突破)
+    # B. 悬空形态 (Lowest > MA5)
+    # 极强特征：回踩连5日线都不碰
+    cond_fly = df['low'] > df['ma5']
+    
+    # C. 拒绝长上影 (Upper Shadow < 2%)
+    # (High - Max(Open, Close)) / Close < 0.02
+    upper_shadow = (df['high'] - df[['open', 'close']].max(axis=1)) / df['close']
+    cond_solid = upper_shadow < 0.02
+    
+    # D. 结构新高
     cond_break = df['close'] >= df['high_60']
     
-    # D. 板块护航
+    # E. 板块护航
     df['sector_pct'] = df['sector_pct'].fillna(0)
     cond_sec = (df['sector_pct'] > sec_min) & (df['sector_pct'] < sec_max)
-    
-    # E. 量能确认
-    cond_vol = df['vol'] > (df['vol_60'] * vol_mul)
     
     # F. 流动性
     cond_mv = (df['amount'] > 50000) & (df['amount'] < 5000000)
     
-    df['is_signal'] = cond_rsi & cond_macd & cond_break & cond_sec & cond_vol & cond_mv
+    df['is_signal'] = cond_rsi & cond_fly & cond_solid & cond_break & cond_sec & cond_mv
     
     return df
 
 def calculate_score(row):
     score = 60
     
-    # 双核评分
+    # 既然已经很强，RSI 12 越高越稳
+    if row['rsi_12'] > 80: score += 20
     
-    # 1. RSI 越接近 90 越好
-    if 85 <= row['rsi_6'] <= 95: score += 30
-    elif 80 <= row['rsi_6'] < 85: score += 15
+    # 悬空越高越好 (远离5日线说明加速中)
+    dist = (row['low'] - row['ma5']) / row['ma5'] * 100
+    if dist > 2.0: score += 15 # 乖离加速
     
-    # 2. MACD 越强越好 (DIF高位加速)
-    if row['dif'] > 0.5: score += 10
-    
-    # 3. 板块适中
-    if 2.0 <= row['sector_pct'] <= 4.0: score += 10
+    # 板块加分
+    if 2.0 <= row['sector_pct'] <= 4.0: score += 15
         
     return round(score, 1)
 
@@ -174,27 +177,26 @@ def calculate_score(row):
 # 4. 主程序
 # ==========================================
 with st.sidebar:
-    st.header("⚙️ V5 双核驱动参数")
+    st.header("⚙️ V6 天梯参数")
     user_token = st.text_input("Tushare Token:", type="password")
     
     days_back = st.slider("回测天数", 30, 120, 60)
     end_date_input = st.date_input("截止日期", datetime.now().date())
     
     st.markdown("---")
-    st.subheader("🔥 核心阈值 (严苛)")
+    st.subheader("🔥 双核阈值")
     
-    # RSI
-    rsi_min = st.number_input("RSI 下限", 0, 100, 80, help="V3.1验证过的暴利门槛")
-    
-    # 板块
     col1, col2 = st.columns(2)
-    sec_min = col1.number_input("板块下限%", 0.0, 5.0, 1.5)
-    sec_max = col2.number_input("板块上限%", 2.0, 10.0, 4.5)
+    rsi6_min = col1.number_input("RSI(6) 下限", 0, 100, 85, help="短线爆发")
+    rsi12_min = col2.number_input("RSI(12) 下限", 0, 100, 75, help="中线确认")
     
-    vol_mul = st.slider("突破量能倍数", 1.0, 5.0, 1.5)
+    col3, col4 = st.columns(2)
+    sec_min = col3.number_input("板块下限%", 0.0, 5.0, 1.5)
+    sec_max = col4.number_input("板块上限%", 2.0, 10.0, 4.5)
+    
     top_n = st.number_input("每日优选 (Top N)", 1, 20, 2)
     
-    run_btn = st.button("🚀 启动双核回测")
+    run_btn = st.button("🚀 启动天梯回测")
 
 def run_analysis():
     if not user_token:
@@ -217,20 +219,20 @@ def run_analysis():
     if df_basic.empty: return
         
     # 3. 计算
-    with st.spinner("正在筛选 RSI+MACD 双强标的..."):
+    with st.spinner("正在筛选天梯形态..."):
         df_sector = calculate_sector_heat(df_all, df_basic)
-        df_calc = calculate_strategy(df_sector, vol_mul, rsi_min, sec_min, sec_max)
+        df_calc = calculate_strategy(df_sector, 1.5, rsi6_min, rsi12_min, sec_min, sec_max)
         
     # 4. 结果
-    st.markdown("### 🐉 V5 诊断")
+    st.markdown("### 🐉 V6 诊断")
     valid_dates = cal_dates[-(days_back):] 
     df_window = df_calc[df_calc['trade_date'].isin(valid_dates)]
     
     df_signals = df_window[df_window['is_signal']].copy()
-    st.write(f"⚪ RSI>80 + MACD加速 + 新高标的: **{len(df_signals)}** 个")
+    st.write(f"⚪ 悬空+双RSI标的: **{len(df_signals)}** 个")
     
     if df_signals.empty:
-        st.warning("无信号。市场情绪不足。")
+        st.warning("无信号。市场无连板妖股。")
         return
 
     # 5. 评分与 Top N
@@ -274,7 +276,8 @@ def run_analysis():
         trade = {
             '信号日': signal_date, '代码': code, '名称': row.name, '排名': row.排名,
             '行业': row.industry, '板块涨幅': f"{row.sector_pct:.1f}%",
-            'RSI': f"{row.rsi_6:.1f}",
+            'RSI6': f"{row.rsi_6:.1f}",
+            'RSI12': f"{row.rsi_12:.1f}",
             '买入价': buy_price, '状态': '持有'
         }
         
@@ -302,7 +305,7 @@ def run_analysis():
     if trades:
         df_res = pd.DataFrame(trades)
         
-        st.markdown(f"### 📊 V5 (双核) 回测结果 (Top {top_n})")
+        st.markdown(f"### 📊 V6 (天梯) 回测结果 (Top {top_n})")
         cols = st.columns(5)
         days = ['D+1', 'D+3', 'D+5', 'D+7', 'D+10']
         
