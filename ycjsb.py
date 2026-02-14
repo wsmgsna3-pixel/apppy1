@@ -11,14 +11,14 @@ warnings.filterwarnings("ignore")
 # ==========================================
 # 1. 页面配置
 # ==========================================
-st.set_page_config(page_title="潜龙 V10·神龙摆尾", layout="wide")
-st.title("🐉 潜龙 V10·神龙摆尾 (龙头首阴/N字战法)")
+st.set_page_config(page_title="潜龙 V11·真龙回头", layout="wide")
+st.title("🐉 潜龙 V11·真龙回头 (强板块+弱个股)")
 st.markdown("""
-**策略核心：不追高，只做“龙回头”**
-1.  **妖股基因**：过去 10 天内，必须有过 **涨停 (涨幅 > 9.5%)**。
-2.  **缩量回调**：今日量能 < 涨停日量能的 **70%** (主力锁仓洗盘)。
-3.  **黄金支撑**：股价回踩 **10日线 (MA10)** 附近获得支撑。
-4.  **拒绝破位**：收盘价必须站稳 MA20 (趋势未坏)。
+**策略核心：牛市急跌找机会 (修复 V10 的板块Bug)**
+1.  **板块护航**：**板块涨幅 > 0%** (必须是红盘，资金未撤退)。
+2.  **个股洗盘**：**个股涨幅 < 2.0%** (甚至绿盘，形成差价背离)。
+3.  **妖股基因**：过去 10 天内有过 **涨停**。
+4.  **缩量回踩**：量能萎缩 + 站稳 MA10/MA20。
 """)
 
 # ==========================================
@@ -97,86 +97,81 @@ def calculate_sector_heat(df_daily, df_basic):
 
 def calculate_strategy(df, days_lookback):
     """
-    V10 核心逻辑: 龙回头
+    V11 核心逻辑: 强板块 + 弱个股 (洗盘)
     """
-    # 1. 均线系统
+    # 1. 均线
     df['ma5'] = df.groupby('ts_code')['close'].transform(lambda x: x.rolling(5).mean())
     df['ma10'] = df.groupby('ts_code')['close'].transform(lambda x: x.rolling(10).mean())
     df['ma20'] = df.groupby('ts_code')['close'].transform(lambda x: x.rolling(20).mean())
     
-    # 2. 寻找过去的涨停板
-    # 标记涨停 (>9.5%)
+    # 2. 涨停基因
     df['is_limit_up'] = df['pct_chg'] > 9.5
-    
-    # 滑动窗口判断过去 N 天是否有涨停 (不含今天)
-    # rolling sum on boolean gives count
     df['limit_up_count'] = df.groupby('ts_code')['is_limit_up'].transform(
         lambda x: x.shift(1).rolling(days_lookback).sum()
     )
     
-    # 3. 获取涨停那天的成交量 (取最近一次涨停的 vol)
-    # 这是一个近似处理，为了速度，我们对比 10日最大量
+    # 3. 历史最大量 (用于判断缩量)
     df['max_vol_10'] = df.groupby('ts_code')['vol'].transform(
         lambda x: x.shift(1).rolling(days_lookback).max()
     )
     
     # === 信号判定 ===
     
-    # A. 妖股基因: 过去10天至少有1个涨停
+    # A. 强板块 (修正 V10 的 Bug)
+    # 板块必须是红的，说明资金没退。防止买到崩盘板块的补跌股。
+    # 但也不能太热(>4%)，否则容易高潮次日跌
+    df['sector_pct'] = df['sector_pct'].fillna(0)
+    cond_sector = (df['sector_pct'] > 0) & (df['sector_pct'] < 4.0)
+    
+    # B. 弱个股 (洗盘特征)
+    # 涨幅 < 2%，甚至绿盘。这与板块形成“背离”。
+    cond_stock_weak = df['pct_chg'] < 2.0
+    
+    # C. 妖股基因
     cond_gene = df['limit_up_count'] >= 1
     
-    # B. 缩量回调: 今日成交量 < 10日最大量 * 0.7 (且越小越好)
+    # D. 缩量
     cond_vol = df['vol'] < (df['max_vol_10'] * 0.7)
     
-    # C. 黄金支撑: 
-    # 回踩 MA10: 最低价 <= MA10 * 1.02 (触及或跌破)
-    # 也就是股价离 MA10 很近了
-    cond_support = (df['low'] <= df['ma10'] * 1.02) & (df['close'] > df['ma20'])
-    
-    # D. 拒绝大跌: 今日跌幅不能太惨 (最好是小阴小阳)
-    # 跌幅不能超过 -5%，如果是红盘更好
-    cond_shape = df['pct_chg'] > -5.0
-    
-    # E. 趋势未坏: MA20 向上 (这里简单用收盘价 > MA20)
+    # E. 趋势支撑 (MA20)
     cond_trend = df['close'] > df['ma20']
     
     # F. 流动性
     cond_mv = (df['amount'] > 50000) & (df['amount'] < 5000000)
     
-    df['is_signal'] = cond_gene & cond_vol & cond_support & cond_shape & cond_trend & cond_mv
+    df['is_signal'] = cond_sector & cond_stock_weak & cond_gene & cond_vol & cond_trend & cond_mv
     
     return df
 
 def calculate_score(row):
     score = 60
     
-    # 离 MA10 越近越好 (性价比高)
-    dist_ma10 = abs(row['close'] - row['ma10']) / row['ma10']
-    if dist_ma10 < 0.02: score += 20
+    # 板块越强越好 (比如板块涨2%，个股跌1%，这种背离最好)
+    score += row['sector_pct'] * 10 
     
-    # 缩量越极致越好
-    if row['vol'] < row['max_vol_10'] * 0.5: score += 10
+    # 个股越弱越好 (深水低吸)
+    if row['pct_chg'] < 0: score += 10
     
-    # 板块如果今天也是绿的(洗盘)，反而好
-    if -2.0 < row['sector_pct'] < 1.0: score += 10
-        
+    # 离 MA10 越近越好
+    if abs(row['close'] - row['ma10']) / row['ma10'] < 0.02: score += 10
+    
     return round(score, 1)
 
 # ==========================================
 # 4. 主程序
 # ==========================================
 with st.sidebar:
-    st.header("⚙️ V10 神龙摆尾参数")
+    st.header("⚙️ V11 真龙回头参数")
     user_token = st.text_input("Tushare Token:", type="password")
     
     days_back = st.slider("回测天数", 30, 120, 60)
     end_date_input = st.date_input("截止日期", datetime.now().date())
     
     st.markdown("---")
-    days_lookback = st.slider("追溯几天内的涨停?", 3, 15, 10)
+    days_lookback = st.slider("追溯几天内涨停?", 3, 15, 10)
     top_n = st.number_input("每日优选 (Top N)", 1, 20, 2)
     
-    run_btn = st.button("🚀 启动龙回头回测")
+    run_btn = st.button("🚀 启动 V11 回测")
 
 def run_analysis():
     if not user_token:
@@ -199,17 +194,17 @@ def run_analysis():
     if df_basic.empty: return
         
     # 3. 计算
-    with st.spinner("正在寻找回踩到位的真龙..."):
+    with st.spinner("正在寻找'强板块弱个股'的错杀机会..."):
         df_sector = calculate_sector_heat(df_all, df_basic)
         df_calc = calculate_strategy(df_sector, days_lookback)
         
     # 4. 结果
-    st.markdown("### 🐉 V10 诊断")
+    st.markdown("### 🐉 V11 诊断")
     valid_dates = cal_dates[-(days_back):] 
     df_window = df_calc[df_calc['trade_date'].isin(valid_dates)]
     
     df_signals = df_window[df_window['is_signal']].copy()
-    st.write(f"⚪ 涨停回调标的: **{len(df_signals)}** 个")
+    st.write(f"⚪ 强板块+洗盘龙头: **{len(df_signals)}** 个")
     
     if df_signals.empty:
         st.warning("无信号。")
@@ -256,7 +251,7 @@ def run_analysis():
         trade = {
             '信号日': signal_date, '代码': code, '名称': row.name, '排名': row.排名,
             '行业': row.industry, '板块涨幅': f"{row.sector_pct:.1f}%",
-            '收盘价': row.close,
+            '个股涨幅': f"{row.pct_chg:.1f}%",
             '买入价': buy_price, '状态': '持有'
         }
         
@@ -284,7 +279,7 @@ def run_analysis():
     if trades:
         df_res = pd.DataFrame(trades)
         
-        st.markdown(f"### 📊 V10 (神龙摆尾) 回测结果 (Top {top_n})")
+        st.markdown(f"### 📊 V11 (真龙回头) 回测结果 (Top {top_n})")
         cols = st.columns(5)
         days = ['D+1', 'D+3', 'D+5', 'D+7', 'D+10']
         
