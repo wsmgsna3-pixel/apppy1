@@ -11,14 +11,14 @@ warnings.filterwarnings("ignore")
 # ==========================================
 # 1. 页面配置
 # ==========================================
-st.set_page_config(page_title="潜龙·共振 V2 (ZL1赋能)", layout="wide")
-st.title("🐉 潜龙·共振 V2 (获利盘 + 趋势确认)")
+st.set_page_config(page_title="潜龙 V3·主升浪", layout="wide")
+st.title("🐉 潜龙 V3·主升浪 (借鉴 ZL1 核心逻辑)")
 st.markdown("""
-**策略逻辑 (ZL1 赋能版)：**
-1.  **位置优势**：10% < 箱体振幅 < 40% (买在低位，不吃鱼尾)。
-2.  **筹码确认**：**获利盘 > 60%** (借鉴ZL1，确认套牢盘被解放)。
-3.  **趋势动力**：**RSI > 60** (确认启动) + **均线多头** (顺势而为)。
-4.  **板块护航**：板块涨幅 > 0.8% (不逆势)。
+**策略核心：用 20% 的利润空间，换取主升浪的确定性。**
+1.  **解放全人类**：收盘价创 **60日新高** (上方无套牢盘)。
+2.  **进入亢奋区**：**RSI > 75** (确认主力正在加速，拒绝磨叽)。
+3.  **板块强共振**：板块涨幅 **> 1.5%** (必须是当日风口)。
+4.  **均线发散**：MA5 > MA10 > MA20 > MA60 (完美多头排列)。
 """)
 
 # ==========================================
@@ -95,87 +95,69 @@ def calculate_sector_heat(df_daily, df_basic):
     df_final = pd.merge(df_merged, sector_stats, on=['trade_date', 'industry'], how='left')
     return df_final
 
-def calculate_winner_rate_approx(df):
+def calculate_strategy(df, vol_mul, rsi_min, sec_min):
     """
-    近似计算获利盘比例 (模拟 ZL1 核心逻辑)
-    逻辑：过去60天内，收盘价低于当前价的成交量占比
+    计算所有信号 (V3 主升浪版)
     """
-    # 这是一个向量化的近似算法
-    # 真实获利盘需要筹码分布算法，这里用 "60日成本均线" 上方的乖离率作为替代
-    # 或者，我们用 (Close - Low60) / (High60 - Low60) 这种位置指标来近似
-    # 为了更接近 ZL1，我们使用 "收盘价在60日筹码分布中的分位数" 近似
-    
-    # 简化版：Pcr (Position Cost Ratio)
-    # 如果当前价 > 60日均价，且 > 20日均价，说明大部分人获利
-    # 我们用 (Close - MA60) / MA60 来衡量获利程度
-    # 但 ZL1 可能用了更高级的。这里我们用 RSI 和 均线 组合模拟。
-    return df
-
-def calculate_strategy(df, vol_mul, box_min, box_max, rsi_min, rsi_max, sec_min):
-    """
-    计算所有信号 (ZL1 赋能)
-    """
-    # 1. 基础指标
+    # 1. 均线系统 (必须多头排列)
     df['ma5'] = df.groupby('ts_code')['close'].transform(lambda x: x.rolling(5).mean())
     df['ma10'] = df.groupby('ts_code')['close'].transform(lambda x: x.rolling(10).mean())
     df['ma20'] = df.groupby('ts_code')['close'].transform(lambda x: x.rolling(20).mean())
     df['ma60'] = df.groupby('ts_code')['close'].transform(lambda x: x.rolling(60).mean())
     
+    # 2. 价格新高 (解放全人类)
+    # 计算过去 60 天的最高收盘价 (不含今天)
     df['high_60'] = df.groupby('ts_code')['close'].transform(lambda x: x.shift(1).rolling(60).max())
-    df['low_60'] = df.groupby('ts_code')['close'].transform(lambda x: x.shift(1).rolling(60).min())
     df['vol_60'] = df.groupby('ts_code')['vol'].transform(lambda x: x.shift(1).rolling(60).mean())
-    df['box_amplitude'] = (df['high_60'] - df['low_60']) / df['low_60']
     
-    # 2. RSI (6日)
+    # 3. RSI (6日) - 动量核心
     df['up_move'] = np.where(df['pct_chg'] > 0, df['pct_chg'], 0)
     df['down_move'] = np.where(df['pct_chg'] < 0, abs(df['pct_chg']), 0)
     avg_up = df.groupby('ts_code')['up_move'].transform(lambda x: x.rolling(6).mean())
     avg_down = df.groupby('ts_code')['down_move'].transform(lambda x: x.rolling(6).mean())
     df['rsi_6'] = 100 * avg_up / (avg_up + avg_down + 0.0001)
     
-    # 3. 筹码获利近似 (Winner Rate Proxy)
-    # 如果股价 > 20日均线 和 60日均线，且 RSI > 60，视为获利盘占优
-    df['trend_score'] = (df['close'] > df['ma20']).astype(int) + (df['close'] > df['ma60']).astype(int)
+    # === 信号判定 (严苛条件) ===
     
-    # 4. 信号判定
-    # A. 振幅区间
-    cond_box = (df['box_amplitude'] > (box_min/100)) & (df['box_amplitude'] < (box_max/100))
+    # A. 趋势共振: 均线完美发散 (代表趋势已经形成，非震荡)
+    cond_trend = (df['ma5'] > df['ma10']) & (df['ma10'] > df['ma20']) & (df['ma20'] > df['ma60'])
     
-    # B. 价格突破
-    cond_break = df['close'] > df['high_60']
+    # B. 价格突破: 创 60 日新高 (买在“确认点”，哪怕贵一点)
+    cond_break = df['close'] >= df['high_60']
     
-    # C. 量能突破
+    # C. 动量确认: RSI > 75 (进入 ZL1 射程，主力加速)
+    # 但防止极度过热，可设 < 95
+    cond_rsi = (df['rsi_6'] > rsi_min) & (df['rsi_6'] < 95)
+    
+    # D. 板块护航: 必须是强板块
+    df['sector_pct'] = df['sector_pct'].fillna(0)
+    cond_sec = df['sector_pct'] > sec_min
+    
+    # E. 量能确认: 必须放量 (有人接力)
     cond_vol = df['vol'] > (df['vol_60'] * vol_mul)
     
-    # D. 流动性筛选
+    # F. 流动性
     cond_mv = (df['amount'] > 50000) & (df['amount'] < 5000000)
     
-    # E. ZL1 基因 (趋势确认)
-    cond_rsi = (df['rsi_6'] > rsi_min) & (df['rsi_6'] < rsi_max) # 60 - 85
-    cond_trend = (df['ma5'] > df['ma10']) & (df['ma10'] > df['ma20']) # 均线多头
-    
-    # F. 板块护航
-    df['sector_pct'] = df['sector_pct'].fillna(0)
-    cond_sec = df['sector_pct'] > sec_min # > 0.8%
-    
-    df['is_signal'] = cond_box & cond_break & cond_vol & cond_mv & cond_rsi & cond_trend & cond_sec
+    df['is_signal'] = cond_trend & cond_break & cond_rsi & cond_sec & cond_vol & cond_mv
     
     return df
 
 def calculate_score(row):
     score = 60
     
-    # 趋势越强分越高 (ZL1逻辑)
-    if row['rsi_6'] > 70: score += 15
-    if row['close'] > row['ma5'] * 1.02: score += 10 # 强势站稳5日线
+    # 既然已经创了新高，就看谁更强
     
-    # 板块加分
-    if row['sector_pct'] > 1.5: score += 20
-    elif row['sector_pct'] > 1.0: score += 10
+    # 1. RSI 越高越好 (但不过 90)
+    if 80 <= row['rsi_6'] <= 90: score += 20
+    elif 75 <= row['rsi_6'] < 80: score += 10
     
-    # 振幅加分
-    amp = row['box_amplitude'] * 100
-    if 15 <= amp <= 30: score += 15
+    # 2. 板块越强越好
+    if row['sector_pct'] > 2.0: score += 20
+    elif row['sector_pct'] > 1.5: score += 10
+    
+    # 3. 突破力度 (涨幅大说明意愿强)
+    if row['pct_chg'] > 5.0: score += 10
         
     return round(score, 1)
 
@@ -183,30 +165,27 @@ def calculate_score(row):
 # 4. 主程序
 # ==========================================
 with st.sidebar:
-    st.header("⚙️ 潜龙 V2 参数")
+    st.header("⚙️ V3 主升浪参数")
     user_token = st.text_input("Tushare Token:", type="password")
     
-    days_back = st.slider("数据回溯天数", 60, 300, 120)
+    days_back = st.slider("数据回溯天数", 60, 300, 60, help="只看最近行情")
     end_date_input = st.date_input("截止日期", datetime.now().date())
     
     st.markdown("---")
-    st.subheader("🛡️ 趋势与形态")
-    # 振幅
-    box_min = st.slider("振幅下限%", 5, 20, 10)
-    box_max = st.slider("振幅上限%", 30, 60, 40)
+    st.subheader("🔥 核心阈值 (严苛)")
     
     # RSI (趋势强度)
     col1, col2 = st.columns(2)
-    rsi_min = col1.number_input("RSI 下限", 0, 100, 60, help="60以上确认启动")
-    rsi_max = col2.number_input("RSI 上限", 0, 100, 85, help="85以上防过热")
+    rsi_min = col1.number_input("RSI 下限", 0, 100, 75, help="75以上才算主升浪")
     
     # 板块
-    sec_min = st.slider("板块最低涨幅 (%)", 0.0, 3.0, 0.8, 0.1)
+    sec_min = col2.number_input("板块涨幅下限%", 0.0, 5.0, 1.5, 0.1, help="板块不强不做")
     
-    vol_mul = st.slider("突破量能倍数", 1.5, 5.0, 1.8)
-    top_n = st.number_input("每日优选 (Top N)", 1, 20, 3, help="建议 Top 3")
+    vol_mul = st.slider("突破量能倍数", 1.0, 5.0, 1.5, 0.1)
     
-    run_btn = st.button("🚀 启动 V2 回测")
+    top_n = st.number_input("每日优选 (Top N)", 1, 20, 2, help="只做最强的前2名")
+    
+    run_btn = st.button("🚀 启动主升浪回测")
 
 def run_analysis():
     if not user_token:
@@ -229,20 +208,21 @@ def run_analysis():
     if df_basic.empty: return
         
     # 3. 计算
-    with st.spinner("正在执行 ZL1 赋能分析..."):
+    with st.spinner("正在扫描主升浪..."):
         df_sector = calculate_sector_heat(df_all, df_basic)
-        df_calc = calculate_strategy(df_sector, vol_mul, box_min, box_max, rsi_min, rsi_max, sec_min)
+        # 这里不需要 box_min/max 了，直接用新高逻辑
+        df_calc = calculate_strategy(df_sector, vol_mul, rsi_min, sec_min)
         
     # 4. 结果
-    st.markdown("### 🐉 潜龙 V2 诊断")
+    st.markdown("### 🐉 V3 漏斗")
     valid_dates = cal_dates[-(days_back):] 
     df_window = df_calc[df_calc['trade_date'].isin(valid_dates)]
     
     df_signals = df_window[df_window['is_signal']].copy()
-    st.write(f"⚪ 符合 V2 标准的标的: **{len(df_signals)}** 个")
+    st.write(f"⚪ 创60日新高 + RSI>75 的标的: **{len(df_signals)}** 个")
     
     if df_signals.empty:
-        st.warning("无信号。")
+        st.warning("无信号。条件太严苛？")
         return
 
     # 5. 评分与 Top N
@@ -314,7 +294,7 @@ def run_analysis():
     if trades:
         df_res = pd.DataFrame(trades)
         
-        st.markdown(f"### 📊 V2 回测结果 (Top {top_n})")
+        st.markdown(f"### 📊 V3 (确定性版) 回测结果 (Top {top_n})")
         cols = st.columns(5)
         days = ['D+1', 'D+3', 'D+5', 'D+7', 'D+10']
         
