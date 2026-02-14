@@ -11,14 +11,14 @@ warnings.filterwarnings("ignore")
 # ==========================================
 # 1. 页面配置
 # ==========================================
-st.set_page_config(page_title="潜龙 V15·天道均线", layout="wide")
-st.title("🐉 潜龙 V15·天道均线 (等距发散+完美排列)")
+st.set_page_config(page_title="潜龙 V16·上帝指纹", layout="wide")
+st.title("🐉 潜龙 V16·上帝指纹 (严选等距+低位起爆)")
 st.markdown("""
-**策略核心：寻找均线的"几何美感" (无量能干扰)**
-1.  **完美排列**：**股价 > MA5 > MA10 > MA20 > MA30** (绝对多头)。
-2.  **等距发散 (您的发现)**：均线之间的距离大致相等 (筹码极度稳定，如仪仗队般整齐)。
-3.  **角度共振**：四根均线全部向上抬头 (合力形成)。
-4.  **首日启动**：昨日未形成此形态，今日**首次**形成 (抓主升浪起点)。
+**策略核心：极度苛刻的"完美图形"筛选**
+1.  **绝对等距**：均线间距误差 < **1.5倍** (从 2.5 收紧到 1.5，真正的仪仗队)。
+2.  **攻击角度**：MA5 必须有明显的上攻角度 (拒绝蠕动)。
+3.  **贴线起爆**：股价距离 **MA10 < 5%** (拒绝追高，只做刚启动或刚回踩)。
+4.  **趋势共振**：四线多头排列且全部向上。
 """)
 
 # ==========================================
@@ -49,11 +49,8 @@ def fetch_all_market_data_by_date(token, date_list):
     for i, date in enumerate(date_list):
         try:
             time.sleep(0.05)
-            # 既然不看量能，只需要日线行情
             df = pro.daily(trade_date=date)
-            # 为了获取更准确的均线，最好有复权因子，但Tushare每日接口通常是不复权的
-            # 这里直接用原始价格计算，短期内影响不大
-            # 如果需要换手率辅助过滤停牌股，可以加 daily_basic
+            # 需要换手率过滤僵尸股
             df_basic = pro.daily_basic(trade_date=date, fields='ts_code,turnover_rate,circ_mv')
             
             if not df.empty and not df_basic.empty:
@@ -91,20 +88,20 @@ def get_stock_basics(token):
 # ==========================================
 def calculate_strategy(df):
     """
-    V15 核心逻辑: 均线等距发散
+    V16 核心逻辑: 严选上帝指纹
     """
-    # 1. 计算均线 (MA5, MA10, MA20, MA30)
+    # 1. 计算均线
     df['ma5'] = df.groupby('ts_code')['close'].transform(lambda x: x.rolling(5).mean())
     df['ma10'] = df.groupby('ts_code')['close'].transform(lambda x: x.rolling(10).mean())
     df['ma20'] = df.groupby('ts_code')['close'].transform(lambda x: x.rolling(20).mean())
     df['ma30'] = df.groupby('ts_code')['close'].transform(lambda x: x.rolling(30).mean())
     
-    # 计算均线斜率 (今日MA - 昨日MA) > 0
-    # 为了简化，直接比较 today vs yesterday
-    df['ma5_slope'] = df.groupby('ts_code')['ma5'].diff()
-    df['ma10_slope'] = df.groupby('ts_code')['ma10'].diff()
-    df['ma20_slope'] = df.groupby('ts_code')['ma20'].diff()
-    df['ma30_slope'] = df.groupby('ts_code')['ma30'].diff()
+    # 计算均线斜率 (归一化斜率: 每日涨幅百分比)
+    # (Today - Yesterday) / Yesterday * 100
+    df['ma5_slope'] = df.groupby('ts_code')['ma5'].pct_change() * 100
+    df['ma10_slope'] = df.groupby('ts_code')['ma10'].pct_change() * 100
+    df['ma20_slope'] = df.groupby('ts_code')['ma20'].pct_change() * 100
+    df['ma30_slope'] = df.groupby('ts_code')['ma30'].pct_change() * 100
     
     # 2. 信号判定逻辑
     
@@ -114,62 +111,57 @@ def calculate_strategy(df):
                  (df['ma10'] > df['ma20']) & \
                  (df['ma20'] > df['ma30'])
     
-    # B. 角度共振: 所有均线都在上涨
-    cond_slope = (df['ma5_slope'] > 0) & \
+    # B. 攻击角度: 
+    # MA5 斜率 > 0.3% (约等于股价每天涨1%带动的斜率，拒绝横盘)
+    # 所有均线必须向上
+    cond_slope = (df['ma5_slope'] > 0.3) & \
                  (df['ma10_slope'] > 0) & \
                  (df['ma20_slope'] > 0) & \
                  (df['ma30_slope'] > 0)
     
-    # C. 等距发散 (核心创新)
+    # C. 严选等距 (Strict Spacing)
     # 计算间距
     df['gap1'] = df['ma5'] - df['ma10']
     df['gap2'] = df['ma10'] - df['ma20']
     df['gap3'] = df['ma20'] - df['ma30']
     
-    # 判断间距是否"差不多"
-    # 我们用最大间距和最小间距的比值来衡量。如果比值 < 2.0 (或更严 1.5)，说明很均匀
-    # 比如 gap1=0.5, gap2=0.6, gap3=0.4 -> max=0.6, min=0.4 -> ratio=1.5 (均匀)
-    # 如果 gap1=2.0, gap2=0.1 -> ratio=20 (不均匀，那是乖离过大或粘合)
-    
-    # 为了避免除以0，加个极小值
     df['max_gap'] = df[['gap1', 'gap2', 'gap3']].max(axis=1)
     df['min_gap'] = df[['gap1', 'gap2', 'gap3']].min(axis=1)
     
-    # 门槛：均匀度 (Ratio < 2.5 比较宽松，< 1.5 非常严格)
-    # 另外，gap必须大于0 (已经在cond_order里隐含了，因为MA5>MA10...)
-    cond_spacing = (df['max_gap'] / (df['min_gap'] + 0.001)) < 2.5
+    # 门槛：最大间距 / 最小间距 < 1.5 (极度均匀)
+    cond_spacing = (df['max_gap'] / (df['min_gap'] + 0.0001)) < 1.5
     
-    # 也可以加一个绝对距离限制，防止已经发散得太大(末期)
-    # 比如 (MA5 - MA30) / MA30 不能超过 15% (刚启动)
-    cond_early = (df['ma5'] - df['ma30']) / df['ma30'] < 0.15
+    # D. 贴线起爆 (Low Risk)
+    # 收盘价距离 MA10 不超过 5% (防止乖离过大接盘)
+    # (Close - MA10) / MA10 < 0.05
+    cond_low = (df['close'] - df['ma10']) / df['ma10'] < 0.05
     
-    # D. 首日启动 (Yesterday NOT perfect)
+    # E. 首日启动 (Yesterday NOT perfect)
     # 组合今日状态
-    df['is_perfect'] = cond_order & cond_slope & cond_spacing & cond_early
+    df['is_perfect'] = cond_order & cond_slope & cond_spacing & cond_low
     # 获取昨日状态
     df['prev_perfect'] = df.groupby('ts_code')['is_perfect'].shift(1).fillna(False)
     
     cond_start = df['is_perfect'] & (~df['prev_perfect'])
     
-    # E. 基础过滤 (非ST，有成交量)
-    cond_basic = (df['turnover_rate'] > 1.0) # 哪怕不看量比，也要有基本换手
+    # F. 基础过滤
+    cond_basic = (df['turnover_rate'] > 1.0) 
     
     df['is_signal'] = cond_start & cond_basic
     
     return df
 
 def calculate_score(row):
-    # 评分逻辑：越均匀越好，角度越陡越好
+    # 评分逻辑：越均匀越好
     score = 60
     
-    # 均匀度加分 (Ratio 越接近 1 越好)
-    ratio = row['max_gap'] / (row['min_gap'] + 0.001)
-    if ratio < 1.5: score += 20
-    elif ratio < 2.0: score += 10
+    # 均匀度 (Ratio 越接近 1 越好)
+    ratio = row['max_gap'] / (row['min_gap'] + 0.0001)
+    if ratio < 1.2: score += 30
+    elif ratio < 1.4: score += 20
     
-    # 涨幅加分 (当天最好是中阳线确认，>3%)
-    if row['pct_chg'] > 3.0: score += 10
-    if row['pct_chg'] > 5.0: score += 10
+    # 斜率越大越好 (攻击性)
+    if row['ma5_slope'] > 0.8: score += 10
     
     return round(score, 1)
 
@@ -177,7 +169,7 @@ def calculate_score(row):
 # 4. 主程序
 # ==========================================
 with st.sidebar:
-    st.header("⚙️ V15 天道均线参数")
+    st.header("⚙️ V16 上帝指纹参数")
     user_token = st.text_input("Tushare Token:", type="password")
     
     days_back = st.slider("回测天数", 30, 120, 60)
@@ -185,9 +177,9 @@ with st.sidebar:
     
     st.markdown("---")
     st.subheader("🔥 筛选标准")
-    top_n = st.number_input("每日优选 (Top N)", 1, 10, 3)
+    top_n = st.number_input("每日优选 (Top N)", 1, 10, 2)
     
-    run_btn = st.button("🚀 启动 V15 回测")
+    run_btn = st.button("🚀 启动 V16 回测")
 
 def run_analysis():
     if not user_token:
@@ -214,11 +206,11 @@ def run_analysis():
         df_all = pd.merge(df_all, df_basic[['ts_code', 'industry', 'name']], on='ts_code', how='left')
         
     # 3. 计算
-    with st.spinner("正在测量均线的几何角度..."):
+    with st.spinner("正在用显微镜寻找上帝指纹..."):
         df_calc = calculate_strategy(df_all)
         
     # 4. 结果
-    st.markdown("### 🐉 V15 诊断 (等距发散)")
+    st.markdown("### 🐉 V16 诊断 (严选版)")
     
     if df_calc.empty:
         st.warning("无信号。")
@@ -233,7 +225,7 @@ def run_analysis():
     st.write(f"⚪ 捕获完美图形: **{len(df_signals)}** 个")
     
     if df_signals.empty:
-        st.warning("近期无完美形态。")
+        st.warning("严选标准下，近期无完美形态。")
         return
 
     # 5. 评分与 Top N
@@ -245,7 +237,6 @@ def run_analysis():
     df_top = df_signals[df_signals['排名'] <= top_n].copy()
     
     # 6. 回测 (加入 MA10 止损逻辑)
-    # 需要 lookup 包含 MA10
     price_lookup = df_calc[['ts_code', 'trade_date', 'open', 'close', 'low', 'ma10']].set_index(['ts_code', 'trade_date'])
     trades = []
     
@@ -271,19 +262,15 @@ def run_analysis():
         
         buy_price = d1_data['open']
         
-        # 初始止损: 买入价 - 5% (防止当天大面)
-        # 移动止损: 收盘价跌破 MA10
-        
         trade = {
             '信号日': signal_date, '代码': code, '名称': row.name, 
             '行业': row.industry, 
-            '均匀度': f"{row.max_gap / (row.min_gap+0.001):.1f}",
-            '当日涨幅': f"{row.pct_chg:.1f}%",
+            '均匀度': f"{row.max_gap / (row.min_gap+0.0001):.2f}",
+            'MA5斜率': f"{row.ma5_slope:.2f}",
             '买入价': buy_price, '状态': '持有'
         }
         
         triggered = False
-        hold_days = 0
         
         for n, f_date in enumerate(future_dates):
             if (code, f_date) not in price_lookup.index: break
@@ -291,8 +278,7 @@ def run_analysis():
             day_label = f"D+{n+1}"
             
             if not triggered:
-                # 检查止损条件
-                # 1. 硬止损: 亏 10%
+                # 1. 硬止损
                 curr_ret = (f_data['close'] - buy_price) / buy_price
                 if curr_ret < -0.10:
                     triggered = True
@@ -303,7 +289,6 @@ def run_analysis():
                 # 2. 趋势止损: 收盘跌破 MA10
                 if f_data['close'] < f_data['ma10']:
                     triggered = True
-                    # 以收盘价卖出
                     final_ret = (f_data['close'] - buy_price) / buy_price * 100
                     trade[day_label] = round(final_ret, 2)
                     trade['状态'] = '破线卖出'
@@ -312,7 +297,6 @@ def run_analysis():
                     final_ret = (f_data['close'] - buy_price) / buy_price * 100
                     trade[day_label] = round(final_ret, 2)
             else:
-                # 已卖出，保持最后状态
                 trade[day_label] = trade.get(f"D+{n}", 0)
         
         trades.append(trade)
@@ -322,7 +306,7 @@ def run_analysis():
     if trades:
         df_res = pd.DataFrame(trades)
         
-        st.markdown(f"### 📊 V15 (天道均线) 回测结果")
+        st.markdown(f"### 📊 V16 (上帝指纹·严选) 回测结果")
         cols = st.columns(5)
         days = ['D+1', 'D+3', 'D+5', 'D+7', 'D+10']
         
@@ -330,7 +314,6 @@ def run_analysis():
             if d in df_res.columns:
                 valid_data = df_res[pd.to_numeric(df_res[d], errors='coerce').notna()]
                 if not valid_data.empty:
-                    # 计算还在持有的胜率(大于0)
                     wins = valid_data[valid_data[d] > 0]
                     win_rate = len(wins) / len(valid_data) * 100
                     avg_ret = valid_data[d].mean()
