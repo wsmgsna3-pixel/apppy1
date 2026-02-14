@@ -14,7 +14,7 @@ warnings.filterwarnings("ignore")
 st.set_page_config(page_title="潜龙·共振实战版", layout="wide")
 st.title("🐉 潜龙·共振实战系统 (箱体突破 + 板块热度)")
 st.markdown("""
-**策略核心逻辑 (V3.0)：**
+**策略核心逻辑 (V3.1 修复版)：**
 1.  **形态基石**：10% < 振幅 < 40% (拒绝死鱼与疯牛)。
 2.  **身份验证**：50亿 < 流通市值 < 500亿 (锁定机构趋势票)。
 3.  **爆发信号**：创 60日新高 + 放量 (突破发令枪)。
@@ -67,13 +67,11 @@ def fetch_all_market_data_by_date(token, date_list):
 @st.cache_data(persist="disk", show_spinner=False)
 def get_stock_basics(token):
     """
-    获取基础信息 (含行业 industry，用于板块共振)
-    同时获取流通股本用于计算市值 (circ_mv)
+    获取基础信息 (含行业 industry 和 名称 name)
     """
     ts.set_token(token)
     pro = ts.pro_api()
     
-    # 1. 获取基础表 (含行业)
     for _ in range(3):
         try:
             time.sleep(0.5)
@@ -83,45 +81,9 @@ def get_stock_basics(token):
                 df = df[~df['name'].str.contains('ST')]
                 df = df[~df['market'].str.contains('北交')]
                 df = df[~df['ts_code'].str.contains('BJ')]
-                break
+                return df
         except: time.sleep(1)
-    else:
-        return pd.DataFrame() # 失败返回空
-        
-    # 2. 获取每日指标表 (daily_basic) 太慢，我们用 "最新一次" 的流通股本估算市值
-    # 为了回测速度，我们采用近似算法：
-    # 既然 ZL1 可以跑，说明它可能用了 stock_basic 里的 industry。
-    # 我们这里需要流通市值。
-    # 方案：再拉一次 daily_basic 的最新数据作为静态参考 (虽然有偏差，但够用)
-    # 或者，简单点，我们假设用户只关心行业共振，市值的 50-500亿 可以在 daily 里用 amount 倒推? 不行。
-    # 妥协方案：再次调用 daily_basic 获取 circ_mv (只取最新一天，用于初筛)
-    try:
-        last_date = df['list_date'].max() # 随便找个日期，其实应该用当前日期
-        # 这里为了稳妥，不强求精确的历史市值，只用最新的市值做静态过滤
-        # (这在回测长周期时会有偏差，但在最近几个月内偏差可接受)
-        pass 
-    except: pass
-    
-    # 我们先拉取一次最新的 daily_basic 用于市值参考
-    # 注意：这会导致“刻舟求剑”，但对于 50-500亿 这种宽范围，影响不大。
-    return df
-
-@st.cache_data(persist="disk", show_spinner=False)
-def get_daily_basic_latest(token):
-    ts.set_token(token)
-    pro = ts.pro_api()
-    # 尝试获取最近交易日的 daily_basic
-    try:
-        # 找昨天或前天
-        today = datetime.now().strftime('%Y%m%d')
-        df = pro.daily_basic(trade_date='', fields='ts_code,circ_mv') # 如果不传日期，默认最新？tushare可能不支持
-        # 稳妥起见，不在这里卡死。我们在主循环里，如果用户开启了市值过滤，
-        # 我们就必须要有 circ_mv。
-        # ZL1 的做法可能是：只用 stock_basic 的 industry，不管市值？
-        # 既然用户强烈要求市值，我们尝试拉取最近一天的。
-        return pd.DataFrame() 
-    except:
-        return pd.DataFrame()
+    return pd.DataFrame()
 
 # ==========================================
 # 3. 核心计算：板块热度 + 箱体突破
@@ -129,18 +91,19 @@ def get_daily_basic_latest(token):
 def calculate_sector_heat(df_daily, df_basic):
     """
     计算当日板块热度 (借鉴 ZL1)
+    修复：同时合并 name 字段，防止后续报错
     """
-    # 合并行业信息
-    # df_daily 包含多天数据，需要先 merge
+    # 合并行业信息 和 名称信息
     if 'industry' not in df_daily.columns:
-        df_merged = pd.merge(df_daily, df_basic[['ts_code', 'industry']], on='ts_code', how='left')
+        # === 关键修复：这里加入了 'name' ===
+        df_merged = pd.merge(df_daily, df_basic[['ts_code', 'industry', 'name']], on='ts_code', how='left')
     else:
         df_merged = df_daily.copy()
         
     # 按 日期 + 行业 分组，计算平均涨幅
-    # 过滤掉涨幅为0的停牌股，避免拉低平均
     valid_df = df_merged[df_merged['pct_chg'] != 0]
     
+    # 注意：如果某股票没有行业归属，会被过滤掉，这是预期的
     sector_stats = valid_df.groupby(['trade_date', 'industry'])['pct_chg'].mean().reset_index()
     sector_stats.rename(columns={'pct_chg': 'sector_pct'}, inplace=True)
     
@@ -153,23 +116,13 @@ def calculate_strategy(df, vol_mul, box_min, box_max, mv_min, mv_max, df_basic):
     """
     计算所有信号
     """
-    # 1. 估算流通市值 (简单算法：成交额 / 换手率 * 100 ? 不行，没换手率)
-    # 既然 ZL1 能跑，我们这里先用一个简化的逻辑：
-    # 如果没有市值数据，我们暂且跳过市值筛选，或者假设用户自行判断。
-    # 为了不报错，我们这里假设 df 里有 circ_mv 或者我们需要外部注入。
-    # ** 修正 **: 既然 Tushare daily 接口没有市值，我们用 "Amount(成交额)" 做替代过滤。
-    # 50亿市值的票，日成交额通常在 1亿~5亿。
-    # 500亿市值的票，日成交额通常在 5亿~30亿。
-    # 我们可以用 amount > 1亿 (100,000 千元) 且 amount < 30亿 (3,000,000 千元) 来近似替代。
-    # 这比去拉 daily_basic 要快得多且逻辑自洽（有流动性但不过热）。
-    
-    # 2. 箱体指标
+    # 1. 箱体指标
     df['high_60'] = df.groupby('ts_code')['close'].transform(lambda x: x.shift(1).rolling(window=60).max())
     df['low_60'] = df.groupby('ts_code')['close'].transform(lambda x: x.shift(1).rolling(window=60).min())
     df['vol_60'] = df.groupby('ts_code')['vol'].transform(lambda x: x.shift(1).rolling(window=60).mean())
     df['box_amplitude'] = (df['high_60'] - df['low_60']) / df['low_60']
     
-    # 3. 信号判定
+    # 2. 信号判定
     # A. 振幅区间 (10% ~ 40%)
     cond_box = (df['box_amplitude'] > (box_min/100)) & (df['box_amplitude'] < (box_max/100))
     
@@ -179,17 +132,17 @@ def calculate_strategy(df, vol_mul, box_min, box_max, mv_min, mv_max, df_basic):
     # C. 量能突破
     cond_vol = df['vol'] > (df['vol_60'] * vol_mul)
     
-    # D. 市值/流动性替代筛选 (成交额在 5000万 ~ 50亿 之间，剔除极小和极大)
-    # amount 单位是千元。 5000万 = 50000. 50亿 = 5000000.
-    # 这种方式能精准剔除僵尸股(成交额<1000万)和巨无霸。
+    # D. 流动性筛选 (近似市值筛选)
+    # 成交额 5000万 ~ 50亿
     cond_mv = (df['amount'] > 50000) & (df['amount'] < 5000000)
     
-    # E. 板块共振 (核心升级)
+    # E. 板块共振
     # 要求所属板块当日平均涨幅 > 1.0% (说明板块在动)
-    # 或者板块排名在前 20% (这个计算复杂，用绝对值简单有效)
-    cond_sector = df['sector_pct'] > 1.0 
+    # 填充NaN防止报错
+    df['sector_pct'] = df['sector_pct'].fillna(0)
+    # 我们将在外部通过 slider 控制阈值，这里先标记，后面 filter
     
-    df['is_signal'] = cond_box & cond_break & cond_vol & cond_mv & cond_sector
+    df['is_signal_base'] = cond_box & cond_break & cond_vol & cond_mv
     
     return df
 
@@ -205,7 +158,6 @@ def calculate_score(row):
         score += 20 # 满分
     elif 10 <= amp < 20:
         score += 10 # 及格
-    # >35 的不加分，防止太乱
     
     # 2. 板块分：板块越热越好
     if row['sector_pct'] > 0:
@@ -264,7 +216,7 @@ def run_analysis():
         return
     st.success(f"✅ K线数据就绪: {len(df_all):,} 条")
 
-    # 2. 基础信息 (含行业)
+    # 2. 基础信息
     df_basic = get_stock_basics(user_token)
     if df_basic.empty:
         st.error("无法获取行业数据，板块共振无法计算。")
@@ -272,7 +224,7 @@ def run_analysis():
         
     # 3. 计算板块热度 (Sector Boost)
     with st.spinner("正在计算全市场板块热度 (ZL1 引擎)..."):
-        # 先把行业 merge 进去
+        # 修复：确保这里带上了 'name'
         df_sector = calculate_sector_heat(df_all, df_basic)
     
     # 4. 计算策略信号
@@ -286,6 +238,7 @@ def run_analysis():
     
     st.write(f"⚪ 样本总数: {len(df_window):,} 条")
     
+    # 重新应用过滤逻辑以显示漏斗
     c_mv = (df_window['amount'] > 50000) & (df_window['amount'] < 5000000)
     n_mv = len(df_window[c_mv])
     st.write(f"1️⃣ 流动性筛选 (成交额5千万-50亿): {n_mv:,}")
@@ -298,6 +251,8 @@ def run_analysis():
     n_sec = len(df_window[c_mv & c_box & c_sec])
     st.write(f"3️⃣ 板块共振 (行业涨幅 > {sector_min_rise}%): {n_sec:,} (大幅过滤孤狼)")
     
+    # 最终信号
+    df_window['is_signal'] = df_window['is_signal_base'] & (df_window['sector_pct'] > sector_min_rise)
     df_signals = df_window[df_window['is_signal']].copy()
     st.write(f"4️⃣ 最终突破 (量价齐升): **{len(df_signals)}** 个")
     
