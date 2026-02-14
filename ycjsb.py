@@ -11,14 +11,14 @@ warnings.filterwarnings("ignore")
 # ==========================================
 # 1. 页面配置
 # ==========================================
-st.set_page_config(page_title="潜龙·狙击手", layout="wide")
-st.title("🎯 潜龙·狙击手 (VR>1.6 极品吸筹版)")
+st.set_page_config(page_title="潜龙·狙击手 (终极版)", layout="wide")
+st.title("🎯 潜龙·狙击手 (黄金区间自动锁定)")
 st.markdown("""
-**本次目标：120天筛选 < 100 只极品 (日均 < 1 只)**
-1.  **极度吸筹**：VR (阳量/阴量) > **1.6** (数据回测显示的赢家底线)。
-2.  **攻击形态**：RSI > **55** (拒绝磨叽，只做主升)。
-3.  **共振确认**：板块涨幅 > **1.2%** (确保风口)。
-4.  **宁缺毋滥**：虽然显示 Top 5，但通常每天只有 0-2 只入围。
+**策略逻辑 (V5.0 终极定稿)：**
+1.  **极品吸筹**：1.7 < VR < 2.0 (拒绝诱多)。
+2.  **板块共振**：1.2% < 涨幅 < 3.0% (拒绝高潮接盘)。
+3.  **攻击形态**：RSI > 55 (主升浪特征)。
+4.  **自动风控**：已内置所有“盖子”，选出来的就是最终标的。
 """)
 
 # ==========================================
@@ -81,7 +81,7 @@ def get_stock_basics(token):
     return pd.DataFrame()
 
 # ==========================================
-# 3. 核心计算：狙击逻辑
+# 3. 核心计算
 # ==========================================
 def calculate_sector_heat(df_daily, df_basic):
     if 'industry' not in df_daily.columns:
@@ -95,9 +95,9 @@ def calculate_sector_heat(df_daily, df_basic):
     df_final = pd.merge(df_merged, sector_stats, on=['trade_date', 'industry'], how='left')
     return df_final
 
-def calculate_strategy(df, vol_mul, box_min, box_max, vr_threshold, rsi_min, rsi_max):
+def calculate_strategy(df, vol_mul, box_min, box_max, vr_min, vr_max, rsi_min, rsi_max, sec_min, sec_max):
     """
-    计算所有信号 (狙击手核心)
+    计算所有信号 (含自动盖子)
     """
     # 1. 基础指标
     df['high_60'] = df.groupby('ts_code')['close'].transform(lambda x: x.shift(1).rolling(window=60).max())
@@ -108,13 +108,11 @@ def calculate_strategy(df, vol_mul, box_min, box_max, vr_threshold, rsi_min, rsi
     # 2. 吸筹指标 (VR)
     df['vol_up'] = np.where(df['pct_chg'] > 0, df['vol'], 0)
     df['vol_down'] = np.where(df['pct_chg'] <= 0, df['vol'], 0)
-    
     df['sum_vol_up'] = df.groupby('ts_code')['vol_up'].transform(lambda x: x.rolling(window=60).sum())
     df['sum_vol_down'] = df.groupby('ts_code')['vol_down'].transform(lambda x: x.rolling(window=60).sum())
-    
     df['accumulation_ratio'] = df['sum_vol_up'] / (df['sum_vol_down'] + 1)
     
-    # 3. RSI 指标 (近似算法)
+    # 3. RSI 指标
     df['up_move'] = np.where(df['pct_chg'] > 0, df['pct_chg'], 0)
     df['down_move'] = np.where(df['pct_chg'] < 0, abs(df['pct_chg']), 0)
     avg_up = df.groupby('ts_code')['up_move'].transform(lambda x: x.rolling(6).mean())
@@ -122,10 +120,10 @@ def calculate_strategy(df, vol_mul, box_min, box_max, vr_threshold, rsi_min, rsi
     df['rsi_6'] = 100 * avg_up / (avg_up + avg_down + 0.0001)
     
     # 4. 信号判定
-    # A. 振幅区间 (10% ~ 40%)
+    # A. 振幅区间
     cond_box = (df['box_amplitude'] > (box_min/100)) & (df['box_amplitude'] < (box_max/100))
     
-    # B. 价格突破 (创60日新高)
+    # B. 价格突破
     cond_break = df['close'] > df['high_60']
     
     # C. 量能突破
@@ -134,31 +132,37 @@ def calculate_strategy(df, vol_mul, box_min, box_max, vr_threshold, rsi_min, rsi
     # D. 流动性筛选
     cond_mv = (df['amount'] > 50000) & (df['amount'] < 5000000)
     
-    # E. 狙击筛选 (极高门槛)
-    cond_acc = df['accumulation_ratio'] > vr_threshold # > 1.6
-    cond_rsi = (df['rsi_6'] > rsi_min) & (df['rsi_6'] < rsi_max) # 55 - 85
+    # === E. 黄金区间锁定 (自动盖子) ===
+    # 吸筹比率：1.7 ~ 2.0 (剔除诱多)
+    cond_acc = (df['accumulation_ratio'] > vr_min) & (df['accumulation_ratio'] < vr_max)
     
-    df['is_signal_base'] = cond_box & cond_break & cond_vol & cond_mv & cond_acc & cond_rsi
+    # RSI：55 ~ 85
+    cond_rsi = (df['rsi_6'] > rsi_min) & (df['rsi_6'] < rsi_max)
+    
+    # 板块涨幅：1.2% ~ 3.0% (剔除高潮)
+    # 注意：板块数据可能为NaN，需填充
+    df['sector_pct'] = df['sector_pct'].fillna(0)
+    cond_sec = (df['sector_pct'] > sec_min) & (df['sector_pct'] < sec_max)
+    
+    df['is_signal'] = cond_box & cond_break & cond_vol & cond_mv & cond_acc & cond_rsi & cond_sec
     
     return df
 
 def calculate_score(row):
     score = 60
+    # 简单的评分，主要用于每日排序
+    # 因为已经筛选得很严了，这里只区分微小的优劣
     
-    # 吸筹分 (权重最大)
-    acc = row['accumulation_ratio']
-    # 既然门槛已经是 1.6，这里主要区分极品
-    if acc > 2.0: score += 30 # 超强吸筹
-    elif acc > 1.8: score += 20
-    else: score += 10
+    # 板块越接近 2.5% 越好 (风口正盛但未过热)
+    if 2.0 <= row['sector_pct'] <= 2.8: score += 20
+    elif 1.2 <= row['sector_pct'] < 2.0: score += 10
     
-    # 振幅分 (偏好适中)
+    # VR 越接近 1.9 越好
+    if 1.8 <= row['accumulation_ratio'] <= 1.95: score += 20
+    
+    # 振幅适中
     amp = row['box_amplitude'] * 100
-    if 20 <= amp <= 35: score += 15
-    
-    # 板块分
-    if row['sector_pct'] > 0:
-        score += min(row['sector_pct'] * 10, 30) # 放大板块权重
+    if 20 <= amp <= 35: score += 10
         
     return round(score, 1)
 
@@ -166,30 +170,31 @@ def calculate_score(row):
 # 4. 主程序
 # ==========================================
 with st.sidebar:
-    st.header("⚙️ 狙击手参数")
+    st.header("⚙️ 狙击手参数 (黄金区间)")
     user_token = st.text_input("Tushare Token:", type="password")
     
     days_back = st.slider("数据回溯天数", 60, 300, 120)
     end_date_input = st.date_input("截止日期", datetime.now().date())
     
     st.markdown("---")
-    st.subheader("🎯 狙击镜")
+    st.subheader("🎯 黄金区间控制")
     col1, col2 = st.columns(2)
-    box_min = col1.number_input("振幅下限%", 5, 20, 10)
-    box_max = col2.number_input("振幅上限%", 30, 60, 40)
+    # VR 控制
+    vr_min = col1.number_input("VR 下限", 1.0, 2.0, 1.7)
+    vr_max = col2.number_input("VR 上限 (防诱多)", 2.0, 5.0, 2.0)
     
-    # 默认值大幅提高
-    vr_threshold = st.slider("VR 吸筹门槛 (阳/阴)", 1.0, 3.0, 1.6, 0.1, help="回测显示赢家均值>1.7")
+    # 板块控制
+    sec_min = col1.number_input("板块涨幅下限%", 0.0, 2.0, 1.2)
+    sec_max = col2.number_input("板块涨幅上限%", 2.0, 5.0, 3.0, help="超过3%容易接盘")
     
-    rsi_min = st.number_input("RSI下限", 0, 100, 55, help="55以上才算进入攻击区")
-    rsi_max = st.number_input("RSI上限", 0, 100, 85)
+    # 振幅控制
+    box_min = st.slider("振幅下限%", 5, 20, 10)
+    box_max = st.slider("振幅上限%", 30, 60, 40)
     
-    vol_mul = st.slider("突破量能倍数", 1.5, 5.0, 1.8, 0.1)
-    sector_min_rise = st.slider("板块最低涨幅 (%)", 0.0, 3.0, 1.2, 0.1)
+    vol_mul = st.slider("突破量能倍数", 1.5, 5.0, 1.8)
+    top_n = st.number_input("每日优选 (Top N)", 1, 20, 5)
     
-    top_n = st.number_input("每日优选 (Top N)", 1, 50, 5)
-    
-    run_btn = st.button("🚀 启动狙击回测")
+    run_btn = st.button("🚀 启动最终回测")
 
 def run_analysis():
     if not user_token:
@@ -201,65 +206,41 @@ def run_analysis():
     start_dt = end_date_input - timedelta(days=days_back * 1.5 + 80)
     
     cal_dates = get_trade_cal(user_token, start_dt.strftime('%Y%m%d'), end_str)
-    if not cal_dates:
-        st.error("获取日历失败")
-        return
+    if not cal_dates: return
         
     df_all = fetch_all_market_data_by_date(user_token, cal_dates)
-    if df_all.empty:
-        st.error("数据加载失败")
-        return
+    if df_all.empty: return
     st.success(f"✅ K线数据就绪: {len(df_all):,} 条")
 
     # 2. 基础信息
     df_basic = get_stock_basics(user_token)
-    if df_basic.empty:
-        st.error("无法获取行业数据。")
-        return
+    if df_basic.empty: return
         
-    # 3. 计算板块热度
-    with st.spinner("正在计算板块热度..."):
+    # 3. 计算
+    with st.spinner("正在执行黄金区间筛选..."):
         df_sector = calculate_sector_heat(df_all, df_basic)
-    
-    # 4. 计算策略信号 (含吸筹逻辑)
-    with st.spinner("正在执行狙击筛选..."):
-        df_calc = calculate_strategy(df_sector, vol_mul, box_min, box_max, vr_threshold, rsi_min, rsi_max)
+        df_calc = calculate_strategy(df_sector, vol_mul, box_min, box_max, vr_min, vr_max, 55, 85, sec_min, sec_max)
         
-    # 5. 漏斗诊断
-    st.markdown("### 🎯 狙击漏斗诊断")
+    # 4. 结果
+    st.markdown("### 🎯 狙击诊断")
     valid_dates = cal_dates[-(days_back):] 
     df_window = df_calc[df_calc['trade_date'].isin(valid_dates)]
     
-    st.write(f"⚪ 样本总数: {len(df_window):,} 条")
-    
-    # 基础筛选
-    c_base = (df_window['amount'] > 50000) & (df_window['amount'] < 5000000) & \
-             (df_window['box_amplitude'] > box_min/100) & (df_window['box_amplitude'] < box_max/100)
-    n_base = len(df_window[c_base])
-    st.write(f"1️⃣ 基础形态筛选: {n_base:,}")
-    
-    # 吸筹筛选
-    c_acc = df_window['accumulation_ratio'] > vr_threshold
-    n_acc = len(df_window[c_base & c_acc])
-    st.write(f"2️⃣ 极品吸筹 (VR > {vr_threshold}): {n_acc:,} (大幅过滤)")
-    
-    # 最终信号
-    df_window['is_signal'] = df_window['is_signal_base'] & (df_window['sector_pct'] > sector_min_rise)
     df_signals = df_window[df_window['is_signal']].copy()
-    st.write(f"3️⃣ 最终狙击点 (含共振): **{len(df_signals)}** 个")
+    st.write(f"⚪ 最终符合黄金区间的标的: **{len(df_signals)}** 个 (120天)")
     
     if df_signals.empty:
-        st.warning("无符合条件的信号。尝试降低VR门槛。")
+        st.warning("太严了，没有股票入选。")
         return
 
-    # 6. 评分与 Top N
+    # 5. 评分与 Top N
     df_signals['潜龙分'] = df_signals.apply(calculate_score, axis=1)
     df_signals = df_signals.sort_values(['trade_date', '潜龙分'], ascending=[True, False])
     df_signals['排名'] = df_signals.groupby('trade_date').cumcount() + 1
     
     df_top = df_signals[df_signals['排名'] <= top_n].copy()
     
-    # 7. 收益回测
+    # 6. 回测
     price_lookup = df_calc[['ts_code', 'trade_date', 'open', 'close', 'low']].set_index(['ts_code', 'trade_date'])
     trades = []
     
@@ -277,14 +258,7 @@ def run_analysis():
             future_dates = cal_dates[curr_idx+1 : curr_idx+11]
         except: continue
             
-        if not future_dates:
-            trades.append({
-                '信号日': signal_date, '代码': code, '名称': row.name, '排名': row.排名,
-                '行业': row.industry, '板块涨幅': f"{row.sector_pct:.1f}%",
-                '吸筹比率': f"{row.accumulation_ratio:.2f}",
-                '潜龙分': row.潜龙分, '状态': '等待开盘'
-            })
-            continue
+        if not future_dates: continue
             
         d1_date = future_dates[0]
         if (code, d1_date) not in price_lookup.index: continue
@@ -301,14 +275,13 @@ def run_analysis():
             '信号日': signal_date, '代码': code, '名称': row.name, '排名': row.排名,
             '行业': row.industry, '板块涨幅': f"{row.sector_pct:.1f}%",
             '吸筹比率': f"{row.accumulation_ratio:.2f}",
-            '潜龙分': row.潜龙分, '买入价': buy_price, '状态': '持有'
+            '买入价': buy_price, '状态': '持有'
         }
         
         triggered = False
         for n, f_date in enumerate(future_dates):
             if (code, f_date) not in price_lookup.index: break
             f_data = price_lookup.loc[(code, f_date)]
-            
             day_label = f"D+{n+1}"
             
             if not triggered:
@@ -329,7 +302,7 @@ def run_analysis():
     if trades:
         df_res = pd.DataFrame(trades)
         
-        st.markdown(f"### 📊 狙击回测结果 (Top {top_n})")
+        st.markdown(f"### 📊 黄金回测结果 (Top {top_n})")
         cols = st.columns(5)
         days = ['D+1', 'D+3', 'D+5', 'D+7', 'D+10']
         
@@ -343,17 +316,9 @@ def run_analysis():
                     cols[idx].metric(f"{d} 胜率", f"{win_rate:.1f}%")
                     cols[idx].metric(f"{d} 均收", f"{avg_ret:.2f}%")
         
-        st.markdown("### 🏆 狙击潜龙榜")
-        display_cols = ['信号日', '排名', '代码', '名称', '行业', '板块涨幅', '吸筹比率', '潜龙分', '状态'] + \
-                       [d for d in days if d in df_res.columns]
-        
-        st.dataframe(
-            df_res[display_cols].sort_values(['信号日', '排名'], ascending=[False, True]),
-            use_container_width=True,
-            height=600
-        )
+        st.dataframe(df_res.sort_values(['信号日'], ascending=False), use_container_width=True)
     else:
-        st.warning("无有效交易。")
+        st.warning("无交易")
 
 if run_btn:
     run_analysis()
