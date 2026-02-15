@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-主力策略 · V36.13 推进器二阶 (拒绝深坑反弹)
+主力策略 · V36.13 推进器二阶 (修复版)
 ------------------------------------------------
-问题诊断: V36.12 虽然 D+5 胜率新高(61.4%)，但 D+1 爆发力不足(0.23%)。
-原因分析: 策略混入了"昨日大跌今日反弹"的补坑股，导致次日抛压大。
-核心修正:
-1. **昨日止损**：昨日涨幅 > -3.0% (剔除大阴线后的反抽，只做强势整理后的突破)。
-2. **继承优势**：保留 V36.12 的高胜率参数 (获利盘>75%, 限价不限速)。
-3. **买入纪律**：继续严守"高开+1.5%"铁律。
+修复记录:
+1. **紧急修复**：找回了 compute_indicators 中丢失的 'ma20' 计算逻辑，解决 KeyError 报错。
+2. **核心逻辑**：
+   - 拒绝深坑：昨日涨幅 > -3.0%。
+   - 动量回归：MOM > 5.0。
+   - 严守纪律：买入逻辑保持"高开+1.5%"不动摇。
 ------------------------------------------------
 """
 
@@ -36,8 +36,8 @@ GLOBAL_STOCK_INDUSTRY = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="主力策略 V36.13 推进器二阶", layout="wide")
-st.title("主力策略 V36.13：推进器二阶 (拒绝深坑)")
+st.set_page_config(page_title="主力策略 V36.13 修复版", layout="wide")
+st.title("主力策略 V36.13：推进器二阶 (修复报错)")
 
 # ---------------------------
 # 基础 API 函数
@@ -300,7 +300,6 @@ def compute_indicators(ts_code, end_date):
     
     df['pct_chg'] = df['close'].pct_change().fillna(0) * 100 
     
-    # [V36.13 新增] 昨日涨幅
     res['pct_lag1'] = df['pct_chg'].iloc[-2] if len(df) >= 2 else 0
     
     close = df['close']
@@ -316,6 +315,8 @@ def compute_indicators(ts_code, end_date):
     res['macd_val'] = ((diff - dea) * 2).iloc[-1]
     
     res['ma5'] = close.tail(5).mean()
+    # [修复] 补回 MA20，防止 KeyError
+    res['ma20'] = close.tail(20).mean()
     
     rsi_series = calculate_rsi(close, period=12)
     res['rsi_12'] = rsi_series.iloc[-1]
