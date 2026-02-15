@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-主力策略 · V36.3 飞龙在天 (结构化修正版)
+主力策略 · V36.4 游龙回首 (N字反包战法)
 ------------------------------------------------
-核心逻辑: "空中加油" 战法
-1. **昨日限速**：昨日涨幅 < 4.0% (剔除连续加速的鱼尾)。
-2. **今日点火**：今日涨幅 > 5.0% (确认再次启动)。
-3. **趋势护航**：RSI > 60 + MOM > 5 (确保是强势股回调)。
-4. **目标**：精准捕捉像田中精机、横店影视那样"小碎步后接大阳线"的启动点。
+核心目标: 专抓 V35.1 漏掉的"暴力洗盘后二波" (如罗博特科)。
+逻辑重构:
+1. **龙的印记**：近10日内必须有过 >7% 的大阳线 (证明有主力)。
+2. **龙的洗盘**：昨日必须是弱势震荡或下跌 (<3%)。
+3. **龙的觉醒**：今日必须强势反攻 (>5%) 且放量。
+4. **互补定位**：V35.1 抓趋势(鱼身)，V36.4 抓反包(龙回头)。
 ------------------------------------------------
 """
 
@@ -35,8 +36,8 @@ GLOBAL_STOCK_INDUSTRY = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="主力策略 V36.3 飞龙在天", layout="wide")
-st.title("主力策略 V36.3：飞龙在天 (昨日蓄势+今日爆发)")
+st.set_page_config(page_title="主力策略 V36.4 游龙回首", layout="wide")
+st.title("主力策略 V36.4：游龙回首 (N字反包战法)")
 
 # ---------------------------
 # 基础 API 函数
@@ -266,7 +267,6 @@ def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[1, 3, 5
     next_open = d1_data['open']
     next_high = d1_data['high']
     
-    # 保持 V36 的买入逻辑: 高开 + 1.5%
     if next_open <= d0_qfq_close: return results 
     target_buy_price = next_open * 1.015
     if next_high < target_buy_price: return results
@@ -299,7 +299,12 @@ def compute_indicators(ts_code, end_date):
     
     df['pct_chg'] = df['close'].pct_change().fillna(0) * 100 
     
-    # [V36.3 核心数据] 昨日涨跌幅
+    # [V36.4 核心数据]
+    # 1. 过去10天最大单日涨幅 (寻找龙的印记)
+    # 取过去 10 天 (不含今天)
+    past_10d = df['pct_chg'].iloc[-11:-1] 
+    res['max_pct_10d'] = past_10d.max() if not past_10d.empty else 0
+    
     res['pct_lag1'] = df['pct_chg'].iloc[-2] if len(df) >= 2 else 0
     
     close = df['close']
@@ -338,7 +343,7 @@ def get_market_state(trade_date):
     return 'Strong' if latest_close > ma20 else 'Weak'
 
 # ---------------------------
-# 核心回测逻辑函数 (V36.3)
+# 核心回测逻辑函数 (V36.4)
 # ---------------------------
 def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MOM_LIMIT, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, MAX_PREV_PCT, MIN_PRICE):
     global GLOBAL_STOCK_INDUSTRY
@@ -394,7 +399,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MOM_LIMIT, MAX_
     df = df[(df['circ_mv_billion'] >= MIN_MV) & (df['circ_mv_billion'] <= MAX_MV)]
     df = df[df['turnover_rate'] <= MAX_TURNOVER_RATE] 
 
-    # [V36.3 修正] 今日涨幅必须 > 5.0 (V36.0是4.5，这里加强要求)
     df = df[df['pct_chg'] > 5.0]
 
     if len(df) == 0: return pd.DataFrame(), "过滤后无标的"
@@ -413,20 +417,22 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MOM_LIMIT, MAX_
         d0_rsi = ind.get('rsi_12', 50)
         d0_mom = ind.get('mom', 0)
         d0_vol = ind.get('vol_ratio', 1.0)
-        d0_pct_lag1 = ind.get('pct_lag1', 0) # 昨日涨跌幅
+        d0_pct_lag1 = ind.get('pct_lag1', 0) 
+        d0_max_pct_10d = ind.get('max_pct_10d', 0)
         
-        # [V36.3 核心结构过滤器]
+        # [V36.4 游龙回首 核心逻辑]
         
-        # 1. 昨日必须是"蓄势" (< 4.0%)
-        # 这是为了过滤掉已经连续大涨的鱼尾
-        if d0_pct_lag1 > 4.0: continue
+        # 1. 龙的印记: 过去10天内(不含今天)必须有过大阳线 (>7%)
+        if d0_max_pct_10d < 7.0: continue
         
-        # 2. 趋势指标 (维持 V36.2)
-        if d0_mom < 5: continue
-        if d0_rsi < 60: continue # 主力策略要求稍高
+        # 2. 龙的洗盘: 昨日必须是调整 (< 3.0%)
+        if d0_pct_lag1 > 3.0: continue
         
-        # 3. 量能确认
+        # 3. 龙的觉醒: 今日放量 (>1.2)
         if d0_vol < 1.2: continue
+        
+        if d0_mom < 5: continue
+        if d0_rsi < 50: continue # 保持基本活跃度
         
         if market_state == 'Weak':
             if d0_rsi > RSI_LIMIT: continue
@@ -443,7 +449,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MOM_LIMIT, MAX_
         future = get_future_prices(row.ts_code, last_trade, d0_close)
         records.append({
             'ts_code': row.ts_code, 'name': row.name, 'Close': row.close, 'Pct_Chg': row.pct_chg,
-            'rsi': d0_rsi, 'mom': d0_mom, 'vol_ratio': d0_vol, 'pct_lag1': d0_pct_lag1,
+            'rsi': d0_rsi, 'mom': d0_mom, 'vol_ratio': d0_vol, 'pct_lag1': d0_pct_lag1, 'max_pct_10d': d0_max_pct_10d,
             'winner_rate': win_rate, 
             'macd': ind['macd_val'], 'net_mf': row.net_mf,
             'Return_D1 (%)': future.get('Return_D1', np.nan),
@@ -456,16 +462,17 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MOM_LIMIT, MAX_
     if not records: return pd.DataFrame(), "深度筛选后无标的"
     fdf = pd.DataFrame(records)
     
-    # [V36.3 评分优化]
+    # [V36.4 评分系统]
     def dynamic_score(r):
         # 基础分
         base_score = r['mom'] * 20 + r['rsi'] * 10 + r['macd'] * 1000 + (r['net_mf'] / 10000)
         
-        # [核心奖励]：反差美
-        # 如果昨天涨幅越小(甚至下跌)，今天涨幅越大，说明爆发力越强
-        # 差值 = 今日涨幅 - 昨日涨幅
+        # 奖励反差 (今强昨弱)
         diff = r['Pct_Chg'] - r['pct_lag1']
         base_score += diff * 200
+        
+        # 奖励历史妖性 (过去10天涨得越猛越好)
+        base_score += r['max_pct_10d'] * 100
         
         # 奖励 RSI > 80 (真龙)
         if r['rsi'] > 80: base_score += 2000
@@ -483,7 +490,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MOM_LIMIT, MAX_
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V36.3 飞龙在天")
+    st.header("V36.4 游龙回首")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数", value=30, step=1, help="建议30-50天")
     TOP_BACKTEST = st.number_input("每日优选 TopK", value=4)
@@ -494,7 +501,7 @@ with st.sidebar:
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
             st.success("缓存已清除。")
-    CHECKPOINT_FILE = "backtest_checkpoint_v36_3.csv"
+    CHECKPOINT_FILE = "backtest_checkpoint_v36_4.csv"
     
     st.markdown("---")
     st.subheader("💰 基础过滤")
@@ -510,8 +517,8 @@ with st.sidebar:
     RSI_LIMIT = st.number_input("RSI 拦截线 (已失效)", value=999.0, disabled=True)
     
     st.markdown("---")
-    st.subheader("📊 形态参数 (V36.3)")
-    st.info("硬性过滤: 昨日涨幅 < 4.0%, 今日涨幅 > 5.0%")
+    st.subheader("📊 形态参数 (V36.4)")
+    st.info("N字战法: 10日内有过>7%大阳 -> 昨日调整 -> 今日反包")
     SECTOR_THRESHOLD = st.number_input("板块涨幅 (%)", value=1.0)
     MAX_UPPER_SHADOW = st.number_input("上影线 (%)", value=6.0) 
     MIN_BODY_POS = st.number_input("实体位置", value=0.6) 
@@ -522,7 +529,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V36.3"):
+if st.button(f"🚀 启动 V36.4"):
     processed_dates = set()
     results = []
     
@@ -552,7 +559,6 @@ if st.button(f"🚀 启动 V36.3"):
         bar = st.progress(0, text="回测引擎启动...")
         
         for i, date in enumerate(dates_to_run):
-            # 注意: V36.3 增加了 MOM_LIMIT
             res, err = run_backtest_for_a_day(date, int(TOP_BACKTEST), 100, MOM_LIMIT, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, 999, MIN_PRICE)
             if not res.empty:
                 res['Trade_Date'] = date
@@ -570,7 +576,7 @@ if st.button(f"🚀 启动 V36.3"):
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         all_res = all_res.sort_values(['Trade_Date', 'Rank'], ascending=[False, True])
         
-        st.header(f"📊 V36.3 统计仪表盘 (Top {TOP_BACKTEST})")
+        st.header(f"📊 V36.4 统计仪表盘 (Top {TOP_BACKTEST})")
         cols = st.columns(3)
         for idx, n in enumerate([1, 3, 5]):
             col_name = f'Return_D{n} (%)'
@@ -584,7 +590,7 @@ if st.button(f"🚀 启动 V36.3"):
         
         show_cols = ['Rank', 'Trade_Date','name','ts_code','Close','Pct_Chg',
              'Return_D1 (%)', 'Return_D3 (%)', 'Return_D5 (%)',
-                        'rsi','mom','pct_lag1','winner_rate','Sector_Boost']
+                        'rsi','mom','pct_lag1','max_pct_10d','Sector_Boost']
         final_cols = [c for c in show_cols if c in all_res.columns]
     
         st.dataframe(all_res[final_cols], use_container_width=True)
