@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-主力策略 · V36.12 推进器 (动量回归版)
+主力策略 · V36.12 推进器 (动量回归 + 严守买入纪律)
 ------------------------------------------------
-调优目标: 解决 V36.11 D+1 收益率过低 (0.12%) 的问题。
-核心手段:
-1. **动量回归**：MOM > 5.0 (拒绝磨叽股，确保买入即有冲劲)。
-2. **RSI 扩容**：上限放宽至 90 (允许更强的趋势龙)。
-3. **安全基石**：保留 V36.11 的"拒追20cm"和"高控盘"逻辑。
-4. **预期效果**：提升 D+1 爆发力，同时维持 D+5 的高胜率。
+版本特性:
+1. **买入纪律锁死**：完全保留"高开+1.5%上冲"的成交机制，与替补策略保持一致。
+2. **动量回归**：MOM > 5.0 (解决 V36.11 D+1 收益过低的问题，确保有冲劲)。
+3. **RSI 微调**：上限放宽至 90 (允许长飞光纤这种强趋势股入围)。
+4. **安全底座**：
+   - 获利盘 > 75% (高控盘)。
+   - 今日涨幅 < 10.5% (拒追 20cm)。
+   - 乖离率 Bias5 < 12% (防天线宝宝)。
 ------------------------------------------------
 """
 
@@ -37,7 +39,7 @@ GLOBAL_STOCK_INDUSTRY = {}
 # 页面设置
 # ---------------------------
 st.set_page_config(page_title="主力策略 V36.12 推进器", layout="wide")
-st.title("主力策略 V36.12：推进器 (动量+高控盘)")
+st.title("主力策略 V36.12：推进器 (动量回归+严守纪律)")
 
 # ---------------------------
 # 基础 API 函数
@@ -267,7 +269,11 @@ def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[1, 3, 5
     next_open = d1_data['open']
     next_high = d1_data['high']
     
-    # 保持 V36 的买入逻辑
+    # ==========================================
+    # 核心买入纪律 (严禁修改)
+    # 1. 必须高开 (Open > Close_Pre)
+    # 2. 必须上冲 1.5% (High > Open * 1.015)
+    # ==========================================
     if next_open <= d0_qfq_close: return results 
     target_buy_price = next_open * 1.015
     if next_high < target_buy_price: return results
@@ -389,7 +395,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MOM_LIMIT, MAX_
     df = df[(df['circ_mv_billion'] >= MIN_MV) & (df['circ_mv_billion'] <= MAX_MV)]
     df = df[df['turnover_rate'] <= MAX_TURNOVER_RATE] 
 
-    # [V36.12 限价不限速]
+    # [V36.12 核心: 限价不限速]
     df = df[df['pct_chg'] > 4.5]
     df = df[df['pct_chg'] < 10.5] # 拒追 20cm
 
@@ -411,10 +417,10 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MOM_LIMIT, MAX_
         
         # [V36.12 核心逻辑: 动量回归]
         
-        # 1. 动量: > 5.0 (V36.11是0, 必须提升!)
+        # 1. 动量: > 5.0 (确保有冲劲)
         if d0_mom < 5.0: continue 
         
-        # 2. RSI: < 90 (放宽, V36.11是85)
+        # 2. RSI: < 90 (放宽，允许趋势龙)
         if d0_rsi < 50: continue
         if d0_rsi > 90: continue
         
