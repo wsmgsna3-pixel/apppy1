@@ -34,7 +34,7 @@ GLOBAL_STOCK_INDUSTRY = {}
 # 页面设置
 # ---------------------------
 st.set_page_config(page_title="选股王 V35.1 修复版", layout="wide")
-st.title("选股王 V35.1：抢跑修复版 (稳定运行)")
+st.title("选股王 替补 (稳定运行)")
 
 # ---------------------------
 # 基础 API 函数
