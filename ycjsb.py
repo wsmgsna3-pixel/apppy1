@@ -2,9 +2,11 @@ import streamlit as st
 import pandas as pd
 import tushare as ts
 import warnings
+from datetime import datetime, timedelta  # 补上了这一行
 
 warnings.filterwarnings("ignore")
 
+st.set_page_config(page_title="V33 照妖镜", layout="wide")
 st.title("🪞 V33 镜像回溯 (照妖镜)")
 st.markdown("直接查看 12 只翻倍股在启动前 3 天的真实 K 线形态，不再盲猜。")
 
@@ -35,54 +37,85 @@ if st.sidebar.button("启动照妖镜"):
         
         results = []
         
-        for name, (code, launch_date) in TARGETS.items():
-            # 获取启动日前 5 天的数据
-            end_dt = datetime.strptime(launch_date, '%Y%m%d')
-            start_dt = end_dt - timedelta(days=20) # 多取点算指标
+        # 创建进度条
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        total = len(TARGETS)
+        
+        for i, (name, (code, launch_date)) in enumerate(TARGETS.items()):
+            status_text.text(f"正在回溯: {name}...")
+            progress_bar.progress((i + 1) / total)
             
-            df = pro.daily(ts_code=code, start_date=start_dt.strftime('%Y%m%d'), end_date=launch_date)
-            df = df.sort_values('trade_date').reset_index(drop=True)
-            
-            if len(df) < 5:
-                st.warning(f"{name}: 数据不足")
-                continue
+            try:
+                # 获取启动日前 25 天的数据 (多取点算指标)
+                end_dt = datetime.strptime(launch_date, '%Y%m%d')
+                start_dt = end_dt - timedelta(days=40) 
                 
-            # 取最后 4 天 (T-3, T-2, T-1, T=Launch)
-            # Launch Day 是最后一天
-            launch_idx = len(df) - 1
-            
-            # 计算形态
-            days = []
-            for i in range(3, -1, -1): # 3, 2, 1, 0
-                idx = launch_idx - i
-                if idx < 0: continue
+                df = pro.daily(ts_code=code, start_date=start_dt.strftime('%Y%m%d'), end_date=launch_date)
+                df = df.sort_values('trade_date').reset_index(drop=True)
                 
-                row = df.iloc[idx]
-                pct = row['pct_chg']
-                color = "🔴" if pct > 0 else "Vk" # 🔴阳 🟢阴
-                days.append(f"{color} {pct:.1f}%")
-            
-            # 组合形态字符串
-            pattern_str = " -> ".join(days)
-            
-            # 计算 RSI(6) at T-1
-            # 简单模拟
-            delta = df['close'].diff()
-            gain = (delta.where(delta > 0, 0)).rolling(6).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(6).mean()
-            rs = gain / (loss + 0.001)
-            rsi = 100 - (100 / (1 + rs))
-            rsi_t1 = rsi.iloc[launch_idx-1]
-            
-            results.append({
-                '名称': name,
-                '启动日': launch_date,
-                '形态 (T-3 -> 启动)': pattern_str,
-                '启动前RSI': f"{rsi_t1:.1f}"
-            })
-            
+                if len(df) < 5:
+                    st.warning(f"{name}: 数据不足")
+                    continue
+                    
+                # 取最后 4 天 (T-3, T-2, T-1, T=Launch)
+                # Launch Day 是最后一天
+                launch_idx = len(df) - 1
+                
+                # --- 计算形态 (T-3 到 启动日) ---
+                days_info = []
+                for j in range(3, -1, -1): # 3, 2, 1, 0
+                    idx = launch_idx - j
+                    if idx < 0: continue
+                    
+                    row = df.iloc[idx]
+                    pct = row['pct_chg']
+                    
+                    # 定义 K 线颜色和形态
+                    icon = "🔴" if pct > 0 else ("🟢" if pct < 0 else "⚪")
+                    if pct > 9.0: type_str = "涨停"
+                    elif pct > 5.0: type_str = "大阳"
+                    elif pct > 0: type_str = "小阳"
+                    elif pct > -5.0: type_str = "小阴"
+                    else: type_str = "大阴"
+                    
+                    days_info.append(f"{icon}{type_str}({pct:.1f}%)")
+                
+                pattern_str = " -> ".join(days_info)
+                
+                # --- 计算 RSI(6) at T-1 (启动前一天) ---
+                # 简单模拟 RSI
+                delta = df['close'].diff()
+                gain = (delta.where(delta > 0, 0)).rolling(6).mean()
+                loss = (-delta.where(delta < 0, 0)).rolling(6).mean()
+                rs = gain / (loss + 0.001)
+                rsi = 100 - (100 / (1 + rs))
+                rsi_t1 = rsi.iloc[launch_idx-1]
+                
+                # --- 计算换手率 at T-1 ---
+                # 需要调 daily_basic，为了速度这里简化，只看涨跌幅形态
+                # 如果需要换手率，可以再加一个 API 请求，但会变慢
+                
+                results.append({
+                    '名称': name,
+                    '启动日': launch_date,
+                    '启动前3天走势 (T-3 -> T-2 -> T-1 -> 启动)': pattern_str,
+                    '启动前RSI(6)': f"{rsi_t1:.1f}"
+                })
+                
+            except Exception as e:
+                st.error(f"{name} 回溯失败: {e}")
+        
+        progress_bar.empty()
+        status_text.empty()
+        
+        st.success("回溯完成！真相如下：")
         st.table(pd.DataFrame(results))
         
-        st.info("💡 **分析指南**：\n"
-                "1. 看 **形态**：是不是全是红的(蚂蚁上树)？还是夹杂了绿的(洗盘)？\n"
-                "2. 看 **RSI**：启动前到底是 50 还是 70？")
+        st.info("""
+        💡 **看图说话**：
+        1. **看连阳**：如果全是 🔴小阳，说明"蚂蚁上树"是对的。
+        2. **看洗盘**：如果中间夹杂了 🟢小阴，说明主力在洗盘，V32 过滤太严了。
+        3. **看力度**：启动那一下是不是都是"涨停"？如果是，说明必须做首板。
+        """)
