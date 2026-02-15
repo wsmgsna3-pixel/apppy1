@@ -12,14 +12,14 @@ warnings.filterwarnings("ignore")
 # ==========================================
 # 1. 页面配置
 # ==========================================
-st.set_page_config(page_title="潜龙 V31·先知", layout="wide")
-st.title("🐉 潜龙 V31·先知 (RSI低位潜伏+蚂蚁上树)")
+st.set_page_config(page_title="潜龙 V32·庄家克星", layout="wide")
+st.title("🐉 潜龙 V32·庄家克星 (宽容版潜伏策略)")
 st.markdown("""
-**策略核心：针对"替补策略"的滞后性进行逆向改造**
-1.  **RSI 抢跑**：锁定 **RSI 40-60** 区间 (拒绝 RSI>90 的鱼尾)。
-2.  **筹码低位**：锁定 **获利盘 20%-60%** (主力刚建仓，还未派发)。
-3.  **经典形态**：**蚂蚁上树** (连续3天小阳线，温和放量)。
-4.  **目标**：在主力大拉升前的"静默期"提前 3-5 天进场。
+**策略核心：在 V31 的基础上，放宽对"强庄股"的容忍度**
+1.  **获利盘松绑**：**20% - 90%** (包容高控盘的强庄股)。
+2.  **RSI 提升**：**40 - 75** (允许主力试盘时的RSI冲高)。
+3.  **形态保留**：**蚂蚁上树** (连续3天小阳线) 依然是核心。
+4.  **目标**：保留致尚科技的"提前8天"，同时把田中精机等强庄股网罗进来。
 """)
 
 DATA_FILE = "market_data_store.csv"
@@ -91,7 +91,7 @@ def sync_market_data(token, start_date, end_date):
         return pd.DataFrame(), "无数据"
 
 # ==========================================
-# 3. 策略逻辑 (先知)
+# 3. 策略逻辑 (庄家克星)
 # ==========================================
 def calculate_strategy(df_all, df_info):
     if 'industry' not in df_all.columns:
@@ -122,37 +122,32 @@ def calculate_strategy(df_all, df_info):
     df['pct_lag1'] = df.groupby('ts_code')['pct_chg'].shift(1)
     df['pct_lag2'] = df.groupby('ts_code')['pct_chg'].shift(2)
     
-    # === 1. 形态: 蚂蚁上树 ===
-    # 连续 3 天都是阳线，且涨幅温和 (0-4%)
-    # 这种形态通常是主力吸筹
-    cond_ant = (df['pct_chg'] > 0) & (df['pct_chg'] < 4.0) & \
-               (df['pct_lag1'] > 0) & (df['pct_lag1'] < 4.0) & \
-               (df['pct_lag2'] > 0) & (df['pct_lag2'] < 4.0)
+    # === 1. 形态: 蚂蚁上树 (核心) ===
+    # 连续 3 天都是阳线，且涨幅温和
+    cond_ant = (df['pct_chg'] > 0) & (df['pct_chg'] < 5.0) & \
+               (df['pct_lag1'] > 0) & (df['pct_lag1'] < 5.0) & \
+               (df['pct_lag2'] > 0) & (df['pct_lag2'] < 5.0)
                
-    # === 2. RSI 黄金起步区 ===
-    # 40-60: 刚刚脱离底部，还没加速，是最佳潜伏区
-    cond_rsi = (df['rsi_6'] >= 40) & (df['rsi_6'] <= 65)
+    # === 2. RSI 宽容区间 ===
+    # 40-75: 允许主力试盘
+    cond_rsi = (df['rsi_6'] >= 40) & (df['rsi_6'] <= 75)
     
-    # === 3. 获利盘低位 ===
-    # 20-60%: 主力有底仓，但还没到派发期
-    cond_winner = (df['winner_rate'] >= 20) & (df['winner_rate'] <= 60)
+    # === 3. 获利盘宽容区间 ===
+    # 20-90%: 包容强庄
+    cond_winner = (df['winner_rate'] >= 20) & (df['winner_rate'] <= 90)
     
     # === 4. 趋势护航 ===
-    # 股价站上 MA20 (生命线)
+    # 股价站上 MA20
     cond_trend = df['close'] > df['ma20']
     
     # === 5. 资金 ===
-    # 量比 > 0.8 (不能完全没量)
     cond_vol = df['volume_ratio'] > 0.8
-    # 市值覆盖
     cond_mv = (df['circ_mv'] >= 30*10000) & (df['circ_mv'] <= 800*10000)
     
     # 综合信号
     df['is_signal'] = cond_ant & cond_rsi & cond_winner & cond_trend & cond_vol & cond_mv
     
-    # 评分 (RSI 越接近 50 越好? 不，RSI 越高说明启动越快，但不能超过 65)
-    # 我们按"获利盘"排序，越低越好? 也不一定。
-    # 我们按"量比"排序，量比放大说明主力开始干活了。
+    # 评分: 优先看谁的量比大 (主力干活)
     df['score'] = df['volume_ratio']
     
     return df
@@ -160,7 +155,7 @@ def calculate_strategy(df_all, df_info):
 # ==========================================
 # 4. 回测逻辑
 # ==========================================
-def run_backtest_prophet(df_signals, df_all, cal_dates):
+def run_backtest_buster(df_signals, df_all, cal_dates):
     df_lookup = df_all.copy()
     if 'ma10' not in df_lookup.columns:
          df_lookup['ma10'] = df_lookup.groupby('ts_code')['close'].transform(lambda x: x.rolling(10).mean())
@@ -228,22 +223,22 @@ def run_backtest_prophet(df_signals, df_all, cal_dates):
 # 5. 主程序
 # ==========================================
 with st.sidebar:
-    st.header("⚙️ V31 先知")
+    st.header("⚙️ V32 庄家克星")
     user_token = st.text_input("Tushare Token:", type="password")
     
     days_back = st.slider("回测天数", 30, 150, 60)
     end_date_input = st.date_input("截止日期", datetime.now().date())
     
     st.markdown("---")
-    st.info("🔮 潜伏参数")
+    st.info("🔓 宽容参数")
     st.markdown("""
-    * **RSI**: 40-65 (拒绝过热)
-    * **获利盘**: 20-60% (拒绝高位)
-    * **形态**: 蚂蚁上树 (3连小阳)
+    * **RSI**: 40-75 (放宽)
+    * **获利盘**: 20-90% (放宽)
+    * **形态**: 蚂蚁上树
     """)
     top_n = st.number_input("每日优选 (Top N)", 1, 10, 5)
     
-    run_btn = st.button("🚀 启动先知")
+    run_btn = st.button("🚀 启动V32")
 
 if run_btn:
     if not user_token:
@@ -260,7 +255,7 @@ if run_btn:
             df_all = res
             st.success(f"✅ 数据加载: {len(df_all):,} 行")
             
-            with st.spinner("寻找潜伏机会..."):
+            with st.spinner("扫描强庄..."):
                 df_calc = calculate_strategy(df_all, df_info)
                 
             cal_dates = sorted(df_calc['trade_date'].unique())
@@ -268,21 +263,21 @@ if run_btn:
             
             df_signals = df_calc[(df_calc['trade_date'].isin(valid_dates)) & (df_calc['is_signal'])].copy()
             
-            # 排序: 量比越大越好 (说明主力在蚂蚁上树时已经在偷偷放量)
+            # 排序: 量比优先
             df_signals = df_signals.sort_values(['trade_date', 'volume_ratio'], ascending=[True, False])
             
             df_signals['排名'] = df_signals.groupby('trade_date').cumcount() + 1
             df_top = df_signals[df_signals['排名'] <= top_n].copy()
             
-            st.write(f"⚪ 先知信号: **{len(df_top)}** 个")
+            st.write(f"⚪ 强庄信号: **{len(df_top)}** 个")
             
             if not df_top.empty:
-                df_res = run_backtest_prophet(df_top, df_calc, cal_dates)
+                df_res = run_backtest_buster(df_top, df_calc, cal_dates)
                 
                 if not df_res.empty:
                     st.success(f"🎯 成交单数: **{len(df_res)}**")
                     
-                    st.markdown(f"### 📊 V31 回测 (RSI低位+蚂蚁上树)")
+                    st.markdown(f"### 📊 V32 回测 (蚂蚁上树+强庄)")
                     cols = st.columns(5)
                     days = ['D+1', 'D+3', 'D+5', 'D+7', 'D+10']
                     for idx, d in enumerate(days):
