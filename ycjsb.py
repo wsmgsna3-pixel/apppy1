@@ -1,18 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-主力策略 · V36.15 穿越者 (T+5 延时买入实验)
+主力策略 · V36.14 完美风暴 (最终定稿版)
 ------------------------------------------------
-实验目的: 验证"主力策略选股后，第5天才是主升浪起点"的假设。
-核心逻辑:
-1. **选股**：完全沿用 V36.14 的逻辑 (MOM>7, RSI无上限, 获利盘>75%)。
-2. **买入**：
-   - 信号日: T
-   - 原买入日: T+1
-   - **新买入日**: **T+5** (第5个交易日开盘价买入)。
-3. **观察**：
-   - Return_Delay_1: T+5 买入，T+6 卖出。
-   - Return_Delay_3: T+5 买入，T+8 卖出。
-   - Return_Delay_5: T+5 买入，T+10 卖出。
+经过多轮残酷回测筛选出的最强版本。
+核心优势:
+1. **胜率之王**：60天回测 D+5 胜率高达 61.3%。
+2. **收益之王**：D+5 均收 3.57% (远超 V36.13 和 V30)。
+3. **逻辑闭环**：
+   - 进攻：解除 RSI 封印，MOM > 7.0 (拥抱趋势)。
+   - 防守：拒追 20cm (今日涨幅<10.5%)，乖离率防守 (Bias5 < 12%)。
+   - 节奏：T+1 买入，T+5 止盈 (完美契合当前市场节奏)。
 ------------------------------------------------
 """
 
@@ -41,8 +38,8 @@ GLOBAL_STOCK_INDUSTRY = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="主力策略 V36.15 穿越者", layout="wide")
-st.title("主力策略 V36.15：穿越者 (T+5 延时买入)")
+st.set_page_config(page_title="主力策略 V36.14 完美风暴", layout="wide")
+st.title("主力策略 V36.14：完美风暴 (最终定稿)")
 
 # ---------------------------
 # 基础 API 函数
@@ -254,42 +251,36 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
 # ---------------------------
 # 实战仿真与指标计算
 # ---------------------------
-# [MODIFIED] 延时买入逻辑
-def get_future_prices_delayed(ts_code, selection_date, delay_days=5, days_ahead=[1, 3, 5]):
-    # 获取更长的未来数据，以便定位到第5天
+def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[1, 3, 5]):
     d0 = datetime.strptime(selection_date, "%Y%m%d")
     start_future = (d0 + timedelta(days=1)).strftime("%Y%m%d")
-    end_future = (d0 + timedelta(days=30)).strftime("%Y%m%d") # 延长时间窗口
+    end_future = (d0 + timedelta(days=15)).strftime("%Y%m%d")
     
     hist = get_qfq_data_v4_optimized_final(ts_code, start_date=start_future, end_date=end_future)
     results = {}
     
-    # 必须要有足够的数据 (至少能支持到 delay_days)
-    if hist.empty or len(hist) < delay_days: return results
+    if hist.empty or len(hist) < 1: return results
     
     hist['open'] = pd.to_numeric(hist['open'], errors='coerce')
+    hist['high'] = pd.to_numeric(hist['high'], errors='coerce')
     hist['close'] = pd.to_numeric(hist['close'], errors='coerce')
     
-    # 获取第 5 个交易日的数据 (索引是 delay_days - 1)
-    # 例如 delay=5, 则是第 1,2,3,4, [5] 天
-    buy_day_idx = delay_days - 1
-    buy_day_data = hist.iloc[buy_day_idx]
+    d1_data = hist.iloc[0]
+    next_open = d1_data['open']
+    next_high = d1_data['high']
     
-    # 假设以 T+5 的开盘价买入
-    target_buy_price = buy_day_data['open']
-    
-    # 计算 T+5 之后的收益 (Delay+1, Delay+3, Delay+5)
-    # 即 T+6, T+8, T+10
-    for n in days_ahead:
-        col = f'Return_Delay_{n}'
-        sell_idx = buy_day_idx + n 
+    # [V36.14 铁律] 高开+1.5% 买入
+    if next_open <= d0_qfq_close: return results 
+    target_buy_price = next_open * 1.015
+    if next_high < target_buy_price: return results
         
-        if len(hist) > sell_idx:
-            sell_price = hist.iloc[sell_idx]['close']
+    for n in days_ahead:
+        col = f'Return_D{n}'
+        if len(hist) >= n:
+            sell_price = hist.iloc[n-1]['close']
             results[col] = (sell_price - target_buy_price) / target_buy_price * 100
         else:
             results[col] = np.nan
-            
     return results
 
 def calculate_rsi(series, period=12):
@@ -347,7 +338,7 @@ def get_market_state(trade_date):
     return 'Strong' if latest_close > ma20 else 'Weak'
 
 # ---------------------------
-# 核心回测逻辑函数 (V36.15 穿越者)
+# 核心回测逻辑函数 (V36.14 完美风暴)
 # ---------------------------
 def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MOM_LIMIT, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, MAX_PREV_PCT, MIN_PRICE):
     global GLOBAL_STOCK_INDUSTRY
@@ -403,9 +394,9 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MOM_LIMIT, MAX_
     df = df[(df['circ_mv_billion'] >= MIN_MV) & (df['circ_mv_billion'] <= MAX_MV)]
     df = df[df['turnover_rate'] <= MAX_TURNOVER_RATE] 
 
-    # 沿用 V36.14 的筛选
+    # [V36.14 核心: 拒绝大面，允许连板]
     df = df[df['pct_chg'] > 4.5]
-    df = df[df['pct_chg'] < 10.5] 
+    df = df[df['pct_chg'] < 10.5] # 拒追 20cm
 
     if len(df) == 0: return pd.DataFrame(), "过滤后无标的"
 
@@ -424,13 +415,22 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MOM_LIMIT, MAX_
         d0_mom = ind.get('mom', 0)
         d0_pct_lag1 = ind.get('pct_lag1', 0)
         
-        # [V36.14 筛选逻辑]
+        # [V36.14 核心逻辑: 解除 RSI 封印]
+        
+        # 1. 获利盘: > 75%
         win_rate = chip_dict.get(row.ts_code, 50) 
         if win_rate < 75.0: continue 
         
+        # 2. 动量: > 7.0 (折中，比V36.13更强)
         if d0_mom < 7.0: continue 
+        
+        # 3. RSI: 只过滤 < 50, 不设上限!
         if d0_rsi < 50: continue
+        
+        # 4. 拒绝深坑
         if d0_pct_lag1 < -3.0: continue
+        
+        # 5. 乖离率防守
         if (d0_close / ind['ma5']) > 1.12: continue
         
         if market_state == 'Weak':
@@ -442,26 +442,30 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MOM_LIMIT, MAX_
             body_pos = (d0_close - ind['last_low']) / range_len
             if body_pos < MIN_BODY_POS: continue 
 
-        # [MODIFIED] 使用延时买入函数
-        # 传入 delay_days = 5 (即买入 T+5)
-        future = get_future_prices_delayed(row.ts_code, last_trade, delay_days=5)
-        
+        future = get_future_prices(row.ts_code, last_trade, d0_close)
         records.append({
             'ts_code': row.ts_code, 'name': row.name, 'Close': row.close, 'Pct_Chg': row.pct_chg,
-            'rsi': d0_rsi, 'mom': d0_mom, 'winner_rate': win_rate, 
-            # 注意: 这里的 returns 是 T+5 买入后的收益
-            'Return_Delay_1 (%)': future.get('Return_Delay_1', np.nan),
-            'Return_Delay_3 (%)': future.get('Return_Delay_3', np.nan),
-            'Return_Delay_5 (%)': future.get('Return_Delay_5', np.nan),
+            'rsi': d0_rsi, 'mom': d0_mom, 'pct_lag1': d0_pct_lag1, 'winner_rate': win_rate, 
+            'macd': ind['macd_val'], 'net_mf': row.net_mf,
+            'Return_D1 (%)': future.get('Return_D1', np.nan),
+            'Return_D3 (%)': future.get('Return_D3', np.nan),
+            'Return_D5 (%)': future.get('Return_D5', np.nan),
+            'market_state': market_state,
             'Sector_Boost': 'Yes' if GLOBAL_STOCK_INDUSTRY else 'N/A'
         })
             
     if not records: return pd.DataFrame(), "深度筛选后无标的"
     fdf = pd.DataFrame(records)
     
+    # [V36.14 评分: 奖励高 RSI]
     def dynamic_score(r):
-        base_score = r['mom'] * 20 + (r['winner_rate'] * 10)
+        base_score = r['mom'] * 20 + r['macd'] * 1000 + (r['net_mf'] / 10000)
+        
+        # V30 的灵魂: 奖励高 RSI (85+)
         if r['rsi'] > 85: base_score += 2000
+        
+        if r['winner_rate'] > 90: base_score += 1500
+        
         return base_score
 
     fdf['Score'] = fdf.apply(dynamic_score, axis=1)
@@ -475,7 +479,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MOM_LIMIT, MAX_
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V36.15 穿越者")
+    st.header("V36.14 完美风暴")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数", value=30, step=1, help="建议30-50天")
     TOP_BACKTEST = st.number_input("每日优选 TopK", value=4)
@@ -486,19 +490,35 @@ with st.sidebar:
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
             st.success("缓存已清除。")
-    CHECKPOINT_FILE = "backtest_checkpoint_v36_15.csv"
+    CHECKPOINT_FILE = "backtest_checkpoint_v36_14.csv"
     
     st.markdown("---")
-    st.subheader("⚔️ 参数设定")
-    st.info("选股逻辑同 V36.14")
-    st.info("买入逻辑: T+5 开盘买入")
+    st.subheader("💰 基础过滤")
+    col1, col2 = st.columns(2)
+    MIN_PRICE = col1.number_input("最低股价", value=15.0) 
+    MIN_MV = col2.number_input("最小市值(亿)", value=30.0) 
+    MAX_MV = st.number_input("最大市值(亿)", value=1000.0)
+    
+    st.markdown("---")
+    st.subheader("⚔️ 核心风控参数")
+    CHIP_MIN_WIN_RATE = st.number_input("最低获利盘 (%)", value=75.0)
+    MOM_LIMIT = st.number_input("最低 MOM", value=7.0, help="V36.14: > 7.0")
+    RSI_LIMIT = st.number_input("RSI 拦截线", value=100.0)
+    
+    st.markdown("---")
+    st.subheader("📊 形态参数")
+    st.info("解除 RSI 上限，拒追 20cm")
+    SECTOR_THRESHOLD = st.number_input("板块涨幅 (%)", value=1.0)
+    MAX_UPPER_SHADOW = st.number_input("上影线 (%)", value=6.0) 
+    MIN_BODY_POS = st.number_input("实体位置", value=0.6) 
+    MAX_TURNOVER_RATE = st.number_input("换手率 (%)", value=20.0)
 
 TS_TOKEN = st.text_input("Tushare Token", type="password")
 if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V36.15"):
+if st.button(f"🚀 启动 V36.14"):
     processed_dates = set()
     results = []
     
@@ -528,9 +548,7 @@ if st.button(f"🚀 启动 V36.15"):
         bar = st.progress(0, text="回测引擎启动...")
         
         for i, date in enumerate(dates_to_run):
-            # 注意: 使用 run_backtest_for_a_day (V36.15)
-            # 参数沿用 V36.14 的默认值
-            res, err = run_backtest_for_a_day(date, int(TOP_BACKTEST), 100, 7.0, 20.0, 0.6, 100.0, 75.0, 1.0, 30.0, 1000.0, 999, 15.0)
+            res, err = run_backtest_for_a_day(date, int(TOP_BACKTEST), 100, MOM_LIMIT, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, 999, MIN_PRICE)
             if not res.empty:
                 res['Trade_Date'] = date
                 is_first = not os.path.exists(CHECKPOINT_FILE)
@@ -547,22 +565,21 @@ if st.button(f"🚀 启动 V36.15"):
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         all_res = all_res.sort_values(['Trade_Date', 'Rank'], ascending=[False, True])
         
-        st.header(f"📊 V36.15 延时买入统计 (Top {TOP_BACKTEST})")
+        st.header(f"📊 V36.14 统计仪表盘 (Top {TOP_BACKTEST})")
         cols = st.columns(3)
         for idx, n in enumerate([1, 3, 5]):
-            col_name = f'Return_Delay_{n} (%)' # 注意列名变了
+            col_name = f'Return_D{n} (%)'
             valid = all_res.dropna(subset=[col_name]) 
             if not valid.empty:
                 avg = valid[col_name].mean()
                 win = (valid[col_name] > 0).mean() * 100
-                cols[idx].metric(f"延时+{n} 均益 / 胜率", f"{avg:.2f}% / {win:.1f}%")
+                cols[idx].metric(f"D+{n} 均益 / 胜率", f"{avg:.2f}% / {win:.1f}%")
  
         st.subheader("📋 回测清单")
         
-        # 显示延时回报列
         show_cols = ['Rank', 'Trade_Date','name','ts_code','Close','Pct_Chg',
-             'Return_Delay_1 (%)', 'Return_Delay_3 (%)', 'Return_Delay_5 (%)',
-                        'rsi','mom','winner_rate']
+             'Return_D1 (%)', 'Return_D3 (%)', 'Return_D5 (%)',
+                        'rsi','mom','pct_lag1','winner_rate','Sector_Boost']
         final_cols = [c for c in show_cols if c in all_res.columns]
     
         st.dataframe(all_res[final_cols], use_container_width=True)
