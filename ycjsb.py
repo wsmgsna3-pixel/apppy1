@@ -1,15 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-主力策略 · V36.14 完美风暴 (最终定稿版)
+选股王 · V35.1 紧急修复版 (修复 UnboundLocalError)
 ------------------------------------------------
-经过多轮残酷回测筛选出的最强版本。
-核心优势:
-1. **胜率之王**：60天回测 D+5 胜率高达 61.3%。
-2. **收益之王**：D+5 均收 3.57% (远超 V36.13 和 V30)。
-3. **逻辑闭环**：
-   - 进攻：解除 RSI 封印，MOM > 7.0 (拥抱趋势)。
-   - 防守：拒追 20cm (今日涨幅<10.5%)，乖离率防守 (Bias5 < 12%)。
-   - 节奏：T+1 买入，T+5 止盈 (完美契合当前市场节奏)。
+修复记录:
+1. [修复] 修复 dynamic_score 中 penalty 变量未初始化导致的闪退 Bug。
+2. [保持] V35.0 的所有抢跑逻辑 (获利盘>40%, RSI 55-80 加分)。
 ------------------------------------------------
 """
 
@@ -38,8 +33,8 @@ GLOBAL_STOCK_INDUSTRY = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="主力策略 V36.14 完美风暴", layout="wide")
-st.title("主力策略 V36.14：完美风暴 (最终定稿)")
+st.set_page_config(page_title="选股王 V35.1 修复版", layout="wide")
+st.title("选股王 V35.1：抢跑修复版 (稳定运行)")
 
 # ---------------------------
 # 基础 API 函数
@@ -111,9 +106,9 @@ def load_industry_mapping():
         return {}
 
 # ---------------------------
-# 数据获取核心
+# 数据获取核心 (本地缓存版)
 # ---------------------------
-CACHE_FILE_NAME = "market_data_cache_v36.pkl"
+CACHE_FILE_NAME = "market_data_cache_v35.pkl"
 
 def get_all_historical_data(trade_days_list, use_cache=True):
     global GLOBAL_ADJ_FACTOR, GLOBAL_DAILY_RAW, GLOBAL_QFQ_BASE_FACTORS, GLOBAL_STOCK_INDUSTRY
@@ -269,7 +264,6 @@ def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[1, 3, 5
     next_open = d1_data['open']
     next_high = d1_data['high']
     
-    # [V36.14 铁律] 高开+1.5% 买入
     if next_open <= d0_qfq_close: return results 
     target_buy_price = next_open * 1.015
     if next_high < target_buy_price: return results
@@ -290,9 +284,6 @@ def calculate_rsi(series, period=12):
     rs = gain / (loss + 1e-9)
     return 100 - (100 / (1 + rs))
 
-def calculate_mom(series, period=10):
-    return (series / series.shift(period) - 1) * 100
-
 @st.cache_data(ttl=3600*12) 
 def compute_indicators(ts_code, end_date):
     start_date = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=150)).strftime("%Y%m%d")
@@ -301,9 +292,6 @@ def compute_indicators(ts_code, end_date):
     if df.empty or len(df) < 26: return res 
     
     df['pct_chg'] = df['close'].pct_change().fillna(0) * 100 
-    
-    res['pct_lag1'] = df['pct_chg'].iloc[-2] if len(df) >= 2 else 0
-    
     close = df['close']
     res['last_close'] = close.iloc[-1]
     res['last_open'] = df['open'].iloc[-1]
@@ -316,15 +304,15 @@ def compute_indicators(ts_code, end_date):
     dea = diff.ewm(span=9, adjust=False).mean()
     res['macd_val'] = ((diff - dea) * 2).iloc[-1]
     
-    res['ma5'] = close.tail(5).mean()
     res['ma20'] = close.tail(20).mean()
+    res['ma60'] = close.tail(60).mean()
     
     rsi_series = calculate_rsi(close, period=12)
     res['rsi_12'] = rsi_series.iloc[-1]
     
-    mom_series = calculate_mom(close, period=10)
-    res['mom'] = mom_series.iloc[-1]
-    
+    hist_60 = df.tail(60)
+    res['position_60d'] = (close.iloc[-1] - hist_60['low'].min()) / (hist_60['high'].max() - hist_60['low'].min() + 1e-9) * 100
+  
     return res
 
 @st.cache_data(ttl=3600*12)
@@ -338,9 +326,9 @@ def get_market_state(trade_date):
     return 'Strong' if latest_close > ma20 else 'Weak'
 
 # ---------------------------
-# 核心回测逻辑函数 (V36.14 完美风暴)
+# 核心回测逻辑函数 (V35 修改版)
 # ---------------------------
-def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MOM_LIMIT, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, MAX_PREV_PCT, MIN_PRICE):
+def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, MAX_PREV_PCT, MIN_PRICE):
     global GLOBAL_STOCK_INDUSTRY
     
     market_state = get_market_state(last_trade)
@@ -388,15 +376,11 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MOM_LIMIT, MAX_
     df['circ_mv_billion'] = df['circ_mv'] / 10000 
     
     df = df[~df['name'].str.contains('ST|退', na=False)]
-    df = df[~df['ts_code'].str.startswith('92')] 
+    df = df[~df['ts_code'].str.startswith('92')] # 排除北交所
     
     df = df[(df['close'] >= MIN_PRICE) & (df['close'] <= 2000.0)]
     df = df[(df['circ_mv_billion'] >= MIN_MV) & (df['circ_mv_billion'] <= MAX_MV)]
     df = df[df['turnover_rate'] <= MAX_TURNOVER_RATE] 
-
-    # [V36.14 核心: 拒绝大面，允许连板]
-    df = df[df['pct_chg'] > 4.5]
-    df = df[df['pct_chg'] < 10.5] # 拒追 20cm
 
     if len(df) == 0: return pd.DataFrame(), "过滤后无标的"
 
@@ -408,44 +392,35 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MOM_LIMIT, MAX_
             ind_code = GLOBAL_STOCK_INDUSTRY.get(row.ts_code)
             if ind_code and (ind_code not in strong_industry_codes): continue
         
+        if row.pct_chg > MAX_PREV_PCT: continue
+
         ind = compute_indicators(row.ts_code, last_trade)
         if not ind: continue
         d0_close = ind['last_close']
         d0_rsi = ind.get('rsi_12', 50)
-        d0_mom = ind.get('mom', 0)
-        d0_pct_lag1 = ind.get('pct_lag1', 0)
         
-        # [V36.14 核心逻辑: 解除 RSI 封印]
-        
-        # 1. 获利盘: > 75%
-        win_rate = chip_dict.get(row.ts_code, 50) 
-        if win_rate < 75.0: continue 
-        
-        # 2. 动量: > 7.0 (折中，比V36.13更强)
-        if d0_mom < 7.0: continue 
-        
-        # 3. RSI: 只过滤 < 50, 不设上限!
-        if d0_rsi < 50: continue
-        
-        # 4. 拒绝深坑
-        if d0_pct_lag1 < -3.0: continue
-        
-        # 5. 乖离率防守
-        if (d0_close / ind['ma5']) > 1.12: continue
+        if d0_rsi < 50: continue 
         
         if market_state == 'Weak':
             if d0_rsi > RSI_LIMIT: continue
             if d0_close < ind['ma20']: continue 
+            
+        if d0_close < ind['ma60']: continue
         
+        upper_shadow = (ind['last_high'] - d0_close) / d0_close * 100
+        if upper_shadow > MAX_UPPER_SHADOW: continue
         range_len = ind['last_high'] - ind['last_low']
         if range_len > 0:
             body_pos = (d0_close - ind['last_low']) / range_len
-            if body_pos < MIN_BODY_POS: continue 
+            if body_pos < MIN_BODY_POS: continue
+
+        win_rate = chip_dict.get(row.ts_code, 50) 
+        if win_rate < CHIP_MIN_WIN_RATE: continue
 
         future = get_future_prices(row.ts_code, last_trade, d0_close)
         records.append({
             'ts_code': row.ts_code, 'name': row.name, 'Close': row.close, 'Pct_Chg': row.pct_chg,
-            'rsi': d0_rsi, 'mom': d0_mom, 'pct_lag1': d0_pct_lag1, 'winner_rate': win_rate, 
+            'rsi': d0_rsi, 'winner_rate': win_rate, 
             'macd': ind['macd_val'], 'net_mf': row.net_mf,
             'Return_D1 (%)': future.get('Return_D1', np.nan),
             'Return_D3 (%)': future.get('Return_D3', np.nan),
@@ -457,20 +432,23 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MOM_LIMIT, MAX_
     if not records: return pd.DataFrame(), "深度筛选后无标的"
     fdf = pd.DataFrame(records)
     
-    # [V36.14 评分: 奖励高 RSI]
+    # [修复点] 确保 penalty 被初始化
     def dynamic_score(r):
-        base_score = r['mom'] * 20 + r['macd'] * 1000 + (r['net_mf'] / 10000)
+        base_score = r['macd'] * 1000 + (r['net_mf'] / 10000) 
+        penalty = 0 # <--- 修复处: 提前初始化 penalty
         
-        # V30 的灵魂: 奖励高 RSI (85+)
-        if r['rsi'] > 85: base_score += 2000
+        if r['winner_rate'] > 60: base_score += 1000
         
-        if r['winner_rate'] > 90: base_score += 1500
+        # 奖励 RSI 甜蜜区
+        if 55 < r['rsi'] < 80: base_score += 2000 
         
-        return base_score
+        if r['rsi'] > RSI_LIMIT: penalty += 500
+        return base_score - penalty
 
     fdf['Score'] = fdf.apply(dynamic_score, axis=1)
     
     final_df = fdf.sort_values('Score', ascending=False).head(TOP_BACKTEST).copy()
+    
     final_df.insert(0, 'Rank', range(1, len(final_df) + 1))
     
     return final_df, None
@@ -479,18 +457,18 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MOM_LIMIT, MAX_
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V36.14 完美风暴")
+    st.header("V35.1 修复版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数", value=30, step=1, help="建议30-50天")
-    TOP_BACKTEST = st.number_input("每日优选 TopK", value=4)
+    TOP_BACKTEST = st.number_input("每日优选 TopK", value=4, help="实盘重点看 Rank 1, 2, 4")
     
     st.markdown("---")
     RESUME_CHECKPOINT = st.checkbox("🔥 开启断点续传", value=True)
     if st.button("🗑️ 清除行情缓存"):
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
-            st.success("缓存已清除。")
-    CHECKPOINT_FILE = "backtest_checkpoint_v36_14.csv"
+            st.success("缓存已清除，下次运行将重新下载最新数据。")
+    CHECKPOINT_FILE = "backtest_checkpoint_v35.csv" 
     
     st.markdown("---")
     st.subheader("💰 基础过滤")
@@ -500,17 +478,16 @@ with st.sidebar:
     MAX_MV = st.number_input("最大市值(亿)", value=1000.0)
     
     st.markdown("---")
-    st.subheader("⚔️ 核心风控参数")
-    CHIP_MIN_WIN_RATE = st.number_input("最低获利盘 (%)", value=75.0)
-    MOM_LIMIT = st.number_input("最低 MOM", value=7.0, help="V36.14: > 7.0")
-    RSI_LIMIT = st.number_input("RSI 拦截线", value=100.0)
+    st.subheader("⚔️ 核心风控参数 (V35)")
+    CHIP_MIN_WIN_RATE = st.number_input("最低获利盘 (%)", value=40.0, help="V35建议: 40-50%")
+    MAX_PREV_PCT = st.number_input("昨日最大涨幅限制 (%)", value=10.0)
+    RSI_LIMIT = st.number_input("RSI 拦截线 (建议100)", value=100.0)
     
     st.markdown("---")
     st.subheader("📊 形态参数")
-    st.info("解除 RSI 上限，拒追 20cm")
     SECTOR_THRESHOLD = st.number_input("板块涨幅 (%)", value=1.0)
     MAX_UPPER_SHADOW = st.number_input("上影线 (%)", value=6.0) 
-    MIN_BODY_POS = st.number_input("实体位置", value=0.6) 
+    MIN_BODY_POS = st.number_input("实体位置", value=0.5) 
     MAX_TURNOVER_RATE = st.number_input("换手率 (%)", value=20.0)
 
 TS_TOKEN = st.text_input("Tushare Token", type="password")
@@ -518,7 +495,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V36.14"):
+if st.button(f"🚀 启动 V35.1"):
     processed_dates = set()
     results = []
     
@@ -548,7 +525,7 @@ if st.button(f"🚀 启动 V36.14"):
         bar = st.progress(0, text="回测引擎启动...")
         
         for i, date in enumerate(dates_to_run):
-            res, err = run_backtest_for_a_day(date, int(TOP_BACKTEST), 100, MOM_LIMIT, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, 999, MIN_PRICE)
+            res, err = run_backtest_for_a_day(date, int(TOP_BACKTEST), 100, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, MAX_PREV_PCT, MIN_PRICE)
             if not res.empty:
                 res['Trade_Date'] = date
                 is_first = not os.path.exists(CHECKPOINT_FILE)
@@ -565,7 +542,7 @@ if st.button(f"🚀 启动 V36.14"):
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         all_res = all_res.sort_values(['Trade_Date', 'Rank'], ascending=[False, True])
         
-        st.header(f"📊 V36.14 统计仪表盘 (Top {TOP_BACKTEST})")
+        st.header(f"📊 V35.1 统计仪表盘 (Top {TOP_BACKTEST})")
         cols = st.columns(3)
         for idx, n in enumerate([1, 3, 5]):
             col_name = f'Return_D{n} (%)'
@@ -579,7 +556,7 @@ if st.button(f"🚀 启动 V36.14"):
         
         show_cols = ['Rank', 'Trade_Date','name','ts_code','Close','Pct_Chg',
              'Return_D1 (%)', 'Return_D3 (%)', 'Return_D5 (%)',
-                        'rsi','mom','pct_lag1','winner_rate','Sector_Boost']
+                        'rsi','winner_rate','Sector_Boost']
         final_cols = [c for c in show_cols if c in all_res.columns]
     
         st.dataframe(all_res[final_cols], use_container_width=True)
