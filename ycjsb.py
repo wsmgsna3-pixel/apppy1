@@ -12,16 +12,14 @@ warnings.filterwarnings("ignore")
 # ==========================================
 # 1. 页面配置
 # ==========================================
-st.set_page_config(page_title="潜龙 V30·形态大师", layout="wide")
-st.title("🐉 潜龙 V30·形态大师 (K线形态+趋势共振)")
+st.set_page_config(page_title="潜龙 V31·先知", layout="wide")
+st.title("🐉 潜龙 V31·先知 (RSI低位潜伏+蚂蚁上树)")
 st.markdown("""
-**策略核心：在 V29 的基础上，增加对"主力试盘"形态的识别**
-1.  **形态包容**：
-    * 🗡️ **仙人指路**：允许长上影线 (主力试盘)。
-    * 🔄 **阳包阴**：反包昨日阴线 (弱转强)。
-    * 📈 **中阳线**：涨幅 > 3.5% (保留 V29 逻辑)。
-2.  **趋势抢跑**：**RSI > 45** (更早介入) + **获利盘 > 50%**。
-3.  **目标**：不仅抓到利通电子，还要把田中精机这种"带刺"的玫瑰也摘下来。
+**策略核心：针对"替补策略"的滞后性进行逆向改造**
+1.  **RSI 抢跑**：锁定 **RSI 40-60** 区间 (拒绝 RSI>90 的鱼尾)。
+2.  **筹码低位**：锁定 **获利盘 20%-60%** (主力刚建仓，还未派发)。
+3.  **经典形态**：**蚂蚁上树** (连续3天小阳线，温和放量)。
+4.  **目标**：在主力大拉升前的"静默期"提前 3-5 天进场。
 """)
 
 DATA_FILE = "market_data_store.csv"
@@ -93,7 +91,7 @@ def sync_market_data(token, start_date, end_date):
         return pd.DataFrame(), "无数据"
 
 # ==========================================
-# 3. 策略逻辑 (形态大师)
+# 3. 策略逻辑 (先知)
 # ==========================================
 def calculate_strategy(df_all, df_info):
     if 'industry' not in df_all.columns:
@@ -120,53 +118,49 @@ def calculate_strategy(df_all, df_info):
     df['high_20'] = df.groupby('ts_code')['high'].transform(lambda x: x.rolling(20).max())
     df['winner_rate'] = (df['close'] - df['low_20']) / (df['high_20'] - df['low_20'] + 0.0001) * 100
     
-    # === K线形态识别 ===
-    # 实体长度
-    df['body'] = (df['close'] - df['open']).abs()
-    # 上影线
-    df['upper_shadow'] = df['high'] - df[['close', 'open']].max(axis=1)
-    # 昨日数据
-    df['close_pre'] = df.groupby('ts_code')['close'].shift(1)
-    df['open_pre'] = df.groupby('ts_code')['open'].shift(1)
+    # 连续涨跌幅 (用于识别蚂蚁上树)
+    df['pct_lag1'] = df.groupby('ts_code')['pct_chg'].shift(1)
+    df['pct_lag2'] = df.groupby('ts_code')['pct_chg'].shift(2)
     
-    # 形态1: 中阳线 (V29)
-    cond_k1 = df['pct_chg'] > 3.5
+    # === 1. 形态: 蚂蚁上树 ===
+    # 连续 3 天都是阳线，且涨幅温和 (0-4%)
+    # 这种形态通常是主力吸筹
+    cond_ant = (df['pct_chg'] > 0) & (df['pct_chg'] < 4.0) & \
+               (df['pct_lag1'] > 0) & (df['pct_lag1'] < 4.0) & \
+               (df['pct_lag2'] > 0) & (df['pct_lag2'] < 4.0)
+               
+    # === 2. RSI 黄金起步区 ===
+    # 40-60: 刚刚脱离底部，还没加速，是最佳潜伏区
+    cond_rsi = (df['rsi_6'] >= 40) & (df['rsi_6'] <= 65)
     
-    # 形态2: 仙人指路 (长上影, 实体虽小但趋势向上)
-    # 上影线 > 实体的0.5倍, 且今日收阳
-    cond_k2 = (df['upper_shadow'] > df['body'] * 0.5) & (df['close'] > df['open']) & (df['pct_chg'] > 1.0)
+    # === 3. 获利盘低位 ===
+    # 20-60%: 主力有底仓，但还没到派发期
+    cond_winner = (df['winner_rate'] >= 20) & (df['winner_rate'] <= 60)
     
-    # 形态3: 阳包阴 (弱转强)
-    # 今天收盘 > 昨天开盘, 昨天是阴线
-    cond_k3 = (df['close'] > df['open_pre']) & (df['close_pre'] < df['open_pre'])
-    
-    cond_pattern = cond_k1 | cond_k2 | cond_k3
-    
-    # === 筛选逻辑 ===
-    # 1. 趋势: 站上 MA20
+    # === 4. 趋势护航 ===
+    # 股价站上 MA20 (生命线)
     cond_trend = df['close'] > df['ma20']
     
-    # 2. RSI: > 45 (放宽)
-    cond_rsi = df['rsi_6'] > 45
-    
-    # 3. 获利盘: > 50%
-    cond_winner = df['winner_rate'] > 50
-    
-    # 4. 市值
+    # === 5. 资金 ===
+    # 量比 > 0.8 (不能完全没量)
+    cond_vol = df['volume_ratio'] > 0.8
+    # 市值覆盖
     cond_mv = (df['circ_mv'] >= 30*10000) & (df['circ_mv'] <= 800*10000)
     
     # 综合信号
-    df['is_signal'] = cond_pattern & cond_trend & cond_rsi & cond_winner & cond_mv
+    df['is_signal'] = cond_ant & cond_rsi & cond_winner & cond_trend & cond_vol & cond_mv
     
-    # 标记形态
-    df['pattern_type'] = np.where(cond_k3, '阳包阴', np.where(cond_k2, '仙人指路', '中阳启动'))
+    # 评分 (RSI 越接近 50 越好? 不，RSI 越高说明启动越快，但不能超过 65)
+    # 我们按"获利盘"排序，越低越好? 也不一定。
+    # 我们按"量比"排序，量比放大说明主力开始干活了。
+    df['score'] = df['volume_ratio']
     
     return df
 
 # ==========================================
 # 4. 回测逻辑
 # ==========================================
-def run_backtest_pm(df_signals, df_all, cal_dates):
+def run_backtest_prophet(df_signals, df_all, cal_dates):
     df_lookup = df_all.copy()
     if 'ma10' not in df_lookup.columns:
          df_lookup['ma10'] = df_lookup.groupby('ts_code')['close'].transform(lambda x: x.rolling(10).mean())
@@ -197,7 +191,7 @@ def run_backtest_pm(df_signals, df_all, cal_dates):
         trade = {
             '信号日': signal_date, '代码': code, '名称': row.name, 
             '行业': row.industry, '买入价': buy_price, 
-            '形态': row.pattern_type,
+            'RSI': f"{row.rsi_6:.1f}", '获利盘': f"{row.winner_rate:.0f}%",
             '状态': '持有'
         }
         
@@ -234,22 +228,22 @@ def run_backtest_pm(df_signals, df_all, cal_dates):
 # 5. 主程序
 # ==========================================
 with st.sidebar:
-    st.header("⚙️ V30 形态大师")
+    st.header("⚙️ V31 先知")
     user_token = st.text_input("Tushare Token:", type="password")
     
     days_back = st.slider("回测天数", 30, 150, 60)
     end_date_input = st.date_input("截止日期", datetime.now().date())
     
     st.markdown("---")
-    st.info("🎨 识别形态")
+    st.info("🔮 潜伏参数")
     st.markdown("""
-    * **仙人指路**: 抓主力试盘
-    * **阳包阴**: 抓弱转强
-    * **中阳线**: 抓正常启动
+    * **RSI**: 40-65 (拒绝过热)
+    * **获利盘**: 20-60% (拒绝高位)
+    * **形态**: 蚂蚁上树 (3连小阳)
     """)
     top_n = st.number_input("每日优选 (Top N)", 1, 10, 5)
     
-    run_btn = st.button("🚀 启动V30")
+    run_btn = st.button("🚀 启动先知")
 
 if run_btn:
     if not user_token:
@@ -266,7 +260,7 @@ if run_btn:
             df_all = res
             st.success(f"✅ 数据加载: {len(df_all):,} 行")
             
-            with st.spinner("扫描K线形态..."):
+            with st.spinner("寻找潜伏机会..."):
                 df_calc = calculate_strategy(df_all, df_info)
                 
             cal_dates = sorted(df_calc['trade_date'].unique())
@@ -274,24 +268,21 @@ if run_btn:
             
             df_signals = df_calc[(df_calc['trade_date'].isin(valid_dates)) & (df_calc['is_signal'])].copy()
             
-            # 排序: 优先看"反包"和"指路"这种特殊形态，其次看涨幅
-            df_signals['score'] = np.where(df_signals['pattern_type'] == '阳包阴', 3, 
-                                  np.where(df_signals['pattern_type'] == '仙人指路', 2, 1))
-            # 同分按RSI排
-            df_signals = df_signals.sort_values(['trade_date', 'score', 'rsi_6'], ascending=[True, False, False])
+            # 排序: 量比越大越好 (说明主力在蚂蚁上树时已经在偷偷放量)
+            df_signals = df_signals.sort_values(['trade_date', 'volume_ratio'], ascending=[True, False])
             
             df_signals['排名'] = df_signals.groupby('trade_date').cumcount() + 1
             df_top = df_signals[df_signals['排名'] <= top_n].copy()
             
-            st.write(f"⚪ 形态信号: **{len(df_top)}** 个")
+            st.write(f"⚪ 先知信号: **{len(df_top)}** 个")
             
             if not df_top.empty:
-                df_res = run_backtest_pm(df_top, df_calc, cal_dates)
+                df_res = run_backtest_prophet(df_top, df_calc, cal_dates)
                 
                 if not df_res.empty:
                     st.success(f"🎯 成交单数: **{len(df_res)}**")
                     
-                    st.markdown(f"### 📊 V30 回测 (形态+趋势)")
+                    st.markdown(f"### 📊 V31 回测 (RSI低位+蚂蚁上树)")
                     cols = st.columns(5)
                     days = ['D+1', 'D+3', 'D+5', 'D+7', 'D+10']
                     for idx, d in enumerate(days):
