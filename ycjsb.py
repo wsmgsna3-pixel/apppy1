@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-主力策略 · V36.5 大道至简版 (通用抢跑逻辑)
+主力策略 · V36.6 准龙头 (基于 V35.1 框架的参数平移)
 ------------------------------------------------
-设计理念: 拒绝过拟合，回归 V35.1 的成功路径。
-核心修改:
-1. **获利盘下沉**：从 80% 降至 50% (与 V35.1 保持一致的低位逻辑)。
-2. **MOM 抢跑**：从 10 降至 3.0 (趋势刚抬头就介入)。
-3. **保留主力特色**：依然看重 **量比** 和 **资金流** (区别于替补策略)。
-4. **目标**：在主力资金刚开始加速时进场，而不是等加速完了再进。
+核心理念: 复制 V35.1 的成功基因，只调整参数以适配"强庄股"。
+修改记录:
+1. **获利盘上移**：> 40% -> > 60% (确保突破关键压力位)。
+2. **RSI 甜蜜区上移**：55-80 -> 70-90 (瞄准主升浪加速段)。
+3. **动量增强**：评分系统中加大 MOM 的权重。
+4. **量能确认**：新增量比 > 1.2 (拒绝无量空涨)。
+5. **底座一致**：保留 V35.1 的 MACD、资金流评分，确保稳健性。
 ------------------------------------------------
 """
 
@@ -36,8 +37,8 @@ GLOBAL_STOCK_INDUSTRY = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="主力策略 V36.5 大道至简", layout="wide")
-st.title("主力策略 V36.5：大道至简 (通用抢跑版)")
+st.set_page_config(page_title="主力策略 V36.6 准龙头", layout="wide")
+st.title("主力策略 V36.6：准龙头 (V35.1 激进版)")
 
 # ---------------------------
 # 基础 API 函数
@@ -267,6 +268,7 @@ def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[1, 3, 5
     next_open = d1_data['open']
     next_high = d1_data['high']
     
+    # [继承 V35.1] 买入条件: 高开 + 1.5%
     if next_open <= d0_qfq_close: return results 
     target_buy_price = next_open * 1.015
     if next_high < target_buy_price: return results
@@ -319,7 +321,6 @@ def compute_indicators(ts_code, end_date):
     mom_series = calculate_mom(close, period=10)
     res['mom'] = mom_series.iloc[-1]
     
-    # 依然保留量比，这是主力资金的灵魂
     vol_ma5 = df['vol'].rolling(5).mean().iloc[-1]
     res['vol_ratio'] = df['vol'].iloc[-1] / (vol_ma5 + 1)
     
@@ -336,7 +337,7 @@ def get_market_state(trade_date):
     return 'Strong' if latest_close > ma20 else 'Weak'
 
 # ---------------------------
-# 核心回测逻辑函数 (V36.5 大道至简)
+# 核心回测逻辑函数 (V36.6 准龙头)
 # ---------------------------
 def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MOM_LIMIT, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, MAX_PREV_PCT, MIN_PRICE):
     global GLOBAL_STOCK_INDUSTRY
@@ -392,7 +393,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MOM_LIMIT, MAX_
     df = df[(df['circ_mv_billion'] >= MIN_MV) & (df['circ_mv_billion'] <= MAX_MV)]
     df = df[df['turnover_rate'] <= MAX_TURNOVER_RATE] 
 
-    # [V36.5 涨幅下调] 放宽到 3.5%
+    # [V36.6 涨幅要求]
     df = df[df['pct_chg'] > 3.5]
 
     if len(df) == 0: return pd.DataFrame(), "过滤后无标的"
@@ -412,30 +413,29 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MOM_LIMIT, MAX_
         d0_mom = ind.get('mom', 0)
         d0_vol = ind.get('vol_ratio', 1.0)
         
-        # [V36.5 大道至简 核心逻辑]
+        # [V36.6 准龙头 核心逻辑]
         
-        # 1. MOM 抢跑: > 3.0 即可 (趋势转正)
-        if d0_mom < MOM_LIMIT: continue 
+        # 1. 获利盘: > 60% (比V35.1高，比V30低)
+        win_rate = chip_dict.get(row.ts_code, 50) 
+        if win_rate < 60.0: continue 
         
-        # 2. RSI: 55+ 即可 (不要求 >90, 也不要 <50)
-        if d0_rsi < 55: continue
+        # 2. RSI: 不设硬性上限，只过滤太弱的
+        if d0_rsi < 60: continue
         
-        # 3. 量能: 必须有量 (>1.0 即可, 不苛求 1.2)
-        if d0_vol < 1.0: continue
+        # 3. 量能: 必须放量 (主力特征)
+        if d0_vol < 1.2: continue
+        
+        # 4. 动量: 只要是正的就行，不设太高门槛
+        if d0_mom < 2.0: continue
         
         if market_state == 'Weak':
             if d0_rsi > RSI_LIMIT: continue
             if d0_close < ind['ma20']: continue 
         
-        # 实体位置保持 0.6 (只买强势收盘)
         range_len = ind['last_high'] - ind['last_low']
         if range_len > 0:
             body_pos = (d0_close - ind['last_low']) / range_len
             if body_pos < MIN_BODY_POS: continue 
-
-        # 4. 获利盘抢跑: > 50%
-        win_rate = chip_dict.get(row.ts_code, 50) 
-        if win_rate < CHIP_MIN_WIN_RATE: continue 
 
         future = get_future_prices(row.ts_code, last_trade, d0_close)
         records.append({
@@ -452,19 +452,24 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MOM_LIMIT, MAX_
     if not records: return pd.DataFrame(), "深度筛选后无标的"
     fdf = pd.DataFrame(records)
     
-    # [V36.5 评分: 动量 + 资金流]
-    # 既然是主力策略，就看谁的钱多、谁冲得快
+    # [V36.6 评分: V35.1 基础 + 激进参数]
     def dynamic_score(r):
-        # 动量权重加大
-        base_score = r['mom'] * 50 + r['net_mf'] / 5000
+        # 继承 V35.1 的 MACD + 资金流 底座 (稳健)
+        base_score = r['macd'] * 1000 + (r['net_mf'] / 10000)
+        penalty = 0
         
-        # 奖励 RSI 甜蜜区 (参考 V35.1)
-        if 60 < r['rsi'] < 85: base_score += 1500
+        # 奖励 RSI 准龙头区 (70-90)
+        # 比 V35.1 (55-80) 更高，因为我们要抓加速段
+        if 70 < r['rsi'] < 90: base_score += 2000
         
-        # 奖励放量
-        if r['vol_ratio'] > 1.5: base_score += 1000
+        # 奖励动量 (V35.1 不看 MOM)
+        if r['mom'] > 5.0: base_score += 500
         
-        return base_score
+        # 奖励获利盘高位
+        if r['winner_rate'] > 80: base_score += 1000
+        
+        if r['rsi'] > RSI_LIMIT: penalty += 500
+        return base_score - penalty
 
     fdf['Score'] = fdf.apply(dynamic_score, axis=1)
     
@@ -477,7 +482,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MOM_LIMIT, MAX_
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V36.5 大道至简")
+    st.header("V36.6 准龙头")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数", value=30, step=1, help="建议30-50天")
     TOP_BACKTEST = st.number_input("每日优选 TopK", value=4)
@@ -488,7 +493,7 @@ with st.sidebar:
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
             st.success("缓存已清除。")
-    CHECKPOINT_FILE = "backtest_checkpoint_v36_5.csv"
+    CHECKPOINT_FILE = "backtest_checkpoint_v36_6.csv"
     
     st.markdown("---")
     st.subheader("💰 基础过滤")
@@ -498,14 +503,13 @@ with st.sidebar:
     MAX_MV = st.number_input("最大市值(亿)", value=1000.0)
     
     st.markdown("---")
-    st.subheader("⚔️ 核心风控参数 (抢跑版)")
-    CHIP_MIN_WIN_RATE = st.number_input("最低获利盘 (%)", value=50.0, help="V36.5建议: 50%")
-    MOM_LIMIT = st.number_input("最低 MOM", value=3.0, help="V36.5建议: 3.0 (趋势转正)")
+    st.subheader("⚔️ 核心风控参数 (准龙头)")
+    CHIP_MIN_WIN_RATE = st.number_input("最低获利盘 (%)", value=60.0, help="V36.6建议: 60%")
+    MOM_LIMIT = st.number_input("最低 MOM", value=2.0)
     RSI_LIMIT = st.number_input("RSI 拦截线", value=100.0)
     
     st.markdown("---")
     st.subheader("📊 形态参数")
-    st.info("涨幅门槛放宽至 3.5%")
     SECTOR_THRESHOLD = st.number_input("板块涨幅 (%)", value=1.0)
     MAX_UPPER_SHADOW = st.number_input("上影线 (%)", value=6.0) 
     MIN_BODY_POS = st.number_input("实体位置", value=0.6) 
@@ -516,7 +520,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V36.5"):
+if st.button(f"🚀 启动 V36.6"):
     processed_dates = set()
     results = []
     
@@ -546,7 +550,7 @@ if st.button(f"🚀 启动 V36.5"):
         bar = st.progress(0, text="回测引擎启动...")
         
         for i, date in enumerate(dates_to_run):
-            # 注意: V36.5 涨幅下调，MOM下调，获利盘下调
+            # 注意: V36.6 使用准龙头参数
             res, err = run_backtest_for_a_day(date, int(TOP_BACKTEST), 100, MOM_LIMIT, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, 999, MIN_PRICE)
             if not res.empty:
                 res['Trade_Date'] = date
@@ -564,7 +568,7 @@ if st.button(f"🚀 启动 V36.5"):
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         all_res = all_res.sort_values(['Trade_Date', 'Rank'], ascending=[False, True])
         
-        st.header(f"📊 V36.5 统计仪表盘 (Top {TOP_BACKTEST})")
+        st.header(f"📊 V36.6 统计仪表盘 (Top {TOP_BACKTEST})")
         cols = st.columns(3)
         for idx, n in enumerate([1, 3, 5]):
             col_name = f'Return_D{n} (%)'
