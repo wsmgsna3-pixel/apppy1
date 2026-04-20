@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V35.1 紧急修复版 (修复 UnboundLocalError)
+选股王 · V35.1 验证版 (测低开反包 + 解除日期限制)
 ------------------------------------------------
-修复记录:
-1. [修复] 修复 dynamic_score 中 penalty 变量未初始化导致的闪退 Bug。
-2. [保持] V35.0 的所有抢跑逻辑 (获利盘>40%, RSI 55-80 加分)。
-3. [修改] 验证“弱转强”版本：取消低开及 1.5% 冲高买入限制，无差别记录所有入选股票的后续走势。
+修复与修改记录:
+1. [保持] V35.0 的所有抢跑逻辑 (获利盘>40%, RSI 55-80 加分)。
+2. [修改] 取消低开拦截及 1.5% 冲高买入限制，无差别以 D+1 开盘价记录所有入选股票的后续走势。
+3. [修改] 解除回测日历强制回退 15 天的限制，所选即所得。
 ------------------------------------------------
 """
 
@@ -223,7 +223,7 @@ def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[1, 3, 5
     d1_data = hist.iloc[0]
     next_open = d1_data['open']
     
-    # 【核心修改】：无条件记录！取消低开拦截，取消 1.5% 冲高拦截。统一按 D+1 的开盘价作为基准。
+    # 【核心修改】：无条件记录！取消低开拦截，取消 1.5% 冲高拦截。统一按 D+1 的开盘价作为基准测算真实收益。
     target_buy_price = next_open
         
     for n in days_ahead:
@@ -393,7 +393,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     # [修复点] 确保 penalty 被初始化
     def dynamic_score(r):
         base_score = r['macd'] * 1000 + (r['net_mf'] / 10000) 
-        penalty = 0 # <--- 修复处: 提前初始化 penalty
+        penalty = 0 
         
         if r['winner_rate'] > 60: base_score += 1000
         
@@ -415,7 +415,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V35.1 修复版")
+    st.header("V35.1 全记录验证版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数", value=30, step=1, help="建议30-50天")
     TOP_BACKTEST = st.number_input("每日优选 TopK", value=4, help="实盘重点看 Rank 1, 2, 4")
@@ -458,12 +458,13 @@ if st.button(f"🚀 启动 V35.1"):
     end_date_str = backtest_date_end.strftime("%Y%m%d")
     
     with st.spinner("获取交易日历..."):
-        dates_to_run = get_trade_days(end_date_str, int(BACKTEST_DAYS) + 15) 
+        # 【核心修改】：取消强制回退15天，所见即所得。最新几天的 D+3/D+5 没走完自然留白，属正常现象。
+        dates_to_run = get_trade_days(end_date_str, int(BACKTEST_DAYS)) 
         if not dates_to_run:
             st.error("获取日历失败，请检查网络或 Token 额度。")
             st.stop()
         
-        test_dates = dates_to_run[15:] 
+        test_dates = dates_to_run 
         
     st.success(f"🗓️ 将回测 {len(test_dates)} 个交易日: {test_dates[-1]} 到 {test_dates[0]}")
     
