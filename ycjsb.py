@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V35.1 验证版 (测低开反包 + 解除日期限制)
+选股王 · V35.1 紧急修复版 (修复 UnboundLocalError)
 ------------------------------------------------
-修复与修改记录:
-1. [保持] V35.0 的所有抢跑逻辑 (获利盘>40%, RSI 55-80 加分)。
-2. [修改] 取消低开拦截及 1.5% 冲高买入限制，无差别以 D+1 开盘价记录所有入选股票的后续走势。
-3. [修改] 解除回测日历强制回退 15 天的限制，所选即所得。
+修复记录:
+1. [修复] 修复 dynamic_score 中 penalty 变量未初始化导致的闪退 Bug。
+2. [保持] V35.0 的所有抢跑逻辑 (获利盘>40%, RSI 55-80 加分)。
+3. [升级] 增加“未触发股票”的后续全量记录 (Dashboard仅统计触发买入的股票，CSV记录所有股票)。
 ------------------------------------------------
 """
 
@@ -34,8 +34,8 @@ GLOBAL_STOCK_INDUSTRY = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V35.1 验证版", layout="wide")
-st.title("选股王 V35.1：全量记录验证版 (测低开反包)")
+st.set_page_config(page_title="选股王 V35.1 修复版", layout="wide")
+st.title("选股王 V35.1：抢跑修复版 (含未触发股对照记录)")
 
 # ---------------------------
 # 基础 API 函数
@@ -222,9 +222,16 @@ def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[1, 3, 5
     
     d1_data = hist.iloc[0]
     next_open = d1_data['open']
+    next_high = d1_data['high']
     
-    # 【核心修改】：无条件记录！取消低开拦截，取消 1.5% 冲高拦截。统一按 D+1 的开盘价作为基准测算真实收益。
-    target_buy_price = next_open
+    # 核心判断逻辑：判断是否符合“高开且冲高1.5%”的原买入纪律
+    triggered = 'Yes'
+    target_buy_price = next_open * 1.015
+    
+    if next_open <= d0_qfq_close or next_high < target_buy_price:
+        triggered = 'No'
+        # 对于不符合条件的股票，仅以次日开盘价为基准进行跟踪（用于研究，不计入仪表盘成绩）
+        target_buy_price = next_open 
         
     for n in days_ahead:
         col = f'Return_D{n}'
@@ -233,6 +240,9 @@ def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[1, 3, 5
             results[col] = (sell_price - target_buy_price) / target_buy_price * 100
         else:
             results[col] = np.nan
+            
+    # 将是否触发标记写入字典
+    results['Buy_Triggered'] = triggered
     return results
 
 def calculate_rsi(series, period=12):
@@ -380,6 +390,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
             'ts_code': row.ts_code, 'name': row.name, 'Close': row.close, 'Pct_Chg': row.pct_chg,
             'rsi': d0_rsi, 'winner_rate': win_rate, 
             'macd': ind['macd_val'], 'net_mf': row.net_mf,
+            'Buy_Triggered': future.get('Buy_Triggered', 'No'),
             'Return_D1 (%)': future.get('Return_D1', np.nan),
             'Return_D3 (%)': future.get('Return_D3', np.nan),
             'Return_D5 (%)': future.get('Return_D5', np.nan),
@@ -415,7 +426,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V35.1 全记录验证版")
+    st.header("V35.1 修复版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数", value=30, step=1, help="建议30-50天")
     TOP_BACKTEST = st.number_input("每日优选 TopK", value=4, help="实盘重点看 Rank 1, 2, 4")
@@ -458,16 +469,17 @@ if st.button(f"🚀 启动 V35.1"):
     end_date_str = backtest_date_end.strftime("%Y%m%d")
     
     with st.spinner("获取交易日历..."):
-        # 【核心修改】：取消强制回退15天，所见即所得。最新几天的 D+3/D+5 没走完自然留白，属正常现象。
-        dates_to_run = get_trade_days(end_date_str, int(BACKTEST_DAYS)) 
+        # 核心修复：多下载 120 天数据确保 MA60 计算通过，但只测指定的分析天数，避免偏移报错
+        dates_to_run = get_trade_days(end_date_str, int(BACKTEST_DAYS) + 120) 
         if not dates_to_run:
             st.error("获取日历失败，请检查网络或 Token 额度。")
             st.stop()
         
-        test_dates = dates_to_run 
+        test_dates = dates_to_run[:int(BACKTEST_DAYS)] 
         
     st.success(f"🗓️ 将回测 {len(test_dates)} 个交易日: {test_dates[-1]} 到 {test_dates[0]}")
     
+    # 获取全量数据 (包含历史垫料)
     if not get_all_historical_data(dates_to_run):
         st.stop()
 
@@ -512,18 +524,25 @@ if st.button(f"🚀 启动 V35.1"):
         
         st.header(f"📊 V35.1 统计仪表盘 (Top {TOP_BACKTEST})")
         cols = st.columns(3)
+        
+        # 核心修改：为了保持原有胜率的真实性，仪表盘统计强制只过滤出【符合买入条件】的记录
+        valid_buys = all_res[all_res['Buy_Triggered'] == 'Yes']
+        
         for idx, n in enumerate([1, 3, 5]):
             col_name = f'Return_D{n} (%)'
-            valid = all_res.dropna(subset=[col_name]) 
+            valid = valid_buys.dropna(subset=[col_name]) 
             if not valid.empty:
                 avg = valid[col_name].mean()
                 win = (valid[col_name] > 0).mean() * 100
                 cols[idx].metric(f"D+{n} 均益 / 胜率", f"{avg:.2f}% / {win:.1f}%")
+            else:
+                cols[idx].metric(f"D+{n} 均益 / 胜率", "0.00% / 0.0%")
  
         st.subheader("📋 回测清单")
         
+        # 增加 Buy_Triggered 到显示列
         show_cols = ['Rank', 'Trade_Date','name','ts_code','Close','Pct_Chg',
-             'Return_D1 (%)', 'Return_D3 (%)', 'Return_D5 (%)', 
+             'Buy_Triggered', 'Return_D1 (%)', 'Return_D3 (%)', 'Return_D5 (%)', 
              'rsi', 'winner_rate', 'Sector_Boost']
         
         exist_cols = [c for c in show_cols if c in all_res.columns]
