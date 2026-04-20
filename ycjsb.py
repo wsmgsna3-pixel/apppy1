@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V35.1 紧急修复版 (修复 UnboundLocalError)
+选股王 · V35.1 终极全量验证版
 ------------------------------------------------
 修复记录:
-1. [修复] 修复 dynamic_score 中 penalty 变量未初始化导致的闪退 Bug。
-2. [保持] V35.0 的所有抢跑逻辑 (获利盘>40%, RSI 55-80 加分)。
-3. [升级] 增加“未触发股票”的后续全量记录 (Dashboard仅统计触发买入的股票，CSV记录所有股票)。
+1. 恢复逐日下载逻辑，解决 Tushare 单次 5000 条限制导致的均线计算失败。
+2. 增加 Buy_Triggered 标签，分别处理仪表盘和 CSV。
 ------------------------------------------------
 """
 
@@ -16,7 +15,6 @@ import tushare as ts
 from datetime import datetime, timedelta
 import warnings
 import time
-import concurrent.futures 
 import os
 import pickle
 
@@ -57,7 +55,7 @@ def safe_get(func_name, **kwargs):
                 
                 if df is not None and not df.empty:
                     return df
-                time.sleep(0.5)
+                time.sleep(0.3)
             except:
                 time.sleep(1)
                 continue
@@ -76,12 +74,6 @@ def get_trade_days(end_date_str, num_days):
     trade_days_df = cal[cal['is_open'] == 1].sort_values('cal_date', ascending=False)
     trade_days_df = trade_days_df[trade_days_df['cal_date'] <= end_date_str]
     return trade_days_df['cal_date'].head(num_days).tolist()
-
-@st.cache_data(ttl=3600*24)
-def fetch_and_cache_daily_data(date):
-    adj_df = safe_get('adj_factor', trade_date=date)
-    daily_df = safe_get('daily', trade_date=date)
-    return {'adj': adj_df, 'daily': daily_df}
 
 @st.cache_data(ttl=3600*24*7) 
 def load_industry_mapping():
@@ -138,16 +130,22 @@ def get_all_historical_data(trade_days_list, use_cache=True):
         except Exception as e:
             st.error("缓存读取失败，将重新下载。")
 
-    start_d = trade_days_list[-1]
-    end_d = trade_days_list[0]
+    st.info(f"正在从 Tushare 逐日下载 {len(trade_days_list)} 天的全量行情数据 (需要几分钟，请耐心等待)...")
     
-    st.info(f"正在从 Tushare 下载 {start_d} 到 {end_d} 全量日线及复权因子，请耐心等待...")
+    # 【修复核心】：恢复原来的逐日下载循环，绕过 5000 条限制！
+    adj_list = []
+    daily_list = []
+    bar = st.progress(0, text="逐日下载数据中...")
     
-    with st.spinner("📦 下载全市场复权因子中..."):
-        GLOBAL_ADJ_FACTOR = safe_get('adj_factor', start_date=start_d, end_date=end_d)
+    for i, d in enumerate(trade_days_list):
+        adj_list.append(safe_get('adj_factor', trade_date=d))
+        daily_list.append(safe_get('daily', trade_date=d))
+        bar.progress((i + 1) / len(trade_days_list), text=f"下载进度: {d} ({i+1}/{len(trade_days_list)})")
+        
+    bar.empty()
     
-    with st.spinner("📦 下载全市场日线行情中..."):
-        GLOBAL_DAILY_RAW = safe_get('daily', start_date=start_d, end_date=end_d)
+    GLOBAL_ADJ_FACTOR = pd.concat(adj_list, ignore_index=True) if adj_list else pd.DataFrame()
+    GLOBAL_DAILY_RAW = pd.concat(daily_list, ignore_index=True) if daily_list else pd.DataFrame()
         
     if GLOBAL_ADJ_FACTOR.empty or GLOBAL_DAILY_RAW.empty:
         st.error("下载失败，请检查网络或 Token 权限。")
@@ -173,8 +171,6 @@ def get_all_historical_data(trade_days_list, use_cache=True):
 
     return True
 
-def fetch_worker(date):
-    return fetch_and_cache_daily_data(date)
 
 def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
     global GLOBAL_ADJ_FACTOR, GLOBAL_DAILY_RAW, GLOBAL_QFQ_BASE_FACTORS
@@ -224,13 +220,13 @@ def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[1, 3, 5
     next_open = d1_data['open']
     next_high = d1_data['high']
     
-    # 核心判断逻辑：判断是否符合“高开且冲高1.5%”的原买入纪律
+    # 判断是否符合“高开且冲高1.5%”的原买入纪律
     triggered = 'Yes'
     target_buy_price = next_open * 1.015
     
     if next_open <= d0_qfq_close or next_high < target_buy_price:
         triggered = 'No'
-        # 对于不符合条件的股票，仅以次日开盘价为基准进行跟踪（用于研究，不计入仪表盘成绩）
+        # 不符合条件的，仅记录用于分析低开反包，按次日开盘价基准算收益
         target_buy_price = next_open 
         
     for n in days_ahead:
@@ -241,7 +237,6 @@ def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[1, 3, 5
         else:
             results[col] = np.nan
             
-    # 将是否触发标记写入字典
     results['Buy_Triggered'] = triggered
     return results
 
@@ -401,23 +396,17 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     if not records: return pd.DataFrame(), "深度筛选后无标的"
     fdf = pd.DataFrame(records)
     
-    # [修复点] 确保 penalty 被初始化
     def dynamic_score(r):
         base_score = r['macd'] * 1000 + (r['net_mf'] / 10000) 
         penalty = 0 
         
         if r['winner_rate'] > 60: base_score += 1000
-        
-        # 奖励 RSI 甜蜜区
         if 55 < r['rsi'] < 80: base_score += 2000 
-        
         if r['rsi'] > RSI_LIMIT: penalty += 500
         return base_score - penalty
 
     fdf['Score'] = fdf.apply(dynamic_score, axis=1)
-    
     final_df = fdf.sort_values('Score', ascending=False).head(TOP_BACKTEST).copy()
-    
     final_df.insert(0, 'Rank', range(1, len(final_df) + 1))
     
     return final_df, None
@@ -437,6 +426,10 @@ with st.sidebar:
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
             st.success("缓存已清除，下次运行将重新下载最新数据。")
+        if os.path.exists("backtest_checkpoint_v35.csv"):
+            os.remove("backtest_checkpoint_v35.csv")
+            st.success("断点文件已清除！")
+            
     CHECKPOINT_FILE = "backtest_checkpoint_v35.csv" 
     
     st.markdown("---")
@@ -469,7 +462,7 @@ if st.button(f"🚀 启动 V35.1"):
     end_date_str = backtest_date_end.strftime("%Y%m%d")
     
     with st.spinner("获取交易日历..."):
-        # 核心修复：多下载 120 天数据确保 MA60 计算通过，但只测指定的分析天数，避免偏移报错
+        # 提取120天保证 MA60 计算不断层
         dates_to_run = get_trade_days(end_date_str, int(BACKTEST_DAYS) + 120) 
         if not dates_to_run:
             st.error("获取日历失败，请检查网络或 Token 额度。")
@@ -479,12 +472,10 @@ if st.button(f"🚀 启动 V35.1"):
         
     st.success(f"🗓️ 将回测 {len(test_dates)} 个交易日: {test_dates[-1]} 到 {test_dates[0]}")
     
-    # 获取全量数据 (包含历史垫料)
     if not get_all_historical_data(dates_to_run):
         st.stop()
 
     results = []
-    start_index = 0
     
     if RESUME_CHECKPOINT and os.path.exists(CHECKPOINT_FILE):
         try:
@@ -525,7 +516,7 @@ if st.button(f"🚀 启动 V35.1"):
         st.header(f"📊 V35.1 统计仪表盘 (Top {TOP_BACKTEST})")
         cols = st.columns(3)
         
-        # 核心修改：为了保持原有胜率的真实性，仪表盘统计强制只过滤出【符合买入条件】的记录
+        # 【核心逻辑】：仪表盘仅统计触发买入条件 (Yes) 的股票
         valid_buys = all_res[all_res['Buy_Triggered'] == 'Yes']
         
         for idx, n in enumerate([1, 3, 5]):
@@ -540,7 +531,6 @@ if st.button(f"🚀 启动 V35.1"):
  
         st.subheader("📋 回测清单")
         
-        # 增加 Buy_Triggered 到显示列
         show_cols = ['Rank', 'Trade_Date','name','ts_code','Close','Pct_Chg',
              'Buy_Triggered', 'Return_D1 (%)', 'Return_D3 (%)', 'Return_D5 (%)', 
              'rsi', 'winner_rate', 'Sector_Boost']
