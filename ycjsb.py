@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V35.11 极致龙回头 (筹码断层绝杀版)
+选股王 · V35.12 深蹲绝杀版 (黄金坑狙击)
 ------------------------------------------------
 修改记录:
-1. [致命破局] 增加“最大获利盘(%)”拦截，只做获利盘 < 75% 的龙回头。过滤高位未洗盘、全员盈利的接盘陷阱！
-2. [蓄势收紧] 昨日最大涨幅压制到 2.0%，必须是真正的窄幅洗盘，杜绝任何高位活跃诱多。
-3. [防守加固] 将默认止损线放宽至 6%，给高波动龙头股更合理的日内洗盘弹性。
-4. [缓存复用] 继续读取 v35.10 的行情缓存，实现秒开提速。
+1. [强制深蹲] 彻底抛弃红盘接力，将昨日最大涨幅强制锁定在 -0.5% 以下，只买真正的洗盘大阴线。
+2. [恐慌断层] 将获利盘上限压制到 65%，确保主力已经将上方浮筹全部洗出。
+3. [打分革命] 引入“深蹲幅度”打分机制，昨日跌得越深（在-5%限制内），反弹动能越强，排名越靠前。
+4. [T+1完美适配] 配合开盘 1.5% 突破法则，完美捕捉 N 型反转的最强一击。
 ------------------------------------------------
 """
 
@@ -35,8 +35,8 @@ GLOBAL_STOCK_INDUSTRY = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V35.11 极致龙回头", layout="wide")
-st.title("选股王 V35.11：筹码断层与极限洗盘")
+st.set_page_config(page_title="选股王 V35.12 深蹲绝杀", layout="wide")
+st.title("选股王 V35.12：深蹲绝杀与黄金坑狙击")
 
 # ---------------------------
 # 基础 API 函数
@@ -108,7 +108,7 @@ def load_industry_mapping():
         return {}
 
 # ---------------------------
-# 数据获取核心 (复用 35.10 的高速缓存)
+# 数据获取核心 (秒开版，复用之前缓存)
 # ---------------------------
 CACHE_FILE_NAME = "market_data_cache_v35_10.pkl" 
 
@@ -434,7 +434,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     df = df[(df['circ_mv_billion'] >= MIN_MV) & (df['circ_mv_billion'] <= MAX_MV)]
     df = df[df['turnover_rate'] <= MAX_TURNOVER_RATE] 
 
-    # 🌟【压制涨幅】：昨日涨幅进一步卡死在 2% 以内，只找深蹲起跳的标的
+    # 🌟【强制深蹲绝杀】：卡死昨日最高涨幅不能超过 -0.5%，彻底抛弃任何红盘接力！
     df = df[(df['pct_chg'] >= MIN_PREV_PCT) & (df['pct_chg'] <= MAX_PREV_PCT)]
     
     if len(df) == 0: return pd.DataFrame(), "过滤后无标的"
@@ -472,7 +472,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         
         win_rate = chip_dict.get(row.ts_code, 50) 
         
-        # 🌟【筹码断层绝杀】：获利盘不仅要大于最低值，更要小于最高值！过滤未充分洗盘的接盘侠
+        # 🌟【恐慌断层】：获利盘绝对不能超过上限（默认65%），必须确保洗得干干净净
         if win_rate < CHIP_MIN_WIN_RATE or win_rate > CHIP_MAX_WIN_RATE: continue
 
         future = get_future_prices(row.ts_code, last_trade, d0_close, [2, 3, 5], STOP_LOSS_PCT, TAKE_PROFIT_PCT)
@@ -496,6 +496,12 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         base_score = r['macd'] * 1000 
         base_score += min(max(mf_ratio * 10000, -500), 1000) 
         
+        # 🌟【深蹲打分革命】：昨日跌得越深（在-6%的安全垫内），今天反弹动能越强，加分越多！
+        base_score += (-r['Pct_Chg']) * 200
+        
+        # 🌟【获利盘惩罚】：获利盘越低，说明洗出带血筹码越多，排名越靠前
+        base_score -= r['winner_rate'] * 10
+        
         penalty = 0 
         if 55 < r['rsi'] < 80: base_score += 2000 
         if r['rsi'] > RSI_LIMIT: penalty += 500
@@ -512,7 +518,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V35.11 极致龙回头")
+    st.header("V35.12 深蹲绝杀版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数", value=30, step=1, help="建议30-50天")
     TOP_BACKTEST = st.number_input("每日优选 TopK", value=4, help="实盘重点看 Rank 1 和 2")
@@ -523,12 +529,12 @@ with st.sidebar:
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
             st.success("缓存已清除，下次运行将重新下载最新数据。")
-    CHECKPOINT_FILE = "backtest_checkpoint_v35_11.csv" 
+    CHECKPOINT_FILE = "backtest_checkpoint_v35_12.csv" 
     
     st.markdown("---")
     st.subheader("⚔️ 实战双向边界 (止盈/止损)")
     TAKE_PROFIT_PCT = st.number_input("动态止盈线 (%)", value=10.0, help="T+1及以后盘中涨到该幅度，即落袋为安")
-    STOP_LOSS_PCT = st.number_input("硬性止损线 (%)", value=6.0, help="龙回头洗盘幅度较大，建议适当放宽至 6%")
+    STOP_LOSS_PCT = st.number_input("硬性止损线 (%)", value=6.0, help="龙回头深蹲洗盘幅度大，建议放宽至 6%")
     
     st.markdown("---")
     st.subheader("💰 基础过滤")
@@ -539,11 +545,12 @@ with st.sidebar:
     
     st.markdown("---")
     st.subheader("⚔️ 核心风控参数")
-    CHIP_MIN_WIN_RATE = st.number_input("最低获利盘 (%)", value=40.0)
-    CHIP_MAX_WIN_RATE = st.number_input("最大获利盘 (%)", value=75.0, help="【绝杀核心】超过75%说明主力没洗干净，坚决不接盘！")
-    MAX_PREV_PCT = st.number_input("昨日最大涨幅 (%)", value=2.0, help="压低至2%，彻底屏蔽高位接盘")
-    MIN_PREV_PCT = st.number_input("昨日最大跌幅 (%)", value=-5.0, help="允许一定程度的阴线深蹲洗盘")
-    RSI_LIMIT = st.number_input("弱势拦截线 (建议100)", value=100.0)
+    CHIP_MIN_WIN_RATE = st.number_input("最低获利盘 (%)", value=30.0)
+    # 🌟强制 UI 默认值压低，锁定真正黄金坑
+    CHIP_MAX_WIN_RATE = st.number_input("最大获利盘 (%)", value=65.0, help="【绝杀核心】超过65%坚决不买，必须让散户交出带血筹码！")
+    MAX_PREV_PCT = st.number_input("昨日最大涨幅 (%)", value=-0.5, help="【深蹲锁】强制最高涨幅低于-0.5%，彻底抛弃任何红盘接力！")
+    MIN_PREV_PCT = st.number_input("昨日最大跌幅 (%)", value=-6.0, help="底部安全垫，限制跌幅不超过-6%")
+    RSI_LIMIT = st.number_input("弱势拦截线 (建议75)", value=75.0)
     
     st.markdown("---")
     st.subheader("📊 形态参数")
@@ -557,7 +564,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V35.11 引擎"):
+if st.button(f"🚀 启动 V35.12 引擎"):
     processed_dates = set()
     results = []
     
@@ -603,7 +610,7 @@ if st.button(f"🚀 启动 V35.11 引擎"):
         all_res = all_res[all_res['Rank'] <= int(TOP_BACKTEST)]
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-        st.header(f"📊 V35.11 极致龙回头 (筹码断层版)")
+        st.header(f"📊 V35.12 深蹲绝杀 (黄金坑)")
         cols = st.columns(3)
         for idx, n in enumerate([2, 3, 5]):
             col_name = f'Return_T{n-1} (%)'
@@ -624,6 +631,6 @@ if st.button(f"🚀 启动 V35.11 引擎"):
         st.dataframe(display_df, use_container_width=True)
         
         csv = all_res.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下载结果 (CSV)", csv, f"export_v35_11.csv", "text/csv")
+        st.download_button("📥 下载结果 (CSV)", csv, f"export_v35_12.csv", "text/csv")
     else:
         st.warning("⚠️ 没有结果。")
