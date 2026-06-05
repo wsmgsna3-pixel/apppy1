@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V35.9 T+1 真实世界版 (修复 T+0 幻觉)
+选股王 · V35.10 龙回头实战版 (N型起爆点)
 ------------------------------------------------
 修改记录:
-1. [核心重构] 严格适配 A 股 T+1 制度。买入当天（T+0）绝对锁定，不触发任何止损止盈。
-2. [实战跳空] T+1 日开盘若大幅跳空跌破止损，强制按开盘价割肉（记录真实超额亏损）。
-3. [指标重塑] 放弃 D1/D3/D5，改为实战视角的 T+1, T+2, T+4 收益统计。
-4. [双向边界] 盘中触碰 10% 止盈或 5% 止损立刻离场，还原盯盘操作。
+1. [基因重塑] 引入“涨停基因”，只做近 15 天内有过涨停 (>=9.5%) 的超级活跃股，拒绝死鱼。
+2. [量价洗盘] 引入“缩量判定”，昨日成交量必须小于前天，确保抛压枯竭。
+3. [温和蓄势] 昨日涨幅限制在 -4% ~ +4% 的窄幅震荡区间，杜绝追高接力。
+4. [T+1坚守] 维持 T+1 真实世界法则与 10%止盈/5%止损，结合右侧 1.5% 突破，打造完美 N型起爆。
 ------------------------------------------------
 """
 
@@ -35,8 +35,8 @@ GLOBAL_STOCK_INDUSTRY = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V35.9 真实法则", layout="wide")
-st.title("选股王 V35.9：T+1 严格约束与实战还原")
+st.set_page_config(page_title="选股王 V35.10 龙回头", layout="wide")
+st.title("选股王 V35.10：N型龙回头与缩量起爆")
 
 # ---------------------------
 # 基础 API 函数
@@ -110,7 +110,7 @@ def load_industry_mapping():
 # ---------------------------
 # 数据获取核心 (本地缓存版)
 # ---------------------------
-CACHE_FILE_NAME = "market_data_cache_v35_9.pkl" 
+CACHE_FILE_NAME = "market_data_cache_v35_10.pkl" # 更换缓存名以包含更长期的涨停基因数据
 
 def get_all_historical_data(trade_days_list, use_cache=True):
     global GLOBAL_ADJ_FACTOR, GLOBAL_DAILY_RAW, GLOBAL_QFQ_BASE_FACTORS, GLOBAL_STOCK_INDUSTRY
@@ -249,7 +249,6 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
 # 🌟实战 T+1 仿真与双向结算 
 # ---------------------------
 def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[2, 3, 5], stop_loss=5.0, take_profit=10.0):
-    # days_ahead 中的 2,3,5 对应买入后的第2天(T+1), 第3天(T+2), 第5天(T+4)
     d0 = datetime.strptime(selection_date, "%Y%m%d")
     start_future = (d0 + timedelta(days=1)).strftime("%Y%m%d")
     end_future = (d0 + timedelta(days=15)).strftime("%Y%m%d")
@@ -268,11 +267,11 @@ def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[2, 3, 5
     next_open = d1_data['open']
     next_high = d1_data['high']
     
-    # 护城河 1：防低开破位或高开诱多陷阱
+    # 护城河：允许一定程度的跳空，但过滤极端情绪
     if next_open < d0_qfq_close * 0.985: return results 
-    if next_open > d0_qfq_close * 1.025: return results 
+    if next_open > d0_qfq_close * 1.03: return results 
 
-    # 坚守原生动能买点：日内突破开盘价 1.5%
+    # 🌟坚守原生动能买点：日内突破开盘价 1.5%
     target_buy_price = next_open * 1.015
     if next_high < target_buy_price: return results
     
@@ -280,7 +279,6 @@ def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[2, 3, 5
     take_profit_price = target_buy_price * (1 + take_profit / 100.0)
         
     for n in days_ahead:
-        # n=2 代表经过T+0和T+1两天，相当于收益展示为 T+1
         col = f'Return_T{n-1} (%)' 
         if len(hist) >= n:
             period_data = hist.iloc[0:n]
@@ -288,21 +286,18 @@ def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[2, 3, 5
             
             for i_day, (_, row) in enumerate(period_data.iterrows()):
                 if i_day == 0:
-                    # 💥【修复重中之重】：T+0 锁定。当天即便暴涨或深跌，绝对禁止卖出，不触发止盈止损！
+                    # 💥T+0 绝对锁定，不触发止盈止损！
                     continue
                     
-                # 到了 T+1 及以后，筹码解除锁定，可以执行卖出了：
-                # 1. 开盘跳空判定 (实战极致还原)
+                # T+1 开盘跳空结算
                 if row['open'] <= stop_loss_price:
-                    # 直接低开跌破止损线，来不及在 -5% 跑，只能以开盘价割肉记录更惨亏损
                     final_return = (row['open'] - target_buy_price) / target_buy_price * 100
                     break
                 elif row['open'] >= take_profit_price:
-                    # 高开越过止盈线，享受溢价止盈
                     final_return = (row['open'] - target_buy_price) / target_buy_price * 100
                     break
                     
-                # 2. 盘内波动触碰判定 (保守原则：同时碰到算止损)
+                # 盘中波动结算
                 if row['low'] <= stop_loss_price:
                     final_return = -stop_loss
                     break
@@ -355,6 +350,15 @@ def compute_indicators(ts_code, end_date):
     hist_60 = df.tail(60)
     res['position_60d'] = (close.iloc[-1] - hist_60['low'].min()) / (hist_60['high'].max() - hist_60['low'].min() + 1e-9) * 100
 
+    # 🌟【新增特性 1】 涨停基因提取：过去15天内必须有 >= 9.5% 的阳线
+    res['has_limit_up_gene'] = (df['pct_chg'].tail(15).max() >= 9.5)
+    
+    # 🌟【新增特性 2】 量价洗盘提取：昨日成交量必须缩量（或极度温和平量）
+    if len(df) >= 2:
+        res['is_vol_shrink'] = df['vol'].iloc[-1] <= df['vol'].iloc[-2] * 1.05 
+    else:
+        res['is_vol_shrink'] = False
+
     df.index = pd.to_datetime(df.index)
     weekly_df = df.resample('W').agg({'close': 'last'}).dropna()
     if len(weekly_df) >= 4:
@@ -378,7 +382,7 @@ def get_market_state(trade_date):
 # ---------------------------
 # 核心回测逻辑函数 
 # ---------------------------
-def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, MAX_PREV_PCT, MIN_PRICE, STOP_LOSS_PCT, TAKE_PROFIT_PCT):
+def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, MIN_PREV_PCT, MAX_PREV_PCT, MIN_PRICE, STOP_LOSS_PCT, TAKE_PROFIT_PCT):
     global GLOBAL_STOCK_INDUSTRY
     
     market_state = get_market_state(last_trade)
@@ -432,17 +436,12 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     df = df[(df['circ_mv_billion'] >= MIN_MV) & (df['circ_mv_billion'] <= MAX_MV)]
     df = df[df['turnover_rate'] <= MAX_TURNOVER_RATE] 
 
-    # 🌟形态锁：找阳线，防出货长上影
-    df = df[(df['pct_chg'] >= 2.0) & (df['pct_chg'] <= MAX_PREV_PCT)]
-    df = df[df['close'] > df['open']]
-    df['range'] = df['high'] - df['low']
-    df['upper_shadow'] = df['high'] - df['close']
-    df = df[df['range'] > 0]
-    df = df[(df['upper_shadow'] / df['range']) <= 0.35] 
+    # 🌟【龙回头核心锁】：强制过滤暴涨接力，只找昨日处于温和震荡区间的标的
+    df = df[(df['pct_chg'] >= MIN_PREV_PCT) & (df['pct_chg'] <= MAX_PREV_PCT)]
     
     if len(df) == 0: return pd.DataFrame(), "过滤后无标的"
 
-    df['activity_score'] = df['turnover_rate'] + (df['pct_chg'] * 2)
+    df['activity_score'] = df['turnover_rate']
     candidates = df.sort_values('activity_score', ascending=False).head(FINAL_POOL)
     
     records = []
@@ -453,6 +452,13 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
 
         ind = compute_indicators(row.ts_code, last_trade)
         if not ind: continue
+        
+        # 🌟【龙回头双重滤网】
+        # 1. 过滤死鱼：必须在近期有过涨停，证明是龙头或热点股
+        if not ind.get('has_limit_up_gene', False): continue
+        # 2. 过滤诱多：昨日必须是缩量洗盘，抛压枯竭后今天的突破才有爆发力
+        if not ind.get('is_vol_shrink', False): continue
+        
         d0_close = ind['last_close']
         d0_rsi = ind.get('rsi_12', 50)
         
@@ -510,7 +516,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V35.9 真实法则版")
+    st.header("V35.10 龙回头起爆版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数", value=30, step=1, help="建议30-50天")
     TOP_BACKTEST = st.number_input("每日优选 TopK", value=4, help="实盘重点看 Rank 1 和 2")
@@ -521,11 +527,11 @@ with st.sidebar:
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
             st.success("缓存已清除，下次运行将重新下载最新数据。")
-    CHECKPOINT_FILE = "backtest_checkpoint_v35_9.csv" 
+    CHECKPOINT_FILE = "backtest_checkpoint_v35_10.csv" 
     
     st.markdown("---")
     st.subheader("⚔️ 实战双向边界 (止盈/止损)")
-    TAKE_PROFIT_PCT = st.number_input("动态止盈线 (%)", value=10.0, help="T+1及以后盘中涨到幅度，即落袋为安")
+    TAKE_PROFIT_PCT = st.number_input("动态止盈线 (%)", value=10.0, help="T+1及以后盘中涨到该幅度，即落袋为安")
     STOP_LOSS_PCT = st.number_input("硬性止损线 (%)", value=5.0, help="T+1及以后跌破该比例即割肉")
     
     st.markdown("---")
@@ -538,7 +544,8 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("⚔️ 核心风控参数")
     CHIP_MIN_WIN_RATE = st.number_input("最低获利盘 (%)", value=40.0)
-    MAX_PREV_PCT = st.number_input("昨日最大涨幅限制 (%)", value=8.0, help="锁定大阳线起爆点，拒绝涨停接盘")
+    MAX_PREV_PCT = st.number_input("昨日最大涨幅 (%)", value=4.0, help="最高涨幅卡死4%，锁定窄幅洗盘股")
+    MIN_PREV_PCT = st.number_input("昨日最大跌幅 (%)", value=-4.0, help="最低跌幅卡死-4%，拒绝断头大阴线")
     RSI_LIMIT = st.number_input("弱势拦截线 (建议100)", value=100.0)
     
     st.markdown("---")
@@ -553,7 +560,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V35.9 引擎"):
+if st.button(f"🚀 启动 V35.10 引擎"):
     processed_dates = set()
     results = []
     
@@ -583,7 +590,7 @@ if st.button(f"🚀 启动 V35.9 引擎"):
         bar = st.progress(0, text="回测引擎启动...")
         
         for i, date in enumerate(dates_to_run):
-            res, err = run_backtest_for_a_day(date, int(TOP_BACKTEST), 100, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, MAX_PREV_PCT, MIN_PRICE, STOP_LOSS_PCT, TAKE_PROFIT_PCT)
+            res, err = run_backtest_for_a_day(date, int(TOP_BACKTEST), 100, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, MIN_PREV_PCT, MAX_PREV_PCT, MIN_PRICE, STOP_LOSS_PCT, TAKE_PROFIT_PCT)
             if not res.empty:
                 res['Trade_Date'] = date
                 is_first = not os.path.exists(CHECKPOINT_FILE)
@@ -599,7 +606,7 @@ if st.button(f"🚀 启动 V35.9 引擎"):
         all_res = all_res[all_res['Rank'] <= int(TOP_BACKTEST)]
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-        st.header(f"📊 V35.9 实战统计仪表盘 (T+1 法则)")
+        st.header(f"📊 V35.10 实战统计仪表盘 (N型起爆)")
         cols = st.columns(3)
         for idx, n in enumerate([2, 3, 5]):
             col_name = f'Return_T{n-1} (%)'
@@ -620,6 +627,6 @@ if st.button(f"🚀 启动 V35.9 引擎"):
         st.dataframe(display_df, use_container_width=True)
         
         csv = all_res.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下载结果 (CSV)", csv, f"export_v35_9.csv", "text/csv")
+        st.download_button("📥 下载结果 (CSV)", csv, f"export_v35_10.csv", "text/csv")
     else:
         st.warning("⚠️ 没有结果。")
