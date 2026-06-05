@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V35.3 护城河实战版
+选股王 · V35.4 真突破狙击版
 ------------------------------------------------
 修改记录:
-1. [买点护城河] 坚守右侧确认：开盘>昨收，且盘中突破开盘价 1.5% 买入。
-2. [防高位接盘] 新增开盘高度限制，开盘价高于昨收 4% 以上直接放弃。
-3. [防守线拓宽] 强制止损线拓宽至 5%，容忍强势股正常日内洗盘，防冤杀。
-4. [趋势与指标] 引入周线 MA4 趋势护航，且强制拦截 RSI > 85 的极端超买股。
-5. [UI与排行] 排除北交所，锁定当前日期，强制回测清单按 Rank 排序展现。
+1. [选股池革命] 废除按涨幅排序，改为按“活跃度(换手+涨幅)”选股，拒绝强弩之末。
+2. [真突破双锁] 买入价必须同时突破“开盘价+1.5%”和“昨天最高点”，过滤假突破。
+3. [防早盘陷阱] 高开上限压制至 2.5%，低开下限 -1.5%，只做平开温和启动的标的。
+4. [持平防守] 维持 5% 实战洗盘防守线，配合起爆点买入大幅提升盈亏比。
 ------------------------------------------------
 """
 
@@ -36,8 +35,8 @@ GLOBAL_STOCK_INDUSTRY = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V35.3 护城河版", layout="wide")
-st.title("选股王 V35.3：右侧确认与 5% 弹性防守")
+st.set_page_config(page_title="选股王 V35.4 真突破版", layout="wide")
+st.title("选股王 V35.4：N型起爆点与真突破狙击")
 
 # ---------------------------
 # 基础 API 函数
@@ -249,7 +248,7 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
 # ---------------------------
 # 实战仿真与指标计算
 # ---------------------------
-def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[1, 3, 5]):
+def get_future_prices(ts_code, selection_date, d0_qfq_close, d0_qfq_high, days_ahead=[1, 3, 5]):
     d0 = datetime.strptime(selection_date, "%Y%m%d")
     start_future = (d0 + timedelta(days=1)).strftime("%Y%m%d")
     end_future = (d0 + timedelta(days=15)).strftime("%Y%m%d")
@@ -268,17 +267,20 @@ def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[1, 3, 5
     next_open = d1_data['open']
     next_high = d1_data['high']
     
-    # 【护城河 1】 坚守底线：开盘必须高于昨收
-    if next_open <= d0_qfq_close: return results 
-    
-    # 【护城河 2】 防高位接盘：如果开盘价已经高出昨收 4% 以上，放弃该标的
-    if next_open > d0_qfq_close * 1.04: return results 
+    # 【护城河 1】 严控开盘形态防诱多
+    # 破位低开超过 1.5% 直接放弃
+    if next_open < d0_qfq_close * 0.985: return results 
+    # 坚决不追大幅高开（限制在 2.5% 以内，防早盘高潮抛压）
+    if next_open > d0_qfq_close * 1.025: return results 
 
-    # 【右侧确认】 盘中最高价触及开盘价的 1.015 倍，确认动能并买入
-    target_buy_price = next_open * 1.015
+    # 【右侧真突破锁】 
+    # 条件A：必须达到开盘价上浮 1.5% (确认动能)
+    # 条件B：必须突破昨天的最高点 (确认没有上方套牢盘压制)
+    # 取两者较高者作为买点，挡住大量假突破
+    target_buy_price = max(next_open * 1.015, d0_qfq_high * 1.001)
     if next_high < target_buy_price: return results
     
-    # 【弹性防守】 实战 5% 强制止损线，过滤合理的洗盘动作
+    # 【弹性防守】 维持 5% 强制止损，给优质起爆点留下洗筹空间
     stop_loss_price = target_buy_price * 0.95 
         
     for n in days_ahead:
@@ -287,14 +289,14 @@ def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[1, 3, 5
             period_data = hist.iloc[0:n]
             hit_stop_loss = False
             
-            # 遍历持有期，模拟真实盘中跌破止损
+            # 模拟盘中跌破止损
             for _, row in period_data.iterrows():
                 if row['low'] <= stop_loss_price:
                     hit_stop_loss = True
                     break
                     
             if hit_stop_loss:
-                results[col] = -5.0 # 触发止损，强制记录 -5%
+                results[col] = -5.0 # 触发止损
             else:
                 sell_price = hist.iloc[n-1]['close']
                 results[col] = (sell_price - target_buy_price) / target_buy_price * 100
@@ -338,7 +340,6 @@ def compute_indicators(ts_code, end_date):
     hist_60 = df.tail(60)
     res['position_60d'] = (close.iloc[-1] - hist_60['low'].min()) / (hist_60['high'].max() - hist_60['low'].min() + 1e-9) * 100
 
-    # 【趋势护航】 合成周线级别趋势判定
     df.index = pd.to_datetime(df.index)
     weekly_df = df.resample('W').agg({'close': 'last'}).dropna()
     if len(weekly_df) >= 4:
@@ -416,17 +417,20 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     df = df[(df['circ_mv_billion'] >= MIN_MV) & (df['circ_mv_billion'] <= MAX_MV)]
     df = df[df['turnover_rate'] <= MAX_TURNOVER_RATE] 
 
+    # [核心修复] 拒绝爆量强弩之末，只找“蓄势待发”的标的（比如微涨红盘）
+    df = df[(df['pct_chg'] >= 0.0) & (df['pct_chg'] <= MAX_PREV_PCT)]
+    
     if len(df) == 0: return pd.DataFrame(), "过滤后无标的"
 
-    candidates = df.sort_values('pct_chg', ascending=False).head(FINAL_POOL)
-    records = []
+    # [核心修复] 选股池革命：按“活跃度”排序，而非盲目选昨日涨停的票
+    df['activity_score'] = df['turnover_rate'] + (df['pct_chg'] * 2)
+    candidates = df.sort_values('activity_score', ascending=False).head(FINAL_POOL)
     
+    records = []
     for row in candidates.itertuples():
         if GLOBAL_STOCK_INDUSTRY and strong_industry_codes:
             ind_code = GLOBAL_STOCK_INDUSTRY.get(row.ts_code)
             if ind_code and (ind_code not in strong_industry_codes): continue
-        
-        if row.pct_chg > MAX_PREV_PCT: continue
 
         ind = compute_indicators(row.ts_code, last_trade)
         if not ind: continue
@@ -434,8 +438,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         d0_rsi = ind.get('rsi_12', 50)
         
         if d0_rsi < 50: continue 
-        
-        # 【护城河 3】 超买过滤：RSI 绝对上限卡在 85，防止接最后一棒
         if d0_rsi > 85: continue 
         
         if market_state == 'Weak':
@@ -444,7 +446,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
             
         if d0_close < ind['ma60']: continue
         
-        # 【护城河 4】 趋势共振：必须处于周线上升趋势，且偏离 20日线不能太远
         if not ind.get('is_weekly_uptrend', False): continue
         if ind['ma20'] > 0 and (d0_close - ind['ma20']) / ind['ma20'] > 0.15: 
             continue
@@ -459,7 +460,8 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         win_rate = chip_dict.get(row.ts_code, 50) 
         if win_rate < CHIP_MIN_WIN_RATE: continue
 
-        future = get_future_prices(row.ts_code, last_trade, d0_close)
+        # 传入 ind['last_high']，做真突破判定
+        future = get_future_prices(row.ts_code, last_trade, d0_close, ind['last_high'])
         records.append({
             'ts_code': row.ts_code, 'name': row.name, 'Close': row.close, 'Pct_Chg': row.pct_chg,
             'rsi': d0_rsi, 'winner_rate': win_rate, 
@@ -498,7 +500,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V35.3 护城河版")
+    st.header("V35.4 真突破版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数", value=30, step=1, help="建议30-50天")
     TOP_BACKTEST = st.number_input("每日优选 TopK", value=4, help="实盘重点看 Rank 1 和 2")
@@ -509,7 +511,7 @@ with st.sidebar:
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
             st.success("缓存已清除，下次运行将重新下载最新数据。")
-    CHECKPOINT_FILE = "backtest_checkpoint_v35_3.csv" 
+    CHECKPOINT_FILE = "backtest_checkpoint_v35_4.csv" 
     
     st.markdown("---")
     st.subheader("💰 基础过滤")
@@ -521,7 +523,8 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("⚔️ 核心风控参数")
     CHIP_MIN_WIN_RATE = st.number_input("最低获利盘 (%)", value=40.0, help="建议: 40-50%")
-    MAX_PREV_PCT = st.number_input("昨日最大涨幅限制 (%)", value=10.0)
+    # [核心修改] 将最高涨幅锁定为 6.0，寻找起爆点，而非追高接力盘
+    MAX_PREV_PCT = st.number_input("昨日最大涨幅限制 (%)", value=6.0, help="坚决拒绝超过 6%，切忌接力昨日暴涨股")
     RSI_LIMIT = st.number_input("弱势拦截线 (建议100)", value=100.0)
     
     st.markdown("---")
@@ -536,7 +539,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V35.3 引擎"):
+if st.button(f"🚀 启动 V35.4 引擎"):
     processed_dates = set()
     results = []
     
@@ -582,7 +585,7 @@ if st.button(f"🚀 启动 V35.3 引擎"):
         all_res = all_res[all_res['Rank'] <= int(TOP_BACKTEST)]
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-        st.header(f"📊 V35.3 统计仪表盘 (强制 5% 止损)")
+        st.header(f"📊 V35.4 统计仪表盘 (真突破+防诱多)")
         cols = st.columns(3)
         for idx, n in enumerate([1, 3, 5]):
             col_name = f'Return_D{n} (%)'
@@ -603,6 +606,6 @@ if st.button(f"🚀 启动 V35.3 引擎"):
         st.dataframe(display_df, use_container_width=True)
         
         csv = all_res.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下载结果 (CSV)", csv, f"export_v35_3.csv", "text/csv")
+        st.download_button("📥 下载结果 (CSV)", csv, f"export_v35_4.csv", "text/csv")
     else:
         st.warning("⚠️ 没有结果。")
