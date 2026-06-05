@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V35.7 动态止盈版 (实战双向结算)
+选股王 · V35.9 T+1 真实世界版 (修复 T+0 幻觉)
 ------------------------------------------------
 修改记录:
-1. [修复痛点] 引入 10% 动态止盈机制 (Take Profit)，解决“利润回撤变亏损”的死扛Bug。
-2. [保守结算] 盘中若同时触碰止盈与止损，优先按止损计算，杜绝回测自欺欺人。
-3. [形态优化] 上影线容忍度放宽至全天振幅的 35%，适配打板回落的强势股。
-4. [排序回归] 恢复“换手率 + 涨幅”的活跃度排序，寻找市场最具共识的起爆点。
+1. [核心重构] 严格适配 A 股 T+1 制度。买入当天（T+0）绝对锁定，不触发任何止损止盈。
+2. [实战跳空] T+1 日开盘若大幅跳空跌破止损，强制按开盘价割肉（记录真实超额亏损）。
+3. [指标重塑] 放弃 D1/D3/D5，改为实战视角的 T+1, T+2, T+4 收益统计。
+4. [双向边界] 盘中触碰 10% 止盈或 5% 止损立刻离场，还原盯盘操作。
 ------------------------------------------------
 """
 
@@ -35,8 +35,8 @@ GLOBAL_STOCK_INDUSTRY = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V35.7 止盈版", layout="wide")
-st.title("选股王 V35.7：动态止盈与真突破狙击")
+st.set_page_config(page_title="选股王 V35.9 真实法则", layout="wide")
+st.title("选股王 V35.9：T+1 严格约束与实战还原")
 
 # ---------------------------
 # 基础 API 函数
@@ -110,7 +110,7 @@ def load_industry_mapping():
 # ---------------------------
 # 数据获取核心 (本地缓存版)
 # ---------------------------
-CACHE_FILE_NAME = "market_data_cache_v35_6.pkl" # 继续使用带有复权数据的缓存
+CACHE_FILE_NAME = "market_data_cache_v35_9.pkl" 
 
 def get_all_historical_data(trade_days_list, use_cache=True):
     global GLOBAL_ADJ_FACTOR, GLOBAL_DAILY_RAW, GLOBAL_QFQ_BASE_FACTORS, GLOBAL_STOCK_INDUSTRY
@@ -246,9 +246,10 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
     return df[['open', 'high', 'low', 'close', 'vol']].copy() 
 
 # ---------------------------
-# 实战仿真与双向结算 (止盈+止损)
+# 🌟实战 T+1 仿真与双向结算 
 # ---------------------------
-def get_future_prices(ts_code, selection_date, d0_qfq_close, d0_qfq_high, days_ahead=[1, 3, 5], stop_loss=5.0, take_profit=10.0):
+def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[2, 3, 5], stop_loss=5.0, take_profit=10.0):
+    # days_ahead 中的 2,3,5 对应买入后的第2天(T+1), 第3天(T+2), 第5天(T+4)
     d0 = datetime.strptime(selection_date, "%Y%m%d")
     start_future = (d0 + timedelta(days=1)).strftime("%Y%m%d")
     end_future = (d0 + timedelta(days=15)).strftime("%Y%m%d")
@@ -267,36 +268,49 @@ def get_future_prices(ts_code, selection_date, d0_qfq_close, d0_qfq_high, days_a
     next_open = d1_data['open']
     next_high = d1_data['high']
     
-    # 【护城河 1】 严控开盘形态，防早盘陷阱
+    # 护城河 1：防低开破位或高开诱多陷阱
     if next_open < d0_qfq_close * 0.985: return results 
     if next_open > d0_qfq_close * 1.025: return results 
 
-    # 【右侧真突破锁】 必须突破开盘价1.5%，且必须吃掉昨天高点！
-    target_buy_price = max(next_open * 1.015, d0_qfq_high * 1.001)
+    # 坚守原生动能买点：日内突破开盘价 1.5%
+    target_buy_price = next_open * 1.015
     if next_high < target_buy_price: return results
     
-    # 动态止盈与止损线计算
     stop_loss_price = target_buy_price * (1 - stop_loss / 100.0)
     take_profit_price = target_buy_price * (1 + take_profit / 100.0)
         
     for n in days_ahead:
-        col = f'Return_D{n}'
+        # n=2 代表经过T+0和T+1两天，相当于收益展示为 T+1
+        col = f'Return_T{n-1} (%)' 
         if len(hist) >= n:
             period_data = hist.iloc[0:n]
             final_return = np.nan
             
-            for _, row in period_data.iterrows():
-                # 极端保守原则：同一天内既碰到止损又碰到止盈（剧烈震荡天地板），我们保守按止损计提。
+            for i_day, (_, row) in enumerate(period_data.iterrows()):
+                if i_day == 0:
+                    # 💥【修复重中之重】：T+0 锁定。当天即便暴涨或深跌，绝对禁止卖出，不触发止盈止损！
+                    continue
+                    
+                # 到了 T+1 及以后，筹码解除锁定，可以执行卖出了：
+                # 1. 开盘跳空判定 (实战极致还原)
+                if row['open'] <= stop_loss_price:
+                    # 直接低开跌破止损线，来不及在 -5% 跑，只能以开盘价割肉记录更惨亏损
+                    final_return = (row['open'] - target_buy_price) / target_buy_price * 100
+                    break
+                elif row['open'] >= take_profit_price:
+                    # 高开越过止盈线，享受溢价止盈
+                    final_return = (row['open'] - target_buy_price) / target_buy_price * 100
+                    break
+                    
+                # 2. 盘内波动触碰判定 (保守原则：同时碰到算止损)
                 if row['low'] <= stop_loss_price:
                     final_return = -stop_loss
                     break
-                # 【新增】触碰止盈线，立马落袋为安，拒绝死扛！
                 elif row['high'] >= take_profit_price:
                     final_return = take_profit
                     break
-                    
+                        
             if pd.isna(final_return):
-                # 既没止损也没止盈，按周期最后一天收盘价结算
                 sell_price = hist.iloc[n-1]['close']
                 final_return = (sell_price - target_buy_price) / target_buy_price * 100
                 
@@ -418,17 +432,16 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     df = df[(df['circ_mv_billion'] >= MIN_MV) & (df['circ_mv_billion'] <= MAX_MV)]
     df = df[df['turnover_rate'] <= MAX_TURNOVER_RATE] 
 
-    # 🌟【形态锁】
+    # 🌟形态锁：找阳线，防出货长上影
     df = df[(df['pct_chg'] >= 2.0) & (df['pct_chg'] <= MAX_PREV_PCT)]
     df = df[df['close'] > df['open']]
     df['range'] = df['high'] - df['low']
     df['upper_shadow'] = df['high'] - df['close']
     df = df[df['range'] > 0]
-    df = df[(df['upper_shadow'] / df['range']) <= 0.35] # 放宽至35%以避免误杀
+    df = df[(df['upper_shadow'] / df['range']) <= 0.35] 
     
     if len(df) == 0: return pd.DataFrame(), "过滤后无标的"
 
-    # 🌟【打分回归】回归最硬核的活跃度（换手+涨幅）排序
     df['activity_score'] = df['turnover_rate'] + (df['pct_chg'] * 2)
     candidates = df.sort_values('activity_score', ascending=False).head(FINAL_POOL)
     
@@ -459,16 +472,15 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         win_rate = chip_dict.get(row.ts_code, 50) 
         if win_rate < CHIP_MIN_WIN_RATE: continue
 
-        # 传入动态止损与止盈参数
-        future = get_future_prices(row.ts_code, last_trade, d0_close, ind['last_high'], [1, 3, 5], STOP_LOSS_PCT, TAKE_PROFIT_PCT)
+        future = get_future_prices(row.ts_code, last_trade, d0_close, [2, 3, 5], STOP_LOSS_PCT, TAKE_PROFIT_PCT)
         records.append({
             'ts_code': row.ts_code, 'name': row.name, 'Close': row.close, 'Pct_Chg': row.pct_chg,
             'rsi': d0_rsi, 'winner_rate': win_rate, 
             'macd': ind['macd_val'], 'net_mf': row.net_mf,
             'circ_mv': row.circ_mv, 
-            'Return_D1 (%)': future.get('Return_D1', np.nan),
-            'Return_D3 (%)': future.get('Return_D3', np.nan),
-            'Return_D5 (%)': future.get('Return_D5', np.nan),
+            'Return_T1 (%)': future.get('Return_T1 (%)', np.nan),
+            'Return_T2 (%)': future.get('Return_T2 (%)', np.nan),
+            'Return_T4 (%)': future.get('Return_T4 (%)', np.nan),
             'market_state': market_state,
             'Sector_Boost': 'Yes' if GLOBAL_STOCK_INDUSTRY else 'N/A'
         })
@@ -477,7 +489,6 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     fdf = pd.DataFrame(records)
     
     def dynamic_score(r):
-        # 修正资金流权重
         mf_ratio = r['net_mf'] / (r['circ_mv'] * 10000 + 1) if r['circ_mv'] > 0 else 0
         base_score = r['macd'] * 1000 
         base_score += min(max(mf_ratio * 10000, -500), 1000) 
@@ -499,7 +510,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V35.7 止盈实战版")
+    st.header("V35.9 真实法则版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数", value=30, step=1, help="建议30-50天")
     TOP_BACKTEST = st.number_input("每日优选 TopK", value=4, help="实盘重点看 Rank 1 和 2")
@@ -510,12 +521,12 @@ with st.sidebar:
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
             st.success("缓存已清除，下次运行将重新下载最新数据。")
-    CHECKPOINT_FILE = "backtest_checkpoint_v35_7.csv" 
+    CHECKPOINT_FILE = "backtest_checkpoint_v35_9.csv" 
     
     st.markdown("---")
     st.subheader("⚔️ 实战双向边界 (止盈/止损)")
-    TAKE_PROFIT_PCT = st.number_input("动态止盈线 (%)", value=10.0, help="盘中只要涨到这个幅度，立马落袋为安！")
-    STOP_LOSS_PCT = st.number_input("硬性止损线 (%)", value=5.0, help="盘中跌破买入价的该比例即割肉")
+    TAKE_PROFIT_PCT = st.number_input("动态止盈线 (%)", value=10.0, help="T+1及以后盘中涨到幅度，即落袋为安")
+    STOP_LOSS_PCT = st.number_input("硬性止损线 (%)", value=5.0, help="T+1及以后跌破该比例即割肉")
     
     st.markdown("---")
     st.subheader("💰 基础过滤")
@@ -542,7 +553,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V35.7 引擎"):
+if st.button(f"🚀 启动 V35.9 引擎"):
     processed_dates = set()
     results = []
     
@@ -588,20 +599,20 @@ if st.button(f"🚀 启动 V35.7 引擎"):
         all_res = all_res[all_res['Rank'] <= int(TOP_BACKTEST)]
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-        st.header(f"📊 V35.7 统计仪表盘 (止盈双向防守)")
+        st.header(f"📊 V35.9 实战统计仪表盘 (T+1 法则)")
         cols = st.columns(3)
-        for idx, n in enumerate([1, 3, 5]):
-            col_name = f'Return_D{n} (%)'
+        for idx, n in enumerate([2, 3, 5]):
+            col_name = f'Return_T{n-1} (%)'
             valid = all_res.dropna(subset=[col_name]) 
             if not valid.empty:
                 avg = valid[col_name].mean()
                 win = (valid[col_name] > 0).mean() * 100
-                cols[idx].metric(f"D+{n} 均益 / 胜率", f"{avg:.2f}% / {win:.1f}%")
+                cols[idx].metric(f"T+{n-1} 均益 / 胜率", f"{avg:.2f}% / {win:.1f}%")
  
         st.subheader("📋 回测清单 (优先锁定 Rank 1 和 2)")
         
         show_cols = ['Rank', 'Trade_Date','name','ts_code','Close','Pct_Chg',
-             'Return_D1 (%)', 'Return_D3 (%)', 'Return_D5 (%)',
+             'Return_T1 (%)', 'Return_T2 (%)', 'Return_T4 (%)',
                         'rsi','winner_rate','Sector_Boost']
         final_cols = [c for c in show_cols if c in all_res.columns]
     
@@ -609,6 +620,6 @@ if st.button(f"🚀 启动 V35.7 引擎"):
         st.dataframe(display_df, use_container_width=True)
         
         csv = all_res.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下载结果 (CSV)", csv, f"export_v35_7.csv", "text/csv")
+        st.download_button("📥 下载结果 (CSV)", csv, f"export_v35_9.csv", "text/csv")
     else:
         st.warning("⚠️ 没有结果。")
