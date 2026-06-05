@@ -1,14 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V35.2 实战防坑版
+选股王 · V35.3 护城河实战版
 ------------------------------------------------
 修改记录:
-1. [新增] 严格 3% 回测强制止损，还原实盘真实盈亏比。
-2. [新增] 增加周线 MA4 趋势判定，过滤假突破。
-3. [新增] 限制高开幅度（<4%）与 20日乖离率（<15%），防止接盘最后一棒。
-4. [新增] 限制 RSI 绝对上限为 85。
-5. [修复] 资金流打分标准化，防止异常数值扭曲 Rank 排名。
-6. [UI] 强制排序，优先展示 Rank 1 和 Rank 2。
+1. [买点护城河] 坚守右侧确认：开盘>昨收，且盘中突破开盘价 1.5% 买入。
+2. [防高位接盘] 新增开盘高度限制，开盘价高于昨收 4% 以上直接放弃。
+3. [防守线拓宽] 强制止损线拓宽至 5%，容忍强势股正常日内洗盘，防冤杀。
+4. [趋势与指标] 引入周线 MA4 趋势护航，且强制拦截 RSI > 85 的极端超买股。
+5. [UI与排行] 排除北交所，锁定当前日期，强制回测清单按 Rank 排序展现。
 ------------------------------------------------
 """
 
@@ -37,8 +36,8 @@ GLOBAL_STOCK_INDUSTRY = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V35.2 实战防坑版", layout="wide")
-st.title("选股王 V35.2：实战防坑版 (强化止损与周线护航)")
+st.set_page_config(page_title="选股王 V35.3 护城河版", layout="wide")
+st.title("选股王 V35.3：右侧确认与 5% 弹性防守")
 
 # ---------------------------
 # 基础 API 函数
@@ -263,24 +262,24 @@ def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[1, 3, 5
     hist['open'] = pd.to_numeric(hist['open'], errors='coerce')
     hist['high'] = pd.to_numeric(hist['high'], errors='coerce')
     hist['close'] = pd.to_numeric(hist['close'], errors='coerce')
-    hist['low'] = pd.to_numeric(hist['low'], errors='coerce') # 必须转为数字用于止损判断
+    hist['low'] = pd.to_numeric(hist['low'], errors='coerce') 
     
     d1_data = hist.iloc[0]
     next_open = d1_data['open']
     next_high = d1_data['high']
     
-    # 核心买入条件：开盘必须高于昨收
+    # 【护城河 1】 坚守底线：开盘必须高于昨收
     if next_open <= d0_qfq_close: return results 
     
-    # [新增拦截]：如果大幅高开超过 4%，防止接最后一棒，直接放弃
+    # 【护城河 2】 防高位接盘：如果开盘价已经高出昨收 4% 以上，放弃该标的
     if next_open > d0_qfq_close * 1.04: return results 
 
-    # 核心买入条件：盘中达到开盘价的 1.015 倍确认动能
+    # 【右侧确认】 盘中最高价触及开盘价的 1.015 倍，确认动能并买入
     target_buy_price = next_open * 1.015
     if next_high < target_buy_price: return results
     
-    # [新增回测机制]：实战 3% 强制止损线
-    stop_loss_price = target_buy_price * 0.97 
+    # 【弹性防守】 实战 5% 强制止损线，过滤合理的洗盘动作
+    stop_loss_price = target_buy_price * 0.95 
         
     for n in days_ahead:
         col = f'Return_D{n}'
@@ -295,7 +294,7 @@ def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[1, 3, 5
                     break
                     
             if hit_stop_loss:
-                results[col] = -3.0 # 触发止损，强制记录亏损
+                results[col] = -5.0 # 触发止损，强制记录 -5%
             else:
                 sell_price = hist.iloc[n-1]['close']
                 results[col] = (sell_price - target_buy_price) / target_buy_price * 100
@@ -339,7 +338,7 @@ def compute_indicators(ts_code, end_date):
     hist_60 = df.tail(60)
     res['position_60d'] = (close.iloc[-1] - hist_60['low'].min()) / (hist_60['high'].max() - hist_60['low'].min() + 1e-9) * 100
 
-    # [新增机制] 合成周线级别趋势判定，护航日线突破
+    # 【趋势护航】 合成周线级别趋势判定
     df.index = pd.to_datetime(df.index)
     weekly_df = df.resample('W').agg({'close': 'last'}).dropna()
     if len(weekly_df) >= 4:
@@ -411,7 +410,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     df['circ_mv_billion'] = df['circ_mv'] / 10000 
     
     df = df[~df['name'].str.contains('ST|退', na=False)]
-    df = df[~df['ts_code'].str.startswith('92')] # 坚决排除北交所
+    df = df[~df['ts_code'].str.startswith('92')] # 排除北交所
     
     df = df[(df['close'] >= MIN_PRICE) & (df['close'] <= 2000.0)]
     df = df[(df['circ_mv_billion'] >= MIN_MV) & (df['circ_mv_billion'] <= MAX_MV)]
@@ -436,7 +435,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         
         if d0_rsi < 50: continue 
         
-        # [新增防接盘拦截] RSI 绝对上限 85，超买末端放弃
+        # 【护城河 3】 超买过滤：RSI 绝对上限卡在 85，防止接最后一棒
         if d0_rsi > 85: continue 
         
         if market_state == 'Weak':
@@ -445,7 +444,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
             
         if d0_close < ind['ma60']: continue
         
-        # [新增防接盘拦截] 必须处于周线上升趋势，且偏离 20日线不能超过 15%
+        # 【护城河 4】 趋势共振：必须处于周线上升趋势，且偏离 20日线不能太远
         if not ind.get('is_weekly_uptrend', False): continue
         if ind['ma20'] > 0 and (d0_close - ind['ma20']) / ind['ma20'] > 0.15: 
             continue
@@ -465,7 +464,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
             'ts_code': row.ts_code, 'name': row.name, 'Close': row.close, 'Pct_Chg': row.pct_chg,
             'rsi': d0_rsi, 'winner_rate': win_rate, 
             'macd': ind['macd_val'], 'net_mf': row.net_mf,
-            'circ_mv': row.circ_mv, # 补充用于资金打分标准化
+            'circ_mv': row.circ_mv, 
             'Return_D1 (%)': future.get('Return_D1', np.nan),
             'Return_D3 (%)': future.get('Return_D3', np.nan),
             'Return_D5 (%)': future.get('Return_D5', np.nan),
@@ -476,11 +475,10 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     if not records: return pd.DataFrame(), "深度筛选后无标的"
     fdf = pd.DataFrame(records)
     
-    # [修复点] 标准化打分，平衡资金流与技术形态比重
     def dynamic_score(r):
         mf_ratio = r['net_mf'] / (r['circ_mv'] * 10000 + 1) if r['circ_mv'] > 0 else 0
         base_score = r['macd'] * 1000 
-        base_score += min(max(mf_ratio * 10000, -500), 1000) # 资金流加分封顶
+        base_score += min(max(mf_ratio * 10000, -500), 1000) 
         
         penalty = 0 
         
@@ -500,8 +498,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V35.2 实战升级版")
-    # 强制默认回测截止日期为今天
+    st.header("V35.3 护城河版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数", value=30, step=1, help="建议30-50天")
     TOP_BACKTEST = st.number_input("每日优选 TopK", value=4, help="实盘重点看 Rank 1 和 2")
@@ -512,7 +509,7 @@ with st.sidebar:
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
             st.success("缓存已清除，下次运行将重新下载最新数据。")
-    CHECKPOINT_FILE = "backtest_checkpoint_v35_2.csv" 
+    CHECKPOINT_FILE = "backtest_checkpoint_v35_3.csv" 
     
     st.markdown("---")
     st.subheader("💰 基础过滤")
@@ -539,7 +536,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V35.2 引擎"):
+if st.button(f"🚀 启动 V35.3 引擎"):
     processed_dates = set()
     results = []
     
@@ -585,7 +582,7 @@ if st.button(f"🚀 启动 V35.2 引擎"):
         all_res = all_res[all_res['Rank'] <= int(TOP_BACKTEST)]
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-        st.header(f"📊 V35.2 统计仪表盘 (强制 3% 止损)")
+        st.header(f"📊 V35.3 统计仪表盘 (强制 5% 止损)")
         cols = st.columns(3)
         for idx, n in enumerate([1, 3, 5]):
             col_name = f'Return_D{n} (%)'
@@ -595,18 +592,17 @@ if st.button(f"🚀 启动 V35.2 引擎"):
                 win = (valid[col_name] > 0).mean() * 100
                 cols[idx].metric(f"D+{n} 均益 / 胜率", f"{avg:.2f}% / {win:.1f}%")
  
-        st.subheader("📋 回测清单 (优先锁定 Rank 1 和 Rank 2)")
+        st.subheader("📋 回测清单 (优先锁定 Rank 1 和 2)")
         
         show_cols = ['Rank', 'Trade_Date','name','ts_code','Close','Pct_Chg',
              'Return_D1 (%)', 'Return_D3 (%)', 'Return_D5 (%)',
                         'rsi','winner_rate','Sector_Boost']
         final_cols = [c for c in show_cols if c in all_res.columns]
     
-        # [修改点] 强制数据框按照日期和排名排序，突出前两名
         display_df = all_res[final_cols].sort_values(['Trade_Date', 'Rank'], ascending=[False, True])
         st.dataframe(display_df, use_container_width=True)
         
         csv = all_res.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下载结果 (CSV)", csv, f"export.csv", "text/csv")
+        st.download_button("📥 下载结果 (CSV)", csv, f"export_v35_3.csv", "text/csv")
     else:
         st.warning("⚠️ 没有结果。")
