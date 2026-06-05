@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V35.6 终极破局版 (K线形态锁)
+选股王 · V35.7 动态止盈版 (实战双向结算)
 ------------------------------------------------
 修改记录:
-1. [形态绝杀] 增加K线几何形态锁：必须是实体红盘，且上影线≤全天振幅30%（光头或短上影阳线）。
-2. [拒绝滞涨] 废除换手率排序，改用“资金净流入比例”排序，彻底过滤天量出货十字星。
-3. [修复均线] 恢复前复权 (qfq) 数据计算，修复 MA20/MA60 和乖离率在除权股上的严重失真Bug。
-4. [双重突破] 维持买入价必须突破“开盘价+1.5%”且“突破昨高”的双重确认逻辑。
+1. [修复痛点] 引入 10% 动态止盈机制 (Take Profit)，解决“利润回撤变亏损”的死扛Bug。
+2. [保守结算] 盘中若同时触碰止盈与止损，优先按止损计算，杜绝回测自欺欺人。
+3. [形态优化] 上影线容忍度放宽至全天振幅的 35%，适配打板回落的强势股。
+4. [排序回归] 恢复“换手率 + 涨幅”的活跃度排序，寻找市场最具共识的起爆点。
 ------------------------------------------------
 """
 
@@ -35,8 +35,8 @@ GLOBAL_STOCK_INDUSTRY = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V35.6 破局版", layout="wide")
-st.title("选股王 V35.6：实体大阳线与突破狙击")
+st.set_page_config(page_title="选股王 V35.7 止盈版", layout="wide")
+st.title("选股王 V35.7：动态止盈与真突破狙击")
 
 # ---------------------------
 # 基础 API 函数
@@ -110,7 +110,7 @@ def load_industry_mapping():
 # ---------------------------
 # 数据获取核心 (本地缓存版)
 # ---------------------------
-CACHE_FILE_NAME = "market_data_cache_v35_6.pkl"
+CACHE_FILE_NAME = "market_data_cache_v35_6.pkl" # 继续使用带有复权数据的缓存
 
 def get_all_historical_data(trade_days_list, use_cache=True):
     global GLOBAL_ADJ_FACTOR, GLOBAL_DAILY_RAW, GLOBAL_QFQ_BASE_FACTORS, GLOBAL_STOCK_INDUSTRY
@@ -212,7 +212,7 @@ def get_all_historical_data(trade_days_list, use_cache=True):
     return True
 
 # ---------------------------
-# 复权计算核心逻辑 (恢复用于修复均线失真)
+# 复权计算核心逻辑 
 # ---------------------------
 def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
     global GLOBAL_DAILY_RAW, GLOBAL_ADJ_FACTOR, GLOBAL_QFQ_BASE_FACTORS
@@ -246,9 +246,9 @@ def get_qfq_data_v4_optimized_final(ts_code, start_date, end_date):
     return df[['open', 'high', 'low', 'close', 'vol']].copy() 
 
 # ---------------------------
-# 实战仿真与指标计算
+# 实战仿真与双向结算 (止盈+止损)
 # ---------------------------
-def get_future_prices(ts_code, selection_date, d0_qfq_close, d0_qfq_high, days_ahead=[1, 3, 5]):
+def get_future_prices(ts_code, selection_date, d0_qfq_close, d0_qfq_high, days_ahead=[1, 3, 5], stop_loss=5.0, take_profit=10.0):
     d0 = datetime.strptime(selection_date, "%Y%m%d")
     start_future = (d0 + timedelta(days=1)).strftime("%Y%m%d")
     end_future = (d0 + timedelta(days=15)).strftime("%Y%m%d")
@@ -275,25 +275,32 @@ def get_future_prices(ts_code, selection_date, d0_qfq_close, d0_qfq_high, days_a
     target_buy_price = max(next_open * 1.015, d0_qfq_high * 1.001)
     if next_high < target_buy_price: return results
     
-    # 5% 实战弹性防守线
-    stop_loss_price = target_buy_price * 0.95 
+    # 动态止盈与止损线计算
+    stop_loss_price = target_buy_price * (1 - stop_loss / 100.0)
+    take_profit_price = target_buy_price * (1 + take_profit / 100.0)
         
     for n in days_ahead:
         col = f'Return_D{n}'
         if len(hist) >= n:
             period_data = hist.iloc[0:n]
-            hit_stop_loss = False
+            final_return = np.nan
             
             for _, row in period_data.iterrows():
+                # 极端保守原则：同一天内既碰到止损又碰到止盈（剧烈震荡天地板），我们保守按止损计提。
                 if row['low'] <= stop_loss_price:
-                    hit_stop_loss = True
+                    final_return = -stop_loss
+                    break
+                # 【新增】触碰止盈线，立马落袋为安，拒绝死扛！
+                elif row['high'] >= take_profit_price:
+                    final_return = take_profit
                     break
                     
-            if hit_stop_loss:
-                results[col] = -5.0 
-            else:
+            if pd.isna(final_return):
+                # 既没止损也没止盈，按周期最后一天收盘价结算
                 sell_price = hist.iloc[n-1]['close']
-                results[col] = (sell_price - target_buy_price) / target_buy_price * 100
+                final_return = (sell_price - target_buy_price) / target_buy_price * 100
+                
+            results[col] = final_return
         else:
             results[col] = np.nan
     return results
@@ -357,7 +364,7 @@ def get_market_state(trade_date):
 # ---------------------------
 # 核心回测逻辑函数 
 # ---------------------------
-def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, MAX_PREV_PCT, MIN_PRICE):
+def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, MAX_PREV_PCT, MIN_PRICE, STOP_LOSS_PCT, TAKE_PROFIT_PCT):
     global GLOBAL_STOCK_INDUSTRY
     
     market_state = get_market_state(last_trade)
@@ -411,25 +418,18 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     df = df[(df['circ_mv_billion'] >= MIN_MV) & (df['circ_mv_billion'] <= MAX_MV)]
     df = df[df['turnover_rate'] <= MAX_TURNOVER_RATE] 
 
-    # 🌟【最核心修复】：K线几何形态锁
-    # 1. 过滤昨日涨幅，锁定 2%~8% 的温和起爆点，排除十字星和极度耗能的涨停板
+    # 🌟【形态锁】
     df = df[(df['pct_chg'] >= 2.0) & (df['pct_chg'] <= MAX_PREV_PCT)]
-    
-    # 2. 必须是实体红盘（防止假阳线）
     df = df[df['close'] > df['open']]
-    
-    # 3. 几何切割：上影线不能超过全天振幅的 30% (保证买方强势控盘直至收盘)
     df['range'] = df['high'] - df['low']
     df['upper_shadow'] = df['high'] - df['close']
     df = df[df['range'] > 0]
-    df = df[(df['upper_shadow'] / df['range']) <= 0.3]
+    df = df[(df['upper_shadow'] / df['range']) <= 0.35] # 放宽至35%以避免误杀
     
     if len(df) == 0: return pd.DataFrame(), "过滤后无标的"
 
-    # 🌟【最核心修复】：资金净流入排序
-    # 彻底废除“看换手率找股票”的错误逻辑，改为谁家主力真金白银买入占比高就选谁
-    df['mf_ratio'] = df['net_mf'] / (df['circ_mv'] + 1)
-    df['activity_score'] = df['mf_ratio'] * 10000 + df['pct_chg']
+    # 🌟【打分回归】回归最硬核的活跃度（换手+涨幅）排序
+    df['activity_score'] = df['turnover_rate'] + (df['pct_chg'] * 2)
     candidates = df.sort_values('activity_score', ascending=False).head(FINAL_POOL)
     
     records = []
@@ -459,7 +459,8 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         win_rate = chip_dict.get(row.ts_code, 50) 
         if win_rate < CHIP_MIN_WIN_RATE: continue
 
-        future = get_future_prices(row.ts_code, last_trade, d0_close, ind['last_high'])
+        # 传入动态止损与止盈参数
+        future = get_future_prices(row.ts_code, last_trade, d0_close, ind['last_high'], [1, 3, 5], STOP_LOSS_PCT, TAKE_PROFIT_PCT)
         records.append({
             'ts_code': row.ts_code, 'name': row.name, 'Close': row.close, 'Pct_Chg': row.pct_chg,
             'rsi': d0_rsi, 'winner_rate': win_rate, 
@@ -476,12 +477,12 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     fdf = pd.DataFrame(records)
     
     def dynamic_score(r):
+        # 修正资金流权重
         mf_ratio = r['net_mf'] / (r['circ_mv'] * 10000 + 1) if r['circ_mv'] > 0 else 0
         base_score = r['macd'] * 1000 
         base_score += min(max(mf_ratio * 10000, -500), 1000) 
         
         penalty = 0 
-        
         if r['winner_rate'] > 60: base_score += 1000
         if 55 < r['rsi'] < 80: base_score += 2000 
         if r['rsi'] > RSI_LIMIT: penalty += 500
@@ -498,7 +499,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V35.6 破局实战版")
+    st.header("V35.7 止盈实战版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数", value=30, step=1, help="建议30-50天")
     TOP_BACKTEST = st.number_input("每日优选 TopK", value=4, help="实盘重点看 Rank 1 和 2")
@@ -509,7 +510,12 @@ with st.sidebar:
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
             st.success("缓存已清除，下次运行将重新下载最新数据。")
-    CHECKPOINT_FILE = "backtest_checkpoint_v35_6.csv" 
+    CHECKPOINT_FILE = "backtest_checkpoint_v35_7.csv" 
+    
+    st.markdown("---")
+    st.subheader("⚔️ 实战双向边界 (止盈/止损)")
+    TAKE_PROFIT_PCT = st.number_input("动态止盈线 (%)", value=10.0, help="盘中只要涨到这个幅度，立马落袋为安！")
+    STOP_LOSS_PCT = st.number_input("硬性止损线 (%)", value=5.0, help="盘中跌破买入价的该比例即割肉")
     
     st.markdown("---")
     st.subheader("💰 基础过滤")
@@ -520,8 +526,8 @@ with st.sidebar:
     
     st.markdown("---")
     st.subheader("⚔️ 核心风控参数")
-    CHIP_MIN_WIN_RATE = st.number_input("最低获利盘 (%)", value=40.0, help="建议: 40-50%")
-    MAX_PREV_PCT = st.number_input("昨日最大涨幅限制 (%)", value=8.0, help="坚决拒绝涨停股，锁定大阳线起爆点")
+    CHIP_MIN_WIN_RATE = st.number_input("最低获利盘 (%)", value=40.0)
+    MAX_PREV_PCT = st.number_input("昨日最大涨幅限制 (%)", value=8.0, help="锁定大阳线起爆点，拒绝涨停接盘")
     RSI_LIMIT = st.number_input("弱势拦截线 (建议100)", value=100.0)
     
     st.markdown("---")
@@ -536,7 +542,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V35.6 引擎"):
+if st.button(f"🚀 启动 V35.7 引擎"):
     processed_dates = set()
     results = []
     
@@ -566,7 +572,7 @@ if st.button(f"🚀 启动 V35.6 引擎"):
         bar = st.progress(0, text="回测引擎启动...")
         
         for i, date in enumerate(dates_to_run):
-            res, err = run_backtest_for_a_day(date, int(TOP_BACKTEST), 100, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, MAX_PREV_PCT, MIN_PRICE)
+            res, err = run_backtest_for_a_day(date, int(TOP_BACKTEST), 100, MAX_UPPER_SHADOW, MAX_TURNOVER_RATE, MIN_BODY_POS, RSI_LIMIT, CHIP_MIN_WIN_RATE, SECTOR_THRESHOLD, MIN_MV, MAX_MV, MAX_PREV_PCT, MIN_PRICE, STOP_LOSS_PCT, TAKE_PROFIT_PCT)
             if not res.empty:
                 res['Trade_Date'] = date
                 is_first = not os.path.exists(CHECKPOINT_FILE)
@@ -582,7 +588,7 @@ if st.button(f"🚀 启动 V35.6 引擎"):
         all_res = all_res[all_res['Rank'] <= int(TOP_BACKTEST)]
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-        st.header(f"📊 V35.6 统计仪表盘 (K线形态锁)")
+        st.header(f"📊 V35.7 统计仪表盘 (止盈双向防守)")
         cols = st.columns(3)
         for idx, n in enumerate([1, 3, 5]):
             col_name = f'Return_D{n} (%)'
@@ -603,6 +609,6 @@ if st.button(f"🚀 启动 V35.6 引擎"):
         st.dataframe(display_df, use_container_width=True)
         
         csv = all_res.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下载结果 (CSV)", csv, f"export_v35_6.csv", "text/csv")
+        st.download_button("📥 下载结果 (CSV)", csv, f"export_v35_7.csv", "text/csv")
     else:
         st.warning("⚠️ 没有结果。")
