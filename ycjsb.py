@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-选股王 · V35.15 终极狙击版 (N型龙回头)
+选股王 · V35.16 灰度破局版 (解除刻板枷锁)
 ------------------------------------------------
 修改记录:
-1. [时空锚点] 引入游资“洗盘天数”法则，从涨停后的绝对高点起算，只抓回调 2~4 天的标的。
-2. [防跑路底线] 增加底线确认，回调期间的最低价绝不可跌破涨停启动日的开盘价。
-3. [量能萎缩] 强制要求 D0(买入前日) 必须缩量，确认抛压枯竭。
-4. [纯粹买点] 废除“突破昨高”的枷锁，完全恢复“开盘价 + 1.5%”的动能起爆买点。
-5. [动态高开] 智能识别板块，科创/创业板高开上限放宽至 5%，主板收紧至 3%。
+1. [解除刻板] 废除“强制回调 2-4 天”和“强制昨日缩量”的死脑筋规则，防止将洗盘中的分歧异动误杀。
+2. [高胜率底盘] 恢复 V35.13 胜率近 50% 的完美判定：最大涨幅<=0（只买绿盘洗盘），获利盘 30%-60%（筹码断层）。
+3. [实战保留 1] 保留动态高开容忍度：20%弹性板允许 5% 高开，10%主板允许 3% 高开，贴合游资点火习惯。
+4. [实战保留 2] 保留最纯粹的“开盘价 + 1.5%”右侧动能买点，无需突破昨高，低位上车。
+5. [重塑打分] 重新启用“MACD动能 + 资金流入比例”动态打分，确保买在起爆点。
 ------------------------------------------------
 """
 
@@ -36,8 +36,8 @@ GLOBAL_STOCK_INDUSTRY = {}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V35.15 终极狙击版", layout="wide")
-st.title("选股王 V35.15：N型龙回头与时空共振")
+st.set_page_config(page_title="选股王 V35.16 灰度破局", layout="wide")
+st.title("选股王 V35.16：打破死脑筋，重归真胜率")
 
 # ---------------------------
 # 基础 API 函数
@@ -111,7 +111,7 @@ def load_industry_mapping():
 # ---------------------------
 # 数据获取核心 
 # ---------------------------
-CACHE_FILE_NAME = "market_data_cache_v35_15.pkl" 
+CACHE_FILE_NAME = "market_data_cache_v35_16.pkl" 
 
 def get_all_historical_data(trade_days_list, use_cache=True):
     global GLOBAL_ADJ_FACTOR, GLOBAL_DAILY_RAW, GLOBAL_QFQ_BASE_FACTORS, GLOBAL_STOCK_INDUSTRY
@@ -268,15 +268,14 @@ def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[2, 3, 5
     next_open = d1_data['open']
     next_high = d1_data['high']
     
-    # 🌟动态防骗炮：智能识别板块，赋予不同的高开容忍度
+    # 🌟动态防高开雷达：科创/创业板允许 5% 高开，主板限制在 3% 
     is_20pct_board = ts_code.startswith('300') or ts_code.startswith('688')
     max_open_gap = 1.05 if is_20pct_board else 1.03
     
-    # 开盘价必须 >= 昨收，且不能超出容忍上限
-    if next_open < d0_qfq_close: return results 
+    if next_open < d0_qfq_close * 0.985: return results 
     if next_open > d0_qfq_close * max_open_gap: return results 
 
-    # 🌟纯粹动能确认：日内突破开盘价 1.5%，无需再看昨日最高点！
+    # 🌟纯粹动能确认：日内突破开盘价 1.5%，直接起爆上车
     target_buy_price = next_open * 1.015
     if next_high < target_buy_price: return results
     
@@ -291,9 +290,9 @@ def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[2, 3, 5
             
             for i_day, (_, row) in enumerate(period_data.iterrows()):
                 if i_day == 0:
-                    continue # T+0 绝对锁定，模拟真实交割
+                    continue # T+0 绝对锁定交割
                     
-                # T+1 结算逻辑
+                # T+1 开盘跳空结算
                 if row['open'] <= stop_loss_price:
                     final_return = (row['open'] - target_buy_price) / target_buy_price * 100
                     break
@@ -301,6 +300,7 @@ def get_future_prices(ts_code, selection_date, d0_qfq_close, days_ahead=[2, 3, 5
                     final_return = (row['open'] - target_buy_price) / target_buy_price * 100
                     break
                     
+                # 盘中波动结算
                 if row['low'] <= stop_loss_price:
                     final_return = -stop_loss
                     break
@@ -350,32 +350,11 @@ def compute_indicators(ts_code, end_date):
     rsi_series = calculate_rsi(close, period=12)
     res['rsi_12'] = rsi_series.iloc[-1]
     
-    # 🌟【时空共振锁】核心算法：定位绝对高点，严查 2~4天 回调与底线防守
-    res['valid_n_shape'] = False
-    hist_15 = df.tail(15)
-    limit_up_days = hist_15[hist_15['pct_chg'] >= 9.5]
-    
-    if not limit_up_days.empty:
-        last_limit_up_idx = limit_up_days.index[-1]
-        sub_df = df.loc[last_limit_up_idx:]
-        
-        if len(sub_df) >= 3: 
-            # 找到涨停之后的绝对最高点
-            highest_day_idx = sub_df['high'].idxmax()
-            # 从最高点到今天（D0）的回调天数
-            pullback_days = len(df.loc[highest_day_idx:]) - 1
-            
-            # 必须恰好回调 2, 3 或 4 天
-            if pullback_days in [2, 3, 4]:
-                limit_up_open = df.loc[last_limit_up_idx, 'open']
-                pullback_min_low = df.loc[highest_day_idx:]['low'].min()
-                
-                # 防跑路：回调的最低价，绝对不能跌破那根涨停大阳线的开盘价
-                if pullback_min_low >= limit_up_open * 0.98:
-                    
-                    # 极致缩量：买入前一天的成交量，必须小于前天（主力无卖盘）
-                    if df['vol'].iloc[-1] < df['vol'].iloc[-2]:
-                        res['valid_n_shape'] = True
+    hist_60 = df.tail(60)
+    res['position_60d'] = (close.iloc[-1] - hist_60['low'].min()) / (hist_60['high'].max() - hist_60['low'].min() + 1e-9) * 100
+
+    # 【唯一保留的活基因】：近 15 天有过涨停
+    res['has_limit_up_gene'] = (df['pct_chg'].tail(15).max() >= 9.5)
 
     df.index = pd.to_datetime(df.index)
     weekly_df = df.resample('W').agg({'close': 'last'}).dropna()
@@ -454,7 +433,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     df = df[(df['circ_mv_billion'] >= MIN_MV) & (df['circ_mv_billion'] <= MAX_MV)]
     df = df[df['turnover_rate'] <= MAX_TURNOVER_RATE] 
 
-    # UI 传进来的温和区间过滤
+    # 🌟【纯绿盘锁死】：回归最高胜率的深蹲区间 (-6.0% ~ 0.0%)
     df = df[(df['pct_chg'] >= MIN_PREV_PCT) & (df['pct_chg'] <= MAX_PREV_PCT)]
     
     if len(df) == 0: return pd.DataFrame(), "过滤后无标的"
@@ -471,8 +450,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
         ind = compute_indicators(row.ts_code, last_trade)
         if not ind: continue
         
-        # 🌟核心过滤器：执行 N型龙回头形态锁！
-        if not ind.get('valid_n_shape', False): continue
+        if not ind.get('has_limit_up_gene', False): continue
         
         d0_close = ind['last_close']
         d0_rsi = ind.get('rsi_12', 50)
@@ -485,9 +463,16 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
             if d0_close < ind['ma20']: continue 
             
         if d0_close < ind['ma60']: continue
+        
         if not ind.get('is_weekly_uptrend', False): continue
         
+        # 🌟均线偏离控制，防空中飞人
+        if ind['ma20'] > 0 and (d0_close - ind['ma20']) / ind['ma20'] > 0.15: 
+            continue
+        
         win_rate = chip_dict.get(row.ts_code, 50) 
+        
+        # 🌟【套牢盘断层】：获利盘绝对不能超过 60%，过滤洗盘不彻底的标的
         if win_rate < CHIP_MIN_WIN_RATE or win_rate > CHIP_MAX_WIN_RATE: continue
 
         future = get_future_prices(row.ts_code, last_trade, d0_close, [2, 3, 5], STOP_LOSS_PCT, TAKE_PROFIT_PCT)
@@ -506,6 +491,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
     if not records: return pd.DataFrame(), "深度筛选后无标的"
     fdf = pd.DataFrame(records)
     
+    # 🌟【恢复资金流打分】：彻底弃用失败的深蹲分值
     def dynamic_score(r):
         mf_ratio = r['net_mf'] / (r['circ_mv'] * 10000 + 1) if r['circ_mv'] > 0 else 0
         base_score = r['macd'] * 1000 
@@ -527,7 +513,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, FINAL_POOL, MAX_UPPER_SHADO
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V35.15 狙击版 (龙回头)")
+    st.header("V35.16 灰度破局实战版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数", value=30, step=1, help="建议30-50天")
     TOP_BACKTEST = st.number_input("每日优选 TopK", value=4, help="实盘重点看 Rank 1 和 2")
@@ -538,7 +524,7 @@ with st.sidebar:
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
             st.success("缓存已清除，下次运行将重新下载最新数据。")
-    CHECKPOINT_FILE = "backtest_checkpoint_v35_15.csv" 
+    CHECKPOINT_FILE = "backtest_checkpoint_v35_16.csv" 
     
     st.markdown("---")
     st.subheader("⚔️ 实战双向边界 (止盈/止损)")
@@ -554,9 +540,9 @@ with st.sidebar:
     
     st.markdown("---")
     st.subheader("⚔️ 核心印钞参数 (绝杀锁)")
-    CHIP_MIN_WIN_RATE = st.number_input("最低获利盘 (%)", value=20.0)
-    CHIP_MAX_WIN_RATE = st.number_input("最大获利盘 (%)", value=80.0, help="最高可放宽至80%，因为形态锁已极度严苛")
-    MAX_PREV_PCT = st.number_input("昨日最大涨幅 (%)", value=3.0, help="N型洗盘期可能出现小红星，放宽至 3.0%")
+    CHIP_MIN_WIN_RATE = st.number_input("最低获利盘 (%)", value=30.0)
+    CHIP_MAX_WIN_RATE = st.number_input("最大获利盘 (%)", value=60.0, help="【绝杀锁】超过60%坚决拒绝，回归V35.13高胜率区间")
+    MAX_PREV_PCT = st.number_input("昨日最大涨幅 (%)", value=0.0, help="【深蹲锁】强制最高涨幅为0，绝对禁止买红盘接力！")
     MIN_PREV_PCT = st.number_input("昨日最大跌幅 (%)", value=-6.0)
     RSI_LIMIT = st.number_input("弱势拦截线", value=100.0)
     
@@ -572,7 +558,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V35.15 狙击引擎"):
+if st.button(f"🚀 启动 V35.16 破局引擎"):
     processed_dates = set()
     results = []
     
@@ -618,7 +604,7 @@ if st.button(f"🚀 启动 V35.15 狙击引擎"):
         all_res = all_res[all_res['Rank'] <= int(TOP_BACKTEST)]
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-        st.header(f"📊 V35.15 狙击版 (2-3日洗盘法则)")
+        st.header(f"📊 V35.16 灰度破局版 (解除死脑筋)")
         cols = st.columns(3)
         for idx, n in enumerate([2, 3, 5]):
             col_name = f'Return_T{n-1} (%)'
@@ -639,6 +625,6 @@ if st.button(f"🚀 启动 V35.15 狙击引擎"):
         st.dataframe(display_df, use_container_width=True)
         
         csv = all_res.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下载结果 (CSV)", csv, f"export_v35_15.csv", "text/csv")
+        st.download_button("📥 下载结果 (CSV)", csv, f"export_v35_16.csv", "text/csv")
     else:
         st.warning("⚠️ 深度筛选后没有满足条件的标的。请耐心等待下一个变盘窗口。")
