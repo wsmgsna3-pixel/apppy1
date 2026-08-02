@@ -22,6 +22,18 @@
    顺带修复了表格颜色标注函数(color_exit)——它里面匹配的还是V39.2之前"一档/二档/假突破"
    这些早就废弃的旧名称，一直没起作用，现在改成匹配现有的固定止损/保本止盈/移动止盈/
    一字板/周期结束平仓这几个真实存在的分类。
+
+【★V39.7新增：行业白名单从L1放宽为L2】
+   原来的白名单用申万一级(L1)行业，只有6个大类(电子/计算机/通信/医药生物/国防军工/
+   机械设备)，颗粒度太粗——比如"医药生物"里既有创新药又有传统中药饮片，"机械设备"
+   里既有工业机器人又有工程机械，混在一起互相稀释了选股精准度，也压低了每日候选池
+   数量，导致100个交易日只选出40多只信号，样本量偏小。
+   本版把行业分类改为申万二级(L2)，直接圈定半导体/软件开发/通信设备/军工电子/
+   自动化设备/电池光伏等更精确的科技细分赛道，同时补充了原白名单完全没覆盖的新能源
+   赛道(电池/光伏设备/风电设备)。这是本次唯一的改动点，止盈止损逻辑、突破信号逻辑、
+   一字板过滤逻辑均未改动，方便和V39.6做单变量对比测试。
+   注意：white_list_names里的二级行业名称是按通用命名推断的，如果实际命中数量过少，
+   页面会自动打印Tushare返回的真实二级行业全名单，请对照核实调整。
 ------------------------------------------------
 """
 
@@ -54,8 +66,8 @@ SINA_STATUS = {'success': 0, 'fail': 0}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V39.6 主板一字板过滤版", layout="wide")
-st.title("选股王 V39.6：周线温和过滤 + 日线爆量共振（新增主板一字板过滤）")
+st.set_page_config(page_title="选股王 V39.7 行业白名单L2放宽版", layout="wide")
+st.title("选股王 V39.7：周线温和过滤 + 日线爆量共振（行业白名单升级为申万二级L2）")
 
 # ---------------------------
 # 新浪实时行情引擎
@@ -133,21 +145,45 @@ def load_industry_mapping():
     global pro
     if pro is None: return {}
     try:
-        sw_indices = pro.index_classify(level='L1', src='SW2021')
+        # 【V39.7改动】行业白名单从6个一级行业(L1)放宽为申万二级行业(L2)，
+        # 颗粒度更细，避免"一级行业"里科技子行业和传统子行业混在一起互相稀释、
+        # 同时把新能源(电池/光伏/风电)这类原来完全没覆盖的双创板密集赛道补进来。
+        sw_indices = pro.index_classify(level='L2', src='SW2021')
         if sw_indices.empty: return {}
-        white_list_names = ['电子', '计算机', '通信', '医药生物', '国防军工', '机械设备']
+
+        # 注意：以下名称是按申万2021版二级行业的通用命名推断的，Tushare实际返回的
+        # 字符串可能有细微出入(比如"IT服务"是否叫这个名字)。函数末尾加了一段自检，
+        # 如果白名单命中0个或很少，会在页面上打印出真实的二级行业全名单，方便直接核对。
+        white_list_names = [
+            '半导体', '光学光电子', '元件', '电子化学品',      # 电子细分(剔除消费电子代工等低壁垒环节)
+            '软件开发', 'IT服务',                              # 计算机细分
+            '通信设备', '通信服务',                            # 通信细分
+            '化学制药', '生物制品', '医疗器械',                # 医药细分(剔除中药/原料药等低波动子行业)
+            '军工电子', '航天装备', '航空装备',                # 军工细分
+            '自动化设备', '工业机器人', '专用设备',            # 高端制造细分(剔除工程机械等强周期股)
+            '电池', '光伏设备', '风电设备',                    # 新能源(原白名单完全没覆盖)
+        ]
         target_indices = sw_indices[sw_indices['industry_name'].isin(white_list_names)]
         index_codes = target_indices['index_code'].tolist()
+
+        # 【自检】命中的二级行业数量太少，大概率是名称对不上，直接把真实全名单打出来
+        if len(index_codes) < 5:
+            st.warning(
+                f"⚠️ 白名单只命中了 {len(index_codes)} 个二级行业，"
+                f"很可能是 white_list_names 里的名称和Tushare实际返回的不一致。"
+                f"下面是Tushare返回的全部二级行业真实名称，请对照修改代码里的 white_list_names 列表："
+            )
+            st.write(sorted(sw_indices['industry_name'].unique().tolist()))
         
         all_members = []
-        load_bar = st.progress(0, text="正在加载硬科技白名单赛道数据...")
+        load_bar = st.progress(0, text=f"正在加载硬科技二级行业白名单数据(命中{len(index_codes)}个二级行业)...")
         for i, idx_code in enumerate(index_codes):
             df = pro.index_member(index_code=idx_code, is_new='Y')
             if not df.empty: 
                 df['industry_code'] = idx_code
                 all_members.append(df)
             time.sleep(0.05) 
-            load_bar.progress((i + 1) / len(index_codes))
+            load_bar.progress((i + 1) / len(index_codes)) if index_codes else None
         load_bar.empty()
         
         if not all_members: return {}
@@ -595,7 +631,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE, 
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V39.6 主板一字板过滤版")
+    st.header("V39.7 行业白名单L2放宽版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数 (设为 1 即启动实盘雷达)", value=100, step=1)
     
@@ -607,7 +643,7 @@ with st.sidebar:
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
             st.success("缓存已清除，下次运行将重新下载最新数据。")
-    CHECKPOINT_FILE = "backtest_checkpoint_v39_6_oneword.csv" 
+    CHECKPOINT_FILE = "backtest_checkpoint_v39_7_L2.csv"  # 【V39.7改动】改名，避免和V39.6(L1白名单)的旧结果混在一起对比失真
     if st.button("🗑️ 清除断点记录 (重新回测)"):
         if os.path.exists(CHECKPOINT_FILE):
             os.remove(CHECKPOINT_FILE)
@@ -625,7 +661,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V39.6 追踪(一字板过滤)"):
+if st.button(f"🚀 启动 V39.7 追踪(L2白名单)"):
     SINA_STATUS = {'success': 0, 'fail': 0}
     processed_dates = set()
     results = []
@@ -683,7 +719,7 @@ if st.button(f"🚀 启动 V39.6 追踪(一字板过滤)"):
         all_res = pd.concat(results)
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-        st.header(f"📊 V39.6 主板一字板过滤版")
+        st.header(f"📊 V39.7 行业白名单L2放宽版")
         st.subheader("🗓️ 周度生存与收益切片")
         cols_row1 = st.columns(4)
         cols_row2 = st.columns(4)
@@ -728,6 +764,6 @@ if st.button(f"🚀 启动 V39.6 追踪(一字板过滤)"):
             st.dataframe(display_df, use_container_width=True)
         
         csv = all_res.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v39_6_oneword.csv", "text/csv")
+        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v39_7_L2.csv", "text/csv")
     else:
         st.warning("⚠️ 暂无符合条件的标的。")
