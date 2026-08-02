@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-选股王 V39.7 · 科技细分增强与可信回测版
+选股王 V39.8 · 市场环境与动态门槛增强版
 ============================================================
 主要变化
 1. 股票池：主板/创业板/科创板，明确剔除北交所；保留流通市值200~1000亿元参数。
@@ -13,6 +13,10 @@
 8. 统计：退出收益向后延续，另设Eligible/Held字段，修复周度幸存者偏差。
 9. 数据：缓存检查日期覆盖并增量补齐；行业/API失败不再静默放行。
 10. 诊断：输出逐日筛选漏斗、退出周、持仓天数、MFE/MAE等字段。
+11. 门槛：当天80分以上核心信号达到4只时门槛为80分，否则提高到82分，但不禁止开仓。
+12. 环境：创业板指与科创50同时跌破下降中的MA20时，暂停次日新开仓。
+13. 保本：浮盈首次达到10%后，从下一交易日启用成本上方0.3%的保护止损。
+14. 审计：另行导出全部核心候选及未入选原因，便于核查动态门槛和市场过滤。
 
 说明
 - 本程序用于研究和回测，不构成投资建议。
@@ -39,7 +43,8 @@ import tushare as ts
 
 warnings.filterwarnings("ignore")
 
-VERSION = "V39.7"
+VERSION = "V39.8"
+# 行情结构与V39.7兼容，沿用原缓存可避免重新下载数百个交易日。
 CACHE_FILE_NAME = "market_data_cache_v39_7.pkl"
 MAX_FETCH_WORKERS = 1  # 避免触发Tushare频率限制
 
@@ -51,6 +56,7 @@ GLOBAL_STOCK_BASIC = pd.DataFrame()
 GLOBAL_TECH_PERIODS: dict[str, list[dict]] = {}
 GLOBAL_THS_TECH_CODES: set[str] = set()
 GLOBAL_BENCHMARK = pd.DataFrame()
+GLOBAL_REGIME_INDICES: dict[str, pd.DataFrame] = {}
 API_ERRORS: list[str] = []
 SINA_STATUS = {"success": 0, "fail": 0}
 
@@ -114,7 +120,7 @@ DEFAULT_THS_KEYWORDS = (
 # 页面
 # -----------------------------------------------------------------------------
 st.set_page_config(page_title=f"选股王 {VERSION} 科技细分增强版", layout="wide")
-st.title(f"选股王 {VERSION}：科技细分增强 + 非追涨评分 + 可信周度回测")
+st.title(f"选股王 {VERSION}：动态评分 + 双指数环境过滤 + 次日保护止损")
 
 
 # -----------------------------------------------------------------------------
@@ -515,6 +521,81 @@ def load_benchmark(start_date: str, end_date: str) -> None:
     GLOBAL_BENCHMARK = df.sort_values("trade_date").set_index("trade_date")
 
 
+def load_market_regime_indices(start_date: str, end_date: str) -> None:
+    """一次性载入创业板指和科创50，所有判断只使用信号日及以前的数据。"""
+    global GLOBAL_REGIME_INDICES
+    GLOBAL_REGIME_INDICES = {}
+    index_names = {
+        "399006.SZ": "创业板指",
+        "000688.SH": "科创50",
+    }
+    for ts_code, name in index_names.items():
+        df = safe_get(
+            "index_daily",
+            ts_code=ts_code,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        if df.empty:
+            record_api_error(f"{name}({ts_code})数据为空；市场环境过滤对该指数按未知处理")
+            continue
+        df["trade_date"] = df["trade_date"].astype(str)
+        df["close"] = pd.to_numeric(df["close"], errors="coerce")
+        df = df.sort_values("trade_date").dropna(subset=["close"]).copy()
+        df["ma20"] = df["close"].rolling(20, min_periods=20).mean()
+        df["ma20_prev"] = df["ma20"].shift(1)
+        GLOBAL_REGIME_INDICES[ts_code] = df.set_index("trade_date")
+
+
+def market_regime_on_date(trade_date: str, enabled: bool = True) -> dict:
+    """双指数同时处于弱势才阻止开仓；单指数弱或数据不足均不阻止。"""
+    result = {
+        "Market_Filter_Enabled": bool(enabled),
+        "Market_Weak_Block": False,
+        "Market_Regime": "过滤关闭" if not enabled else "数据不足-允许开仓",
+        "CYB_Close": np.nan,
+        "CYB_MA20": np.nan,
+        "CYB_MA20_Falling": False,
+        "STAR50_Close": np.nan,
+        "STAR50_MA20": np.nan,
+        "STAR50_MA20_Falling": False,
+    }
+    if not enabled:
+        return result
+
+    weak_flags = []
+    labels = {
+        "399006.SZ": ("CYB", "创业板指"),
+        "000688.SH": ("STAR50", "科创50"),
+    }
+    descriptions = []
+    for ts_code, (prefix, name) in labels.items():
+        df = GLOBAL_REGIME_INDICES.get(ts_code, pd.DataFrame())
+        subset = df[df.index <= trade_date] if not df.empty else pd.DataFrame()
+        if subset.empty:
+            descriptions.append(f"{name}缺数据")
+            continue
+        row = subset.iloc[-1]
+        close = float(row["close"])
+        ma20 = float(row["ma20"]) if pd.notna(row["ma20"]) else np.nan
+        ma20_prev = float(row["ma20_prev"]) if pd.notna(row["ma20_prev"]) else np.nan
+        falling = bool(pd.notna(ma20) and pd.notna(ma20_prev) and ma20 < ma20_prev)
+        below = bool(pd.notna(ma20) and close < ma20)
+        weak = below and falling
+        result[f"{prefix}_Close"] = round(close, 3)
+        result[f"{prefix}_MA20"] = round(ma20, 3) if pd.notna(ma20) else np.nan
+        result[f"{prefix}_MA20_Falling"] = falling
+        weak_flags.append(weak)
+        descriptions.append(f"{name}{'弱' if weak else '非弱'}")
+
+    if len(weak_flags) == 2:
+        result["Market_Weak_Block"] = bool(all(weak_flags))
+        result["Market_Regime"] = "双指数弱势-暂停开仓" if all(weak_flags) else "允许开仓(" + "、".join(descriptions) + ")"
+    else:
+        result["Market_Regime"] = "数据不足-允许开仓(" + "、".join(descriptions) + ")"
+    return result
+
+
 def benchmark_return_20d(end_date: str) -> float:
     if GLOBAL_BENCHMARK.empty:
         return 0.0
@@ -761,6 +842,8 @@ def future_result_template(hold_weeks: int = 8) -> dict:
             "Buy_Price": np.nan,
             "Gap_pct (%)": np.nan,
             "Stop_pct (%)": np.nan,
+            "Protection_Trigger_Day": np.nan,
+            "Protection_Stop_Price": np.nan,
             "MFE_pct (%)": np.nan,
             "MAE_pct (%)": np.nan,
             "Tradable": True,
@@ -783,6 +866,8 @@ def get_medium_term_future(
     sell_slippage_pct: float,
     commission_pct: float,
     sell_tax_pct: float,
+    protection_trigger_pct: float,
+    protection_buffer_pct: float,
     use_sina: bool = False,
 ) -> dict:
     d0 = datetime.strptime(selection_date, "%Y%m%d")
@@ -829,6 +914,8 @@ def get_medium_term_future(
     risk_pct = float(np.clip(raw_risk_pct, min_stop_pct, max_stop_pct))
     stop_price = buy_price * (1.0 - risk_pct)
     result["Stop_pct (%)"] = round(-risk_pct * 100.0, 2)
+    protection_stop_price = buy_price * (1.0 + protection_buffer_pct / 100.0)
+    protection_active_from_day = None
 
     def net_return(raw_sell_price: float) -> float:
         net_sell = raw_sell_price * (1.0 - sell_slippage_pct / 100.0)
@@ -870,19 +957,29 @@ def get_medium_term_future(
             exited = True
             break
 
-        if curr_low <= stop_price:
-            raw_exit = curr_open if curr_open < stop_price else stop_price
-            finalize_exit(raw_exit, week, day_count, f"结构止损({-risk_pct*100:.1f}%)")
+        protection_active = (
+            protection_active_from_day is not None
+            and day_count >= protection_active_from_day
+        )
+        active_stop = max(stop_price, protection_stop_price) if protection_active else stop_price
+        if curr_low <= active_stop:
+            raw_exit = curr_open if curr_open < active_stop else active_stop
+            if protection_active and protection_stop_price >= stop_price:
+                reason = f"成本保护止损(+{protection_buffer_pct:.1f}%原始价)"
+            else:
+                reason = f"结构止损({-risk_pct*100:.1f}%)"
+            finalize_exit(raw_exit, week, day_count, reason)
             exited = True
             break
 
         peak_profit = peak_high / buy_price - 1.0
-        if tier == 0 and peak_profit >= 0.10:
+        if tier == 0 and peak_profit >= protection_trigger_pct / 100.0:
             tier = 1
+            protection_active_from_day = day_count + 1
+            result["Protection_Trigger_Day"] = day_count
+            result["Protection_Stop_Price"] = round(protection_stop_price, 3)
         if tier == 1:
-            if curr_close < buy_price * 0.995:
-                pending_reason = "保本线触发-次日开盘退出"
-            elif peak_profit >= 0.20:
+            if peak_profit >= 0.20:
                 tier = 2
         if tier == 2 and (peak_high - curr_close) / peak_high >= 0.15:
             pending_reason = "移动止盈(峰值回撤15%)-次日开盘退出"
@@ -930,6 +1027,12 @@ def run_backtest_for_day(
     sell_slippage_pct: float,
     commission_pct: float,
     sell_tax_pct: float,
+    min_total_score: float,
+    scarce_total_score: float,
+    breadth_threshold: int,
+    enable_market_filter: bool,
+    protection_trigger_pct: float,
+    protection_buffer_pct: float,
     use_sina: bool = False,
 ):
     query_date = trade_date
@@ -951,7 +1054,11 @@ def run_backtest_for_day(
         fields="ts_code,trade_date,turnover_rate,turnover_rate_f,circ_mv,total_mv",
     )
     if daily.empty or daily_basic.empty:
-        return pd.DataFrame(), {"Trade_Date": trade_date, "Error": "daily/daily_basic缺失"}
+        return (
+            pd.DataFrame(),
+            {"Trade_Date": trade_date, "Error": "daily/daily_basic缺失"},
+            pd.DataFrame(),
+        )
 
     stock_basic = GLOBAL_STOCK_BASIC.copy()
     df = daily.merge(stock_basic, on="ts_code", how="inner")
@@ -959,9 +1066,16 @@ def run_backtest_for_day(
     df["circ_mv_billion"] = pd.to_numeric(df["circ_mv"], errors="coerce") / 10000.0
     df["close"] = pd.to_numeric(df["close"], errors="coerce")
 
+    regime = market_regime_on_date(trade_date, enabled=enable_market_filter)
     funnel = {
         "Trade_Date": trade_date,
         "Market_Rows": len(df),
+        "Market_Regime": regime["Market_Regime"],
+        "Market_Weak_Block": int(regime["Market_Weak_Block"]),
+        "CYB_Close": regime["CYB_Close"],
+        "CYB_MA20": regime["CYB_MA20"],
+        "STAR50_Close": regime["STAR50_Close"],
+        "STAR50_MA20": regime["STAR50_MA20"],
     }
     df = df[df.apply(lambda r: stock_active_on_date(r, trade_date), axis=1)]
     df = df[~df["name"].str.contains("ST|退", na=False)]
@@ -987,8 +1101,14 @@ def run_backtest_for_day(
         "Pass_Above_MA20",
         "Pass_Not_Overextended",
         "Pass_Volume",
+        "Core_Signal",
+        "Base_Score_Pass",
+        "Dynamic_Score_Pass",
+        "After_Market_Filter",
+        "Execution_Checked",
         "Final_Signal",
         "Tradable_Signal",
+        "Selected_TopK",
     ]:
         funnel[key] = 0
 
@@ -1014,26 +1134,7 @@ def run_backtest_for_day(
         funnel["Pass_Volume"] += int(indicators["volume_ok"])
         if not indicators["is_buy_signal"]:
             continue
-        funnel["Final_Signal"] += 1
-
-        future = get_medium_term_future(
-            row.ts_code,
-            row.market,
-            trade_date,
-            indicators["last_close"],
-            indicators["signal_low"],
-            indicators["ma20"],
-            indicators["atr14"],
-            hold_weeks=8,
-            max_gap_pct=max_gap_pct,
-            buy_slippage_pct=buy_slippage_pct,
-            sell_slippage_pct=sell_slippage_pct,
-            commission_pct=commission_pct,
-            sell_tax_pct=sell_tax_pct,
-            use_sina=use_sina,
-        )
-        if future["Tradable"]:
-            funnel["Tradable_Signal"] += 1
+        funnel["Core_Signal"] += 1
 
         record = {
             "Trade_Date": trade_date,
@@ -1063,20 +1164,111 @@ def run_backtest_for_day(
             "Pulled_Back": indicators["pulled_back"],
             "MACD_Improving": indicators["macd_improving"],
             "Solid_Candle": indicators["solid_candle"],
+            # 下列字段用于通过门槛后的成交回测，候选导出前会移除前导下划线。
+            "_Signal_Low": indicators["signal_low"],
+            "_Signal_MA20": indicators["ma20"],
+            "_ATR14": indicators["atr14"],
         }
-        record.update(future)
         records.append(record)
 
     if not records:
-        return pd.DataFrame(), funnel
+        funnel["Day_Base_Signal_Count"] = 0
+        funnel["Required_Score"] = scarce_total_score
+        return pd.DataFrame(), funnel, pd.DataFrame()
+
     all_candidates = pd.DataFrame(records)
-    # 先剔除无法交易的信号，再取TopK，避免占用名额
-    tradable = all_candidates[all_candidates["Tradable"]].copy()
-    if tradable.empty:
-        return pd.DataFrame(), funnel
-    final = tradable.sort_values(["Total_Score", "ATR_pct"], ascending=[False, False]).head(top_k)
+    # 广度只能使用D0收盘已经知道的信息：80分以上核心信号数。
+    base_count = int((all_candidates["Total_Score"] >= min_total_score).sum())
+    required_score = min_total_score if base_count >= breadth_threshold else scarce_total_score
+    all_candidates["Day_Base_Signal_Count"] = base_count
+    all_candidates["Required_Score"] = required_score
+    all_candidates["Score_Pass"] = all_candidates["Total_Score"] >= required_score
+    all_candidates["Market_Regime"] = regime["Market_Regime"]
+    all_candidates["Market_Weak_Block"] = bool(regime["Market_Weak_Block"])
+    all_candidates["CYB_Close"] = regime["CYB_Close"]
+    all_candidates["CYB_MA20"] = regime["CYB_MA20"]
+    all_candidates["CYB_MA20_Falling"] = regime["CYB_MA20_Falling"]
+    all_candidates["STAR50_Close"] = regime["STAR50_Close"]
+    all_candidates["STAR50_MA20"] = regime["STAR50_MA20"]
+    all_candidates["STAR50_MA20_Falling"] = regime["STAR50_MA20_Falling"]
+    # 固定候选导出结构，避免不同交易日追加CSV时列数不一致。
+    for key in future_result_template(8):
+        if key not in all_candidates.columns:
+            if key.startswith("Eligible_W") or key.startswith("Held_W") or key == "Tradable":
+                all_candidates[key] = pd.Series(pd.NA, index=all_candidates.index, dtype="boolean")
+            elif key == "Exit_Reason":
+                all_candidates[key] = pd.Series(None, index=all_candidates.index, dtype="object")
+            else:
+                all_candidates[key] = np.nan
+    all_candidates["Execution_Checked"] = False
+    all_candidates["Selection_Status"] = np.where(
+        all_candidates["Score_Pass"], "通过动态分数门槛", "未达动态分数门槛"
+    )
+
+    funnel["Day_Base_Signal_Count"] = base_count
+    funnel["Required_Score"] = required_score
+    funnel["Base_Score_Pass"] = base_count
+    funnel["Dynamic_Score_Pass"] = int(all_candidates["Score_Pass"].sum())
+    funnel["Final_Signal"] = funnel["Dynamic_Score_Pass"]
+
+    if regime["Market_Weak_Block"]:
+        all_candidates.loc[all_candidates["Score_Pass"], "Selection_Status"] = "双指数弱势-暂停开仓"
+    else:
+        eligible_indices = all_candidates.index[all_candidates["Score_Pass"]].tolist()
+        funnel["After_Market_Filter"] = len(eligible_indices)
+        for idx in eligible_indices:
+            candidate = all_candidates.loc[idx]
+            future = get_medium_term_future(
+                candidate["ts_code"],
+                candidate["market"],
+                trade_date,
+                float(candidate["Signal_Close"]),
+                float(candidate["_Signal_Low"]),
+                float(candidate["_Signal_MA20"]),
+                float(candidate["_ATR14"]),
+                hold_weeks=8,
+                max_gap_pct=max_gap_pct,
+                buy_slippage_pct=buy_slippage_pct,
+                sell_slippage_pct=sell_slippage_pct,
+                commission_pct=commission_pct,
+                sell_tax_pct=sell_tax_pct,
+                protection_trigger_pct=protection_trigger_pct,
+                protection_buffer_pct=protection_buffer_pct,
+                use_sina=use_sina,
+            )
+            for key, value in future.items():
+                all_candidates.loc[idx, key] = value
+            all_candidates.loc[idx, "Execution_Checked"] = True
+            if future["Tradable"]:
+                all_candidates.loc[idx, "Selection_Status"] = "可成交-等待TopK排序"
+            else:
+                all_candidates.loc[idx, "Selection_Status"] = str(future["Exit_Reason"])
+
+    checked_mask = all_candidates["Execution_Checked"].fillna(False).astype(bool)
+    tradable_mask = checked_mask & all_candidates["Tradable"].eq(True).fillna(False)
+    funnel["Execution_Checked"] = int(checked_mask.sum())
+    funnel["Tradable_Signal"] = int(tradable_mask.sum())
+
+    tradable = all_candidates[tradable_mask].copy()
+    final_indices = (
+        tradable.sort_values(["Total_Score", "ATR_pct"], ascending=[False, False])
+        .head(top_k)
+        .index
+        .tolist()
+    )
+    all_candidates.loc[tradable.index, "Selection_Status"] = "未进入TopK"
+    all_candidates.loc[final_indices, "Selection_Status"] = "入选TopK"
+    all_candidates["Selected"] = all_candidates.index.isin(final_indices)
+    funnel["Selected_TopK"] = len(final_indices)
+
+    internal_cols = ["_Signal_Low", "_Signal_MA20", "_ATR14"]
+    candidate_export = all_candidates.drop(columns=internal_cols, errors="ignore").copy()
+    if not final_indices:
+        return pd.DataFrame(), funnel, candidate_export
+    final = candidate_export.loc[final_indices].copy()
+    final = final.sort_values(["Total_Score", "ATR_pct"], ascending=[False, False])
     final.insert(1, "Rank", range(1, len(final) + 1))
-    return final, funnel
+    return final, funnel, candidate_export
 
 
 # -----------------------------------------------------------------------------
@@ -1129,7 +1321,7 @@ def style_exit(value):
         return "color: white; background-color: darkred"
     if "剔除" in value:
         return "color: white; background-color: gray"
-    if "保本" in value:
+    if "保本" in value or "成本保护" in value:
         return "color: orange"
     if "移动止盈" in value:
         return "color: green"
@@ -1155,21 +1347,33 @@ with st.sidebar:
     ENABLE_THS = st.checkbox("实时雷达启用THS概念补充(需6000积分)", value=False)
     THS_KEYWORDS_TEXT = st.text_area("THS科技概念关键词", value=DEFAULT_THS_KEYWORDS, height=100)
 
-    st.subheader("信号门槛")
+    st.subheader("信号与动态评分门槛")
     MIN_ATR_PCT = st.number_input("ATR14/股价最低(%)", min_value=0.0, value=2.5, step=0.1)
     MIN_VOL_RATIO = st.number_input("最低量比", min_value=0.5, value=1.10, step=0.05)
     MAX_BIAS_PCT = st.number_input("相对MA20最大偏离(%)", min_value=1.0, value=8.0, step=0.5)
     MAX_GAP_PCT = st.number_input("T+1最大允许高开(%)", min_value=0.0, value=8.0, step=0.5)
+    MIN_TOTAL_SCORE = st.number_input("常规最低总分", min_value=0.0, value=80.0, step=1.0)
+    SCARCE_TOTAL_SCORE = st.number_input("信号稀少时最低总分", min_value=0.0, value=82.0, step=1.0)
+    BREADTH_THRESHOLD = st.number_input("常规门槛所需信号数", min_value=1, value=4, step=1)
 
-    st.subheader("成交成本")
+    st.subheader("市场环境")
+    ENABLE_MARKET_FILTER = st.checkbox(
+        "双指数同时跌破下降MA20时暂停开仓",
+        value=True,
+        help="同时检查创业板指399006.SZ和科创50 000688.SH；数据不足时默认允许开仓。",
+    )
+
+    st.subheader("成交成本与保护止损")
     BUY_SLIPPAGE = st.number_input("买入滑点(%)", min_value=0.0, value=0.20, step=0.05)
     SELL_SLIPPAGE = st.number_input("卖出滑点(%)", min_value=0.0, value=0.20, step=0.05)
     COMMISSION = st.number_input("单边佣金(%)", min_value=0.0, value=0.03, step=0.01)
     SELL_TAX = st.number_input("卖出税费(%)", min_value=0.0, value=0.05, step=0.01)
+    PROTECTION_TRIGGER = st.number_input("保护止损触发浮盈(%)", min_value=1.0, value=10.0, step=1.0)
+    PROTECTION_BUFFER = st.number_input("保护止损原始价高于成本(%)", min_value=0.0, value=0.30, step=0.10)
 
     RESUME_CHECKPOINT = st.checkbox("开启参数隔离的断点续传", value=True)
     USE_CACHE = st.checkbox("使用并增量更新行情缓存", value=True)
-    if st.button("清除V39.7行情缓存"):
+    if st.button("清除V39.7/V39.8共享行情缓存"):
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
             st.success("缓存已清除")
@@ -1188,6 +1392,8 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
     SINA_STATUS = {"success": 0, "fail": 0}
     is_realtime = int(BACKTEST_DAYS) == 1
     try:
+        if SCARCE_TOTAL_SCORE < MIN_TOTAL_SCORE:
+            raise ValueError("信号稀少时最低总分不能低于常规最低总分")
         GLOBAL_STOCK_BASIC = load_stock_basic()
         memberships = load_sw_tech_memberships()
         GLOBAL_TECH_PERIODS = build_tech_period_index(memberships)
@@ -1218,6 +1424,7 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
         required_dates = get_open_dates(fetch_start, fetch_end)
         load_market_data(required_dates, use_cache=USE_CACHE)
         load_benchmark(fetch_start, fetch_end)
+        load_market_regime_indices(fetch_start, fetch_end)
 
         config = {
             "version": VERSION,
@@ -1231,18 +1438,26 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
             "min_vol": MIN_VOL_RATIO,
             "max_bias": MAX_BIAS_PCT,
             "max_gap": MAX_GAP_PCT,
+            "min_score": MIN_TOTAL_SCORE,
+            "scarce_score": SCARCE_TOTAL_SCORE,
+            "breadth_threshold": int(BREADTH_THRESHOLD),
+            "market_filter": bool(ENABLE_MARKET_FILTER),
             "buy_slip": BUY_SLIPPAGE,
             "sell_slip": SELL_SLIPPAGE,
             "commission": COMMISSION,
             "sell_tax": SELL_TAX,
+            "protection_trigger": PROTECTION_TRIGGER,
+            "protection_buffer": PROTECTION_BUFFER,
         }
         config_hash = hashlib.sha1(json.dumps(config, sort_keys=True).encode()).hexdigest()[:12]
         result_file = f"backtest_{VERSION.replace('.', '_')}_{config_hash}.csv"
         funnel_file = f"funnel_{VERSION.replace('.', '_')}_{config_hash}.csv"
+        candidate_file = f"candidates_{VERSION.replace('.', '_')}_{config_hash}.csv"
         state_file = f"state_{VERSION.replace('.', '_')}_{config_hash}.json"
 
         processed = set()
         result_frames = []
+        candidate_frames = []
         funnel_rows = []
         if RESUME_CHECKPOINT and os.path.exists(state_file):
             try:
@@ -1253,6 +1468,8 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
                     result_frames.append(pd.read_csv(result_file, encoding="utf-8-sig"))
                 if os.path.exists(funnel_file):
                     funnel_rows.extend(pd.read_csv(funnel_file, encoding="utf-8-sig").to_dict("records"))
+                if os.path.exists(candidate_file):
+                    candidate_frames.append(pd.read_csv(candidate_file, encoding="utf-8-sig"))
             except Exception as exc:
                 record_api_error(f"断点读取失败，将从头运行: {exc}")
                 processed = set()
@@ -1261,7 +1478,7 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
         progress = st.progress(0, text="开始逐日计算科技信号...")
         for i, trade_date in enumerate(dates_to_run):
             use_sina = is_realtime and trade_date == datetime.now().strftime("%Y%m%d")
-            day_result, funnel = run_backtest_for_day(
+            day_result, funnel, day_candidates = run_backtest_for_day(
                 trade_date=trade_date,
                 top_k=int(TOP_BACKTEST),
                 min_mv=float(MIN_MV),
@@ -1275,6 +1492,12 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
                 sell_slippage_pct=float(SELL_SLIPPAGE),
                 commission_pct=float(COMMISSION),
                 sell_tax_pct=float(SELL_TAX),
+                min_total_score=float(MIN_TOTAL_SCORE),
+                scarce_total_score=float(SCARCE_TOTAL_SCORE),
+                breadth_threshold=int(BREADTH_THRESHOLD),
+                enable_market_filter=bool(ENABLE_MARKET_FILTER),
+                protection_trigger_pct=float(PROTECTION_TRIGGER),
+                protection_buffer_pct=float(PROTECTION_BUFFER),
                 use_sina=use_sina,
             )
             if not day_result.empty:
@@ -1284,6 +1507,15 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
                     mode="a",
                     index=False,
                     header=not os.path.exists(result_file),
+                    encoding="utf-8-sig",
+                )
+            if not day_candidates.empty:
+                candidate_frames.append(day_candidates)
+                day_candidates.to_csv(
+                    candidate_file,
+                    mode="a",
+                    index=False,
+                    header=not os.path.exists(candidate_file),
                     encoding="utf-8-sig",
                 )
             funnel_rows.append(funnel)
@@ -1306,6 +1538,51 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
         progress.empty()
 
         st.header(f"📊 {VERSION} 回测结果")
+        funnel_df = pd.DataFrame(funnel_rows).drop_duplicates("Trade_Date", keep="last")
+        all_candidates_export = pd.DataFrame()
+        if candidate_frames:
+            all_candidates_export = pd.concat(candidate_frames, ignore_index=True)
+            all_candidates_export = all_candidates_export.drop_duplicates(
+                ["Trade_Date", "ts_code"], keep="last"
+            )
+
+        st.subheader("🌦️ 市场环境与动态门槛")
+        if not funnel_df.empty:
+            funnel_defaults = {
+                "Market_Weak_Block": 0,
+                "Market_Regime": "数据缺失",
+                "Day_Base_Signal_Count": 0,
+                "Required_Score": np.nan,
+                "Dynamic_Score_Pass": 0,
+                "Tradable_Signal": 0,
+                "Selected_TopK": 0,
+                "CYB_Close": np.nan,
+                "CYB_MA20": np.nan,
+                "STAR50_Close": np.nan,
+                "STAR50_MA20": np.nan,
+            }
+            for column, default_value in funnel_defaults.items():
+                if column not in funnel_df.columns:
+                    funnel_df[column] = default_value
+            blocked_days = int(pd.to_numeric(funnel_df["Market_Weak_Block"], errors="coerce").fillna(0).sum())
+            score_pass_total = int(pd.to_numeric(funnel_df["Dynamic_Score_Pass"], errors="coerce").fillna(0).sum())
+            selected_total = int(pd.to_numeric(funnel_df["Selected_TopK"], errors="coerce").fillna(0).sum())
+            env_cols = st.columns(3)
+            env_cols[0].metric("双指数弱势暂停日", blocked_days)
+            env_cols[1].metric("通过动态分数门槛", score_pass_total)
+            env_cols[2].metric("最终入选", selected_total)
+            st.dataframe(
+                funnel_df[
+                    [
+                        "Trade_Date", "Market_Regime", "Day_Base_Signal_Count", "Required_Score",
+                        "Dynamic_Score_Pass", "Tradable_Signal", "Selected_TopK",
+                        "CYB_Close", "CYB_MA20", "STAR50_Close", "STAR50_MA20",
+                    ]
+                ].sort_values("Trade_Date", ascending=False),
+                use_container_width=True,
+                hide_index=True,
+            )
+
         if result_frames:
             all_results = pd.concat(result_frames, ignore_index=True)
             all_results = all_results.drop_duplicates(["Trade_Date", "ts_code"], keep="last")
@@ -1318,9 +1595,10 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
             show_exit_report(all_results)
 
             st.subheader("🔬 筛选漏斗（逐日合计）")
-            funnel_df = pd.DataFrame(funnel_rows).drop_duplicates("Trade_Date", keep="last")
             numeric_cols = [c for c in funnel_df.columns if c not in ["Trade_Date", "Error"]]
-            totals = funnel_df[numeric_cols].apply(pd.to_numeric, errors="coerce").sum().to_frame("累计数量")
+            numeric_funnel = funnel_df[numeric_cols].apply(pd.to_numeric, errors="coerce")
+            numeric_funnel = numeric_funnel.dropna(axis=1, how="all")
+            totals = numeric_funnel.sum().to_frame("累计/求和")
             st.dataframe(totals, use_container_width=True)
 
             st.subheader("📋 优选记录")
@@ -1340,20 +1618,30 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
 
             export_csv = all_results.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
-                "📥 下载V39.7完整轨迹CSV",
+                "📥 下载V39.8入选股票完整轨迹CSV",
                 export_csv,
-                f"export_v39_7_{config_hash}.csv",
-                "text/csv",
-            )
-            funnel_csv = funnel_df.to_csv(index=False).encode("utf-8-sig")
-            st.download_button(
-                "📥 下载筛选漏斗CSV",
-                funnel_csv,
-                f"funnel_v39_7_{config_hash}.csv",
+                f"export_v39_8_{config_hash}.csv",
                 "text/csv",
             )
         else:
             st.warning("本次没有产生可交易信号。请先查看筛选漏斗确定主要淘汰环节。")
+
+        if not all_candidates_export.empty:
+            candidate_csv = all_candidates_export.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                "📥 下载V39.8全部核心候选及未入选原因CSV",
+                candidate_csv,
+                f"candidates_v39_8_{config_hash}.csv",
+                "text/csv",
+            )
+        if not funnel_df.empty:
+            funnel_csv = funnel_df.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                "📥 下载V39.8逐日筛选漏斗CSV",
+                funnel_csv,
+                f"funnel_v39_8_{config_hash}.csv",
+                "text/csv",
+            )
 
         if API_ERRORS:
             with st.expander(f"⚠️ API/数据警告（{len(API_ERRORS)}条）"):
