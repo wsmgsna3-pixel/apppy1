@@ -34,6 +34,14 @@
    一字板过滤逻辑均未改动，方便和V39.6做单变量对比测试。
    注意：white_list_names里的二级行业名称是按通用命名推断的，如果实际命中数量过少，
    页面会自动打印Tushare返回的真实二级行业全名单，请对照核实调整。
+
+【★V39.8新增：白名单去掉"电池"，只保留光伏设备/风电设备】
+   V39.7实测发现，白名单里的"电池"二级分类混入了大中矿业/国城矿业/西部材料/盛和资源/
+   亚钾国际/中钨高新/华盛锂电/永兴材料这类锂矿、稀土、钨矿开采及材料股——申万分类
+   因为供应链关联，把上游资源股也归到了"电力设备-电池"这个二级分类下，跟"电池设备
+   制造商"混在一起了。这批资源股的波动逻辑跟着大宗商品价格和政策炒作走，跟技术突破
+   + 放量的选股逻辑不是一回事，也是V39.7固定止损占比(39%)比V39.6(32%)偏高的主要
+   嫌疑对象，故本版去掉"电池"，只保留波动同样很大、但更纯粹的光伏设备和风电设备。
 ------------------------------------------------
 """
 
@@ -66,8 +74,8 @@ SINA_STATUS = {'success': 0, 'fail': 0}
 # ---------------------------
 # 页面设置
 # ---------------------------
-st.set_page_config(page_title="选股王 V39.7 行业白名单L2放宽版", layout="wide")
-st.title("选股王 V39.7：周线温和过滤 + 日线爆量共振（行业白名单升级为申万二级L2）")
+st.set_page_config(page_title="选股王 V39.8 白名单去电池版", layout="wide")
+st.title("选股王 V39.8：周线温和过滤 + 日线爆量共振（L2白名单去掉\"电池\"，剔除混入的资源股）")
 
 # ---------------------------
 # 新浪实时行情引擎
@@ -147,7 +155,7 @@ def load_industry_mapping():
     try:
         # 【V39.7改动】行业白名单从6个一级行业(L1)放宽为申万二级行业(L2)，
         # 颗粒度更细，避免"一级行业"里科技子行业和传统子行业混在一起互相稀释、
-        # 同时把新能源(电池/光伏/风电)这类原来完全没覆盖的双创板密集赛道补进来。
+        # 同时把新能源(光伏/风电)这类原来完全没覆盖的双创板密集赛道补进来。
         sw_indices = pro.index_classify(level='L2', src='SW2021')
         if sw_indices.empty: return {}
 
@@ -161,7 +169,9 @@ def load_industry_mapping():
             '化学制药', '生物制品', '医疗器械',                # 医药细分(剔除中药/原料药等低波动子行业)
             '军工电子', '航天装备', '航空装备',                # 军工细分
             '自动化设备', '工业机器人', '专用设备',            # 高端制造细分(剔除工程机械等强周期股)
-            '电池', '光伏设备', '风电设备',                    # 新能源(原白名单完全没覆盖)
+            '光伏设备', '风电设备',                            # 新能源(去掉了"电池"——这个二级分类里容易
+                                                                # 混入锂矿/稀土开采等上游资源股，跟技术突破
+                                                                # 逻辑不搭，波动驱动因子也不同，故剔除)
         ]
         target_indices = sw_indices[sw_indices['industry_name'].isin(white_list_names)]
         index_codes = target_indices['index_code'].tolist()
@@ -631,7 +641,7 @@ def run_backtest_for_a_day(last_trade, TOP_BACKTEST, MIN_MV, MAX_MV, MIN_PRICE, 
 # UI 及 主程序
 # ---------------------------
 with st.sidebar:
-    st.header("V39.7 行业白名单L2放宽版")
+    st.header("V39.8 白名单去电池版")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析天数 (设为 1 即启动实盘雷达)", value=100, step=1)
     
@@ -643,7 +653,7 @@ with st.sidebar:
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
             st.success("缓存已清除，下次运行将重新下载最新数据。")
-    CHECKPOINT_FILE = "backtest_checkpoint_v39_7_L2.csv"  # 【V39.7改动】改名，避免和V39.6(L1白名单)的旧结果混在一起对比失真
+    CHECKPOINT_FILE = "backtest_checkpoint_v39_8_noBattery.csv"  # 【V39.8改动】改名，避免和V39.7(含"电池"资源股)的旧结果混在一起对比失真
     if st.button("🗑️ 清除断点记录 (重新回测)"):
         if os.path.exists(CHECKPOINT_FILE):
             os.remove(CHECKPOINT_FILE)
@@ -661,7 +671,7 @@ if not TS_TOKEN: st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
 
-if st.button(f"🚀 启动 V39.7 追踪(L2白名单)"):
+if st.button(f"🚀 启动 V39.8 追踪(L2白名单去电池)"):
     SINA_STATUS = {'success': 0, 'fail': 0}
     processed_dates = set()
     results = []
@@ -719,7 +729,7 @@ if st.button(f"🚀 启动 V39.7 追踪(L2白名单)"):
         all_res = pd.concat(results)
         all_res['Trade_Date'] = all_res['Trade_Date'].astype(str)
         
-        st.header(f"📊 V39.7 行业白名单L2放宽版")
+        st.header(f"📊 V39.8 白名单去电池版")
         st.subheader("🗓️ 周度生存与收益切片")
         cols_row1 = st.columns(4)
         cols_row2 = st.columns(4)
@@ -764,6 +774,6 @@ if st.button(f"🚀 启动 V39.7 追踪(L2白名单)"):
             st.dataframe(display_df, use_container_width=True)
         
         csv = all_res.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v39_7_L2.csv", "text/csv")
+        st.download_button("📥 下载完整轨迹 (CSV)", csv, f"export_v39_8_noBattery.csv", "text/csv")
     else:
         st.warning("⚠️ 暂无符合条件的标的。")
