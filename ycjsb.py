@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-选股王 V39.9 · 三仓组合回测版
+选股王 V40.0 · 周线MACD波浪诊断版
 ============================================================
 主要变化
 1. 股票池：主板/创业板/科创板，明确剔除北交所；保留流通市值200~1000亿元参数。
@@ -21,6 +21,10 @@
 16. 广度：T+1成交检查后可交易股票少于2只时，全部仅观察而不开仓。
 17. 组合：30万元初始资金、最多3只持仓、单只约10万元，输出组合曲线与真实空仓率。
 18. 断点：改用主键去重和原子覆盖保存，防止续跑时重复记录。
+19. 周线波浪：仅用已完成周K计算周线MACD，标记绿柱缩短、首次翻红、
+    红柱扩张/再加速/衰减和绿柱弱势，本版只诊断、不改变入选与买卖。
+20. 假反弹：记录T+1收盘是否延续，并将“10个交易日内结构止损且最大浮盈
+    不足5%”标记为早期假反弹，用于检验周线波浪假设。
 
 说明
 - 本程序用于研究和回测，不构成投资建议。
@@ -48,7 +52,7 @@ import tushare as ts
 
 warnings.filterwarnings("ignore")
 
-VERSION = "V39.9"
+VERSION = "V40.0"
 # 行情结构与V39.7兼容，沿用原缓存可避免重新下载数百个交易日。
 CACHE_FILE_NAME = "market_data_cache_v39_7.pkl"
 MAX_FETCH_WORKERS = 1  # 避免触发Tushare频率限制
@@ -137,8 +141,8 @@ DEFAULT_THS_KEYWORDS = (
 # -----------------------------------------------------------------------------
 # 页面
 # -----------------------------------------------------------------------------
-st.set_page_config(page_title=f"选股王 {VERSION} 三仓组合回测版", layout="wide")
-st.title(f"选股王 {VERSION}：多信号确认 + 30万三仓组合回测")
+st.set_page_config(page_title=f"选股王 {VERSION} 周线MACD波浪诊断版", layout="wide")
+st.title(f"选股王 {VERSION}：V39.9原交易逻辑 + 周线MACD波浪诊断")
 
 
 # -----------------------------------------------------------------------------
@@ -754,6 +758,121 @@ def calculate_breakout_score(bias: float) -> float:
     return max(5.0, 20.0 - (bias - 0.05) / 0.03 * 15.0)
 
 
+WEEKLY_STAGE_ORDER = {
+    "R1_首周翻红": 1,
+    "R2_第二根红柱扩张": 2,
+    "R3_红柱再加速": 3,
+    "R4_红柱扩张": 4,
+    "G1_绿柱连续缩短": 5,
+    "G2_绿柱缩短": 6,
+    "R5_红柱衰减": 7,
+    "G3_绿柱扩大/弱势": 8,
+    "W0_周线数据不足": 9,
+}
+
+
+def classify_completed_weekly_macd(weekly: pd.DataFrame, signal_date: str) -> dict:
+    """
+    只用信号日当时已完成的周K进行诊断。
+
+    resample("W-FRI")会在周一至周四生成一根以未来周五为标签的部分周K；
+    这根K线盘中会反复变化，因此本函数把其排除，避免周线MACD“重绘”。
+    交易逻辑仍使用V39.9原weekly_safe，本函数只产生诊断字段。
+    """
+    empty = {
+        "weekly_completed_date": "",
+        "weekly_macd_stage": "W0_周线数据不足",
+        "weekly_macd_hist_pct": np.nan,
+        "weekly_macd_hist_prev_pct": np.nan,
+        "weekly_dif_pct": np.nan,
+        "weekly_dea_pct": np.nan,
+        "weekly_close": np.nan,
+        "weekly_ma20": np.nan,
+        "weekly_ma20_slope_pct": np.nan,
+        "weekly_bias_pct": np.nan,
+        "weekly_dif_rising": False,
+        "weekly_dea_rising": False,
+        "weekly_ma20_rising": False,
+        "weekly_close_above_ma20": False,
+        "weekly_trend_confirmed": False,
+        "weekly_wave_candidate": False,
+    }
+    if weekly is None or weekly.empty or "dt" not in weekly.columns:
+        return empty
+
+    signal_ts = pd.Timestamp(datetime.strptime(normalize_date(signal_date), "%Y%m%d"))
+    completed = weekly[pd.to_datetime(weekly["dt"]) <= signal_ts].copy()
+    if len(completed) < 30:
+        return empty
+
+    completed["w_ema12"] = completed["close"].ewm(span=12, adjust=False).mean()
+    completed["w_ema26"] = completed["close"].ewm(span=26, adjust=False).mean()
+    completed["w_dif"] = completed["w_ema12"] - completed["w_ema26"]
+    completed["w_dea"] = completed["w_dif"].ewm(span=9, adjust=False).mean()
+    completed["w_macd"] = (completed["w_dif"] - completed["w_dea"]) * 2.0
+    if "w_ma20" not in completed.columns:
+        completed["w_ma20"] = completed["close"].rolling(20).mean()
+    if len(completed) < 3 or pd.isna(completed.iloc[-1]["w_ma20"]):
+        return empty
+
+    curr, prev, prev2 = completed.iloc[-1], completed.iloc[-2], completed.iloc[-3]
+    hist, hist_prev, hist_prev2 = float(curr["w_macd"]), float(prev["w_macd"]), float(prev2["w_macd"])
+    dif_rising = float(curr["w_dif"]) > float(prev["w_dif"])
+    dea_rising = float(curr["w_dea"]) >= float(prev["w_dea"])
+    ma20_rising = float(curr["w_ma20"]) >= float(prev["w_ma20"])
+    close_above_ma20 = float(curr["close"]) >= float(curr["w_ma20"])
+
+    if hist > 0:
+        if hist_prev <= 0:
+            stage = "R1_首周翻红"
+        elif hist_prev > 0 and hist_prev2 <= 0 and hist >= hist_prev:
+            stage = "R2_第二根红柱扩张"
+        elif hist > hist_prev and hist_prev < hist_prev2:
+            stage = "R3_红柱再加速"
+        elif hist >= hist_prev:
+            stage = "R4_红柱扩张"
+        else:
+            stage = "R5_红柱衰减"
+    else:
+        if hist > hist_prev and hist_prev > hist_prev2 and dif_rising:
+            stage = "G1_绿柱连续缩短"
+        elif hist > hist_prev and dif_rising:
+            stage = "G2_绿柱缩短"
+        else:
+            stage = "G3_绿柱扩大/弱势"
+
+    close = float(curr["close"])
+    ma20 = float(curr["w_ma20"])
+    prev_ma20 = float(prev["w_ma20"])
+    trend_confirmed = bool(dif_rising and ma20_rising and close_above_ma20)
+    wave_candidate = bool(
+        stage in {
+            "R1_首周翻红", "R2_第二根红柱扩张", "R3_红柱再加速",
+            "R4_红柱扩张", "G1_绿柱连续缩短",
+        }
+        and dif_rising
+    )
+    scale = close if close > 0 else np.nan
+    return {
+        "weekly_completed_date": pd.Timestamp(curr["dt"]).strftime("%Y%m%d"),
+        "weekly_macd_stage": stage,
+        "weekly_macd_hist_pct": hist / scale * 100.0,
+        "weekly_macd_hist_prev_pct": hist_prev / float(prev["close"]) * 100.0,
+        "weekly_dif_pct": float(curr["w_dif"]) / scale * 100.0,
+        "weekly_dea_pct": float(curr["w_dea"]) / scale * 100.0,
+        "weekly_close": close,
+        "weekly_ma20": ma20,
+        "weekly_ma20_slope_pct": (ma20 / prev_ma20 - 1.0) * 100.0 if prev_ma20 > 0 else np.nan,
+        "weekly_bias_pct": (close / ma20 - 1.0) * 100.0 if ma20 > 0 else np.nan,
+        "weekly_dif_rising": bool(dif_rising),
+        "weekly_dea_rising": bool(dea_rising),
+        "weekly_ma20_rising": bool(ma20_rising),
+        "weekly_close_above_ma20": bool(close_above_ma20),
+        "weekly_trend_confirmed": trend_confirmed,
+        "weekly_wave_candidate": wave_candidate,
+    }
+
+
 def compute_trend_indicators(
     ts_code: str,
     end_date: str,
@@ -809,6 +928,7 @@ def compute_trend_indicators(
     if len(weekly) < 21 or pd.isna(weekly.iloc[-1]["w_ma20"]):
         result["reject_reason"] = "有效周线不足20周"
         return result
+    weekly_wave = classify_completed_weekly_macd(weekly, end_date)
     w_curr = weekly.iloc[-1]
     w_prev = weekly.iloc[-2]
     weekly_bias = (w_curr["close"] - w_curr["w_ma20"]) / w_curr["w_ma20"]
@@ -903,6 +1023,7 @@ def compute_trend_indicators(
             "score_trend": float(score_trend),
             "score_rs": float(score_rs),
             "chase_penalty": float(chase_penalty),
+            **weekly_wave,
         }
     )
     return result
@@ -940,6 +1061,11 @@ def future_result_template(hold_weeks: int = 8) -> dict:
             "Protection_Stop_Price": np.nan,
             "MFE_pct (%)": np.nan,
             "MAE_pct (%)": np.nan,
+            "T1_Close_Return_pct": np.nan,
+            "T1_Close_vs_Signal_pct": np.nan,
+            "T1_Follow_Through": False,
+            "Early_Structural_Stop_10D": False,
+            "False_Rebound_10D": False,
             "Tradable": True,
         }
     )
@@ -1003,6 +1129,13 @@ def get_medium_term_future(
     buy_price = raw_open * (1.0 + buy_slippage_pct / 100.0) * (1.0 + commission_pct / 100.0)
     result["Entry_Date"] = normalize_date(next_row.name)
     result["Buy_Price"] = round(buy_price, 3)
+    next_close = float(next_row["close"])
+    result["T1_Close_Return_pct"] = round((next_close / buy_price - 1.0) * 100.0, 4)
+    result["T1_Close_vs_Signal_pct"] = round(
+        (next_close / signal_close - 1.0) * 100.0 if signal_close > 0 else np.nan,
+        4,
+    )
+    result["T1_Follow_Through"] = bool(next_close >= signal_close and next_close >= raw_open)
 
     raw_structural_stop = min(signal_low, signal_ma20) - 0.5 * atr14
     raw_risk_pct = (buy_price - raw_structural_stop) / buy_price
@@ -1117,6 +1250,12 @@ def get_medium_term_future(
             result[f"Held_W{hold_weeks}"] = True
         else:
             result["Exit_Reason"] = "持仓中/观察期未满"
+    structural_stop = str(result.get("Exit_Reason", "")).startswith("结构止损")
+    holding_days = pd.to_numeric(pd.Series([result.get("Holding_Days", np.nan)]), errors="coerce").iloc[0]
+    mfe = pd.to_numeric(pd.Series([result.get("MFE_pct (%)", np.nan)]), errors="coerce").iloc[0]
+    early_stop = bool(structural_stop and pd.notna(holding_days) and holding_days <= 10)
+    result["Early_Structural_Stop_10D"] = early_stop
+    result["False_Rebound_10D"] = bool(early_stop and pd.notna(mfe) and mfe < 5.0)
     return result
 
 
@@ -1283,6 +1422,30 @@ def run_backtest_for_day(
             "Pulled_Back": indicators["pulled_back"],
             "MACD_Improving": indicators["macd_improving"],
             "Solid_Candle": indicators["solid_candle"],
+            "W_Completed_Date": indicators["weekly_completed_date"],
+            "W_MACD_Stage": indicators["weekly_macd_stage"],
+            "W_MACD_Hist_pct": round(indicators["weekly_macd_hist_pct"], 4)
+            if pd.notna(indicators["weekly_macd_hist_pct"]) else np.nan,
+            "W_MACD_Hist_Prev_pct": round(indicators["weekly_macd_hist_prev_pct"], 4)
+            if pd.notna(indicators["weekly_macd_hist_prev_pct"]) else np.nan,
+            "W_DIF_pct": round(indicators["weekly_dif_pct"], 4)
+            if pd.notna(indicators["weekly_dif_pct"]) else np.nan,
+            "W_DEA_pct": round(indicators["weekly_dea_pct"], 4)
+            if pd.notna(indicators["weekly_dea_pct"]) else np.nan,
+            "W_Close": round(indicators["weekly_close"], 3)
+            if pd.notna(indicators["weekly_close"]) else np.nan,
+            "W_MA20": round(indicators["weekly_ma20"], 3)
+            if pd.notna(indicators["weekly_ma20"]) else np.nan,
+            "W_MA20_Slope_pct": round(indicators["weekly_ma20_slope_pct"], 4)
+            if pd.notna(indicators["weekly_ma20_slope_pct"]) else np.nan,
+            "W_Bias_pct": round(indicators["weekly_bias_pct"], 3)
+            if pd.notna(indicators["weekly_bias_pct"]) else np.nan,
+            "W_DIF_Rising": indicators["weekly_dif_rising"],
+            "W_DEA_Rising": indicators["weekly_dea_rising"],
+            "W_MA20_Rising": indicators["weekly_ma20_rising"],
+            "W_Close_Above_MA20": indicators["weekly_close_above_ma20"],
+            "W_Trend_Confirmed": indicators["weekly_trend_confirmed"],
+            "W_Wave_Candidate": indicators["weekly_wave_candidate"],
             # 下列字段用于通过门槛后的成交回测，候选导出前会移除前导下划线。
             "_Signal_Low": indicators["signal_low"],
             "_Signal_MA20": indicators["ma20"],
@@ -1313,7 +1476,14 @@ def run_backtest_for_day(
     # 固定候选导出结构，避免不同交易日追加CSV时列数不一致。
     for key in future_result_template(8):
         if key not in all_candidates.columns:
-            if key.startswith("Eligible_W") or key.startswith("Held_W") or key == "Tradable":
+            if (
+                key.startswith("Eligible_W")
+                or key.startswith("Held_W")
+                or key in {
+                    "Tradable", "T1_Follow_Through",
+                    "Early_Structural_Stop_10D", "False_Rebound_10D",
+                }
+            ):
                 all_candidates[key] = pd.Series(pd.NA, index=all_candidates.index, dtype="boolean")
             elif key in ["Exit_Reason", "Entry_Date", "Exit_Date"]:
                 all_candidates[key] = pd.Series(None, index=all_candidates.index, dtype="object")
@@ -1505,6 +1675,10 @@ def build_portfolio_backtest(
                 "ts_code": row.get("ts_code", ""),
                 "name": row.get("name", ""),
                 "Total_Score": row.get("Total_Score", np.nan),
+                "W_MACD_Stage": row.get("W_MACD_Stage", ""),
+                "W_Trend_Confirmed": row.get("W_Trend_Confirmed", False),
+                "T1_Follow_Through": row.get("T1_Follow_Through", False),
+                "False_Rebound_10D": row.get("False_Rebound_10D", False),
                 "Portfolio_Action": action,
                 "Portfolio_Reason": reason,
                 "Positions_Before": positions_before,
@@ -1543,6 +1717,10 @@ def build_portfolio_backtest(
                 "Rank": row.get("Rank", np.nan),
                 "ts_code": ts_code,
                 "name": row.get("name", ""),
+                "W_MACD_Stage": row.get("W_MACD_Stage", ""),
+                "W_Trend_Confirmed": row.get("W_Trend_Confirmed", False),
+                "T1_Follow_Through": row.get("T1_Follow_Through", False),
+                "False_Rebound_10D": row.get("False_Rebound_10D", False),
                 "Buy_Price": round(buy_price, 3),
                 "Shares": shares,
                 "Entry_Cost": round(cost, 2),
@@ -1745,6 +1923,100 @@ def show_weekly_report(all_results: pd.DataFrame) -> None:
             )
 
 
+def bool_series(series: pd.Series) -> pd.Series:
+    if pd.api.types.is_bool_dtype(series):
+        return series.fillna(False).astype(bool)
+    return (
+        series.astype(str).str.strip().str.lower()
+        .map({"true": True, "false": False, "1": True, "0": False})
+        .fillna(False).astype(bool)
+    )
+
+
+def show_weekly_wave_report(all_results: pd.DataFrame) -> None:
+    st.subheader("🌊 周线MACD波浪阶段验证（只诊断，未参与选股）")
+    required = {"W_MACD_Stage", "Realized_Return (%)", "Exit_Reason"}
+    if all_results.empty or not required.issubset(all_results.columns):
+        st.info("暂无周线波浪诊断样本。")
+        return
+
+    data = all_results.copy()
+    data["_ret"] = pd.to_numeric(data["Realized_Return (%)"], errors="coerce")
+    data = data[data["_ret"].notna()].copy()
+    if data.empty:
+        st.info("当前信号尚未形成完整退出收益。")
+        return
+
+    data["_实质盈利"] = data["_ret"] >= 0.1
+    data["_近似保本"] = (data["_ret"] > 0) & (data["_ret"] < 0.1)
+    data["_亏损"] = data["_ret"] < 0
+    data["_结构止损"] = data["Exit_Reason"].fillna("").astype(str).str.startswith("结构止损")
+    data["_假反弹"] = (
+        bool_series(data["False_Rebound_10D"])
+        if "False_Rebound_10D" in data.columns else False
+    )
+    data["_周趋势确认"] = (
+        bool_series(data["W_Trend_Confirmed"])
+        if "W_Trend_Confirmed" in data.columns else False
+    )
+
+    rows = []
+    for stage, group in data.groupby("W_MACD_Stage", dropna=False):
+        n = len(group)
+        rows.append(
+            {
+                "周线阶段": stage,
+                "样本": n,
+                "实质盈利率(%)": round(group["_实质盈利"].mean() * 100.0, 1),
+                "保本率(%)": round(group["_近似保本"].mean() * 100.0, 1),
+                "亏损率(%)": round(group["_亏损"].mean() * 100.0, 1),
+                "结构止损率(%)": round(group["_结构止损"].mean() * 100.0, 1),
+                "10日假反弹率(%)": round(group["_假反弹"].mean() * 100.0, 1),
+                "平均收益(%)": round(group["_ret"].mean(), 2),
+                "中位收益(%)": round(group["_ret"].median(), 2),
+                "周趋势确认(%)": round(group["_周趋势确认"].mean() * 100.0, 1),
+                "_order": WEEKLY_STAGE_ORDER.get(str(stage), 99),
+            }
+        )
+    stage_table = pd.DataFrame(rows).sort_values(["_order", "样本"], ascending=[True, False])
+    st.dataframe(stage_table.drop(columns=["_order"]), use_container_width=True, hide_index=True)
+
+    headline = st.columns(4)
+    wave_mask = data["W_MACD_Stage"].isin(
+        ["R1_首周翻红", "R2_第二根红柱扩张", "R3_红柱再加速", "R4_红柱扩张", "G1_绿柱连续缩短"]
+    )
+    wave = data[wave_mask]
+    weak = data[data["W_MACD_Stage"].isin(["R5_红柱衰减", "G3_绿柱扩大/弱势"])]
+    headline[0].metric("波浪候选样本", len(wave))
+    headline[1].metric(
+        "候选结构止损率",
+        "--" if wave.empty else f"{wave['_结构止损'].mean()*100:.1f}%",
+    )
+    headline[2].metric("衰减/弱势样本", len(weak))
+    headline[3].metric(
+        "衰减/弱势止损率",
+        "--" if weak.empty else f"{weak['_结构止损'].mean()*100:.1f}%",
+    )
+
+    if "T1_Follow_Through" in data.columns:
+        data["T1状态"] = np.where(bool_series(data["T1_Follow_Through"]), "T+1延续", "T+1未延续")
+        follow_rows = []
+        for label, group in data.groupby("T1状态"):
+            follow_rows.append(
+                {
+                    "T+1状态": label,
+                    "样本": len(group),
+                    "实质盈利率(%)": round(group["_实质盈利"].mean() * 100.0, 1),
+                    "亏损率(%)": round(group["_亏损"].mean() * 100.0, 1),
+                    "结构止损率(%)": round(group["_结构止损"].mean() * 100.0, 1),
+                    "10日假反弹率(%)": round(group["_假反弹"].mean() * 100.0, 1),
+                    "平均收益(%)": round(group["_ret"].mean(), 2),
+                }
+            )
+        st.caption("T+1延续：买入日收盘同时不低于信号日收盘和买入日开盘。")
+        st.dataframe(pd.DataFrame(follow_rows), use_container_width=True, hide_index=True)
+
+
 def show_exit_report(all_results: pd.DataFrame) -> None:
     st.subheader("🚪 退出原因分布")
     summary = (
@@ -1798,6 +2070,10 @@ with st.sidebar:
         "T+1实际可成交不足2只时观察不买。"
     )
     st.caption("组合：初始30万元，最多3只，单只目标约10万元。")
+    st.info(
+        "V40.0只新增已完成周K的MACD波浪标签和T+1/假反弹诊断；"
+        "本轮不用周线标签过滤、加分或改变买卖。"
+    )
     ENABLE_THS = st.checkbox("实时雷达启用THS概念补充(需6000积分)", value=False)
     THS_KEYWORDS_TEXT = st.text_area("THS科技概念关键词", value=DEFAULT_THS_KEYWORDS, height=100)
 
@@ -1823,7 +2099,7 @@ with st.sidebar:
 
     RESUME_CHECKPOINT = st.checkbox("开启参数隔离的断点续传", value=True)
     USE_CACHE = st.checkbox("使用并增量更新行情缓存", value=True)
-    if st.button("清除V39.7/V39.9共享行情缓存"):
+    if st.button("清除V39.7/V39.9/V40.0共享行情缓存"):
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
             st.success("缓存已清除")
@@ -2072,6 +2348,7 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
                 portfolio_curve, portfolio_ledger, portfolio_orders, portfolio_summary
             )
             show_weekly_report(all_results)
+            show_weekly_wave_report(all_results)
             show_exit_report(all_results)
 
             st.subheader("🔬 筛选漏斗（逐日合计）")
@@ -2098,30 +2375,30 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
 
             export_csv = all_results.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
-                "📥 下载V39.9入选股票完整轨迹CSV",
+                "📥 下载V40.0入选股票与周线波浪轨迹CSV",
                 export_csv,
-                f"export_v39_9_{config_hash}.csv",
+                f"export_v40_0_{config_hash}.csv",
                 "text/csv",
             )
             if not portfolio_curve.empty:
                 st.download_button(
-                    "📥 下载V39.9组合每日权益CSV",
+                    "📥 下载V40.0组合每日权益CSV",
                     portfolio_curve.to_csv(index=False).encode("utf-8-sig"),
-                    f"portfolio_curve_v39_9_{config_hash}.csv",
+                    f"portfolio_curve_v40_0_{config_hash}.csv",
                     "text/csv",
                 )
             if not portfolio_ledger.empty:
                 st.download_button(
-                    "📥 下载V39.9组合成交账本CSV",
+                    "📥 下载V40.0组合成交账本CSV",
                     portfolio_ledger.to_csv(index=False).encode("utf-8-sig"),
-                    f"portfolio_ledger_v39_9_{config_hash}.csv",
+                    f"portfolio_ledger_v40_0_{config_hash}.csv",
                     "text/csv",
                 )
             if not portfolio_orders.empty:
                 st.download_button(
-                    "📥 下载V39.9信号执行审计CSV",
+                    "📥 下载V40.0信号执行审计CSV",
                     portfolio_orders.to_csv(index=False).encode("utf-8-sig"),
-                    f"portfolio_orders_v39_9_{config_hash}.csv",
+                    f"portfolio_orders_v40_0_{config_hash}.csv",
                     "text/csv",
                 )
         else:
@@ -2134,17 +2411,17 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
         if not all_candidates_export.empty:
             candidate_csv = all_candidates_export.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
-                "📥 下载V39.9全部核心候选及未入选原因CSV",
+                "📥 下载V40.0全部核心候选及周线标签CSV",
                 candidate_csv,
-                f"candidates_v39_9_{config_hash}.csv",
+                f"candidates_v40_0_{config_hash}.csv",
                 "text/csv",
             )
         if not funnel_df.empty:
             funnel_csv = funnel_df.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
-                "📥 下载V39.9逐日筛选漏斗CSV",
+                "📥 下载V40.0逐日筛选漏斗CSV",
                 funnel_csv,
-                f"funnel_v39_9_{config_hash}.csv",
+                f"funnel_v40_0_{config_hash}.csv",
                 "text/csv",
             )
 
