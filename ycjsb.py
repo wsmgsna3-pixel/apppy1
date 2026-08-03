@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-选股王 V40.0 · 周线MACD波浪诊断版
+选股王 V40.1 · 双周线与延续确认诊断版
 ============================================================
 主要变化
 1. 股票池：主板/创业板/科创板，明确剔除北交所；保留流通市值200~1000亿元参数。
@@ -25,6 +25,10 @@
     红柱扩张/再加速/衰减和绿柱弱势，本版只诊断、不改变入选与买卖。
 20. 假反弹：记录T+1收盘是否延续，并将“10个交易日内结构止损且最大浮盈
     不足5%”标记为早期假反弹，用于检验周线波浪假设。
+21. 双周线：W_字段只用完成周K；P_W_字段使用截至信号日收盘的当周临时K线，
+    两者并列导出，既防止把未来周五数据泄漏到回测，又能观察“本周正在翻红”。
+22. 替代入场：主组合仍保持T+1开盘买入；另行诊断T+1收盘延续后T+2开盘买入，
+    以及50% T+1 + 50% T+2的近似分批收益，不影响主组合权益。
 
 说明
 - 本程序用于研究和回测，不构成投资建议。
@@ -52,7 +56,7 @@ import tushare as ts
 
 warnings.filterwarnings("ignore")
 
-VERSION = "V40.0"
+VERSION = "V40.1"
 # 行情结构与V39.7兼容，沿用原缓存可避免重新下载数百个交易日。
 CACHE_FILE_NAME = "market_data_cache_v39_7.pkl"
 MAX_FETCH_WORKERS = 1  # 避免触发Tushare频率限制
@@ -141,8 +145,8 @@ DEFAULT_THS_KEYWORDS = (
 # -----------------------------------------------------------------------------
 # 页面
 # -----------------------------------------------------------------------------
-st.set_page_config(page_title=f"选股王 {VERSION} 周线MACD波浪诊断版", layout="wide")
-st.title(f"选股王 {VERSION}：V39.9原交易逻辑 + 周线MACD波浪诊断")
+st.set_page_config(page_title=f"选股王 {VERSION} 双周线与延续确认诊断版", layout="wide")
+st.title(f"选股王 {VERSION}：完成/临时周MACD + T+2延续确认诊断")
 
 
 # -----------------------------------------------------------------------------
@@ -873,6 +877,42 @@ def classify_completed_weekly_macd(weekly: pd.DataFrame, signal_date: str) -> di
     }
 
 
+def classify_provisional_weekly_macd(weekly: pd.DataFrame, signal_date: str) -> dict:
+    """
+    使用截至D0收盘已知的当周数据。周一至周四时，W-FRI标签会晚于D0，
+    因此把最后一根部分周K的标签临时改为D0再调用同一分类器。
+    这不使用D0之后的价格，但临时周柱可能在本周剩余交易日内改变。
+    """
+    provisional = weekly.copy()
+    if provisional.empty or "dt" not in provisional.columns:
+        base = classify_completed_weekly_macd(provisional, signal_date)
+    else:
+        signal_ts = pd.Timestamp(datetime.strptime(normalize_date(signal_date), "%Y%m%d"))
+        last_idx = provisional.index[-1]
+        if pd.Timestamp(provisional.loc[last_idx, "dt"]) > signal_ts:
+            provisional.loc[last_idx, "dt"] = signal_ts
+        base = classify_completed_weekly_macd(provisional, signal_date)
+
+    return {
+        "provisional_asof_date": normalize_date(signal_date),
+        "provisional_macd_stage": base["weekly_macd_stage"],
+        "provisional_macd_hist_pct": base["weekly_macd_hist_pct"],
+        "provisional_macd_hist_prev_pct": base["weekly_macd_hist_prev_pct"],
+        "provisional_dif_pct": base["weekly_dif_pct"],
+        "provisional_dea_pct": base["weekly_dea_pct"],
+        "provisional_close": base["weekly_close"],
+        "provisional_ma20": base["weekly_ma20"],
+        "provisional_ma20_slope_pct": base["weekly_ma20_slope_pct"],
+        "provisional_bias_pct": base["weekly_bias_pct"],
+        "provisional_dif_rising": base["weekly_dif_rising"],
+        "provisional_dea_rising": base["weekly_dea_rising"],
+        "provisional_ma20_rising": base["weekly_ma20_rising"],
+        "provisional_close_above_ma20": base["weekly_close_above_ma20"],
+        "provisional_trend_confirmed": base["weekly_trend_confirmed"],
+        "provisional_wave_candidate": base["weekly_wave_candidate"],
+    }
+
+
 def compute_trend_indicators(
     ts_code: str,
     end_date: str,
@@ -929,6 +969,10 @@ def compute_trend_indicators(
         result["reject_reason"] = "有效周线不足20周"
         return result
     weekly_wave = classify_completed_weekly_macd(weekly, end_date)
+    provisional_wave = classify_provisional_weekly_macd(weekly, end_date)
+    provisional_wave["provisional_changed_from_completed"] = bool(
+        provisional_wave["provisional_macd_stage"] != weekly_wave["weekly_macd_stage"]
+    )
     w_curr = weekly.iloc[-1]
     w_prev = weekly.iloc[-2]
     weekly_bias = (w_curr["close"] - w_curr["w_ma20"]) / w_curr["w_ma20"]
@@ -1024,6 +1068,7 @@ def compute_trend_indicators(
             "score_rs": float(score_rs),
             "chase_penalty": float(chase_penalty),
             **weekly_wave,
+            **provisional_wave,
         }
     )
     return result
@@ -1061,6 +1106,7 @@ def future_result_template(hold_weeks: int = 8) -> dict:
             "Protection_Stop_Price": np.nan,
             "MFE_pct (%)": np.nan,
             "MAE_pct (%)": np.nan,
+            "T1_Close_Price": np.nan,
             "T1_Close_Return_pct": np.nan,
             "T1_Close_vs_Signal_pct": np.nan,
             "T1_Follow_Through": False,
@@ -1130,6 +1176,7 @@ def get_medium_term_future(
     result["Entry_Date"] = normalize_date(next_row.name)
     result["Buy_Price"] = round(buy_price, 3)
     next_close = float(next_row["close"])
+    result["T1_Close_Price"] = round(next_close, 3)
     result["T1_Close_Return_pct"] = round((next_close / buy_price - 1.0) * 100.0, 4)
     result["T1_Close_vs_Signal_pct"] = round(
         (next_close / signal_close - 1.0) * 100.0 if signal_close > 0 else np.nan,
@@ -1257,6 +1304,122 @@ def get_medium_term_future(
     result["Early_Structural_Stop_10D"] = early_stop
     result["False_Rebound_10D"] = bool(early_stop and pd.notna(mfe) and mfe < 5.0)
     return result
+
+
+def alternative_entry_template() -> dict:
+    return {
+        "T2_Eligible": False,
+        "T2_Tradable": False,
+        "T2_Skip_Reason": "",
+        "T2_Entry_Date": "",
+        "T2_Exit_Date": "",
+        "T2_Buy_Price": np.nan,
+        "T2_Net_Exit_Price": np.nan,
+        "T2_Realized_Return_pct": np.nan,
+        "T2_Exit_Reason": "",
+        "T2_Holding_Days": np.nan,
+        "T2_MFE_pct": np.nan,
+        "T2_MAE_pct": np.nan,
+        "T2_Structural_Stop": False,
+        "Split_Invested_pct": np.nan,
+        "Split_Realized_Return_pct": np.nan,
+    }
+
+
+def build_alternative_entry_diagnostics(
+    main_result: dict,
+    ts_code: str,
+    market: str,
+    signal_low: float,
+    signal_ma20: float,
+    atr14: float,
+    max_gap_pct: float,
+    buy_slippage_pct: float,
+    sell_slippage_pct: float,
+    commission_pct: float,
+    sell_tax_pct: float,
+    protection_trigger_pct: float,
+    protection_buffer_pct: float,
+    use_sina: bool = False,
+) -> dict:
+    """
+    主组合仍使用T+1开盘买入。这里只产生两个并行诊断：
+    1) T+1收盘延续后，T+2开盘独立买入；
+    2) 50%资金按原T+1结果 + 50%资金按T+2结果。若T+1未延续，
+       第二半资金保持现金，分批收益为0.5 * 原T+1收益。
+
+    分批结果是两个独立子仓退出的资金加权近似，不是新的真实组合曲线。
+    """
+    out = alternative_entry_template()
+    main_ret = pd.to_numeric(
+        pd.Series([main_result.get("Realized_Return (%)", np.nan)]), errors="coerce"
+    ).iloc[0]
+    follow = bool(main_result.get("T1_Follow_Through", False))
+    out["T2_Eligible"] = follow
+
+    if not follow:
+        out["T2_Skip_Reason"] = "T+1收盘未延续"
+        if pd.notna(main_ret):
+            out["Split_Invested_pct"] = 50.0
+            out["Split_Realized_Return_pct"] = round(float(main_ret) * 0.5, 4)
+        return out
+
+    t1_date = normalize_date(main_result.get("Entry_Date", ""))
+    t1_close = pd.to_numeric(
+        pd.Series([main_result.get("T1_Close_Price", np.nan)]), errors="coerce"
+    ).iloc[0]
+    if not t1_date or pd.isna(t1_close) or t1_close <= 0:
+        out["T2_Skip_Reason"] = "T+1日期或收盘价缺失"
+        if pd.notna(main_ret):
+            out["Split_Invested_pct"] = 50.0
+            out["Split_Realized_Return_pct"] = round(float(main_ret) * 0.5, 4)
+        return out
+
+    delayed = get_medium_term_future(
+        ts_code=ts_code,
+        market=market,
+        selection_date=t1_date,
+        signal_close=float(t1_close),
+        signal_low=signal_low,
+        signal_ma20=signal_ma20,
+        atr14=atr14,
+        hold_weeks=8,
+        max_gap_pct=max_gap_pct,
+        buy_slippage_pct=buy_slippage_pct,
+        sell_slippage_pct=sell_slippage_pct,
+        commission_pct=commission_pct,
+        sell_tax_pct=sell_tax_pct,
+        protection_trigger_pct=protection_trigger_pct,
+        protection_buffer_pct=protection_buffer_pct,
+        use_sina=use_sina,
+    )
+    out["T2_Tradable"] = bool(delayed.get("Tradable", False))
+    out["T2_Entry_Date"] = delayed.get("Entry_Date", "")
+    out["T2_Exit_Date"] = delayed.get("Exit_Date", "")
+    out["T2_Buy_Price"] = delayed.get("Buy_Price", np.nan)
+    out["T2_Net_Exit_Price"] = delayed.get("Net_Exit_Price", np.nan)
+    out["T2_Realized_Return_pct"] = delayed.get("Realized_Return (%)", np.nan)
+    out["T2_Exit_Reason"] = delayed.get("Exit_Reason", "")
+    out["T2_Holding_Days"] = delayed.get("Holding_Days", np.nan)
+    out["T2_MFE_pct"] = delayed.get("MFE_pct (%)", np.nan)
+    out["T2_MAE_pct"] = delayed.get("MAE_pct (%)", np.nan)
+    out["T2_Structural_Stop"] = str(delayed.get("Exit_Reason", "")).startswith("结构止损")
+    if not out["T2_Tradable"]:
+        out["T2_Skip_Reason"] = str(delayed.get("Exit_Reason", "T+2无法成交"))
+
+    t2_ret = pd.to_numeric(
+        pd.Series([out["T2_Realized_Return_pct"]]), errors="coerce"
+    ).iloc[0]
+    if pd.notna(main_ret):
+        if out["T2_Tradable"] and pd.notna(t2_ret):
+            out["Split_Invested_pct"] = 100.0
+            out["Split_Realized_Return_pct"] = round(
+                float(main_ret) * 0.5 + float(t2_ret) * 0.5, 4
+            )
+        else:
+            out["Split_Invested_pct"] = 50.0
+            out["Split_Realized_Return_pct"] = round(float(main_ret) * 0.5, 4)
+    return out
 
 
 # -----------------------------------------------------------------------------
@@ -1446,6 +1609,31 @@ def run_backtest_for_day(
             "W_Close_Above_MA20": indicators["weekly_close_above_ma20"],
             "W_Trend_Confirmed": indicators["weekly_trend_confirmed"],
             "W_Wave_Candidate": indicators["weekly_wave_candidate"],
+            "P_W_AsOf_Date": indicators["provisional_asof_date"],
+            "P_W_MACD_Stage": indicators["provisional_macd_stage"],
+            "P_W_MACD_Hist_pct": round(indicators["provisional_macd_hist_pct"], 4)
+            if pd.notna(indicators["provisional_macd_hist_pct"]) else np.nan,
+            "P_W_MACD_Hist_Prev_pct": round(indicators["provisional_macd_hist_prev_pct"], 4)
+            if pd.notna(indicators["provisional_macd_hist_prev_pct"]) else np.nan,
+            "P_W_DIF_pct": round(indicators["provisional_dif_pct"], 4)
+            if pd.notna(indicators["provisional_dif_pct"]) else np.nan,
+            "P_W_DEA_pct": round(indicators["provisional_dea_pct"], 4)
+            if pd.notna(indicators["provisional_dea_pct"]) else np.nan,
+            "P_W_Close": round(indicators["provisional_close"], 3)
+            if pd.notna(indicators["provisional_close"]) else np.nan,
+            "P_W_MA20": round(indicators["provisional_ma20"], 3)
+            if pd.notna(indicators["provisional_ma20"]) else np.nan,
+            "P_W_MA20_Slope_pct": round(indicators["provisional_ma20_slope_pct"], 4)
+            if pd.notna(indicators["provisional_ma20_slope_pct"]) else np.nan,
+            "P_W_Bias_pct": round(indicators["provisional_bias_pct"], 3)
+            if pd.notna(indicators["provisional_bias_pct"]) else np.nan,
+            "P_W_DIF_Rising": indicators["provisional_dif_rising"],
+            "P_W_DEA_Rising": indicators["provisional_dea_rising"],
+            "P_W_MA20_Rising": indicators["provisional_ma20_rising"],
+            "P_W_Close_Above_MA20": indicators["provisional_close_above_ma20"],
+            "P_W_Trend_Confirmed": indicators["provisional_trend_confirmed"],
+            "P_W_Wave_Candidate": indicators["provisional_wave_candidate"],
+            "P_W_Changed_From_Completed": indicators["provisional_changed_from_completed"],
             # 下列字段用于通过门槛后的成交回测，候选导出前会移除前导下划线。
             "_Signal_Low": indicators["signal_low"],
             "_Signal_MA20": indicators["ma20"],
@@ -1489,6 +1677,15 @@ def run_backtest_for_day(
                 all_candidates[key] = pd.Series(None, index=all_candidates.index, dtype="object")
             else:
                 all_candidates[key] = np.nan
+    for key in alternative_entry_template():
+        if key in all_candidates.columns:
+            continue
+        if key in {"T2_Eligible", "T2_Tradable", "T2_Structural_Stop"}:
+            all_candidates[key] = pd.Series(pd.NA, index=all_candidates.index, dtype="boolean")
+        elif key in {"T2_Skip_Reason", "T2_Entry_Date", "T2_Exit_Date", "T2_Exit_Reason"}:
+            all_candidates[key] = pd.Series(None, index=all_candidates.index, dtype="object")
+        else:
+            all_candidates[key] = np.nan
     all_candidates["Execution_Checked"] = False
     all_candidates["Selection_Status"] = np.where(
         all_candidates["Score_Pass"], "通过动态分数门槛", "未达动态分数门槛"
@@ -1526,6 +1723,24 @@ def run_backtest_for_day(
                 use_sina=use_sina,
             )
             for key, value in future.items():
+                all_candidates.loc[idx, key] = value
+            alternative = build_alternative_entry_diagnostics(
+                main_result=future,
+                ts_code=str(candidate["ts_code"]),
+                market=str(candidate["market"]),
+                signal_low=float(candidate["_Signal_Low"]),
+                signal_ma20=float(candidate["_Signal_MA20"]),
+                atr14=float(candidate["_ATR14"]),
+                max_gap_pct=max_gap_pct,
+                buy_slippage_pct=buy_slippage_pct,
+                sell_slippage_pct=sell_slippage_pct,
+                commission_pct=commission_pct,
+                sell_tax_pct=sell_tax_pct,
+                protection_trigger_pct=protection_trigger_pct,
+                protection_buffer_pct=protection_buffer_pct,
+                use_sina=use_sina,
+            )
+            for key, value in alternative.items():
                 all_candidates.loc[idx, key] = value
             all_candidates.loc[idx, "Execution_Checked"] = True
             if future["Tradable"]:
@@ -1677,8 +1892,14 @@ def build_portfolio_backtest(
                 "Total_Score": row.get("Total_Score", np.nan),
                 "W_MACD_Stage": row.get("W_MACD_Stage", ""),
                 "W_Trend_Confirmed": row.get("W_Trend_Confirmed", False),
+                "P_W_MACD_Stage": row.get("P_W_MACD_Stage", ""),
+                "P_W_Trend_Confirmed": row.get("P_W_Trend_Confirmed", False),
                 "T1_Follow_Through": row.get("T1_Follow_Through", False),
                 "False_Rebound_10D": row.get("False_Rebound_10D", False),
+                "T2_Eligible": row.get("T2_Eligible", False),
+                "T2_Tradable": row.get("T2_Tradable", False),
+                "T2_Realized_Return_pct": row.get("T2_Realized_Return_pct", np.nan),
+                "Split_Realized_Return_pct": row.get("Split_Realized_Return_pct", np.nan),
                 "Portfolio_Action": action,
                 "Portfolio_Reason": reason,
                 "Positions_Before": positions_before,
@@ -1719,8 +1940,14 @@ def build_portfolio_backtest(
                 "name": row.get("name", ""),
                 "W_MACD_Stage": row.get("W_MACD_Stage", ""),
                 "W_Trend_Confirmed": row.get("W_Trend_Confirmed", False),
+                "P_W_MACD_Stage": row.get("P_W_MACD_Stage", ""),
+                "P_W_Trend_Confirmed": row.get("P_W_Trend_Confirmed", False),
                 "T1_Follow_Through": row.get("T1_Follow_Through", False),
                 "False_Rebound_10D": row.get("False_Rebound_10D", False),
+                "T2_Eligible": row.get("T2_Eligible", False),
+                "T2_Tradable": row.get("T2_Tradable", False),
+                "T2_Realized_Return_pct": row.get("T2_Realized_Return_pct", np.nan),
+                "Split_Realized_Return_pct": row.get("Split_Realized_Return_pct", np.nan),
                 "Buy_Price": round(buy_price, 3),
                 "Shares": shares,
                 "Entry_Cost": round(cost, 2),
@@ -2017,6 +2244,124 @@ def show_weekly_wave_report(all_results: pd.DataFrame) -> None:
         st.dataframe(pd.DataFrame(follow_rows), use_container_width=True, hide_index=True)
 
 
+def show_provisional_weekly_report(all_results: pd.DataFrame) -> None:
+    st.subheader("🌫️ 信号日临时周MACD（P_W_字段）")
+    required = {"P_W_MACD_Stage", "W_MACD_Stage", "Realized_Return (%)", "Exit_Reason"}
+    if all_results.empty or not required.issubset(all_results.columns):
+        st.info("暂无临时周MACD诊断样本。")
+        return
+    data = all_results.copy()
+    data["_ret"] = pd.to_numeric(data["Realized_Return (%)"], errors="coerce")
+    data = data[data["_ret"].notna()].copy()
+    if data.empty:
+        st.info("当前样本尚未成熟。")
+        return
+    data["_实质盈利"] = data["_ret"] >= 0.1
+    data["_保本"] = (data["_ret"] > 0) & (data["_ret"] < 0.1)
+    data["_亏损"] = data["_ret"] < 0
+    data["_结构止损"] = data["Exit_Reason"].fillna("").astype(str).str.startswith("结构止损")
+    data["_假反弹"] = (
+        bool_series(data["False_Rebound_10D"])
+        if "False_Rebound_10D" in data.columns else False
+    )
+    data["_临时趋势确认"] = (
+        bool_series(data["P_W_Trend_Confirmed"])
+        if "P_W_Trend_Confirmed" in data.columns else False
+    )
+    rows = []
+    for stage, group in data.groupby("P_W_MACD_Stage", dropna=False):
+        rows.append(
+            {
+                "临时周阶段": stage,
+                "样本": len(group),
+                "实质盈利率(%)": round(group["_实质盈利"].mean() * 100.0, 1),
+                "保本率(%)": round(group["_保本"].mean() * 100.0, 1),
+                "亏损率(%)": round(group["_亏损"].mean() * 100.0, 1),
+                "结构止损率(%)": round(group["_结构止损"].mean() * 100.0, 1),
+                "10日假反弹率(%)": round(group["_假反弹"].mean() * 100.0, 1),
+                "平均收益(%)": round(group["_ret"].mean(), 2),
+                "中位收益(%)": round(group["_ret"].median(), 2),
+                "临时趋势确认(%)": round(group["_临时趋势确认"].mean() * 100.0, 1),
+                "_order": WEEKLY_STAGE_ORDER.get(str(stage), 99),
+            }
+        )
+    table = pd.DataFrame(rows).sort_values(["_order", "样本"], ascending=[True, False])
+    st.dataframe(table.drop(columns=["_order"]), use_container_width=True, hide_index=True)
+
+    changed = data["P_W_MACD_Stage"].astype(str) != data["W_MACD_Stage"].astype(str)
+    metrics = st.columns(3)
+    metrics[0].metric("完成周→临时周发生阶段变化", f"{changed.sum()}/{len(data)} ({changed.mean()*100:.1f}%)")
+    provisional_wave = data["P_W_MACD_Stage"].isin(
+        ["R1_首周翻红", "R2_第二根红柱扩张", "R3_红柱再加速", "R4_红柱扩张", "G1_绿柱连续缩短"]
+    )
+    wave = data[provisional_wave]
+    metrics[1].metric("临时周波浪候选", len(wave))
+    metrics[2].metric(
+        "临时候选结构止损率",
+        "--" if wave.empty else f"{wave['_结构止损'].mean()*100:.1f}%",
+    )
+    with st.expander("查看完成周阶段→临时周阶段转移矩阵"):
+        cross = pd.crosstab(data["W_MACD_Stage"], data["P_W_MACD_Stage"], margins=True)
+        st.dataframe(cross, use_container_width=True)
+
+
+def show_alternative_entry_report(all_results: pd.DataFrame) -> None:
+    st.subheader("⏱️ T+1原入场 vs T+2确认 vs 50/50分批（诊断）")
+    needed = {"Realized_Return (%)", "T2_Realized_Return_pct", "Split_Realized_Return_pct"}
+    if all_results.empty or not needed.issubset(all_results.columns):
+        st.info("暂无替代入场诊断数据。")
+        return
+    data = all_results.copy()
+    data["_main"] = pd.to_numeric(data["Realized_Return (%)"], errors="coerce")
+    data["_t2"] = pd.to_numeric(data["T2_Realized_Return_pct"], errors="coerce")
+    data["_split"] = pd.to_numeric(data["Split_Realized_Return_pct"], errors="coerce")
+    t2_tradable = bool_series(data["T2_Tradable"]) if "T2_Tradable" in data.columns else pd.Series(False, index=data.index)
+    t2_mature = t2_tradable & data["_t2"].notna()
+
+    def metric_row(label: str, returns: pd.Series, structural: pd.Series | None = None) -> dict:
+        values = pd.to_numeric(returns, errors="coerce").dropna()
+        if values.empty:
+            return {"方案": label, "成熟样本": 0}
+        row = {
+            "方案": label,
+            "成熟样本": len(values),
+            "实质盈利率(%)": round((values >= 0.1).mean() * 100.0, 1),
+            "保本率(%)": round(((values > 0) & (values < 0.1)).mean() * 100.0, 1),
+            "亏损率(%)": round((values < 0).mean() * 100.0, 1),
+            "平均收益(%)": round(values.mean(), 2),
+            "中位收益(%)": round(values.median(), 2),
+        }
+        if structural is not None:
+            aligned = bool_series(structural.reindex(values.index))
+            row["结构止损率(%)"] = round(aligned.mean() * 100.0, 1)
+        else:
+            row["结构止损率(%)"] = np.nan
+        return row
+
+    main_struct = data["Exit_Reason"].fillna("").astype(str).str.startswith("结构止损")
+    t2_struct = bool_series(data["T2_Structural_Stop"]) if "T2_Structural_Stop" in data.columns else pd.Series(False, index=data.index)
+    rows = [
+        metric_row("原T+1全部信号", data["_main"], main_struct),
+        metric_row("原T+1（仅T+2可成交的延续样本）", data.loc[t2_mature, "_main"], main_struct.loc[t2_mature]),
+        metric_row("T+2确认买入（同一批样本）", data.loc[t2_mature, "_t2"], t2_struct.loc[t2_mature]),
+        metric_row("50/50分批近似（全部信号）", data["_split"], None),
+    ]
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    eligible = bool_series(data["T2_Eligible"]) if "T2_Eligible" in data.columns else pd.Series(False, index=data.index)
+    info = st.columns(4)
+    info[0].metric("T+1延续样本", f"{eligible.sum()}/{len(data)}")
+    info[1].metric("T+2可成交且成熟", f"{t2_mature.sum()}/{len(data)}")
+    info[2].metric(
+        "分批平均资金投入",
+        "--" if "Split_Invested_pct" not in data.columns else f"{pd.to_numeric(data['Split_Invested_pct'], errors='coerce').mean():.1f}%",
+    )
+    info[3].metric("T+2不可成交/未成熟", int(eligible.sum() - t2_mature.sum()))
+    st.caption(
+        "50/50分批为两个独立子仓收益的资金加权近似；"
+        "本版主组合仍完全按V39.9/V40.0的T+1开盘买入执行。"
+    )
+
+
 def show_exit_report(all_results: pd.DataFrame) -> None:
     st.subheader("🚪 退出原因分布")
     summary = (
@@ -2071,8 +2416,8 @@ with st.sidebar:
     )
     st.caption("组合：初始30万元，最多3只，单只目标约10万元。")
     st.info(
-        "V40.0只新增已完成周K的MACD波浪标签和T+1/假反弹诊断；"
-        "本轮不用周线标签过滤、加分或改变买卖。"
+        "V40.1并列诊断已完成周MACD(W_)、信号日临时周MACD(P_W_)、"
+        "T+2确认和50/50分批；主组合仍按V39.9原T+1逻辑执行。"
     )
     ENABLE_THS = st.checkbox("实时雷达启用THS概念补充(需6000积分)", value=False)
     THS_KEYWORDS_TEXT = st.text_area("THS科技概念关键词", value=DEFAULT_THS_KEYWORDS, height=100)
@@ -2099,7 +2444,7 @@ with st.sidebar:
 
     RESUME_CHECKPOINT = st.checkbox("开启参数隔离的断点续传", value=True)
     USE_CACHE = st.checkbox("使用并增量更新行情缓存", value=True)
-    if st.button("清除V39.7/V39.9/V40.0共享行情缓存"):
+    if st.button("清除V39.7/V39.9/V40.x共享行情缓存"):
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
             st.success("缓存已清除")
@@ -2349,6 +2694,8 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
             )
             show_weekly_report(all_results)
             show_weekly_wave_report(all_results)
+            show_provisional_weekly_report(all_results)
+            show_alternative_entry_report(all_results)
             show_exit_report(all_results)
 
             st.subheader("🔬 筛选漏斗（逐日合计）")
@@ -2375,30 +2722,30 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
 
             export_csv = all_results.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
-                "📥 下载V40.0入选股票与周线波浪轨迹CSV",
+                "📥 下载V40.1双周线与替代入场轨迹CSV",
                 export_csv,
-                f"export_v40_0_{config_hash}.csv",
+                f"export_v40_1_{config_hash}.csv",
                 "text/csv",
             )
             if not portfolio_curve.empty:
                 st.download_button(
-                    "📥 下载V40.0组合每日权益CSV",
+                    "📥 下载V40.1主组合每日权益CSV",
                     portfolio_curve.to_csv(index=False).encode("utf-8-sig"),
-                    f"portfolio_curve_v40_0_{config_hash}.csv",
+                    f"portfolio_curve_v40_1_{config_hash}.csv",
                     "text/csv",
                 )
             if not portfolio_ledger.empty:
                 st.download_button(
-                    "📥 下载V40.0组合成交账本CSV",
+                    "📥 下载V40.1主组合成交账本CSV",
                     portfolio_ledger.to_csv(index=False).encode("utf-8-sig"),
-                    f"portfolio_ledger_v40_0_{config_hash}.csv",
+                    f"portfolio_ledger_v40_1_{config_hash}.csv",
                     "text/csv",
                 )
             if not portfolio_orders.empty:
                 st.download_button(
-                    "📥 下载V40.0信号执行审计CSV",
+                    "📥 下载V40.1信号执行审计CSV",
                     portfolio_orders.to_csv(index=False).encode("utf-8-sig"),
-                    f"portfolio_orders_v40_0_{config_hash}.csv",
+                    f"portfolio_orders_v40_1_{config_hash}.csv",
                     "text/csv",
                 )
         else:
@@ -2411,17 +2758,17 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
         if not all_candidates_export.empty:
             candidate_csv = all_candidates_export.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
-                "📥 下载V40.0全部核心候选及周线标签CSV",
+                "📥 下载V40.1全部核心候选及诊断CSV",
                 candidate_csv,
-                f"candidates_v40_0_{config_hash}.csv",
+                f"candidates_v40_1_{config_hash}.csv",
                 "text/csv",
             )
         if not funnel_df.empty:
             funnel_csv = funnel_df.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
-                "📥 下载V40.0逐日筛选漏斗CSV",
+                "📥 下载V40.1逐日筛选漏斗CSV",
                 funnel_csv,
-                f"funnel_v40_0_{config_hash}.csv",
+                f"funnel_v40_1_{config_hash}.csv",
                 "text/csv",
             )
 
