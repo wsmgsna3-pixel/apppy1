@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-选股王 V39.8 · 市场环境与动态门槛增强版
+选股王 V39.9 · 三仓组合回测版
 ============================================================
 主要变化
 1. 股票池：主板/创业板/科创板，明确剔除北交所；保留流通市值200~1000亿元参数。
@@ -14,9 +14,13 @@
 9. 数据：缓存检查日期覆盖并增量补齐；行业/API失败不再静默放行。
 10. 诊断：输出逐日筛选漏斗、退出周、持仓天数、MFE/MAE等字段。
 11. 门槛：当天80分以上核心信号达到4只时门槛为80分，否则提高到82分，但不禁止开仓。
-12. 环境：创业板指与科创50同时跌破下降中的MA20时，暂停次日新开仓。
+12. 环境：取消创业板指/科创50的一刀切暂停开仓，避免误杀弱市中的强势股。
 13. 保本：浮盈首次达到10%后，从下一交易日启用成本上方0.3%的保护止损。
-14. 审计：另行导出全部核心候选及未入选原因，便于核查动态门槛和市场过滤。
+14. 审计：另行导出全部核心候选及未入选原因，便于核查动态门槛。
+15. 固化：股价不低于20元、流通市值200~1000亿元、关闭大盘硬过滤。
+16. 广度：T+1成交检查后可交易股票少于2只时，全部仅观察而不开仓。
+17. 组合：30万元初始资金、最多3只持仓、单只约10万元，输出组合曲线与真实空仓率。
+18. 断点：改用主键去重和原子覆盖保存，防止续跑时重复记录。
 
 说明
 - 本程序用于研究和回测，不构成投资建议。
@@ -32,6 +36,7 @@ import json
 import os
 import pickle
 import time
+import traceback
 import warnings
 from datetime import datetime, timedelta
 
@@ -43,7 +48,7 @@ import tushare as ts
 
 warnings.filterwarnings("ignore")
 
-VERSION = "V39.8"
+VERSION = "V39.9"
 # 行情结构与V39.7兼容，沿用原缓存可避免重新下载数百个交易日。
 CACHE_FILE_NAME = "market_data_cache_v39_7.pkl"
 MAX_FETCH_WORKERS = 1  # 避免触发Tushare频率限制
@@ -59,6 +64,19 @@ GLOBAL_BENCHMARK = pd.DataFrame()
 GLOBAL_REGIME_INDICES: dict[str, pd.DataFrame] = {}
 API_ERRORS: list[str] = []
 SINA_STATUS = {"success": 0, "fail": 0}
+
+# 经多轮A/B回测确认后固化的基准参数。
+FIXED_MIN_PRICE = 20.0
+FIXED_MIN_MV = 200.0
+FIXED_MAX_MV = 1000.0
+FIXED_MARKET_FILTER = False
+MIN_TRADABLE_SIGNALS = 2
+
+# 真实组合约束。
+INITIAL_CAPITAL = 300_000.0
+MAX_PORTFOLIO_POSITIONS = 3
+POSITION_BUDGET = INITIAL_CAPITAL / MAX_PORTFOLIO_POSITIONS
+LOT_SIZE = 100
 
 
 # -----------------------------------------------------------------------------
@@ -119,8 +137,8 @@ DEFAULT_THS_KEYWORDS = (
 # -----------------------------------------------------------------------------
 # 页面
 # -----------------------------------------------------------------------------
-st.set_page_config(page_title=f"选股王 {VERSION} 科技细分增强版", layout="wide")
-st.title(f"选股王 {VERSION}：动态评分 + 双指数环境过滤 + 次日保护止损")
+st.set_page_config(page_title=f"选股王 {VERSION} 三仓组合回测版", layout="wide")
+st.title(f"选股王 {VERSION}：多信号确认 + 30万三仓组合回测")
 
 
 # -----------------------------------------------------------------------------
@@ -172,6 +190,77 @@ def normalize_date(value, default: str = "") -> str:
         return default
     text = str(value).strip().replace(".0", "")
     return text if len(text) == 8 and text.isdigit() else default
+
+
+def canonicalize_records(df: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
+    """统一断点文件的主键类型并去重。
+
+    Streamlit表格下载可能带入 Unnamed 索引列；CSV重读还可能把
+    Trade_Date 变成数字。先规范化再去重，避免“看起来相同、实际类型不同”。
+    """
+    if df is None or df.empty:
+        return pd.DataFrame() if df is None else df.copy()
+    clean = df.copy()
+    clean = clean.drop(columns=[c for c in clean.columns if str(c).startswith("Unnamed:")], errors="ignore")
+    if "Trade_Date" in clean.columns:
+        clean["Trade_Date"] = clean["Trade_Date"].map(normalize_date)
+        clean = clean[clean["Trade_Date"] != ""]
+    if "ts_code" in clean.columns:
+        clean["ts_code"] = clean["ts_code"].astype(str).str.strip()
+        clean = clean[clean["ts_code"] != ""]
+    existing_keys = [key for key in keys if key in clean.columns]
+    if existing_keys:
+        clean = clean.drop_duplicates(existing_keys, keep="last")
+    return clean.reset_index(drop=True)
+
+
+def merge_records(current: pd.DataFrame, new_rows: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
+    frames = [frame for frame in [current, new_rows] if frame is not None and not frame.empty]
+    if not frames:
+        return pd.DataFrame()
+    return canonicalize_records(pd.concat(frames, ignore_index=True), keys)
+
+
+def replace_trade_date_records(
+    current: pd.DataFrame,
+    new_rows: pd.DataFrame,
+    trade_date: str,
+    keys: list[str],
+) -> pd.DataFrame:
+    """断点重跑某日时先删除该日旧快照，再写入新快照。"""
+    base = canonicalize_records(current, keys)
+    if not base.empty and "Trade_Date" in base.columns:
+        base = base[base["Trade_Date"] != normalize_date(trade_date)].copy()
+    return merge_records(base, new_rows, keys)
+
+
+def read_checkpoint_csv(path: str, keys: list[str]) -> pd.DataFrame:
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    key_dtypes = {key: str for key in keys}
+    try:
+        loaded = pd.read_csv(path, encoding="utf-8-sig", dtype=key_dtypes)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame(columns=keys)
+    return canonicalize_records(loaded, keys)
+
+
+def atomic_write_csv(df: pd.DataFrame, path: str, keys: list[str]) -> pd.DataFrame:
+    """先写临时文件再原子替换；每次都写入已去重的完整快照。"""
+    clean = canonicalize_records(df, keys)
+    if len(clean.columns) == 0:
+        clean = pd.DataFrame(columns=keys)
+    temp_path = f"{path}.tmp"
+    clean.to_csv(temp_path, index=False, encoding="utf-8-sig")
+    os.replace(temp_path, path)
+    return clean
+
+
+def atomic_write_json(payload: dict, path: str) -> None:
+    temp_path = f"{path}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as file:
+        json.dump(payload, file, ensure_ascii=False, indent=2)
+    os.replace(temp_path, path)
 
 
 def parse_keywords(text: str) -> list[str]:
@@ -839,7 +928,12 @@ def future_result_template(hold_weeks: int = 8) -> dict:
             "Exit_Reason": "等待T+1数据",
             "Exit_Week": np.nan,
             "Holding_Days": 0,
+            "Entry_Date": "",
+            "Exit_Date": "",
             "Buy_Price": np.nan,
+            "Raw_Exit_Price": np.nan,
+            "Net_Exit_Price": np.nan,
+            "Realized_Return (%)": np.nan,
             "Gap_pct (%)": np.nan,
             "Stop_pct (%)": np.nan,
             "Protection_Trigger_Day": np.nan,
@@ -907,6 +1001,7 @@ def get_medium_term_future(
         return result
 
     buy_price = raw_open * (1.0 + buy_slippage_pct / 100.0) * (1.0 + commission_pct / 100.0)
+    result["Entry_Date"] = normalize_date(next_row.name)
     result["Buy_Price"] = round(buy_price, 3)
 
     raw_structural_stop = min(signal_low, signal_ma20) - 0.5 * atr14
@@ -917,16 +1012,30 @@ def get_medium_term_future(
     protection_stop_price = buy_price * (1.0 + protection_buffer_pct / 100.0)
     protection_active_from_day = None
 
-    def net_return(raw_sell_price: float) -> float:
+    def net_exit_price(raw_sell_price: float) -> float:
         net_sell = raw_sell_price * (1.0 - sell_slippage_pct / 100.0)
         net_sell *= 1.0 - (commission_pct + sell_tax_pct) / 100.0
-        return (net_sell / buy_price - 1.0) * 100.0
+        return net_sell
 
-    def finalize_exit(raw_sell_price: float, week: int, day_count: int, reason: str):
-        exit_return = net_return(raw_sell_price)
+    def net_return(raw_sell_price: float) -> float:
+        return (net_exit_price(raw_sell_price) / buy_price - 1.0) * 100.0
+
+    def finalize_exit(
+        raw_sell_price: float,
+        week: int,
+        day_count: int,
+        reason: str,
+        exit_date: str,
+    ):
+        net_sell = net_exit_price(raw_sell_price)
+        exit_return = (net_sell / buy_price - 1.0) * 100.0
         result["Exit_Reason"] = reason
         result["Exit_Week"] = week
         result["Holding_Days"] = day_count
+        result["Exit_Date"] = normalize_date(exit_date)
+        result["Raw_Exit_Price"] = round(raw_sell_price, 3)
+        result["Net_Exit_Price"] = round(net_sell, 3)
+        result["Realized_Return (%)"] = round(exit_return, 4)
         # 退出后的实现收益延续到后续周，修复幸存者偏差
         for w in range(week, hold_weeks + 1):
             result[f"Return_W{w} (%)"] = exit_return
@@ -953,7 +1062,7 @@ def get_medium_term_future(
         trough_low = min(trough_low, curr_low)
 
         if pending_reason is not None:
-            finalize_exit(curr_open, week, day_count, pending_reason)
+            finalize_exit(curr_open, week, day_count, pending_reason, row.name)
             exited = True
             break
 
@@ -968,7 +1077,7 @@ def get_medium_term_future(
                 reason = f"成本保护止损(+{protection_buffer_pct:.1f}%原始价)"
             else:
                 reason = f"结构止损({-risk_pct*100:.1f}%)"
-            finalize_exit(raw_exit, week, day_count, reason)
+            finalize_exit(raw_exit, week, day_count, reason, row.name)
             exited = True
             break
 
@@ -996,7 +1105,14 @@ def get_medium_term_future(
         result["Holding_Days"] = observed_days
         if observed_days >= hold_weeks * 5:
             last_close = float(future.iloc[hold_weeks * 5 - 1]["close"])
-            finalize_exit(last_close, hold_weeks, hold_weeks * 5, "周期结束平仓")
+            cycle_exit_date = future.iloc[hold_weeks * 5 - 1].name
+            finalize_exit(
+                last_close,
+                hold_weeks,
+                hold_weeks * 5,
+                "周期结束平仓",
+                cycle_exit_date,
+            )
             # 周期末强制平仓代表已经完整存活到W8末，不应计为W8前退出。
             result[f"Held_W{hold_weeks}"] = True
         else:
@@ -1030,6 +1146,7 @@ def run_backtest_for_day(
     min_total_score: float,
     scarce_total_score: float,
     breadth_threshold: int,
+    min_tradable_signals: int,
     enable_market_filter: bool,
     protection_trigger_pct: float,
     protection_buffer_pct: float,
@@ -1108,6 +1225,8 @@ def run_backtest_for_day(
         "Execution_Checked",
         "Final_Signal",
         "Tradable_Signal",
+        "Breadth_Confirmed",
+        "Scarce_Tradable_Skipped",
         "Selected_TopK",
     ]:
         funnel[key] = 0
@@ -1196,7 +1315,7 @@ def run_backtest_for_day(
         if key not in all_candidates.columns:
             if key.startswith("Eligible_W") or key.startswith("Held_W") or key == "Tradable":
                 all_candidates[key] = pd.Series(pd.NA, index=all_candidates.index, dtype="boolean")
-            elif key == "Exit_Reason":
+            elif key in ["Exit_Reason", "Entry_Date", "Exit_Date"]:
                 all_candidates[key] = pd.Series(None, index=all_candidates.index, dtype="object")
             else:
                 all_candidates[key] = np.nan
@@ -1250,14 +1369,29 @@ def run_backtest_for_day(
     funnel["Tradable_Signal"] = int(tradable_mask.sum())
 
     tradable = all_candidates[tradable_mask].copy()
-    final_indices = (
-        tradable.sort_values(["Total_Score", "ATR_pct"], ascending=[False, False])
-        .head(top_k)
-        .index
-        .tolist()
-    )
-    all_candidates.loc[tradable.index, "Selection_Status"] = "未进入TopK"
-    all_candidates.loc[final_indices, "Selection_Status"] = "入选TopK"
+    tradable_count = len(tradable)
+    breadth_confirmed = tradable_count >= int(min_tradable_signals)
+    all_candidates["Day_Tradable_Signal_Count"] = tradable_count
+    all_candidates["Breadth_Confirmed"] = breadth_confirmed
+    funnel["Breadth_Confirmed"] = int(breadth_confirmed)
+    funnel["Scarce_Tradable_Skipped"] = tradable_count if 0 < tradable_count < int(min_tradable_signals) else 0
+
+    if breadth_confirmed:
+        final_indices = (
+            tradable.sort_values(["Total_Score", "ATR_pct"], ascending=[False, False])
+            .head(top_k)
+            .index
+            .tolist()
+        )
+        all_candidates.loc[tradable.index, "Selection_Status"] = "广度确认-未进入TopK"
+        all_candidates.loc[final_indices, "Selection_Status"] = "广度确认-入选TopK"
+    else:
+        final_indices = []
+        if tradable_count > 0:
+            all_candidates.loc[tradable.index, "Selection_Status"] = (
+                f"实际可成交仅{tradable_count}只<"
+                f"{int(min_tradable_signals)}只，观察不买"
+            )
     all_candidates["Selected"] = all_candidates.index.isin(final_indices)
     funnel["Selected_TopK"] = len(final_indices)
 
@@ -1272,8 +1406,320 @@ def run_backtest_for_day(
 
 
 # -----------------------------------------------------------------------------
+# 30万元、最多3只的真实组合回测
+# -----------------------------------------------------------------------------
+def build_portfolio_backtest(
+    signals: pd.DataFrame,
+    trade_days: list[str],
+    initial_capital: float = INITIAL_CAPITAL,
+    max_positions: int = MAX_PORTFOLIO_POSITIONS,
+    position_budget: float = POSITION_BUDGET,
+    lot_size: int = LOT_SIZE,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
+    """
+    把独立信号回测转换为有现金、仓位和重复持仓约束的组合回测。
+
+    执行时序：
+    - D0收盘产生信号，Entry_Date(D1)开盘按Rank买入。
+    - 当日开盘买入时，旧持仓仍占用仓位；当日盘中/收盘退出后才释放。
+      这样不使用当日未知的止损结果提前腾仓，是偏保守的模拟。
+    - A股数量按100股整手取整；Buy_Price/Net_Exit_Price已包含滑点和费用。
+    """
+    days = sorted({normalize_date(day) for day in trade_days if normalize_date(day)})
+    empty_curve_columns = [
+        "Trade_Date", "Cash", "Market_Value", "Equity", "Positions",
+        "Exposure_pct", "Daily_Return_pct", "Drawdown_pct", "Is_Empty",
+    ]
+    if signals is None or signals.empty or not days:
+        curve = pd.DataFrame(columns=empty_curve_columns)
+        summary = {
+            "Initial_Capital": float(initial_capital),
+            "Final_Equity": float(initial_capital),
+            "Total_Return_pct": 0.0,
+            "Max_Drawdown_pct": 0.0,
+            "Total_Days": len(days),
+            "Empty_Days": len(days),
+            "Empty_Ratio_pct": 100.0 if days else np.nan,
+            "Invested_Days": 0,
+            "Invested_Ratio_pct": 0.0 if days else np.nan,
+            "Average_Positions": 0.0,
+            "Average_Exposure_pct": 0.0,
+            "Executed_Entries": 0,
+            "Closed_Trades": 0,
+            "Open_Positions": 0,
+            "Closed_Win_Rate_pct": np.nan,
+            "Structural_Stop_Rate_pct": np.nan,
+            "Rejected_Full": 0,
+            "Rejected_Duplicate": 0,
+        }
+        return curve, pd.DataFrame(), pd.DataFrame(), summary
+
+    work = canonicalize_records(signals, ["Trade_Date", "ts_code"])
+    for date_col in ["Trade_Date", "Entry_Date", "Exit_Date"]:
+        if date_col not in work.columns:
+            work[date_col] = ""
+        work[date_col] = work[date_col].map(normalize_date)
+    for number_col in ["Rank", "Total_Score", "Buy_Price", "Net_Exit_Price", "Realized_Return (%)"]:
+        if number_col not in work.columns:
+            work[number_col] = np.nan
+        work[number_col] = pd.to_numeric(work[number_col], errors="coerce")
+    work = work.sort_values(["Entry_Date", "Rank", "Total_Score"], ascending=[True, True, False])
+    first_day, last_day = days[0], days[-1]
+
+    # 组合每日盯市使用前复权收盘价，与单笔买入/退出价口径一致。
+    price_series: dict[str, pd.Series] = {}
+    price_start = (datetime.strptime(first_day, "%Y%m%d") - timedelta(days=15)).strftime("%Y%m%d")
+    for ts_code in sorted(work["ts_code"].dropna().astype(str).unique()):
+        hist = get_qfq_data(ts_code, price_start, last_day, use_sina=False)
+        if hist.empty or "close" not in hist.columns:
+            price_series[ts_code] = pd.Series(dtype=float)
+        else:
+            closes = pd.to_numeric(hist["close"], errors="coerce").dropna()
+            closes.index = closes.index.astype(str)
+            price_series[ts_code] = closes.sort_index()
+
+    def close_on_or_before(ts_code: str, trade_date: str, fallback: float) -> float:
+        series = price_series.get(ts_code, pd.Series(dtype=float))
+        subset = series[series.index <= trade_date]
+        if subset.empty:
+            return float(fallback)
+        return float(subset.iloc[-1])
+
+    entry_groups = {
+        date: group.sort_values(["Rank", "Total_Score"], ascending=[True, False])
+        for date, group in work.groupby("Entry_Date", dropna=False)
+        if date
+    }
+    cash = float(initial_capital)
+    active: dict[str, dict] = {}
+    executed_trades: list[dict] = []
+    order_audit: list[dict] = []
+    curve_rows: list[dict] = []
+
+    def audit_order(row: pd.Series, action: str, reason: str, positions_before: int) -> None:
+        order_audit.append(
+            {
+                "Signal_Date": row.get("Trade_Date", ""),
+                "Entry_Date": row.get("Entry_Date", ""),
+                "Rank": row.get("Rank", np.nan),
+                "ts_code": row.get("ts_code", ""),
+                "name": row.get("name", ""),
+                "Total_Score": row.get("Total_Score", np.nan),
+                "Portfolio_Action": action,
+                "Portfolio_Reason": reason,
+                "Positions_Before": positions_before,
+            }
+        )
+
+    day_set = set(days)
+    for _, outside_row in work[~work["Entry_Date"].isin(day_set)].iterrows():
+        audit_order(outside_row, "未计入组合", "T+1买入日不在本次组合窗口", 0)
+
+    for trade_date in days:
+        # 先在开盘处理D1候选；当日将退出的旧持仓不提前释放仓位。
+        for _, row in entry_groups.get(trade_date, pd.DataFrame()).iterrows():
+            ts_code = str(row["ts_code"])
+            positions_before = len(active)
+            if ts_code in active:
+                audit_order(row, "未买入", "同一股票已在持仓", positions_before)
+                continue
+            if len(active) >= int(max_positions):
+                audit_order(row, "未买入", "3个仓位已满", positions_before)
+                continue
+            buy_price = float(row["Buy_Price"]) if pd.notna(row["Buy_Price"]) else np.nan
+            if not np.isfinite(buy_price) or buy_price <= 0:
+                audit_order(row, "未买入", "买入价无效", positions_before)
+                continue
+            budget = min(float(position_budget), cash)
+            shares = int(np.floor(budget / buy_price / int(lot_size)) * int(lot_size))
+            if shares < int(lot_size):
+                audit_order(row, "未买入", "可用现金不足一手", positions_before)
+                continue
+            cost = shares * buy_price
+            cash -= cost
+            trade = {
+                "Signal_Date": row.get("Trade_Date", ""),
+                "Entry_Date": trade_date,
+                "Rank": row.get("Rank", np.nan),
+                "ts_code": ts_code,
+                "name": row.get("name", ""),
+                "Buy_Price": round(buy_price, 3),
+                "Shares": shares,
+                "Entry_Cost": round(cost, 2),
+                "Planned_Exit_Date": row.get("Exit_Date", ""),
+                "Actual_Exit_Date": "",
+                "Net_Exit_Price": np.nan,
+                "Exit_Proceeds": np.nan,
+                "PnL": np.nan,
+                "Portfolio_Return (%)": np.nan,
+                "Exit_Reason": row.get("Exit_Reason", ""),
+                "Portfolio_Status": "持仓中",
+                "_fallback_price": buy_price,
+            }
+            executed_trades.append(trade)
+            active[ts_code] = trade
+            audit_order(row, "已买入", f"买入{shares}股", positions_before)
+
+        # 当日退出在日末入账，不为当日开盘的新交易提前腾仓。
+        exiting_codes = []
+        for ts_code, trade in active.items():
+            exit_date = normalize_date(trade.get("Planned_Exit_Date", ""))
+            if exit_date != trade_date:
+                continue
+            net_exit_price = work.loc[
+                (work["Trade_Date"] == trade["Signal_Date"]) & (work["ts_code"] == ts_code),
+                "Net_Exit_Price",
+            ]
+            net_exit_price = float(net_exit_price.iloc[-1]) if not net_exit_price.empty else np.nan
+            if not np.isfinite(net_exit_price) or net_exit_price <= 0:
+                # 理论上已完整退出的记录必有净卖价；缺失时保守按当日收盘估值。
+                net_exit_price = close_on_or_before(ts_code, trade_date, trade["Buy_Price"])
+            proceeds = trade["Shares"] * net_exit_price
+            cash += proceeds
+            pnl = proceeds - trade["Entry_Cost"]
+            trade["Actual_Exit_Date"] = trade_date
+            trade["Net_Exit_Price"] = round(net_exit_price, 3)
+            trade["Exit_Proceeds"] = round(proceeds, 2)
+            trade["PnL"] = round(pnl, 2)
+            trade["Portfolio_Return (%)"] = round(pnl / trade["Entry_Cost"] * 100.0, 4)
+            trade["Portfolio_Status"] = "已平仓"
+            exiting_codes.append(ts_code)
+        for ts_code in exiting_codes:
+            active.pop(ts_code, None)
+
+        market_value = 0.0
+        for ts_code, trade in active.items():
+            mark = close_on_or_before(ts_code, trade_date, trade["_fallback_price"])
+            market_value += trade["Shares"] * mark
+            trade["_last_mark"] = mark
+        equity = cash + market_value
+        positions = len(active)
+        exposure = market_value / equity * 100.0 if equity > 0 else 0.0
+        curve_rows.append(
+            {
+                "Trade_Date": trade_date,
+                "Cash": round(cash, 2),
+                "Market_Value": round(market_value, 2),
+                "Equity": round(equity, 2),
+                "Positions": positions,
+                "Exposure_pct": round(exposure, 2),
+                "Is_Empty": positions == 0,
+            }
+        )
+
+    curve = pd.DataFrame(curve_rows)
+    curve["Daily_Return_pct"] = curve["Equity"].pct_change().fillna(
+        curve["Equity"].iloc[0] / float(initial_capital) - 1.0
+    ) * 100.0
+    running_peak = curve["Equity"].cummax().clip(lower=float(initial_capital))
+    curve["Drawdown_pct"] = (curve["Equity"] / running_peak - 1.0) * 100.0
+
+    # 给回测结束时仍持有的仓位补充未实现盈亏。
+    for trade in executed_trades:
+        if trade["Portfolio_Status"] == "持仓中":
+            mark = float(trade.get("_last_mark", trade["Buy_Price"]))
+            market_value = trade["Shares"] * mark
+            pnl = market_value - trade["Entry_Cost"]
+            trade["Mark_Date"] = last_day
+            trade["Mark_Price"] = round(mark, 3)
+            trade["Market_Value"] = round(market_value, 2)
+            trade["PnL"] = round(pnl, 2)
+            trade["Portfolio_Return (%)"] = round(pnl / trade["Entry_Cost"] * 100.0, 4)
+        trade.pop("_fallback_price", None)
+        trade.pop("_last_mark", None)
+
+    ledger = pd.DataFrame(executed_trades)
+    orders = pd.DataFrame(order_audit)
+    empty_days = int(curve["Is_Empty"].sum())
+    invested_days = len(curve) - empty_days
+    closed = ledger[ledger["Portfolio_Status"] == "已平仓"].copy() if not ledger.empty else pd.DataFrame()
+    final_equity = float(curve.iloc[-1]["Equity"])
+    summary = {
+        "Initial_Capital": float(initial_capital),
+        "Final_Equity": final_equity,
+        "Total_Return_pct": (final_equity / float(initial_capital) - 1.0) * 100.0,
+        "Max_Drawdown_pct": float(curve["Drawdown_pct"].min()),
+        "Total_Days": len(curve),
+        "Empty_Days": empty_days,
+        "Empty_Ratio_pct": empty_days / len(curve) * 100.0,
+        "Invested_Days": invested_days,
+        "Invested_Ratio_pct": invested_days / len(curve) * 100.0,
+        "Average_Positions": float(curve["Positions"].mean()),
+        "Average_Exposure_pct": float(curve["Exposure_pct"].mean()),
+        "Executed_Entries": len(ledger),
+        "Closed_Trades": len(closed),
+        "Open_Positions": int((ledger["Portfolio_Status"] == "持仓中").sum()) if not ledger.empty else 0,
+        "Closed_Win_Rate_pct": (
+            float((closed["Portfolio_Return (%)"] > 0).mean() * 100.0) if not closed.empty else np.nan
+        ),
+        "Structural_Stop_Rate_pct": (
+            float(closed["Exit_Reason"].fillna("").str.startswith("结构止损").mean() * 100.0)
+            if not closed.empty else np.nan
+        ),
+        "Rejected_Full": int((orders.get("Portfolio_Reason", pd.Series(dtype=str)) == "3个仓位已满").sum()),
+        "Rejected_Duplicate": int((orders.get("Portfolio_Reason", pd.Series(dtype=str)) == "同一股票已在持仓").sum()),
+    }
+    return curve, ledger, orders, summary
+
+
+# -----------------------------------------------------------------------------
 # 报表
 # -----------------------------------------------------------------------------
+def show_portfolio_report(
+    curve: pd.DataFrame,
+    ledger: pd.DataFrame,
+    orders: pd.DataFrame,
+    summary: dict,
+) -> None:
+    st.subheader("💼 30万元·最多3只真实组合")
+    first = st.columns(4)
+    first[0].metric("组合期末权益", f"¥{summary['Final_Equity']:,.0f}")
+    first[1].metric("组合总收益", f"{summary['Total_Return_pct']:.2f}%")
+    first[2].metric("最大回撤", f"{summary['Max_Drawdown_pct']:.2f}%")
+    first[3].metric(
+        "真实空仓率",
+        f"{summary['Empty_Ratio_pct']:.1f}%",
+        help="按回测交易日每日收盘持仓数为0计算。",
+    )
+    second = st.columns(4)
+    second[0].metric(
+        "有持仓日",
+        f"{summary['Invested_Days']}/{summary['Total_Days']} ({summary['Invested_Ratio_pct']:.1f}%)",
+    )
+    second[1].metric("平均持仓数", f"{summary['Average_Positions']:.2f}/3")
+    second[2].metric("平均资金暴露", f"{summary['Average_Exposure_pct']:.1f}%")
+    second[3].metric(
+        "已执行/已平仓/在持",
+        f"{summary['Executed_Entries']}/{summary['Closed_Trades']}/{summary['Open_Positions']}",
+    )
+    third = st.columns(4)
+    closed_win = summary["Closed_Win_Rate_pct"]
+    structural = summary["Structural_Stop_Rate_pct"]
+    third[0].metric("已平仓胜率", "--" if pd.isna(closed_win) else f"{closed_win:.1f}%")
+    third[1].metric("亏损性结构止损率", "--" if pd.isna(structural) else f"{structural:.1f}%")
+    third[2].metric("因仓位已满未买", f"{summary['Rejected_Full']}笔")
+    third[3].metric("因重复持仓未买", f"{summary['Rejected_Duplicate']}笔")
+
+    if not curve.empty:
+        chart = curve.set_index(pd.to_datetime(curve["Trade_Date"], format="%Y%m%d"))[["Equity"]]
+        st.line_chart(chart, use_container_width=True)
+        position_distribution = (
+            curve["Positions"].value_counts().reindex(range(MAX_PORTFOLIO_POSITIONS + 1), fill_value=0)
+            .rename_axis("收盘持仓数").reset_index(name="交易日数")
+        )
+        position_distribution["占比(%)"] = (
+            position_distribution["交易日数"] / len(curve) * 100.0
+        ).round(1)
+        st.dataframe(position_distribution, use_container_width=True, hide_index=True)
+
+    if not ledger.empty:
+        st.caption("组合成交账本（持仓中的收益按回测截止日收盘估值）")
+        st.dataframe(ledger, use_container_width=True, hide_index=True, height=420)
+    if not orders.empty:
+        with st.expander("查看每个信号的组合执行/拒绝原因"):
+            st.dataframe(orders, use_container_width=True, hide_index=True, height=360)
+
+
 def show_weekly_report(all_results: pd.DataFrame) -> None:
     st.subheader("🗓️ 全样本周度收益与真实持仓生存")
     row1 = st.columns(4)
@@ -1337,13 +1783,21 @@ with st.sidebar:
     st.header(f"{VERSION} 回测参数")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("分析交易日数", min_value=1, value=100, step=10)
-    TOP_BACKTEST = st.number_input("每日优选 TopK", min_value=1, max_value=20, value=5, step=1)
+    TOP_BACKTEST = st.number_input(
+        "每日优选 TopK", min_value=2, max_value=20, value=5, step=1,
+        help="TopK用于保留候选广度；真实同时持仓仍由组合引擎限制为3只。",
+    )
 
-    st.subheader("股票池")
-    MIN_PRICE = st.number_input("最低股价(元)", min_value=1.0, value=20.0, step=1.0)
-    col1, col2 = st.columns(2)
-    MIN_MV = col1.number_input("最小流通市值(亿)", min_value=1.0, value=200.0, step=10.0)
-    MAX_MV = col2.number_input("最大流通市值(亿)", min_value=10.0, value=1000.0, step=50.0)
+    st.subheader("已固化的股票池与交易约束")
+    MIN_PRICE = FIXED_MIN_PRICE
+    MIN_MV = FIXED_MIN_MV
+    MAX_MV = FIXED_MAX_MV
+    ENABLE_MARKET_FILTER = FIXED_MARKET_FILTER
+    st.info(
+        "股价≥20元；流通市值200~1000亿元；大盘硬过滤关闭；"
+        "T+1实际可成交不足2只时观察不买。"
+    )
+    st.caption("组合：初始30万元，最多3只，单只目标约10万元。")
     ENABLE_THS = st.checkbox("实时雷达启用THS概念补充(需6000积分)", value=False)
     THS_KEYWORDS_TEXT = st.text_area("THS科技概念关键词", value=DEFAULT_THS_KEYWORDS, height=100)
 
@@ -1357,11 +1811,7 @@ with st.sidebar:
     BREADTH_THRESHOLD = st.number_input("常规门槛所需信号数", min_value=1, value=4, step=1)
 
     st.subheader("市场环境")
-    ENABLE_MARKET_FILTER = st.checkbox(
-        "双指数同时跌破下降MA20时暂停开仓",
-        value=True,
-        help="同时检查创业板指399006.SZ和科创50 000688.SH；数据不足时默认允许开仓。",
-    )
+    st.caption("双指数仅保留为诊断字段，不再一刀切暂停开仓。")
 
     st.subheader("成交成本与保护止损")
     BUY_SLIPPAGE = st.number_input("买入滑点(%)", min_value=0.0, value=0.20, step=0.05)
@@ -1373,7 +1823,7 @@ with st.sidebar:
 
     RESUME_CHECKPOINT = st.checkbox("开启参数隔离的断点续传", value=True)
     USE_CACHE = st.checkbox("使用并增量更新行情缓存", value=True)
-    if st.button("清除V39.7/V39.8共享行情缓存"):
+    if st.button("清除V39.7/V39.9共享行情缓存"):
         if os.path.exists(CACHE_FILE_NAME):
             os.remove(CACHE_FILE_NAME)
             st.success("缓存已清除")
@@ -1424,7 +1874,8 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
         required_dates = get_open_dates(fetch_start, fetch_end)
         load_market_data(required_dates, use_cache=USE_CACHE)
         load_benchmark(fetch_start, fetch_end)
-        load_market_regime_indices(fetch_start, fetch_end)
+        # 市场硬过滤已经固化关闭，不再额外请求双指数数据。
+        GLOBAL_REGIME_INDICES = {}
 
         config = {
             "version": VERSION,
@@ -1441,6 +1892,7 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
             "min_score": MIN_TOTAL_SCORE,
             "scarce_score": SCARCE_TOTAL_SCORE,
             "breadth_threshold": int(BREADTH_THRESHOLD),
+            "min_tradable_signals": MIN_TRADABLE_SIGNALS,
             "market_filter": bool(ENABLE_MARKET_FILTER),
             "buy_slip": BUY_SLIPPAGE,
             "sell_slip": SELL_SLIPPAGE,
@@ -1448,6 +1900,9 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
             "sell_tax": SELL_TAX,
             "protection_trigger": PROTECTION_TRIGGER,
             "protection_buffer": PROTECTION_BUFFER,
+            "initial_capital": INITIAL_CAPITAL,
+            "max_positions": MAX_PORTFOLIO_POSITIONS,
+            "position_budget": POSITION_BUDGET,
         }
         config_hash = hashlib.sha1(json.dumps(config, sort_keys=True).encode()).hexdigest()[:12]
         result_file = f"backtest_{VERSION.replace('.', '_')}_{config_hash}.csv"
@@ -1455,24 +1910,41 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
         candidate_file = f"candidates_{VERSION.replace('.', '_')}_{config_hash}.csv"
         state_file = f"state_{VERSION.replace('.', '_')}_{config_hash}.json"
 
-        processed = set()
-        result_frames = []
-        candidate_frames = []
-        funnel_rows = []
+        processed: set[str] = set()
+        results_store = pd.DataFrame()
+        candidates_store = pd.DataFrame()
+        funnel_store = pd.DataFrame()
         if RESUME_CHECKPOINT and os.path.exists(state_file):
             try:
                 with open(state_file, "r", encoding="utf-8") as file:
                     state = json.load(file)
-                processed = set(state.get("processed_dates", []))
-                if os.path.exists(result_file):
-                    result_frames.append(pd.read_csv(result_file, encoding="utf-8-sig"))
-                if os.path.exists(funnel_file):
-                    funnel_rows.extend(pd.read_csv(funnel_file, encoding="utf-8-sig").to_dict("records"))
-                if os.path.exists(candidate_file):
-                    candidate_frames.append(pd.read_csv(candidate_file, encoding="utf-8-sig"))
+                state_processed = {normalize_date(day) for day in state.get("processed_dates", [])}
+                state_processed.discard("")
+                results_store = read_checkpoint_csv(result_file, ["Trade_Date", "ts_code"])
+                candidates_store = read_checkpoint_csv(candidate_file, ["Trade_Date", "ts_code"])
+                funnel_store = read_checkpoint_csv(funnel_file, ["Trade_Date"])
+                # 每个交易日必须有一条漏斗记录；只有state而没有漏斗快照的日期重跑。
+                funnel_dates = set(funnel_store.get("Trade_Date", pd.Series(dtype=str)).astype(str))
+                processed = state_processed & funnel_dates
+
+                # 读取旧断点后立即紧缩为唯一主键快照，从源头消除历史重复。
+                if not results_store.empty:
+                    results_store = atomic_write_csv(results_store, result_file, ["Trade_Date", "ts_code"])
+                if not candidates_store.empty:
+                    candidates_store = atomic_write_csv(candidates_store, candidate_file, ["Trade_Date", "ts_code"])
+                if not funnel_store.empty:
+                    funnel_store = atomic_write_csv(funnel_store, funnel_file, ["Trade_Date"])
             except Exception as exc:
                 record_api_error(f"断点读取失败，将从头运行: {exc}")
                 processed = set()
+                results_store = pd.DataFrame()
+                candidates_store = pd.DataFrame()
+                funnel_store = pd.DataFrame()
+        elif not RESUME_CHECKPOINT:
+            # 用户明确关闭续跑时，本次使用同一配置的文件从头覆盖。
+            for exact_path in [result_file, candidate_file, funnel_file, state_file]:
+                if os.path.exists(exact_path):
+                    os.remove(exact_path)
 
         dates_to_run = [d for d in trade_days if d not in processed]
         progress = st.progress(0, text="开始逐日计算科技信号...")
@@ -1495,66 +1967,51 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
                 min_total_score=float(MIN_TOTAL_SCORE),
                 scarce_total_score=float(SCARCE_TOTAL_SCORE),
                 breadth_threshold=int(BREADTH_THRESHOLD),
+                min_tradable_signals=MIN_TRADABLE_SIGNALS,
                 enable_market_filter=bool(ENABLE_MARKET_FILTER),
                 protection_trigger_pct=float(PROTECTION_TRIGGER),
                 protection_buffer_pct=float(PROTECTION_BUFFER),
                 use_sina=use_sina,
             )
-            if not day_result.empty:
-                result_frames.append(day_result)
-                day_result.to_csv(
-                    result_file,
-                    mode="a",
-                    index=False,
-                    header=not os.path.exists(result_file),
-                    encoding="utf-8-sig",
-                )
-            if not day_candidates.empty:
-                candidate_frames.append(day_candidates)
-                day_candidates.to_csv(
-                    candidate_file,
-                    mode="a",
-                    index=False,
-                    header=not os.path.exists(candidate_file),
-                    encoding="utf-8-sig",
-                )
-            funnel_rows.append(funnel)
-            pd.DataFrame([funnel]).to_csv(
-                funnel_file,
-                mode="a",
-                index=False,
-                header=not os.path.exists(funnel_file),
-                encoding="utf-8-sig",
+            results_store = replace_trade_date_records(
+                results_store, day_result, trade_date, ["Trade_Date", "ts_code"]
             )
+            candidates_store = replace_trade_date_records(
+                candidates_store, day_candidates, trade_date, ["Trade_Date", "ts_code"]
+            )
+            funnel_store = replace_trade_date_records(
+                funnel_store, pd.DataFrame([funnel]), trade_date, ["Trade_Date"]
+            )
+
+            # 小数据集每日写完整快照；不再append，因此断点重跑也不会双倍。
+            results_store = atomic_write_csv(results_store, result_file, ["Trade_Date", "ts_code"])
+            candidates_store = atomic_write_csv(candidates_store, candidate_file, ["Trade_Date", "ts_code"])
+            funnel_store = atomic_write_csv(funnel_store, funnel_file, ["Trade_Date"])
             processed.add(trade_date)
-            with open(state_file, "w", encoding="utf-8") as file:
-                json.dump(
-                    {"config": config, "processed_dates": sorted(processed)},
-                    file,
-                    ensure_ascii=False,
-                    indent=2,
-                )
+            atomic_write_json(
+                {"config": config, "processed_dates": sorted(processed)},
+                state_file,
+            )
             progress.progress((i + 1) / max(len(dates_to_run), 1), text=f"分析 {trade_date}")
         progress.empty()
 
         st.header(f"📊 {VERSION} 回测结果")
-        funnel_df = pd.DataFrame(funnel_rows).drop_duplicates("Trade_Date", keep="last")
-        all_candidates_export = pd.DataFrame()
-        if candidate_frames:
-            all_candidates_export = pd.concat(candidate_frames, ignore_index=True)
-            all_candidates_export = all_candidates_export.drop_duplicates(
-                ["Trade_Date", "ts_code"], keep="last"
-            )
+        funnel_df = canonicalize_records(funnel_store, ["Trade_Date"])
+        all_candidates_export = canonicalize_records(
+            candidates_store, ["Trade_Date", "ts_code"]
+        )
 
-        st.subheader("🌦️ 市场环境与动态门槛")
+        st.subheader("🧭 动态门槛与多信号确认")
         if not funnel_df.empty:
             funnel_defaults = {
                 "Market_Weak_Block": 0,
-                "Market_Regime": "数据缺失",
+                "Market_Regime": "过滤关闭",
                 "Day_Base_Signal_Count": 0,
                 "Required_Score": np.nan,
                 "Dynamic_Score_Pass": 0,
                 "Tradable_Signal": 0,
+                "Breadth_Confirmed": 0,
+                "Scarce_Tradable_Skipped": 0,
                 "Selected_TopK": 0,
                 "CYB_Close": np.nan,
                 "CYB_MA20": np.nan,
@@ -1564,33 +2021,56 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
             for column, default_value in funnel_defaults.items():
                 if column not in funnel_df.columns:
                     funnel_df[column] = default_value
-            blocked_days = int(pd.to_numeric(funnel_df["Market_Weak_Block"], errors="coerce").fillna(0).sum())
             score_pass_total = int(pd.to_numeric(funnel_df["Dynamic_Score_Pass"], errors="coerce").fillna(0).sum())
             selected_total = int(pd.to_numeric(funnel_df["Selected_TopK"], errors="coerce").fillna(0).sum())
-            env_cols = st.columns(3)
-            env_cols[0].metric("双指数弱势暂停日", blocked_days)
-            env_cols[1].metric("通过动态分数门槛", score_pass_total)
-            env_cols[2].metric("最终入选", selected_total)
+            breadth_days = int(pd.to_numeric(
+                funnel_df["Breadth_Confirmed"], errors="coerce"
+            ).fillna(0).sum())
+            scarce_days = int((pd.to_numeric(
+                funnel_df["Scarce_Tradable_Skipped"], errors="coerce"
+            ).fillna(0) > 0).sum())
+            env_cols = st.columns(4)
+            env_cols[0].metric("通过动态分数门槛", score_pass_total)
+            env_cols[1].metric("至少2只可成交的日期", breadth_days)
+            env_cols[2].metric("仅1只而放弃的日期", scarce_days)
+            env_cols[3].metric("最终入选样本", selected_total)
             st.dataframe(
                 funnel_df[
                     [
                         "Trade_Date", "Market_Regime", "Day_Base_Signal_Count", "Required_Score",
-                        "Dynamic_Score_Pass", "Tradable_Signal", "Selected_TopK",
-                        "CYB_Close", "CYB_MA20", "STAR50_Close", "STAR50_MA20",
+                        "Dynamic_Score_Pass", "Tradable_Signal", "Breadth_Confirmed",
+                        "Scarce_Tradable_Skipped", "Selected_TopK",
                     ]
                 ].sort_values("Trade_Date", ascending=False),
                 use_container_width=True,
                 hide_index=True,
             )
 
-        if result_frames:
-            all_results = pd.concat(result_frames, ignore_index=True)
-            all_results = all_results.drop_duplicates(["Trade_Date", "ts_code"], keep="last")
+        if not results_store.empty:
+            all_results = canonicalize_records(results_store, ["Trade_Date", "ts_code"])
             for week in range(1, 9):
                 for prefix in ["Eligible_W", "Held_W"]:
                     col = f"{prefix}{week}"
-                    if all_results[col].dtype == object:
-                        all_results[col] = all_results[col].astype(str).str.lower().map({"true": True, "false": False})
+                    if col in all_results.columns and all_results[col].dtype == object:
+                        all_results[col] = (
+                            all_results[col].astype(str).str.lower()
+                            .map({"true": True, "false": False})
+                            .fillna(False)
+                        )
+
+            portfolio_curve, portfolio_ledger, portfolio_orders, portfolio_summary = (
+                build_portfolio_backtest(
+                    all_results,
+                    trade_days,
+                    initial_capital=INITIAL_CAPITAL,
+                    max_positions=MAX_PORTFOLIO_POSITIONS,
+                    position_budget=POSITION_BUDGET,
+                    lot_size=LOT_SIZE,
+                )
+            )
+            show_portfolio_report(
+                portfolio_curve, portfolio_ledger, portfolio_orders, portfolio_summary
+            )
             show_weekly_report(all_results)
             show_exit_report(all_results)
 
@@ -1618,28 +2098,53 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
 
             export_csv = all_results.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
-                "📥 下载V39.8入选股票完整轨迹CSV",
+                "📥 下载V39.9入选股票完整轨迹CSV",
                 export_csv,
-                f"export_v39_8_{config_hash}.csv",
+                f"export_v39_9_{config_hash}.csv",
                 "text/csv",
             )
+            if not portfolio_curve.empty:
+                st.download_button(
+                    "📥 下载V39.9组合每日权益CSV",
+                    portfolio_curve.to_csv(index=False).encode("utf-8-sig"),
+                    f"portfolio_curve_v39_9_{config_hash}.csv",
+                    "text/csv",
+                )
+            if not portfolio_ledger.empty:
+                st.download_button(
+                    "📥 下载V39.9组合成交账本CSV",
+                    portfolio_ledger.to_csv(index=False).encode("utf-8-sig"),
+                    f"portfolio_ledger_v39_9_{config_hash}.csv",
+                    "text/csv",
+                )
+            if not portfolio_orders.empty:
+                st.download_button(
+                    "📥 下载V39.9信号执行审计CSV",
+                    portfolio_orders.to_csv(index=False).encode("utf-8-sig"),
+                    f"portfolio_orders_v39_9_{config_hash}.csv",
+                    "text/csv",
+                )
         else:
+            empty_curve, empty_ledger, empty_orders, empty_summary = build_portfolio_backtest(
+                pd.DataFrame(), trade_days
+            )
+            show_portfolio_report(empty_curve, empty_ledger, empty_orders, empty_summary)
             st.warning("本次没有产生可交易信号。请先查看筛选漏斗确定主要淘汰环节。")
 
         if not all_candidates_export.empty:
             candidate_csv = all_candidates_export.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
-                "📥 下载V39.8全部核心候选及未入选原因CSV",
+                "📥 下载V39.9全部核心候选及未入选原因CSV",
                 candidate_csv,
-                f"candidates_v39_8_{config_hash}.csv",
+                f"candidates_v39_9_{config_hash}.csv",
                 "text/csv",
             )
         if not funnel_df.empty:
             funnel_csv = funnel_df.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
-                "📥 下载V39.8逐日筛选漏斗CSV",
+                "📥 下载V39.9逐日筛选漏斗CSV",
                 funnel_csv,
-                f"funnel_v39_8_{config_hash}.csv",
+                f"funnel_v39_9_{config_hash}.csv",
                 "text/csv",
             )
 
@@ -1654,5 +2159,7 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
 
     except Exception as exc:
         st.error(f"运行终止：{exc}")
+        with st.expander("查看详细错误位置"):
+            st.code(traceback.format_exc())
         if API_ERRORS:
             st.code("\n".join(API_ERRORS[-30:]))
