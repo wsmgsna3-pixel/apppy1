@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-选股王 V40.1 · 双周线与延续确认诊断版
+选股王 V40.2 · 周线质量优先版
 ============================================================
 主要变化
 1. 股票池：主板/创业板/科创板，明确剔除北交所；保留流通市值200~1000亿元参数。
@@ -16,7 +16,7 @@
 11. 门槛：当天80分以上核心信号达到4只时门槛为80分，否则提高到82分，但不禁止开仓。
 12. 环境：取消创业板指/科创50的一刀切暂停开仓，避免误杀弱市中的强势股。
 13. 保本：浮盈首次达到10%后，从下一交易日启用成本上方0.3%的保护止损。
-14. 审计：另行导出全部核心候选及未入选原因，便于核查动态门槛。
+14. 审计：另行导出全部核心候选及未入选原因，便于核查质量门槛。
 15. 固化：股价不低于20元、流通市值200~1000亿元、关闭大盘硬过滤。
 16. 广度：T+1成交检查后可交易股票少于2只时，全部仅观察而不开仓。
 17. 组合：30万元初始资金、最多3只持仓、单只约10万元，输出组合曲线与真实空仓率。
@@ -29,6 +29,12 @@
     两者并列导出，既防止把未来周五数据泄漏到回测，又能观察“本周正在翻红”。
 22. 替代入场：主组合仍保持T+1开盘买入；另行诊断T+1收盘延续后T+2开盘买入，
     以及50% T+1 + 50% T+2的近似分批收益，不影响主组合权益。
+23. 质量优先：固定82分底线，默认要求信号日涨幅≥3%、高于日MA20≥3%、
+    信号日临时周线偏离MA20≤25%，优先G2绿柱缩短和R1首周翻红。
+24. 热点保留：不限制每日新开仓数，不限制同一申万二级行业持仓；
+    仍允许热点板块联动时同日买入多只，总持仓上限3只不变。
+25. 提前退出：增加“T+1未延续时T+2开盘退出”独立开关，默认关闭；
+    便于先验证入选质量，再单独比较退出策略，避免混淆W1生存率。
 
 说明
 - 本程序用于研究和回测，不构成投资建议。
@@ -56,7 +62,7 @@ import tushare as ts
 
 warnings.filterwarnings("ignore")
 
-VERSION = "V40.1"
+VERSION = "V40.2"
 # 行情结构与V39.7兼容，沿用原缓存可避免重新下载数百个交易日。
 CACHE_FILE_NAME = "market_data_cache_v39_7.pkl"
 MAX_FETCH_WORKERS = 1  # 避免触发Tushare频率限制
@@ -79,6 +85,23 @@ FIXED_MIN_MV = 200.0
 FIXED_MAX_MV = 1000.0
 FIXED_MARKET_FILTER = False
 MIN_TRADABLE_SIGNALS = 2
+
+# V40.2单股质量默认值；侧边栏可调，方便做严格/宽松对照。
+DEFAULT_MIN_DAY_GAIN_PCT = 3.0
+DEFAULT_MIN_DAILY_BIAS_PCT = 3.0
+DEFAULT_MAX_WEEKLY_BIAS_PCT = 25.0
+DEFAULT_FIXED_SCORE_FLOOR = 82.0
+
+# 只改变同日候选的优先顺序，不把任何周线阶段一刀切删除。
+STAGE_PRIORITY = {
+    "G2_绿柱缩短": (0, "A1_G2绿柱缩短"),
+    "R1_首周翻红": (1, "A2_R1首周翻红"),
+    "G3_绿柱扩大/弱势": (2, "B_中性阶段"),
+    "R3_红柱再加速": (2, "B_中性阶段"),
+    "R4_红柱扩张": (2, "B_中性阶段"),
+    "G1_绿柱连续缩短": (3, "C_降级阶段"),
+    "R5_红柱衰减": (3, "C_降级阶段"),
+}
 
 # 真实组合约束。
 INITIAL_CAPITAL = 300_000.0
@@ -145,8 +168,8 @@ DEFAULT_THS_KEYWORDS = (
 # -----------------------------------------------------------------------------
 # 页面
 # -----------------------------------------------------------------------------
-st.set_page_config(page_title=f"选股王 {VERSION} 双周线与延续确认诊断版", layout="wide")
-st.title(f"选股王 {VERSION}：完成/临时周MACD + T+2延续确认诊断")
+st.set_page_config(page_title=f"选股王 {VERSION} 周线质量优先版", layout="wide")
+st.title(f"选股王 {VERSION}：周线阶段优先 + 弱反弹过滤")
 
 
 # -----------------------------------------------------------------------------
@@ -754,7 +777,7 @@ def calculate_volume_score(vol_ratio: float) -> float:
 
 
 def calculate_breakout_score(bias: float) -> float:
-    # bias为相对MA20偏离率；0.5%~5%为较健康突破，8%以上不允许入场
+    # bias为相对MA20偏离率；评分偏好有力但不过度的突破。
     if bias < 0.005:
         return 0.0
     if bias <= 0.05:
@@ -918,7 +941,10 @@ def compute_trend_indicators(
     end_date: str,
     min_atr_pct: float,
     min_vol_ratio: float,
+    min_day_gain_pct: float,
+    min_daily_bias_pct: float,
     max_bias_pct: float,
+    max_weekly_bias_pct: float,
     use_sina: bool = False,
 ) -> dict:
     start_date = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=450)).strftime("%Y%m%d")
@@ -980,11 +1006,14 @@ def compute_trend_indicators(
     w_upper = w_prev["high"] - max(w_prev["open"], w_prev["close"])
     shadow_ratio = w_upper / w_range if w_range > 0 else 0.0
 
-    weekly_safe = weekly_bias <= 0.45 and shadow_ratio < 0.60
+    weekly_safe = (
+        weekly_bias <= max_weekly_bias_pct / 100.0
+        and shadow_ratio < 0.60
+    )
     trend_up = row["ma60"] > row["ma120"]
     pulled_back = any(recent_prev["close"] <= recent_prev["ma20"] * 1.01)
     bias = row["close"] / row["ma20"] - 1.0
-    above_ma20 = bias >= 0.005
+    above_ma20 = bias >= min_daily_bias_pct / 100.0
     not_overextended = bias <= max_bias_pct / 100.0
     ma20_healthy = row["ma20"] >= prev["ma20"] * 0.995
     vol_ratio = row["vol"] / row["ma5_vol"] if row["ma5_vol"] > 0 else 0.0
@@ -997,7 +1026,10 @@ def compute_trend_indicators(
     atr_pct = row["atr14"] / row["close"] * 100.0
     atr_ok = atr_pct >= min_atr_pct
     day_gain_pct = (row["close"] / prev["close"] - 1.0) * 100.0
-    positive_day = day_gain_pct > 0 and row["close"] > row["open"]
+    positive_day = (
+        day_gain_pct >= min_day_gain_pct
+        and row["close"] > row["open"]
+    )
     stock_return_20 = row["close"] / clean.iloc[-21]["close"] - 1.0 if len(clean) >= 21 else 0.0
     rs20 = stock_return_20 - benchmark_return_20d(end_date)
 
@@ -1134,6 +1166,7 @@ def get_medium_term_future(
     sell_tax_pct: float,
     protection_trigger_pct: float,
     protection_buffer_pct: float,
+    exit_non_follow_t2: bool = False,
     use_sina: bool = False,
 ) -> dict:
     d0 = datetime.strptime(selection_date, "%Y%m%d")
@@ -1272,6 +1305,16 @@ def get_medium_term_future(
                 tier = 2
         if tier == 2 and (peak_high - curr_close) / peak_high >= 0.15:
             pending_reason = "移动止盈(峰值回撤15%)-次日开盘退出"
+
+        # 买入日收盘已知道是否延续；若开启该独立对照，
+        # 只在T+1收盘后挂出退出计划，T+2开盘执行，不偷看T+2数据。
+        if (
+            day_count == 1
+            and exit_non_follow_t2
+            and not bool(result["T1_Follow_Through"])
+            and pending_reason is None
+        ):
+            pending_reason = "T+1未延续-T+2开盘退出"
 
         if day_count % 5 == 0:
             result[f"Return_W{week} (%)"] = net_return(curr_close)
@@ -1439,7 +1482,10 @@ def run_backtest_for_day(
     min_price: float,
     min_atr_pct: float,
     min_vol_ratio: float,
+    min_day_gain_pct: float,
+    min_daily_bias_pct: float,
     max_bias_pct: float,
+    max_weekly_bias_pct: float,
     max_gap_pct: float,
     buy_slippage_pct: float,
     sell_slippage_pct: float,
@@ -1452,6 +1498,7 @@ def run_backtest_for_day(
     enable_market_filter: bool,
     protection_trigger_pct: float,
     protection_buffer_pct: float,
+    exit_non_follow_t2: bool,
     use_sina: bool = False,
 ):
     query_date = trade_date
@@ -1540,7 +1587,10 @@ def run_backtest_for_day(
             trade_date,
             min_atr_pct=min_atr_pct,
             min_vol_ratio=min_vol_ratio,
+            min_day_gain_pct=min_day_gain_pct,
+            min_daily_bias_pct=min_daily_bias_pct,
             max_bias_pct=max_bias_pct,
+            max_weekly_bias_pct=max_weekly_bias_pct,
             use_sina=use_sina,
         )
         if not indicators.get("valid"):
@@ -1556,6 +1606,10 @@ def run_backtest_for_day(
         if not indicators["is_buy_signal"]:
             continue
         funnel["Core_Signal"] += 1
+
+        stage_priority, stage_priority_label = STAGE_PRIORITY.get(
+            indicators["provisional_macd_stage"], (2, "B_中性阶段")
+        )
 
         record = {
             "Trade_Date": trade_date,
@@ -1634,6 +1688,8 @@ def run_backtest_for_day(
             "P_W_Trend_Confirmed": indicators["provisional_trend_confirmed"],
             "P_W_Wave_Candidate": indicators["provisional_wave_candidate"],
             "P_W_Changed_From_Completed": indicators["provisional_changed_from_completed"],
+            "Stage_Priority": stage_priority,
+            "Stage_Priority_Label": stage_priority_label,
             # 下列字段用于通过门槛后的成交回测，候选导出前会移除前导下划线。
             "_Signal_Low": indicators["signal_low"],
             "_Signal_MA20": indicators["ma20"],
@@ -1643,13 +1699,14 @@ def run_backtest_for_day(
 
     if not records:
         funnel["Day_Base_Signal_Count"] = 0
-        funnel["Required_Score"] = scarce_total_score
+        funnel["Required_Score"] = max(min_total_score, scarce_total_score)
         return pd.DataFrame(), funnel, pd.DataFrame()
 
     all_candidates = pd.DataFrame(records)
-    # 广度只能使用D0收盘已经知道的信息：80分以上核心信号数。
-    base_count = int((all_candidates["Total_Score"] >= min_total_score).sum())
-    required_score = min_total_score if base_count >= breadth_threshold else scarce_total_score
+    # V40.2不再因为当日信号多就降低单股质量标准。
+    # 保留两个入参只为兼容旧断点结构，实际统一取两者较高值。
+    required_score = max(min_total_score, scarce_total_score)
+    base_count = int((all_candidates["Total_Score"] >= required_score).sum())
     all_candidates["Day_Base_Signal_Count"] = base_count
     all_candidates["Required_Score"] = required_score
     all_candidates["Score_Pass"] = all_candidates["Total_Score"] >= required_score
@@ -1688,7 +1745,7 @@ def run_backtest_for_day(
             all_candidates[key] = np.nan
     all_candidates["Execution_Checked"] = False
     all_candidates["Selection_Status"] = np.where(
-        all_candidates["Score_Pass"], "通过动态分数门槛", "未达动态分数门槛"
+        all_candidates["Score_Pass"], "通过固定质量分数", "未达固定质量分数"
     )
 
     funnel["Day_Base_Signal_Count"] = base_count
@@ -1720,6 +1777,7 @@ def run_backtest_for_day(
                 sell_tax_pct=sell_tax_pct,
                 protection_trigger_pct=protection_trigger_pct,
                 protection_buffer_pct=protection_buffer_pct,
+                exit_non_follow_t2=exit_non_follow_t2,
                 use_sina=use_sina,
             )
             for key, value in future.items():
@@ -1763,7 +1821,10 @@ def run_backtest_for_day(
 
     if breadth_confirmed:
         final_indices = (
-            tradable.sort_values(["Total_Score", "ATR_pct"], ascending=[False, False])
+            tradable.sort_values(
+                ["Stage_Priority", "Total_Score", "ATR_pct"],
+                ascending=[True, False, False],
+            )
             .head(top_k)
             .index
             .tolist()
@@ -1785,7 +1846,10 @@ def run_backtest_for_day(
     if not final_indices:
         return pd.DataFrame(), funnel, candidate_export
     final = candidate_export.loc[final_indices].copy()
-    final = final.sort_values(["Total_Score", "ATR_pct"], ascending=[False, False])
+    final = final.sort_values(
+        ["Stage_Priority", "Total_Score", "ATR_pct"],
+        ascending=[True, False, False],
+    )
     final.insert(1, "Rank", range(1, len(final) + 1))
     return final, funnel, candidate_export
 
@@ -1894,6 +1958,10 @@ def build_portfolio_backtest(
                 "W_Trend_Confirmed": row.get("W_Trend_Confirmed", False),
                 "P_W_MACD_Stage": row.get("P_W_MACD_Stage", ""),
                 "P_W_Trend_Confirmed": row.get("P_W_Trend_Confirmed", False),
+                "Stage_Priority": row.get("Stage_Priority", np.nan),
+                "Stage_Priority_Label": row.get("Stage_Priority_Label", ""),
+                "Day_Gain_pct": row.get("Day_Gain_pct", np.nan),
+                "MA20_Bias_pct": row.get("MA20_Bias_pct", np.nan),
                 "T1_Follow_Through": row.get("T1_Follow_Through", False),
                 "False_Rebound_10D": row.get("False_Rebound_10D", False),
                 "T2_Eligible": row.get("T2_Eligible", False),
@@ -1942,6 +2010,10 @@ def build_portfolio_backtest(
                 "W_Trend_Confirmed": row.get("W_Trend_Confirmed", False),
                 "P_W_MACD_Stage": row.get("P_W_MACD_Stage", ""),
                 "P_W_Trend_Confirmed": row.get("P_W_Trend_Confirmed", False),
+                "Stage_Priority": row.get("Stage_Priority", np.nan),
+                "Stage_Priority_Label": row.get("Stage_Priority_Label", ""),
+                "Day_Gain_pct": row.get("Day_Gain_pct", np.nan),
+                "MA20_Bias_pct": row.get("MA20_Bias_pct", np.nan),
                 "T1_Follow_Through": row.get("T1_Follow_Through", False),
                 "False_Rebound_10D": row.get("False_Rebound_10D", False),
                 "T2_Eligible": row.get("T2_Eligible", False),
@@ -2123,6 +2195,46 @@ def show_portfolio_report(
     if not orders.empty:
         with st.expander("查看每个信号的组合执行/拒绝原因"):
             st.dataframe(orders, use_container_width=True, hide_index=True, height=360)
+
+
+def show_quality_priority_report(all_results: pd.DataFrame) -> None:
+    st.subheader("🎯 V40.2周线阶段优先级成效")
+    required = {
+        "Stage_Priority_Label", "Realized_Return (%)", "Exit_Reason", "Held_W1"
+    }
+    if all_results.empty or not required.issubset(all_results.columns):
+        st.info("暂无周线优先级诊断数据。")
+        return
+    data = all_results.copy()
+    data["_ret"] = pd.to_numeric(data["Realized_Return (%)"], errors="coerce")
+    data = data[data["_ret"].notna()].copy()
+    if data.empty:
+        st.info("当前样本尚未成熟。")
+        return
+    data["_结构止损"] = data["Exit_Reason"].fillna("").astype(str).str.startswith("结构止损")
+    data["_W1生存"] = bool_series(data["Held_W1"])
+    rows = []
+    for label, group in data.groupby("Stage_Priority_Label", dropna=False):
+        rows.append(
+            {
+                "周线优先级": label,
+                "样本": len(group),
+                "W1生存率(%)": round(group["_W1生存"].mean() * 100.0, 1),
+                "结构止损率(%)": round(group["_结构止损"].mean() * 100.0, 1),
+                "实质盈利率(%)": round((group["_ret"] >= 0.1).mean() * 100.0, 1),
+                "平均收益(%)": round(group["_ret"].mean(), 2),
+                "中位收益(%)": round(group["_ret"].median(), 2),
+            }
+        )
+    st.dataframe(
+        pd.DataFrame(rows).sort_values("周线优先级"),
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.caption(
+        "A1=G2绿柱缩短，A2=R1首周翻红；B=中性阶段；"
+        "C=G1绿柱连续缩短或R5红柱衰减。C类仅降级，没有硬删除。"
+    )
 
 
 def show_weekly_report(all_results: pd.DataFrame) -> None:
@@ -2416,20 +2528,37 @@ with st.sidebar:
     )
     st.caption("组合：初始30万元，最多3只，单只目标约10万元。")
     st.info(
-        "V40.1并列诊断已完成周MACD(W_)、信号日临时周MACD(P_W_)、"
-        "T+2确认和50/50分批；主组合仍按V39.9原T+1逻辑执行。"
+        "V40.2只收紧单股质量并改变同日排名；"
+        "不限制每日新开仓数，不限制同一申万行业，保留热点板块联动。"
     )
     ENABLE_THS = st.checkbox("实时雷达启用THS概念补充(需6000积分)", value=False)
     THS_KEYWORDS_TEXT = st.text_area("THS科技概念关键词", value=DEFAULT_THS_KEYWORDS, height=100)
 
-    st.subheader("信号与动态评分门槛")
+    st.subheader("单股质量与固定评分门槛")
     MIN_ATR_PCT = st.number_input("ATR14/股价最低(%)", min_value=0.0, value=2.5, step=0.1)
     MIN_VOL_RATIO = st.number_input("最低量比", min_value=0.5, value=1.10, step=0.05)
+    MIN_DAY_GAIN_PCT = st.number_input(
+        "信号日最低涨幅(%)", min_value=0.0,
+        value=DEFAULT_MIN_DAY_GAIN_PCT, step=0.5,
+    )
+    MIN_DAILY_BIAS_PCT = st.number_input(
+        "信号日高于日MA20最低(%)", min_value=0.0,
+        value=DEFAULT_MIN_DAILY_BIAS_PCT, step=0.5,
+    )
     MAX_BIAS_PCT = st.number_input("相对MA20最大偏离(%)", min_value=1.0, value=8.0, step=0.5)
+    MAX_WEEKLY_BIAS_PCT = st.number_input(
+        "信号日临时周线高于周MA20最大(%)", min_value=5.0,
+        value=DEFAULT_MAX_WEEKLY_BIAS_PCT, step=5.0,
+    )
     MAX_GAP_PCT = st.number_input("T+1最大允许高开(%)", min_value=0.0, value=8.0, step=0.5)
-    MIN_TOTAL_SCORE = st.number_input("常规最低总分", min_value=0.0, value=80.0, step=1.0)
-    SCARCE_TOTAL_SCORE = st.number_input("信号稀少时最低总分", min_value=0.0, value=82.0, step=1.0)
-    BREADTH_THRESHOLD = st.number_input("常规门槛所需信号数", min_value=1, value=4, step=1)
+    FIXED_SCORE_FLOOR = st.number_input(
+        "固定最低总分", min_value=0.0,
+        value=DEFAULT_FIXED_SCORE_FLOOR, step=1.0,
+        help="不再因为当日信号较多而从82分降到80分。",
+    )
+    MIN_TOTAL_SCORE = FIXED_SCORE_FLOOR
+    SCARCE_TOTAL_SCORE = FIXED_SCORE_FLOOR
+    BREADTH_THRESHOLD = 4  # 仅为兼容旧函数入参，V40.2不再用它降分。
 
     st.subheader("市场环境")
     st.caption("双指数仅保留为诊断字段，不再一刀切暂停开仓。")
@@ -2441,6 +2570,14 @@ with st.sidebar:
     SELL_TAX = st.number_input("卖出税费(%)", min_value=0.0, value=0.05, step=0.01)
     PROTECTION_TRIGGER = st.number_input("保护止损触发浮盈(%)", min_value=1.0, value=10.0, step=1.0)
     PROTECTION_BUFFER = st.number_input("保护止损原始价高于成本(%)", min_value=0.0, value=0.30, step=0.10)
+    EXIT_NON_FOLLOW_T2 = st.checkbox(
+        "T+1未延续时T+2开盘提前退出（独立对照）",
+        value=False,
+        help=(
+            "第一轮建议保持关闭，先测试新入选条件；"
+            "第二轮只打开此项，检验提前退出是否降低亏损。"
+        ),
+    )
 
     RESUME_CHECKPOINT = st.checkbox("开启参数隔离的断点续传", value=True)
     USE_CACHE = st.checkbox("使用并增量更新行情缓存", value=True)
@@ -2465,6 +2602,8 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
     try:
         if SCARCE_TOTAL_SCORE < MIN_TOTAL_SCORE:
             raise ValueError("信号稀少时最低总分不能低于常规最低总分")
+        if MIN_DAILY_BIAS_PCT >= MAX_BIAS_PCT:
+            raise ValueError("日MA20最低偏离必须小于最大偏离")
         GLOBAL_STOCK_BASIC = load_stock_basic()
         memberships = load_sw_tech_memberships()
         GLOBAL_TECH_PERIODS = build_tech_period_index(memberships)
@@ -2508,7 +2647,10 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
             "max_mv": MAX_MV,
             "min_atr": MIN_ATR_PCT,
             "min_vol": MIN_VOL_RATIO,
+            "min_day_gain": MIN_DAY_GAIN_PCT,
+            "min_daily_bias": MIN_DAILY_BIAS_PCT,
             "max_bias": MAX_BIAS_PCT,
+            "max_weekly_bias": MAX_WEEKLY_BIAS_PCT,
             "max_gap": MAX_GAP_PCT,
             "min_score": MIN_TOTAL_SCORE,
             "scarce_score": SCARCE_TOTAL_SCORE,
@@ -2521,6 +2663,7 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
             "sell_tax": SELL_TAX,
             "protection_trigger": PROTECTION_TRIGGER,
             "protection_buffer": PROTECTION_BUFFER,
+            "exit_non_follow_t2": bool(EXIT_NON_FOLLOW_T2),
             "initial_capital": INITIAL_CAPITAL,
             "max_positions": MAX_PORTFOLIO_POSITIONS,
             "position_budget": POSITION_BUDGET,
@@ -2579,7 +2722,10 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
                 min_price=float(MIN_PRICE),
                 min_atr_pct=float(MIN_ATR_PCT),
                 min_vol_ratio=float(MIN_VOL_RATIO),
+                min_day_gain_pct=float(MIN_DAY_GAIN_PCT),
+                min_daily_bias_pct=float(MIN_DAILY_BIAS_PCT),
                 max_bias_pct=float(MAX_BIAS_PCT),
+                max_weekly_bias_pct=float(MAX_WEEKLY_BIAS_PCT),
                 max_gap_pct=float(MAX_GAP_PCT),
                 buy_slippage_pct=float(BUY_SLIPPAGE),
                 sell_slippage_pct=float(SELL_SLIPPAGE),
@@ -2592,6 +2738,7 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
                 enable_market_filter=bool(ENABLE_MARKET_FILTER),
                 protection_trigger_pct=float(PROTECTION_TRIGGER),
                 protection_buffer_pct=float(PROTECTION_BUFFER),
+                exit_non_follow_t2=bool(EXIT_NON_FOLLOW_T2),
                 use_sina=use_sina,
             )
             results_store = replace_trade_date_records(
@@ -2622,7 +2769,7 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
             candidates_store, ["Trade_Date", "ts_code"]
         )
 
-        st.subheader("🧭 动态门槛与多信号确认")
+        st.subheader("🧭 固定质量门槛与多信号确认")
         if not funnel_df.empty:
             funnel_defaults = {
                 "Market_Weak_Block": 0,
@@ -2651,7 +2798,7 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
                 funnel_df["Scarce_Tradable_Skipped"], errors="coerce"
             ).fillna(0) > 0).sum())
             env_cols = st.columns(4)
-            env_cols[0].metric("通过动态分数门槛", score_pass_total)
+            env_cols[0].metric("通过固定质量分数", score_pass_total)
             env_cols[1].metric("至少2只可成交的日期", breadth_days)
             env_cols[2].metric("仅1只而放弃的日期", scarce_days)
             env_cols[3].metric("最终入选样本", selected_total)
@@ -2692,6 +2839,7 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
             show_portfolio_report(
                 portfolio_curve, portfolio_ledger, portfolio_orders, portfolio_summary
             )
+            show_quality_priority_report(all_results)
             show_weekly_report(all_results)
             show_weekly_wave_report(all_results)
             show_provisional_weekly_report(all_results)
@@ -2722,30 +2870,30 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
 
             export_csv = all_results.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
-                "📥 下载V40.1双周线与替代入场轨迹CSV",
+                "📥 下载V40.2周线质量优先轨迹CSV",
                 export_csv,
-                f"export_v40_1_{config_hash}.csv",
+                f"export_v40_2_{config_hash}.csv",
                 "text/csv",
             )
             if not portfolio_curve.empty:
                 st.download_button(
-                    "📥 下载V40.1主组合每日权益CSV",
+                    "📥 下载V40.2主组合每日权益CSV",
                     portfolio_curve.to_csv(index=False).encode("utf-8-sig"),
-                    f"portfolio_curve_v40_1_{config_hash}.csv",
+                    f"portfolio_curve_v40_2_{config_hash}.csv",
                     "text/csv",
                 )
             if not portfolio_ledger.empty:
                 st.download_button(
-                    "📥 下载V40.1主组合成交账本CSV",
+                    "📥 下载V40.2主组合成交账本CSV",
                     portfolio_ledger.to_csv(index=False).encode("utf-8-sig"),
-                    f"portfolio_ledger_v40_1_{config_hash}.csv",
+                    f"portfolio_ledger_v40_2_{config_hash}.csv",
                     "text/csv",
                 )
             if not portfolio_orders.empty:
                 st.download_button(
-                    "📥 下载V40.1信号执行审计CSV",
+                    "📥 下载V40.2信号执行审计CSV",
                     portfolio_orders.to_csv(index=False).encode("utf-8-sig"),
-                    f"portfolio_orders_v40_1_{config_hash}.csv",
+                    f"portfolio_orders_v40_2_{config_hash}.csv",
                     "text/csv",
                 )
         else:
@@ -2758,17 +2906,17 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
         if not all_candidates_export.empty:
             candidate_csv = all_candidates_export.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
-                "📥 下载V40.1全部核心候选及诊断CSV",
+                "📥 下载V40.2全部核心候选及诊断CSV",
                 candidate_csv,
-                f"candidates_v40_1_{config_hash}.csv",
+                f"candidates_v40_2_{config_hash}.csv",
                 "text/csv",
             )
         if not funnel_df.empty:
             funnel_csv = funnel_df.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
-                "📥 下载V40.1逐日筛选漏斗CSV",
+                "📥 下载V40.2逐日筛选漏斗CSV",
                 funnel_csv,
-                f"funnel_v40_1_{config_hash}.csv",
+                f"funnel_v40_2_{config_hash}.csv",
                 "text/csv",
             )
 
