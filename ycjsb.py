@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-选股王 V40.3 · 周线C级剔除平衡版
+选股王 V40.4 · 评分四模式诊断版
 ============================================================
 主要变化
 1. 股票池：主板/创业板/科创板，明确剔除北交所；保留流通市值200~1000亿元参数。
@@ -37,6 +37,10 @@
     不再仅靠降排名处理，直接减少历史上止损率偏高的弱阶段入选。
 26. 退出还原：取消“T+1未延续时T+2开盘退出”；T+1跟随仅保留诊断，
     G2/R1/B阶段继续使用原结构止损、成本保护和移动止盈规则。
+27. 评分诊断：同一批核心候选一次性计算完整未来轨迹，同时比较固定82分、
+    固定80分、固定78分和不设固定分数（评分仅排序）四种准入模式。
+28. 公平对照：四种模式共用股票池、T+1成交、TopK、至少2只确认、退出规则
+    和30万元三仓组合；只改变评分准入，避免混入其他变量。
 
 说明
 - 本程序用于研究和回测，不构成投资建议。
@@ -64,7 +68,7 @@ import tushare as ts
 
 warnings.filterwarnings("ignore")
 
-VERSION = "V40.3"
+VERSION = "V40.4"
 # 行情结构与V39.7兼容，沿用原缓存可避免重新下载数百个交易日。
 CACHE_FILE_NAME = "market_data_cache_v39_7.pkl"
 MAX_FETCH_WORKERS = 1  # 避免触发Tushare频率限制
@@ -88,11 +92,20 @@ FIXED_MAX_MV = 1000.0
 FIXED_MARKET_FILTER = False
 MIN_TRADABLE_SIGNALS = 2
 
-# V40.3单股质量默认值；侧边栏可调，方便做严格/宽松对照。
+# V40.4四模式共用的单股质量默认值。
 DEFAULT_MIN_DAY_GAIN_PCT = 3.0
 DEFAULT_MIN_DAILY_BIAS_PCT = 3.0
 DEFAULT_MAX_WEEKLY_BIAS_PCT = 35.0
 DEFAULT_FIXED_SCORE_FLOOR = 82.0
+
+# 四种评分准入模式。None表示评分不再一票否决，只用于同日排序。
+SCORE_MODES = (
+    ("82分", "Mode_82", 82.0),
+    ("80分", "Mode_80", 80.0),
+    ("78分", "Mode_78", 78.0),
+    ("仅排名", "Mode_RankOnly", None),
+)
+SCORE_MODE_LABELS = tuple(item[0] for item in SCORE_MODES)
 
 # G1/R5为V40.2实证中的C级弱阶段，先硬剔除；其余阶段只改变同日优先顺序。
 EXCLUDED_PROVISIONAL_STAGES = {
@@ -173,8 +186,8 @@ DEFAULT_THS_KEYWORDS = (
 # -----------------------------------------------------------------------------
 # 页面
 # -----------------------------------------------------------------------------
-st.set_page_config(page_title=f"选股王 {VERSION} 周线C级剔除平衡版", layout="wide")
-st.title(f"选股王 {VERSION}：C级弱阶段剔除 + 交易机会平衡")
+st.set_page_config(page_title=f"选股王 {VERSION} 评分四模式诊断版", layout="wide")
+st.title(f"选股王 {VERSION}：82 / 80 / 78 / 仅排名公平对照")
 
 
 # -----------------------------------------------------------------------------
@@ -1468,6 +1481,106 @@ def stock_active_on_date(row, trade_date: str) -> bool:
     return list_date <= trade_date < delist_date
 
 
+def apply_score_modes(
+    all_candidates: pd.DataFrame,
+    funnel: dict,
+    top_k: int,
+    min_tradable_signals: int,
+) -> tuple[pd.DataFrame, dict]:
+    """在同一批已完成T+1检查的核心候选上套用四种评分准入模式。"""
+    checked = all_candidates["Execution_Checked"].fillna(False).astype(bool)
+    tradable = checked & all_candidates["Tradable"].eq(True).fillna(False)
+    scores = pd.to_numeric(all_candidates["Total_Score"], errors="coerce")
+
+    for label, prefix, threshold in SCORE_MODES:
+        score_eligible = pd.Series(True, index=all_candidates.index)
+        if threshold is not None:
+            score_eligible = scores >= float(threshold)
+        mode_tradable = tradable & score_eligible.fillna(False)
+        tradable_indices = all_candidates.index[mode_tradable].tolist()
+        tradable_count = len(tradable_indices)
+        breadth_confirmed = tradable_count >= int(min_tradable_signals)
+
+        if breadth_confirmed:
+            selected_indices = (
+                all_candidates.loc[tradable_indices]
+                .sort_values(
+                    ["Stage_Priority", "Total_Score", "ATR_pct"],
+                    ascending=[True, False, False],
+                )
+                .head(int(top_k))
+                .index.tolist()
+            )
+        else:
+            selected_indices = []
+
+        rank_map = {idx: rank for rank, idx in enumerate(selected_indices, start=1)}
+        all_candidates[f"{prefix}_Score_Eligible"] = score_eligible.fillna(False)
+        all_candidates[f"{prefix}_Tradable"] = mode_tradable
+        all_candidates[f"{prefix}_Day_Tradable_Count"] = tradable_count
+        all_candidates[f"{prefix}_Breadth_Confirmed"] = breadth_confirmed
+        all_candidates[f"{prefix}_Selected"] = all_candidates.index.isin(selected_indices)
+        all_candidates[f"{prefix}_Rank"] = all_candidates.index.map(rank_map).astype("Int64")
+
+        status_col = f"{prefix}_Status"
+        all_candidates[status_col] = "未达到本模式分数准入"
+        if threshold is None:
+            all_candidates[status_col] = "仅排名模式核心候选"
+        all_candidates.loc[score_eligible & ~checked, status_col] = "未完成T+1成交检查"
+        all_candidates.loc[score_eligible & checked & ~tradable, status_col] = (
+            all_candidates.loc[score_eligible & checked & ~tradable, "Exit_Reason"]
+            .fillna("T+1不可成交").astype(str)
+        )
+        if 0 < tradable_count < int(min_tradable_signals):
+            all_candidates.loc[mode_tradable, status_col] = (
+                f"本模式可成交仅{tradable_count}只<"
+                f"{int(min_tradable_signals)}只，观察不买"
+            )
+        elif breadth_confirmed:
+            all_candidates.loc[mode_tradable, status_col] = "广度确认-未进入TopK"
+            all_candidates.loc[selected_indices, status_col] = "广度确认-入选TopK"
+
+        funnel[f"{prefix}_Score_Eligible"] = int(score_eligible.sum())
+        funnel[f"{prefix}_Tradable"] = tradable_count
+        funnel[f"{prefix}_Breadth_Confirmed"] = int(breadth_confirmed)
+        funnel[f"{prefix}_Scarce_Skipped"] = (
+            tradable_count if 0 < tradable_count < int(min_tradable_signals) else 0
+        )
+        funnel[f"{prefix}_Selected_TopK"] = len(selected_indices)
+
+    # 旧字段固定映射到82分模式，方便与V40.3漏斗直接比较。
+    funnel["Base_Score_Pass"] = funnel["Mode_82_Score_Eligible"]
+    funnel["Dynamic_Score_Pass"] = funnel["Mode_82_Score_Eligible"]
+    funnel["Final_Signal"] = funnel["Mode_82_Score_Eligible"]
+    funnel["Tradable_Signal"] = funnel["Mode_82_Tradable"]
+    funnel["Breadth_Confirmed"] = funnel["Mode_82_Breadth_Confirmed"]
+    funnel["Scarce_Tradable_Skipped"] = funnel["Mode_82_Scarce_Skipped"]
+    funnel["Selected_TopK"] = funnel["Mode_82_Selected_TopK"]
+    return all_candidates, funnel
+
+
+def collect_mode_results(all_candidates: pd.DataFrame) -> pd.DataFrame:
+    """把四种模式的入选记录展开为带Diagnostic_Mode的长表。"""
+    frames = []
+    for label, prefix, threshold in SCORE_MODES:
+        selected = all_candidates[f"{prefix}_Selected"].fillna(False).astype(bool)
+        if not selected.any():
+            continue
+        part = all_candidates.loc[selected].copy()
+        part["Diagnostic_Mode"] = label
+        part["Mode_Score_Threshold"] = np.nan if threshold is None else float(threshold)
+        part["Rank"] = pd.to_numeric(part[f"{prefix}_Rank"], errors="coerce").astype("Int64")
+        part["Selection_Status"] = part[f"{prefix}_Status"]
+        frames.append(part)
+    if not frames:
+        return pd.DataFrame()
+    combined = pd.concat(frames, ignore_index=True)
+    return combined.sort_values(
+        ["Trade_Date", "Diagnostic_Mode", "Rank"],
+        ascending=[True, True, True],
+    ).reset_index(drop=True)
+
+
 def run_backtest_for_day(
     trade_date: str,
     top_k: int,
@@ -1574,6 +1687,12 @@ def run_backtest_for_day(
         "Selected_TopK",
     ]:
         funnel[key] = 0
+    for _, prefix, _ in SCORE_MODES:
+        for suffix in [
+            "Score_Eligible", "Tradable", "Breadth_Confirmed",
+            "Scarce_Skipped", "Selected_TopK",
+        ]:
+            funnel[f"{prefix}_{suffix}"] = 0
 
     records = []
     for row, membership in tech_rows:
@@ -1707,8 +1826,7 @@ def run_backtest_for_day(
         return pd.DataFrame(), funnel, pd.DataFrame()
 
     all_candidates = pd.DataFrame(records)
-    # V40.3不再因为当日信号多就降低单股质量标准。
-    # 保留两个入参只为兼容旧断点结构，实际统一取两者较高值。
+    # 保留V40.3的82分字段作为基准；四种模式各自的准入结果另列导出。
     required_score = max(min_total_score, scarce_total_score)
     base_count = int((all_candidates["Total_Score"] >= required_score).sum())
     all_candidates["Day_Base_Signal_Count"] = base_count
@@ -1748,20 +1866,20 @@ def run_backtest_for_day(
         else:
             all_candidates[key] = np.nan
     all_candidates["Execution_Checked"] = False
-    all_candidates["Selection_Status"] = np.where(
-        all_candidates["Score_Pass"], "通过固定质量分数", "未达固定质量分数"
-    )
+    all_candidates["Selection_Status"] = "核心候选-等待全量T+1成交检查"
 
     funnel["Day_Base_Signal_Count"] = base_count
     funnel["Required_Score"] = required_score
     funnel["Base_Score_Pass"] = base_count
-    funnel["Dynamic_Score_Pass"] = int(all_candidates["Score_Pass"].sum())
-    funnel["Final_Signal"] = funnel["Dynamic_Score_Pass"]
+    funnel["Dynamic_Score_Pass"] = base_count
+    funnel["Final_Signal"] = base_count
 
     if regime["Market_Weak_Block"]:
-        all_candidates.loc[all_candidates["Score_Pass"], "Selection_Status"] = "双指数弱势-暂停开仓"
+        all_candidates["Selection_Status"] = "双指数弱势-暂停开仓"
     else:
-        eligible_indices = all_candidates.index[all_candidates["Score_Pass"]].tolist()
+        # 四模式诊断必须给所有核心候选计算同一套未来轨迹；否则无法知道
+        # 82分以下候选的真实收益与止损表现。
+        eligible_indices = all_candidates.index.tolist()
         funnel["After_Market_Filter"] = len(eligible_indices)
         for idx in eligible_indices:
             candidate = all_candidates.loc[idx]
@@ -1785,75 +1903,59 @@ def run_backtest_for_day(
             )
             for key, value in future.items():
                 all_candidates.loc[idx, key] = value
-            alternative = build_alternative_entry_diagnostics(
-                main_result=future,
-                ts_code=str(candidate["ts_code"]),
-                market=str(candidate["market"]),
-                signal_low=float(candidate["_Signal_Low"]),
-                signal_ma20=float(candidate["_Signal_MA20"]),
-                atr14=float(candidate["_ATR14"]),
-                max_gap_pct=max_gap_pct,
-                buy_slippage_pct=buy_slippage_pct,
-                sell_slippage_pct=sell_slippage_pct,
-                commission_pct=commission_pct,
-                sell_tax_pct=sell_tax_pct,
-                protection_trigger_pct=protection_trigger_pct,
-                protection_buffer_pct=protection_buffer_pct,
-                use_sina=use_sina,
-            )
-            for key, value in alternative.items():
-                all_candidates.loc[idx, key] = value
             all_candidates.loc[idx, "Execution_Checked"] = True
             if future["Tradable"]:
-                all_candidates.loc[idx, "Selection_Status"] = "可成交-等待TopK排序"
+                all_candidates.loc[idx, "Selection_Status"] = "全量诊断可成交"
             else:
                 all_candidates.loc[idx, "Selection_Status"] = str(future["Exit_Reason"])
 
     checked_mask = all_candidates["Execution_Checked"].fillna(False).astype(bool)
     tradable_mask = checked_mask & all_candidates["Tradable"].eq(True).fillna(False)
     funnel["Execution_Checked"] = int(checked_mask.sum())
-    funnel["Tradable_Signal"] = int(tradable_mask.sum())
+    funnel["Tradable_Signal_All_Core"] = int(tradable_mask.sum())
 
-    tradable = all_candidates[tradable_mask].copy()
-    tradable_count = len(tradable)
-    breadth_confirmed = tradable_count >= int(min_tradable_signals)
-    all_candidates["Day_Tradable_Signal_Count"] = tradable_count
-    all_candidates["Breadth_Confirmed"] = breadth_confirmed
-    funnel["Breadth_Confirmed"] = int(breadth_confirmed)
-    funnel["Scarce_Tradable_Skipped"] = tradable_count if 0 < tradable_count < int(min_tradable_signals) else 0
+    all_candidates, funnel = apply_score_modes(
+        all_candidates,
+        funnel,
+        top_k=top_k,
+        min_tradable_signals=min_tradable_signals,
+    )
 
-    if breadth_confirmed:
-        final_indices = (
-            tradable.sort_values(
-                ["Stage_Priority", "Total_Score", "ATR_pct"],
-                ascending=[True, False, False],
-            )
-            .head(top_k)
-            .index
-            .tolist()
+    # T2延续与分批诊断只计算至少被一种模式选中的并集，减少重复行情读取。
+    selected_union = pd.Series(False, index=all_candidates.index)
+    for _, prefix, _ in SCORE_MODES:
+        selected_union |= all_candidates[f"{prefix}_Selected"].fillna(False).astype(bool)
+    for idx in all_candidates.index[selected_union]:
+        candidate = all_candidates.loc[idx]
+        main_result = {key: candidate.get(key, value) for key, value in future_result_template(8).items()}
+        alternative = build_alternative_entry_diagnostics(
+            main_result=main_result,
+            ts_code=str(candidate["ts_code"]),
+            market=str(candidate["market"]),
+            signal_low=float(candidate["_Signal_Low"]),
+            signal_ma20=float(candidate["_Signal_MA20"]),
+            atr14=float(candidate["_ATR14"]),
+            max_gap_pct=max_gap_pct,
+            buy_slippage_pct=buy_slippage_pct,
+            sell_slippage_pct=sell_slippage_pct,
+            commission_pct=commission_pct,
+            sell_tax_pct=sell_tax_pct,
+            protection_trigger_pct=protection_trigger_pct,
+            protection_buffer_pct=protection_buffer_pct,
+            use_sina=use_sina,
         )
-        all_candidates.loc[tradable.index, "Selection_Status"] = "广度确认-未进入TopK"
-        all_candidates.loc[final_indices, "Selection_Status"] = "广度确认-入选TopK"
-    else:
-        final_indices = []
-        if tradable_count > 0:
-            all_candidates.loc[tradable.index, "Selection_Status"] = (
-                f"实际可成交仅{tradable_count}只<"
-                f"{int(min_tradable_signals)}只，观察不买"
-            )
-    all_candidates["Selected"] = all_candidates.index.isin(final_indices)
-    funnel["Selected_TopK"] = len(final_indices)
+        for key, value in alternative.items():
+            all_candidates.loc[idx, key] = value
+
+    # 旧通用列映射到82分模式，候选CSV仍可与V40.3直接对照。
+    all_candidates["Day_Tradable_Signal_Count"] = all_candidates["Mode_82_Day_Tradable_Count"]
+    all_candidates["Breadth_Confirmed"] = all_candidates["Mode_82_Breadth_Confirmed"]
+    all_candidates["Selected"] = all_candidates["Mode_82_Selected"]
 
     internal_cols = ["_Signal_Low", "_Signal_MA20", "_ATR14"]
+    final = collect_mode_results(all_candidates)
     candidate_export = all_candidates.drop(columns=internal_cols, errors="ignore").copy()
-    if not final_indices:
-        return pd.DataFrame(), funnel, candidate_export
-    final = candidate_export.loc[final_indices].copy()
-    final = final.sort_values(
-        ["Stage_Priority", "Total_Score", "ATR_pct"],
-        ascending=[True, False, False],
-    )
-    final.insert(1, "Rank", range(1, len(final) + 1))
+    final = final.drop(columns=internal_cols, errors="ignore")
     return final, funnel, candidate_export
 
 
@@ -2201,7 +2303,7 @@ def show_portfolio_report(
 
 
 def show_quality_priority_report(all_results: pd.DataFrame) -> None:
-    st.subheader("🎯 V40.3周线阶段筛选成效")
+    st.subheader("🎯 当前详细模式的周线阶段成效")
     required = {
         "Stage_Priority_Label", "Realized_Return (%)", "Exit_Reason", "Held_W1"
     }
@@ -2273,6 +2375,95 @@ def bool_series(series: pd.Series) -> pd.Series:
         .map({"true": True, "false": False, "1": True, "0": False})
         .fillna(False).astype(bool)
     )
+
+
+def signal_gap_metrics(signals: pd.DataFrame, trade_days: list[str]) -> dict:
+    """按少于2只即无信号的最终入选口径，统计连续交易日空窗。"""
+    days = sorted({normalize_date(day) for day in trade_days if normalize_date(day)})
+    signal_dates = set()
+    if signals is not None and not signals.empty and "Trade_Date" in signals.columns:
+        counts = signals.assign(
+            _date=signals["Trade_Date"].map(normalize_date)
+        ).groupby("_date").size()
+        signal_dates = set(counts[counts >= int(MIN_TRADABLE_SIGNALS)].index)
+
+    gaps = []
+    current = 0
+    for day in days:
+        if day in signal_dates:
+            if current:
+                gaps.append(current)
+            current = 0
+        else:
+            current += 1
+    if current:
+        gaps.append(current)
+    return {
+        "Signal_Days": len(signal_dates),
+        "No_Signal_Days": len(days) - len(signal_dates),
+        "Gaps_Over_10": sum(gap > 10 for gap in gaps),
+        "Longest_Gap_Days": max(gaps) if gaps else 0,
+    }
+
+
+def build_mode_comparison(
+    all_results: pd.DataFrame,
+    trade_days: list[str],
+    portfolio_summaries: dict[str, dict],
+) -> pd.DataFrame:
+    rows = []
+    for label in SCORE_MODE_LABELS:
+        data = all_results[all_results["Diagnostic_Mode"] == label].copy()
+        realized = pd.to_numeric(data.get("Realized_Return (%)"), errors="coerce")
+        exit_reason = data.get("Exit_Reason", pd.Series("", index=data.index)).fillna("").astype(str)
+        gaps = signal_gap_metrics(data, trade_days)
+        summary = portfolio_summaries.get(label, {})
+        row = {
+            "模式": label,
+            "入选样本": len(data),
+            "信号日": gaps["Signal_Days"],
+            "超过10日空窗次数": gaps["Gaps_Over_10"],
+            "最长空窗(交易日)": gaps["Longest_Gap_Days"],
+            "平均实现收益(%)": round(realized.mean(), 2) if realized.notna().any() else np.nan,
+            "亏损率(%)": round((realized < 0).mean() * 100.0, 1) if len(data) else np.nan,
+            "结构止损率(%)": round(exit_reason.str.startswith("结构止损").mean() * 100.0, 1)
+            if len(data) else np.nan,
+            "假反弹率(%)": round(bool_series(data["False_Rebound_10D"]).mean() * 100.0, 1)
+            if len(data) and "False_Rebound_10D" in data.columns else np.nan,
+            "组合总收益(%)": round(summary.get("Total_Return_pct", np.nan), 2),
+            "组合最大回撤(%)": round(summary.get("Max_Drawdown_pct", np.nan), 2),
+            "组合空仓率(%)": round(summary.get("Empty_Ratio_pct", np.nan), 1),
+            "组合交易数": summary.get("Executed_Entries", 0),
+        }
+        for week in range(1, 9):
+            eligible_col = f"Eligible_W{week}"
+            held_col = f"Held_W{week}"
+            return_col = f"Return_W{week} (%)"
+            if eligible_col not in data.columns:
+                row[f"W{week}生存率(%)"] = np.nan
+                row[f"W{week}均益(%)"] = np.nan
+                row[f"W{week}胜率(%)"] = np.nan
+                continue
+            eligible = bool_series(data[eligible_col])
+            subset = data[eligible]
+            returns = pd.to_numeric(subset.get(return_col), errors="coerce")
+            row[f"W{week}生存率(%)"] = round(
+                bool_series(subset[held_col]).mean() * 100.0, 1
+            ) if len(subset) else np.nan
+            row[f"W{week}均益(%)"] = round(returns.mean(), 2) if returns.notna().any() else np.nan
+            row[f"W{week}胜率(%)"] = round((returns > 0).mean() * 100.0, 1) \
+                if returns.notna().any() else np.nan
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def show_mode_comparison(comparison: pd.DataFrame) -> None:
+    st.subheader("🧪 四种评分准入模式总对照")
+    st.caption(
+        "四种模式共用同一核心候选、T+1成交、至少2只确认、TopK、退出规则和三仓组合；"
+        "仅改变固定评分准入。"
+    )
+    st.dataframe(comparison, use_container_width=True, hide_index=True)
 
 
 def show_weekly_wave_report(all_results: pd.DataFrame) -> None:
@@ -2531,13 +2722,20 @@ with st.sidebar:
     )
     st.caption("组合：初始30万元，最多3只，单只目标约10万元。")
     st.info(
-        "V40.3硬剔除G1绿柱连续缩短和R5红柱衰减；"
+        "V40.4同时比较82分、80分、78分与仅排名四种准入；"
+        "继续硬剔除G1绿柱连续缩短和R5红柱衰减；"
         "不限制每日新开仓数，不限制同一申万行业，保留热点板块联动。"
+    )
+    DETAIL_MODE = st.selectbox(
+        "详细报告显示模式",
+        options=list(SCORE_MODE_LABELS),
+        index=0,
+        help="只影响页面详细图表；四种模式都会同时计算并导出。",
     )
     ENABLE_THS = st.checkbox("实时雷达启用THS概念补充(需6000积分)", value=False)
     THS_KEYWORDS_TEXT = st.text_area("THS科技概念关键词", value=DEFAULT_THS_KEYWORDS, height=100)
 
-    st.subheader("单股质量与固定评分门槛")
+    st.subheader("单股质量（四模式共用）")
     MIN_ATR_PCT = st.number_input("ATR14/股价最低(%)", min_value=0.0, value=2.5, step=0.1)
     MIN_VOL_RATIO = st.number_input("最低量比", min_value=0.5, value=1.10, step=0.05)
     MIN_DAY_GAIN_PCT = st.number_input(
@@ -2554,14 +2752,11 @@ with st.sidebar:
         value=DEFAULT_MAX_WEEKLY_BIAS_PCT, step=5.0,
     )
     MAX_GAP_PCT = st.number_input("T+1最大允许高开(%)", min_value=0.0, value=8.0, step=0.5)
-    FIXED_SCORE_FLOOR = st.number_input(
-        "固定最低总分", min_value=0.0,
-        value=DEFAULT_FIXED_SCORE_FLOOR, step=1.0,
-        help="不再因为当日信号较多而从82分降到80分。",
-    )
+    FIXED_SCORE_FLOOR = DEFAULT_FIXED_SCORE_FLOOR
+    st.caption("评分准入固定对照：82分、80分、78分、仅排名；不在侧边栏改数值。")
     MIN_TOTAL_SCORE = FIXED_SCORE_FLOOR
     SCARCE_TOTAL_SCORE = FIXED_SCORE_FLOOR
-    BREADTH_THRESHOLD = 4  # 仅为兼容旧函数入参，V40.3不再用它降分。
+    BREADTH_THRESHOLD = 4  # 仅为兼容旧函数入参，V40.4不再用它降分。
 
     st.subheader("市场环境")
     st.caption("双指数仅保留为诊断字段，不再一刀切暂停开仓。")
@@ -2653,6 +2848,10 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
             "max_gap": MAX_GAP_PCT,
             "min_score": MIN_TOTAL_SCORE,
             "scarce_score": SCARCE_TOTAL_SCORE,
+            "score_modes": [
+                {"label": label, "threshold": threshold}
+                for label, _, threshold in SCORE_MODES
+            ],
             "breadth_threshold": int(BREADTH_THRESHOLD),
             "min_tradable_signals": MIN_TRADABLE_SIGNALS,
             "market_filter": bool(ENABLE_MARKET_FILTER),
@@ -2682,7 +2881,9 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
                     state = json.load(file)
                 state_processed = {normalize_date(day) for day in state.get("processed_dates", [])}
                 state_processed.discard("")
-                results_store = read_checkpoint_csv(result_file, ["Trade_Date", "ts_code"])
+                results_store = read_checkpoint_csv(
+                    result_file, ["Trade_Date", "ts_code", "Diagnostic_Mode"]
+                )
                 candidates_store = read_checkpoint_csv(candidate_file, ["Trade_Date", "ts_code"])
                 funnel_store = read_checkpoint_csv(funnel_file, ["Trade_Date"])
                 # 每个交易日必须有一条漏斗记录；只有state而没有漏斗快照的日期重跑。
@@ -2691,7 +2892,10 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
 
                 # 读取旧断点后立即紧缩为唯一主键快照，从源头消除历史重复。
                 if not results_store.empty:
-                    results_store = atomic_write_csv(results_store, result_file, ["Trade_Date", "ts_code"])
+                    results_store = atomic_write_csv(
+                        results_store, result_file,
+                        ["Trade_Date", "ts_code", "Diagnostic_Mode"],
+                    )
                 if not candidates_store.empty:
                     candidates_store = atomic_write_csv(candidates_store, candidate_file, ["Trade_Date", "ts_code"])
                 if not funnel_store.empty:
@@ -2739,7 +2943,8 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
                 use_sina=use_sina,
             )
             results_store = replace_trade_date_records(
-                results_store, day_result, trade_date, ["Trade_Date", "ts_code"]
+                results_store, day_result, trade_date,
+                ["Trade_Date", "ts_code", "Diagnostic_Mode"],
             )
             candidates_store = replace_trade_date_records(
                 candidates_store, day_candidates, trade_date, ["Trade_Date", "ts_code"]
@@ -2749,7 +2954,10 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
             )
 
             # 小数据集每日写完整快照；不再append，因此断点重跑也不会双倍。
-            results_store = atomic_write_csv(results_store, result_file, ["Trade_Date", "ts_code"])
+            results_store = atomic_write_csv(
+                results_store, result_file,
+                ["Trade_Date", "ts_code", "Diagnostic_Mode"],
+            )
             candidates_store = atomic_write_csv(candidates_store, candidate_file, ["Trade_Date", "ts_code"])
             funnel_store = atomic_write_csv(funnel_store, funnel_file, ["Trade_Date"])
             processed.add(trade_date)
@@ -2766,82 +2974,103 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
             candidates_store, ["Trade_Date", "ts_code"]
         )
 
-        st.subheader("🧭 固定质量门槛与多信号确认")
+        st.subheader("🧭 四种评分准入的逐日漏斗")
         if not funnel_df.empty:
-            funnel_defaults = {
-                "Market_Weak_Block": 0,
-                "Market_Regime": "过滤关闭",
-                "Day_Base_Signal_Count": 0,
-                "Required_Score": np.nan,
-                "Dynamic_Score_Pass": 0,
-                "Tradable_Signal": 0,
-                "Breadth_Confirmed": 0,
-                "Scarce_Tradable_Skipped": 0,
-                "Selected_TopK": 0,
-                "CYB_Close": np.nan,
-                "CYB_MA20": np.nan,
-                "STAR50_Close": np.nan,
-                "STAR50_MA20": np.nan,
-            }
-            for column, default_value in funnel_defaults.items():
-                if column not in funnel_df.columns:
-                    funnel_df[column] = default_value
-            score_pass_total = int(pd.to_numeric(funnel_df["Dynamic_Score_Pass"], errors="coerce").fillna(0).sum())
-            selected_total = int(pd.to_numeric(funnel_df["Selected_TopK"], errors="coerce").fillna(0).sum())
-            breadth_days = int(pd.to_numeric(
-                funnel_df["Breadth_Confirmed"], errors="coerce"
-            ).fillna(0).sum())
-            scarce_days = int((pd.to_numeric(
-                funnel_df["Scarce_Tradable_Skipped"], errors="coerce"
-            ).fillna(0) > 0).sum())
-            env_cols = st.columns(4)
-            env_cols[0].metric("通过固定质量分数", score_pass_total)
-            env_cols[1].metric("至少2只可成交的日期", breadth_days)
-            env_cols[2].metric("仅1只而放弃的日期", scarce_days)
-            env_cols[3].metric("最终入选样本", selected_total)
-            st.dataframe(
-                funnel_df[
-                    [
-                        "Trade_Date", "Market_Regime", "Day_Base_Signal_Count", "Required_Score",
-                        "Dynamic_Score_Pass", "Tradable_Signal", "Breadth_Confirmed",
-                        "Scarce_Tradable_Skipped", "Selected_TopK",
-                    ]
-                ].sort_values("Trade_Date", ascending=False),
-                use_container_width=True,
-                hide_index=True,
-            )
+            mode_funnel_rows = []
+            for label, prefix, threshold in SCORE_MODES:
+                for suffix in [
+                    "Score_Eligible", "Tradable", "Breadth_Confirmed",
+                    "Scarce_Skipped", "Selected_TopK",
+                ]:
+                    column = f"{prefix}_{suffix}"
+                    if column not in funnel_df.columns:
+                        funnel_df[column] = 0
+                mode_funnel_rows.append(
+                    {
+                        "模式": label,
+                        "分数门槛": "仅排名" if threshold is None else threshold,
+                        "分数准入样本": int(pd.to_numeric(
+                            funnel_df[f"{prefix}_Score_Eligible"], errors="coerce"
+                        ).fillna(0).sum()),
+                        "可成交样本": int(pd.to_numeric(
+                            funnel_df[f"{prefix}_Tradable"], errors="coerce"
+                        ).fillna(0).sum()),
+                        "至少2只日期": int(pd.to_numeric(
+                            funnel_df[f"{prefix}_Breadth_Confirmed"], errors="coerce"
+                        ).fillna(0).sum()),
+                        "仅1只放弃日期": int((pd.to_numeric(
+                            funnel_df[f"{prefix}_Scarce_Skipped"], errors="coerce"
+                        ).fillna(0) > 0).sum()),
+                        "最终入选样本": int(pd.to_numeric(
+                            funnel_df[f"{prefix}_Selected_TopK"], errors="coerce"
+                        ).fillna(0).sum()),
+                    }
+                )
+            st.dataframe(pd.DataFrame(mode_funnel_rows), use_container_width=True, hide_index=True)
+
+        portfolio_curve = pd.DataFrame()
+        portfolio_ledger = pd.DataFrame()
+        portfolio_orders = pd.DataFrame()
+        mode_comparison = pd.DataFrame()
 
         if not results_store.empty:
-            all_results = canonicalize_records(results_store, ["Trade_Date", "ts_code"])
+            all_results = canonicalize_records(
+                results_store, ["Trade_Date", "ts_code", "Diagnostic_Mode"]
+            )
             for week in range(1, 9):
                 for prefix in ["Eligible_W", "Held_W"]:
                     col = f"{prefix}{week}"
                     if col in all_results.columns and all_results[col].dtype == object:
-                        all_results[col] = (
-                            all_results[col].astype(str).str.lower()
-                            .map({"true": True, "false": False})
-                            .fillna(False)
-                        )
+                        all_results[col] = bool_series(all_results[col])
 
-            portfolio_curve, portfolio_ledger, portfolio_orders, portfolio_summary = (
-                build_portfolio_backtest(
-                    all_results,
+            portfolio_summaries = {}
+            curve_frames, ledger_frames, order_frames = [], [], []
+            portfolio_by_mode = {}
+            for label in SCORE_MODE_LABELS:
+                mode_signals = all_results[all_results["Diagnostic_Mode"] == label].copy()
+                curve, ledger, orders, summary = build_portfolio_backtest(
+                    mode_signals,
                     trade_days,
                     initial_capital=INITIAL_CAPITAL,
                     max_positions=MAX_PORTFOLIO_POSITIONS,
                     position_budget=POSITION_BUDGET,
                     lot_size=LOT_SIZE,
                 )
+                portfolio_summaries[label] = summary
+                portfolio_by_mode[label] = (curve, ledger, orders, summary)
+                for frame, target in [
+                    (curve, curve_frames), (ledger, ledger_frames), (orders, order_frames)
+                ]:
+                    if frame is not None and not frame.empty:
+                        tagged = frame.copy()
+                        tagged.insert(0, "Diagnostic_Mode", label)
+                        target.append(tagged)
+
+            portfolio_curve = pd.concat(curve_frames, ignore_index=True) if curve_frames else pd.DataFrame()
+            portfolio_ledger = pd.concat(ledger_frames, ignore_index=True) if ledger_frames else pd.DataFrame()
+            portfolio_orders = pd.concat(order_frames, ignore_index=True) if order_frames else pd.DataFrame()
+            comparison_trade_days = trade_days
+            if not funnel_df.empty and "Error" in funnel_df.columns:
+                valid_funnel_days = funnel_df[funnel_df["Error"].isna()]["Trade_Date"].tolist()
+                if valid_funnel_days:
+                    comparison_trade_days = valid_funnel_days
+            mode_comparison = build_mode_comparison(
+                all_results, comparison_trade_days, portfolio_summaries
             )
+            show_mode_comparison(mode_comparison)
+
+            detail_results = all_results[all_results["Diagnostic_Mode"] == DETAIL_MODE].copy()
+            detail_curve, detail_ledger, detail_orders, detail_summary = portfolio_by_mode[DETAIL_MODE]
+            st.header(f"🔎 {DETAIL_MODE}模式详细报告")
             show_portfolio_report(
-                portfolio_curve, portfolio_ledger, portfolio_orders, portfolio_summary
+                detail_curve, detail_ledger, detail_orders, detail_summary
             )
-            show_quality_priority_report(all_results)
-            show_weekly_report(all_results)
-            show_weekly_wave_report(all_results)
-            show_provisional_weekly_report(all_results)
-            show_alternative_entry_report(all_results)
-            show_exit_report(all_results)
+            show_quality_priority_report(detail_results)
+            show_weekly_report(detail_results)
+            show_weekly_wave_report(detail_results)
+            show_provisional_weekly_report(detail_results)
+            show_alternative_entry_report(detail_results)
+            show_exit_report(detail_results)
 
             st.subheader("🔬 筛选漏斗（逐日合计）")
             numeric_cols = [c for c in funnel_df.columns if c not in ["Trade_Date", "Error"]]
@@ -2850,8 +3079,8 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
             totals = numeric_funnel.sum().to_frame("累计/求和")
             st.dataframe(totals, use_container_width=True)
 
-            st.subheader("📋 优选记录")
-            display = all_results.sort_values(["Trade_Date", "Rank"], ascending=[False, True])
+            st.subheader(f"📋 {DETAIL_MODE}模式优选记录")
+            display = detail_results.sort_values(["Trade_Date", "Rank"], ascending=[False, True])
             try:
                 st.dataframe(
                     display.style.map(style_exit, subset=["Exit_Reason"]),
@@ -2865,55 +3094,56 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
                     height=650,
                 )
 
-            export_csv = all_results.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
-                "📥 下载V40.3周线C级剔除轨迹CSV",
-                export_csv,
-                f"export_v40_3_{config_hash}.csv",
+                "📥 下载V40.4四模式总对照CSV",
+                mode_comparison.to_csv(index=False).encode("utf-8-sig"),
+                f"mode_comparison_v40_4_{config_hash}.csv",
+                "text/csv",
+            )
+            st.download_button(
+                "📥 下载V40.4四模式全部入选轨迹CSV",
+                all_results.to_csv(index=False).encode("utf-8-sig"),
+                f"export_v40_4_{config_hash}.csv",
                 "text/csv",
             )
             if not portfolio_curve.empty:
                 st.download_button(
-                    "📥 下载V40.3主组合每日权益CSV",
+                    "📥 下载V40.4四模式组合每日权益CSV",
                     portfolio_curve.to_csv(index=False).encode("utf-8-sig"),
-                    f"portfolio_curve_v40_3_{config_hash}.csv",
+                    f"portfolio_curve_v40_4_{config_hash}.csv",
                     "text/csv",
                 )
             if not portfolio_ledger.empty:
                 st.download_button(
-                    "📥 下载V40.3主组合成交账本CSV",
+                    "📥 下载V40.4四模式组合成交账本CSV",
                     portfolio_ledger.to_csv(index=False).encode("utf-8-sig"),
-                    f"portfolio_ledger_v40_3_{config_hash}.csv",
+                    f"portfolio_ledger_v40_4_{config_hash}.csv",
                     "text/csv",
                 )
             if not portfolio_orders.empty:
                 st.download_button(
-                    "📥 下载V40.3信号执行审计CSV",
+                    "📥 下载V40.4四模式信号执行审计CSV",
                     portfolio_orders.to_csv(index=False).encode("utf-8-sig"),
-                    f"portfolio_orders_v40_3_{config_hash}.csv",
+                    f"portfolio_orders_v40_4_{config_hash}.csv",
                     "text/csv",
                 )
         else:
-            empty_curve, empty_ledger, empty_orders, empty_summary = build_portfolio_backtest(
-                pd.DataFrame(), trade_days
-            )
-            show_portfolio_report(empty_curve, empty_ledger, empty_orders, empty_summary)
-            st.warning("本次没有产生可交易信号。请先查看筛选漏斗确定主要淘汰环节。")
+            st.warning("本次四种模式都没有产生可交易信号，请先查看筛选漏斗。")
 
         if not all_candidates_export.empty:
             candidate_csv = all_candidates_export.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
-                "📥 下载V40.3全部核心候选及诊断CSV",
+                "📥 下载V40.4全部核心候选及四模式诊断CSV",
                 candidate_csv,
-                f"candidates_v40_3_{config_hash}.csv",
+                f"candidates_v40_4_{config_hash}.csv",
                 "text/csv",
             )
         if not funnel_df.empty:
             funnel_csv = funnel_df.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
-                "📥 下载V40.3逐日筛选漏斗CSV",
+                "📥 下载V40.4四模式逐日筛选漏斗CSV",
                 funnel_csv,
-                f"funnel_v40_3_{config_hash}.csv",
+                f"funnel_v40_4_{config_hash}.csv",
                 "text/csv",
             )
 
