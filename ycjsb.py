@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-选股王 V40.2 · 周线质量优先版
+选股王 V40.3 · 周线C级剔除平衡版
 ============================================================
 主要变化
 1. 股票池：主板/创业板/科创板，明确剔除北交所；保留流通市值200~1000亿元参数。
@@ -29,12 +29,14 @@
     两者并列导出，既防止把未来周五数据泄漏到回测，又能观察“本周正在翻红”。
 22. 替代入场：主组合仍保持T+1开盘买入；另行诊断T+1收盘延续后T+2开盘买入，
     以及50% T+1 + 50% T+2的近似分批收益，不影响主组合权益。
-23. 质量优先：固定82分底线，默认要求信号日涨幅≥3%、高于日MA20≥3%、
-    信号日临时周线偏离MA20≤25%，优先G2绿柱缩短和R1首周翻红。
+23. 质量平衡：固定82分底线，默认要求信号日涨幅≥3%、高于日MA20≥3%、
+    信号日临时周线偏离MA20≤35%，优先G2绿柱缩短和R1首周翻红。
 24. 热点保留：不限制每日新开仓数，不限制同一申万二级行业持仓；
     仍允许热点板块联动时同日买入多只，总持仓上限3只不变。
-25. 提前退出：增加“T+1未延续时T+2开盘退出”独立开关，默认关闭；
-    便于先验证入选质量，再单独比较退出策略，避免混淆W1生存率。
+25. C级剔除：G1绿柱连续缩短、R5红柱衰减在评分和成交前硬剔除；
+    不再仅靠降排名处理，直接减少历史上止损率偏高的弱阶段入选。
+26. 退出还原：取消“T+1未延续时T+2开盘退出”；T+1跟随仅保留诊断，
+    G2/R1/B阶段继续使用原结构止损、成本保护和移动止盈规则。
 
 说明
 - 本程序用于研究和回测，不构成投资建议。
@@ -62,7 +64,7 @@ import tushare as ts
 
 warnings.filterwarnings("ignore")
 
-VERSION = "V40.2"
+VERSION = "V40.3"
 # 行情结构与V39.7兼容，沿用原缓存可避免重新下载数百个交易日。
 CACHE_FILE_NAME = "market_data_cache_v39_7.pkl"
 MAX_FETCH_WORKERS = 1  # 避免触发Tushare频率限制
@@ -86,21 +88,24 @@ FIXED_MAX_MV = 1000.0
 FIXED_MARKET_FILTER = False
 MIN_TRADABLE_SIGNALS = 2
 
-# V40.2单股质量默认值；侧边栏可调，方便做严格/宽松对照。
+# V40.3单股质量默认值；侧边栏可调，方便做严格/宽松对照。
 DEFAULT_MIN_DAY_GAIN_PCT = 3.0
 DEFAULT_MIN_DAILY_BIAS_PCT = 3.0
-DEFAULT_MAX_WEEKLY_BIAS_PCT = 25.0
+DEFAULT_MAX_WEEKLY_BIAS_PCT = 35.0
 DEFAULT_FIXED_SCORE_FLOOR = 82.0
 
-# 只改变同日候选的优先顺序，不把任何周线阶段一刀切删除。
+# G1/R5为V40.2实证中的C级弱阶段，先硬剔除；其余阶段只改变同日优先顺序。
+EXCLUDED_PROVISIONAL_STAGES = {
+    "G1_绿柱连续缩短",
+    "R5_红柱衰减",
+}
+
 STAGE_PRIORITY = {
     "G2_绿柱缩短": (0, "A1_G2绿柱缩短"),
     "R1_首周翻红": (1, "A2_R1首周翻红"),
     "G3_绿柱扩大/弱势": (2, "B_中性阶段"),
     "R3_红柱再加速": (2, "B_中性阶段"),
     "R4_红柱扩张": (2, "B_中性阶段"),
-    "G1_绿柱连续缩短": (3, "C_降级阶段"),
-    "R5_红柱衰减": (3, "C_降级阶段"),
 }
 
 # 真实组合约束。
@@ -168,8 +173,8 @@ DEFAULT_THS_KEYWORDS = (
 # -----------------------------------------------------------------------------
 # 页面
 # -----------------------------------------------------------------------------
-st.set_page_config(page_title=f"选股王 {VERSION} 周线质量优先版", layout="wide")
-st.title(f"选股王 {VERSION}：周线阶段优先 + 弱反弹过滤")
+st.set_page_config(page_title=f"选股王 {VERSION} 周线C级剔除平衡版", layout="wide")
+st.title(f"选股王 {VERSION}：C级弱阶段剔除 + 交易机会平衡")
 
 
 # -----------------------------------------------------------------------------
@@ -1166,7 +1171,6 @@ def get_medium_term_future(
     sell_tax_pct: float,
     protection_trigger_pct: float,
     protection_buffer_pct: float,
-    exit_non_follow_t2: bool = False,
     use_sina: bool = False,
 ) -> dict:
     d0 = datetime.strptime(selection_date, "%Y%m%d")
@@ -1305,16 +1309,6 @@ def get_medium_term_future(
                 tier = 2
         if tier == 2 and (peak_high - curr_close) / peak_high >= 0.15:
             pending_reason = "移动止盈(峰值回撤15%)-次日开盘退出"
-
-        # 买入日收盘已知道是否延续；若开启该独立对照，
-        # 只在T+1收盘后挂出退出计划，T+2开盘执行，不偷看T+2数据。
-        if (
-            day_count == 1
-            and exit_non_follow_t2
-            and not bool(result["T1_Follow_Through"])
-            and pending_reason is None
-        ):
-            pending_reason = "T+1未延续-T+2开盘退出"
 
         if day_count % 5 == 0:
             result[f"Return_W{week} (%)"] = net_return(curr_close)
@@ -1498,7 +1492,6 @@ def run_backtest_for_day(
     enable_market_filter: bool,
     protection_trigger_pct: float,
     protection_buffer_pct: float,
-    exit_non_follow_t2: bool,
     use_sina: bool = False,
 ):
     query_date = trade_date
@@ -1567,6 +1560,8 @@ def run_backtest_for_day(
         "Pass_Above_MA20",
         "Pass_Not_Overextended",
         "Pass_Volume",
+        "Pass_Weekly_Stage",
+        "Excluded_Weak_Weekly_Stage",
         "Core_Signal",
         "Base_Score_Pass",
         "Dynamic_Score_Pass",
@@ -1604,6 +1599,15 @@ def run_backtest_for_day(
         funnel["Pass_Not_Overextended"] += int(indicators["not_overextended"])
         funnel["Pass_Volume"] += int(indicators["volume_ok"])
         if not indicators["is_buy_signal"]:
+            continue
+
+        stage_allowed = (
+            indicators["provisional_macd_stage"]
+            not in EXCLUDED_PROVISIONAL_STAGES
+        )
+        funnel["Pass_Weekly_Stage"] += int(stage_allowed)
+        funnel["Excluded_Weak_Weekly_Stage"] += int(not stage_allowed)
+        if not stage_allowed:
             continue
         funnel["Core_Signal"] += 1
 
@@ -1703,7 +1707,7 @@ def run_backtest_for_day(
         return pd.DataFrame(), funnel, pd.DataFrame()
 
     all_candidates = pd.DataFrame(records)
-    # V40.2不再因为当日信号多就降低单股质量标准。
+    # V40.3不再因为当日信号多就降低单股质量标准。
     # 保留两个入参只为兼容旧断点结构，实际统一取两者较高值。
     required_score = max(min_total_score, scarce_total_score)
     base_count = int((all_candidates["Total_Score"] >= required_score).sum())
@@ -1777,7 +1781,6 @@ def run_backtest_for_day(
                 sell_tax_pct=sell_tax_pct,
                 protection_trigger_pct=protection_trigger_pct,
                 protection_buffer_pct=protection_buffer_pct,
-                exit_non_follow_t2=exit_non_follow_t2,
                 use_sina=use_sina,
             )
             for key, value in future.items():
@@ -2198,7 +2201,7 @@ def show_portfolio_report(
 
 
 def show_quality_priority_report(all_results: pd.DataFrame) -> None:
-    st.subheader("🎯 V40.2周线阶段优先级成效")
+    st.subheader("🎯 V40.3周线阶段筛选成效")
     required = {
         "Stage_Priority_Label", "Realized_Return (%)", "Exit_Reason", "Held_W1"
     }
@@ -2232,8 +2235,8 @@ def show_quality_priority_report(all_results: pd.DataFrame) -> None:
         hide_index=True,
     )
     st.caption(
-        "A1=G2绿柱缩短，A2=R1首周翻红；B=中性阶段；"
-        "C=G1绿柱连续缩短或R5红柱衰减。C类仅降级，没有硬删除。"
+        "A1=G2绿柱缩短，A2=R1首周翻红，B=G3/R3/R4中性阶段；"
+        "G1绿柱连续缩短与R5红柱衰减已在候选评分和成交前硬剔除。"
     )
 
 
@@ -2528,7 +2531,7 @@ with st.sidebar:
     )
     st.caption("组合：初始30万元，最多3只，单只目标约10万元。")
     st.info(
-        "V40.2只收紧单股质量并改变同日排名；"
+        "V40.3硬剔除G1绿柱连续缩短和R5红柱衰减；"
         "不限制每日新开仓数，不限制同一申万行业，保留热点板块联动。"
     )
     ENABLE_THS = st.checkbox("实时雷达启用THS概念补充(需6000积分)", value=False)
@@ -2558,7 +2561,7 @@ with st.sidebar:
     )
     MIN_TOTAL_SCORE = FIXED_SCORE_FLOOR
     SCARCE_TOTAL_SCORE = FIXED_SCORE_FLOOR
-    BREADTH_THRESHOLD = 4  # 仅为兼容旧函数入参，V40.2不再用它降分。
+    BREADTH_THRESHOLD = 4  # 仅为兼容旧函数入参，V40.3不再用它降分。
 
     st.subheader("市场环境")
     st.caption("双指数仅保留为诊断字段，不再一刀切暂停开仓。")
@@ -2570,13 +2573,9 @@ with st.sidebar:
     SELL_TAX = st.number_input("卖出税费(%)", min_value=0.0, value=0.05, step=0.01)
     PROTECTION_TRIGGER = st.number_input("保护止损触发浮盈(%)", min_value=1.0, value=10.0, step=1.0)
     PROTECTION_BUFFER = st.number_input("保护止损原始价高于成本(%)", min_value=0.0, value=0.30, step=0.10)
-    EXIT_NON_FOLLOW_T2 = st.checkbox(
-        "T+1未延续时T+2开盘提前退出（独立对照）",
-        value=False,
-        help=(
-            "第一轮建议保持关闭，先测试新入选条件；"
-            "第二轮只打开此项，检验提前退出是否降低亏损。"
-        ),
+    st.caption(
+        "T+1是否延续只保留为诊断字段，不触发提前卖出；"
+        "历史对照显示强制T+2退出会误杀后续大幅盈利股。"
     )
 
     RESUME_CHECKPOINT = st.checkbox("开启参数隔离的断点续传", value=True)
@@ -2663,7 +2662,6 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
             "sell_tax": SELL_TAX,
             "protection_trigger": PROTECTION_TRIGGER,
             "protection_buffer": PROTECTION_BUFFER,
-            "exit_non_follow_t2": bool(EXIT_NON_FOLLOW_T2),
             "initial_capital": INITIAL_CAPITAL,
             "max_positions": MAX_PORTFOLIO_POSITIONS,
             "position_budget": POSITION_BUDGET,
@@ -2738,7 +2736,6 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
                 enable_market_filter=bool(ENABLE_MARKET_FILTER),
                 protection_trigger_pct=float(PROTECTION_TRIGGER),
                 protection_buffer_pct=float(PROTECTION_BUFFER),
-                exit_non_follow_t2=bool(EXIT_NON_FOLLOW_T2),
                 use_sina=use_sina,
             )
             results_store = replace_trade_date_records(
@@ -2870,30 +2867,30 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
 
             export_csv = all_results.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
-                "📥 下载V40.2周线质量优先轨迹CSV",
+                "📥 下载V40.3周线C级剔除轨迹CSV",
                 export_csv,
-                f"export_v40_2_{config_hash}.csv",
+                f"export_v40_3_{config_hash}.csv",
                 "text/csv",
             )
             if not portfolio_curve.empty:
                 st.download_button(
-                    "📥 下载V40.2主组合每日权益CSV",
+                    "📥 下载V40.3主组合每日权益CSV",
                     portfolio_curve.to_csv(index=False).encode("utf-8-sig"),
-                    f"portfolio_curve_v40_2_{config_hash}.csv",
+                    f"portfolio_curve_v40_3_{config_hash}.csv",
                     "text/csv",
                 )
             if not portfolio_ledger.empty:
                 st.download_button(
-                    "📥 下载V40.2主组合成交账本CSV",
+                    "📥 下载V40.3主组合成交账本CSV",
                     portfolio_ledger.to_csv(index=False).encode("utf-8-sig"),
-                    f"portfolio_ledger_v40_2_{config_hash}.csv",
+                    f"portfolio_ledger_v40_3_{config_hash}.csv",
                     "text/csv",
                 )
             if not portfolio_orders.empty:
                 st.download_button(
-                    "📥 下载V40.2信号执行审计CSV",
+                    "📥 下载V40.3信号执行审计CSV",
                     portfolio_orders.to_csv(index=False).encode("utf-8-sig"),
-                    f"portfolio_orders_v40_2_{config_hash}.csv",
+                    f"portfolio_orders_v40_3_{config_hash}.csv",
                     "text/csv",
                 )
         else:
@@ -2906,17 +2903,17 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
         if not all_candidates_export.empty:
             candidate_csv = all_candidates_export.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
-                "📥 下载V40.2全部核心候选及诊断CSV",
+                "📥 下载V40.3全部核心候选及诊断CSV",
                 candidate_csv,
-                f"candidates_v40_2_{config_hash}.csv",
+                f"candidates_v40_3_{config_hash}.csv",
                 "text/csv",
             )
         if not funnel_df.empty:
             funnel_csv = funnel_df.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
-                "📥 下载V40.2逐日筛选漏斗CSV",
+                "📥 下载V40.3逐日筛选漏斗CSV",
                 funnel_csv,
-                f"funnel_v40_2_{config_hash}.csv",
+                f"funnel_v40_3_{config_hash}.csv",
                 "text/csv",
             )
 
