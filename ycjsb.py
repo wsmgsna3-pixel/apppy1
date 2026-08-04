@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-周线波浪选股 V41.0 · 每日临时周MACD版
+周线波浪选股 V41.1 · 断点续传缓存增强版
 ============================================================
 核心原则
 1. 每个交易日收盘后运行；周一至周四使用截至当日的临时周K，周五使用完整周K。
@@ -10,6 +10,7 @@
 4. 不再使用82/80/78评分门槛；日线质量只用于同日候选排序，不决定准入。
 5. D0收盘产生信号，D1开盘成交；D1买入当天禁止卖出，最早D2执行止损。
 6. 股票池、历史行业成分、复权、交易成本、组合约束、候选审计和回测报表继续保留。
+7. 行情按交易日分片原子保存；网络中断后只补缺失日期，不再重下已成功日期。
 
 说明
 - 本程序用于研究和回测，不构成投资建议。
@@ -19,11 +20,11 @@
 
 from __future__ import annotations
 
-import concurrent.futures
 import hashlib
 import json
 import os
 import pickle
+import shutil
 import time
 import traceback
 import warnings
@@ -37,10 +38,13 @@ import tushare as ts
 
 warnings.filterwarnings("ignore")
 
-VERSION = "V41.0"
-# 行情结构与V39.7兼容，沿用原缓存可避免重新下载数百个交易日。
-CACHE_FILE_NAME = "market_data_cache_v39_7.pkl"
-MAX_FETCH_WORKERS = 1  # 避免触发Tushare频率限制
+VERSION = "V41.1"
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+# 每个交易日一个独立缓存分片；路径固定在代码旁，避免启动目录变化导致“缓存消失”。
+CACHE_DIR = os.path.join(APP_DIR, "market_cache_v41_1")
+CACHE_SHARD_PREFIX = "market_"
+LEGACY_CACHE_BASENAME = "market_data_cache_v39_7.pkl"
+TUSHARE_REQUEST_TIMEOUT_SECONDS = 20
 
 pro = None
 GLOBAL_ADJ_FACTOR = pd.DataFrame()
@@ -502,70 +506,196 @@ def standardize_market_frames(daily: pd.DataFrame, adj: pd.DataFrame):
     return daily, adj
 
 
+def market_frame_dates(frame: pd.DataFrame) -> set[str]:
+    if frame is None or frame.empty or not isinstance(frame.index, pd.MultiIndex):
+        return set()
+    try:
+        return set(frame.index.get_level_values("trade_date").astype(str))
+    except Exception:
+        return set()
+
+
+def filter_market_dates(frame: pd.DataFrame, required: set[str]) -> pd.DataFrame:
+    if frame is None or frame.empty or not isinstance(frame.index, pd.MultiIndex):
+        return pd.DataFrame()
+    mask = frame.index.get_level_values("trade_date").astype(str).isin(required)
+    return frame.loc[mask].copy()
+
+
+def merge_market_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
+    usable = [frame for frame in frames if frame is not None and not frame.empty]
+    if not usable:
+        return pd.DataFrame()
+    merged = pd.concat(usable)
+    return merged[~merged.index.duplicated(keep="last")].sort_index()
+
+
+def cache_shard_path(trade_date: str) -> str:
+    return os.path.join(CACHE_DIR, f"{CACHE_SHARD_PREFIX}{trade_date}.pkl")
+
+
+def atomic_write_pickle(payload: dict, path: str) -> None:
+    """先完整写入临时文件，再原子替换正式缓存，避免中断损坏旧文件。"""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temp_path = f"{path}.{os.getpid()}.{time.time_ns()}.tmp"
+    try:
+        with open(temp_path, "wb") as file:
+            pickle.dump(payload, file, protocol=pickle.HIGHEST_PROTOCOL)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+
+def save_market_cache_shard(
+    trade_date: str,
+    daily: pd.DataFrame,
+    adj: pd.DataFrame,
+) -> None:
+    daily_dates = market_frame_dates(daily)
+    adj_dates = market_frame_dates(adj)
+    if trade_date not in daily_dates or trade_date not in adj_dates:
+        raise ValueError(f"{trade_date} 日行情或复权因子不完整，拒绝写入缓存")
+    atomic_write_pickle(
+        {
+            "version": VERSION,
+            "trade_date": trade_date,
+            "saved_at": datetime.now().isoformat(),
+            "daily": daily,
+            "adj": adj,
+        },
+        cache_shard_path(trade_date),
+    )
+
+
+def load_market_cache_shards(required_dates: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    daily_frames: list[pd.DataFrame] = []
+    adj_frames: list[pd.DataFrame] = []
+    for trade_date in required_dates:
+        path = cache_shard_path(trade_date)
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "rb") as file:
+                payload = pickle.load(file)
+            daily = payload.get("daily", pd.DataFrame())
+            adj = payload.get("adj", pd.DataFrame())
+            if not isinstance(daily.index, pd.MultiIndex) or not isinstance(adj.index, pd.MultiIndex):
+                daily, adj = standardize_market_frames(daily, adj)
+            if trade_date not in market_frame_dates(daily) or trade_date not in market_frame_dates(adj):
+                raise ValueError("分片日期与内容不一致")
+            daily_frames.append(filter_market_dates(daily, {trade_date}))
+            adj_frames.append(filter_market_dates(adj, {trade_date}))
+        except Exception as exc:
+            record_api_error(f"缓存分片 {os.path.basename(path)} 损坏，将重新下载: {exc}")
+    return merge_market_frames(daily_frames), merge_market_frames(adj_frames)
+
+
+def legacy_cache_paths() -> list[str]:
+    candidates = [
+        os.path.join(APP_DIR, LEGACY_CACHE_BASENAME),
+        os.path.join(os.getcwd(), LEGACY_CACHE_BASENAME),
+    ]
+    result = []
+    for path in candidates:
+        normalized = os.path.abspath(path)
+        if normalized not in result:
+            result.append(normalized)
+    return result
+
+
+def load_legacy_market_cache(required: set[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """兼容V39.7/V40/V41.0单文件缓存，避免升级后重新下载。"""
+    for path in legacy_cache_paths():
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "rb") as file:
+                cached = pickle.load(file)
+            daily = cached.get("daily", pd.DataFrame())
+            adj = cached.get("adj", pd.DataFrame())
+            if not isinstance(daily.index, pd.MultiIndex) or not isinstance(adj.index, pd.MultiIndex):
+                daily, adj = standardize_market_frames(daily, adj)
+            daily = filter_market_dates(daily, required)
+            adj = filter_market_dates(adj, required)
+            return daily, adj
+        except Exception as exc:
+            record_api_error(f"旧缓存 {path} 读取失败，忽略并使用分片缓存: {exc}")
+    return pd.DataFrame(), pd.DataFrame()
+
+
+def clear_all_market_caches() -> list[str]:
+    removed: list[str] = []
+    if os.path.isdir(CACHE_DIR):
+        shutil.rmtree(CACHE_DIR)
+        removed.append(CACHE_DIR)
+    for path in legacy_cache_paths():
+        if os.path.isfile(path):
+            os.remove(path)
+            removed.append(path)
+    return removed
+
+
 def load_market_data(required_dates: list[str], use_cache: bool = True) -> None:
     global GLOBAL_ADJ_FACTOR, GLOBAL_DAILY_RAW, GLOBAL_QFQ_BASE_FACTORS
 
+    required_dates = sorted({normalize_date(date) for date in required_dates if normalize_date(date)})
+    required_set = set(required_dates)
     cached_daily = pd.DataFrame()
     cached_adj = pd.DataFrame()
-    if use_cache and os.path.exists(CACHE_FILE_NAME):
-        try:
-            with open(CACHE_FILE_NAME, "rb") as file:
-                cached = pickle.load(file)
-            cached_daily = cached.get("daily", pd.DataFrame())
-            cached_adj = cached.get("adj", pd.DataFrame())
-            if not isinstance(cached_daily.index, pd.MultiIndex):
-                cached_daily, cached_adj = standardize_market_frames(cached_daily, cached_adj)
-        except Exception as exc:
-            record_api_error(f"旧缓存读取失败，将重新下载: {exc}")
-            cached_daily = pd.DataFrame()
-            cached_adj = pd.DataFrame()
+    if use_cache:
+        legacy_daily, legacy_adj = load_legacy_market_cache(required_set)
+        shard_daily, shard_adj = load_market_cache_shards(required_dates)
+        cached_daily = merge_market_frames([legacy_daily, shard_daily])
+        cached_adj = merge_market_frames([legacy_adj, shard_adj])
 
-    cached_dates = set()
-    if not cached_daily.empty and isinstance(cached_daily.index, pd.MultiIndex):
-        cached_dates = set(cached_daily.index.get_level_values("trade_date").astype(str))
-    missing_dates = [d for d in required_dates if d not in cached_dates]
+    # 只有日行情和复权因子同时存在，才算该交易日缓存完整。
+    cached_dates = market_frame_dates(cached_daily) & market_frame_dates(cached_adj)
+    missing_dates = [date for date in required_dates if date not in cached_dates]
+    if use_cache:
+        st.caption(
+            f"行情缓存：命中 {len(cached_dates)} 个交易日，待下载 {len(missing_dates)} 个；"
+            f"缓存目录：{CACHE_DIR}"
+        )
 
-    new_daily_frames = []
-    new_adj_frames = []
-    failed_dates = []
+    new_daily_frames: list[pd.DataFrame] = []
+    new_adj_frames: list[pd.DataFrame] = []
+    failed_dates: list[str] = []
     if missing_dates:
         progress = st.progress(0, text="正在增量下载行情和复权因子...")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_FETCH_WORKERS) as executor:
-            futures = {executor.submit(fetch_daily_bundle, d): d for d in missing_dates}
-            for i, future in enumerate(concurrent.futures.as_completed(futures)):
-                date = futures[future]
-                try:
-                    _, daily, adj = future.result()
-                    if daily.empty or adj.empty:
-                        failed_dates.append(date)
-                    else:
-                        new_daily_frames.append(daily)
-                        new_adj_frames.append(adj)
-                except Exception as exc:
-                    failed_dates.append(date)
-                    record_api_error(f"下载交易日 {date} 失败: {exc}")
-                progress.progress((i + 1) / len(missing_dates), text=f"行情下载 {i+1}/{len(missing_dates)}")
+        # 单线程顺序下载以遵守Tushare频率限制；每成功一天立即原子落盘。
+        for i, trade_date in enumerate(missing_dates):
+            try:
+                _, daily_raw, adj_raw = fetch_daily_bundle(trade_date)
+                if daily_raw.empty or adj_raw.empty:
+                    failed_dates.append(trade_date)
+                else:
+                    daily, adj = standardize_market_frames(daily_raw, adj_raw)
+                    if trade_date not in market_frame_dates(daily) or trade_date not in market_frame_dates(adj):
+                        raise ValueError("接口返回日期不完整")
+                    new_daily_frames.append(daily)
+                    new_adj_frames.append(adj)
+                    if use_cache:
+                        save_market_cache_shard(trade_date, daily, adj)
+            except Exception as exc:
+                failed_dates.append(trade_date)
+                record_api_error(f"下载交易日 {trade_date} 失败: {exc}")
+            progress.progress(
+                (i + 1) / len(missing_dates),
+                text=(
+                    f"行情下载 {i+1}/{len(missing_dates)}；"
+                    f"已缓存成功 {i+1-len(failed_dates)}，失败 {len(failed_dates)}"
+                ),
+            )
         progress.empty()
 
-    new_daily = pd.concat(new_daily_frames, ignore_index=True) if new_daily_frames else pd.DataFrame()
-    new_adj = pd.concat(new_adj_frames, ignore_index=True) if new_adj_frames else pd.DataFrame()
-    new_daily, new_adj = standardize_market_frames(new_daily, new_adj)
-
-    if cached_daily.empty:
-        GLOBAL_DAILY_RAW = new_daily
-    elif new_daily.empty:
-        GLOBAL_DAILY_RAW = cached_daily
-    else:
-        GLOBAL_DAILY_RAW = pd.concat([cached_daily, new_daily])
-        GLOBAL_DAILY_RAW = GLOBAL_DAILY_RAW[~GLOBAL_DAILY_RAW.index.duplicated(keep="last")].sort_index()
-
-    if cached_adj.empty:
-        GLOBAL_ADJ_FACTOR = new_adj
-    elif new_adj.empty:
-        GLOBAL_ADJ_FACTOR = cached_adj
-    else:
-        GLOBAL_ADJ_FACTOR = pd.concat([cached_adj, new_adj])
-        GLOBAL_ADJ_FACTOR = GLOBAL_ADJ_FACTOR[~GLOBAL_ADJ_FACTOR.index.duplicated(keep="last")].sort_index()
+    GLOBAL_DAILY_RAW = merge_market_frames([cached_daily, *new_daily_frames])
+    GLOBAL_ADJ_FACTOR = merge_market_frames([cached_adj, *new_adj_frames])
 
     if GLOBAL_DAILY_RAW.empty or GLOBAL_ADJ_FACTOR.empty:
         raise RuntimeError("行情或复权数据为空，无法回测")
@@ -576,22 +706,11 @@ def load_market_data(required_dates: list[str], use_cache: bool = True) -> None:
         adj_reset.groupby("ts_code", sort=False).tail(1).set_index("ts_code")["adj_factor"].to_dict()
     )
 
-    try:
-        with open(CACHE_FILE_NAME, "wb") as file:
-            pickle.dump(
-                {
-                    "version": VERSION,
-                    "saved_at": datetime.now().isoformat(),
-                    "daily": GLOBAL_DAILY_RAW,
-                    "adj": GLOBAL_ADJ_FACTOR,
-                },
-                file,
-            )
-    except Exception as exc:
-        record_api_error(f"缓存保存失败: {exc}")
-
     if failed_dates:
-        st.warning(f"有 {len(failed_dates)} 个交易日下载失败；示例: {failed_dates[:8]}")
+        st.warning(
+            f"有 {len(failed_dates)} 个交易日下载失败；示例: {failed_dates[:8]}。"
+            "已成功日期已经保存，下次运行只会补失败日期。"
+        )
 
 
 def load_benchmark(start_date: str, end_date: str) -> None:
@@ -2750,11 +2869,14 @@ with st.sidebar:
     )
 
     RESUME_CHECKPOINT = st.checkbox("开启参数隔离的断点续传", value=True)
-    USE_CACHE = st.checkbox("使用并增量更新行情缓存", value=True)
-    if st.button("清除V39.7/V39.9/V40.x共享行情缓存"):
-        if os.path.exists(CACHE_FILE_NAME):
-            os.remove(CACHE_FILE_NAME)
-            st.success("缓存已清除")
+    USE_CACHE = st.checkbox("使用断点续传行情缓存", value=True)
+    st.caption("每成功下载一个交易日就立即原子保存；中断后只补缺失日期。")
+    if st.button("清除全部行情缓存（含旧版单文件缓存）"):
+        removed_paths = clear_all_market_caches()
+        if removed_paths:
+            st.success(f"已清除 {len(removed_paths)} 个缓存位置")
+        else:
+            st.info("没有找到可清除的行情缓存")
 
 
 TS_TOKEN = st.text_input("Tushare Token", type="password")
@@ -2763,6 +2885,11 @@ if not TS_TOKEN:
     st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
+try:
+    # Tushare官方DataApi内部使用requests超时；显式设定，避免网络波动时长时间等待。
+    setattr(pro, "_DataApi__timeout", TUSHARE_REQUEST_TIMEOUT_SECONDS)
+except Exception as exc:
+    record_api_error(f"无法设置Tushare请求超时，将使用SDK默认值: {exc}")
 
 
 if st.button(f"🚀 启动 {VERSION} 周线波浪回测"):
@@ -3070,34 +3197,34 @@ if st.button(f"🚀 启动 {VERSION} 周线波浪回测"):
             st.download_button(
                 "📥 下载V41周线策略总览CSV",
                 mode_comparison.to_csv(index=False).encode("utf-8-sig"),
-                f"weekly_summary_v41_0_{config_hash}.csv",
+                f"weekly_summary_v41_1_{config_hash}.csv",
                 "text/csv",
             )
             st.download_button(
                 "📥 下载V41全部入选轨迹CSV",
                 all_results.to_csv(index=False).encode("utf-8-sig"),
-                f"weekly_signals_v41_0_{config_hash}.csv",
+                f"weekly_signals_v41_1_{config_hash}.csv",
                 "text/csv",
             )
             if not portfolio_curve.empty:
                 st.download_button(
                     "📥 下载V41组合每日权益CSV",
                     portfolio_curve.to_csv(index=False).encode("utf-8-sig"),
-                    f"portfolio_curve_v41_0_{config_hash}.csv",
+                    f"portfolio_curve_v41_1_{config_hash}.csv",
                     "text/csv",
                 )
             if not portfolio_ledger.empty:
                 st.download_button(
                     "📥 下载V41组合成交账本CSV",
                     portfolio_ledger.to_csv(index=False).encode("utf-8-sig"),
-                    f"portfolio_ledger_v41_0_{config_hash}.csv",
+                    f"portfolio_ledger_v41_1_{config_hash}.csv",
                     "text/csv",
                 )
             if not portfolio_orders.empty:
                 st.download_button(
                     "📥 下载V41信号执行审计CSV",
                     portfolio_orders.to_csv(index=False).encode("utf-8-sig"),
-                    f"portfolio_orders_v41_0_{config_hash}.csv",
+                    f"portfolio_orders_v41_1_{config_hash}.csv",
                     "text/csv",
                 )
         else:
@@ -3108,7 +3235,7 @@ if st.button(f"🚀 启动 {VERSION} 周线波浪回测"):
             st.download_button(
                 "📥 下载V41全部核心候选诊断CSV",
                 candidate_csv,
-                f"candidates_v41_0_{config_hash}.csv",
+                f"candidates_v41_1_{config_hash}.csv",
                 "text/csv",
             )
         if not funnel_df.empty:
@@ -3116,7 +3243,7 @@ if st.button(f"🚀 启动 {VERSION} 周线波浪回测"):
             st.download_button(
                 "📥 下载V41逐日筛选漏斗CSV",
                 funnel_csv,
-                f"funnel_v41_0_{config_hash}.csv",
+                f"funnel_v41_1_{config_hash}.csv",
                 "text/csv",
             )
 
