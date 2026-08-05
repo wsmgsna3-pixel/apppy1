@@ -1,19 +1,46 @@
 # -*- coding: utf-8 -*-
 """
-周线波浪选股 V41.3 · 三仓位周线质量对照版
+选股王 V40.4 · 评分四模式诊断版
 ============================================================
-核心原则
-1. 每个交易日收盘后运行；周一至周四使用截至当日的临时周K，周五使用完整周K。
-2. 周线是硬准入：只选“绿柱连续两周缩短”或“本周第一根红柱”；可选第二根红柱。
-3. 日线只负责触发：收盘站上MA20、突破此前5日高点、量能不低于此前5日均量、
-   日MACD同步改善且收阳线。
-4. 不再使用82/80/78评分门槛；日线质量只用于同日候选排序，不决定准入。
-5. D0收盘产生信号，D1开盘成交；D1买入当天禁止卖出，最早D2执行止损。
-6. 股票池、历史行业成分、复权、交易成本、组合约束、候选审计和回测报表继续保留。
-7. 行情按交易日分片原子保存；网络中断后只补缺失日期，不再重下已成功日期。
-8. 恢复V40.4的轻量执行理念：先做T+1成交确认和TopK，再只为入选股计算完整未来轨迹。
-9. 全市场交易日索引只构建一次；周线退出序列每只入选股只计算一次。
-10. 原“周线主导”排序保持不变，新增“周线质量参考”并行模式；两种模式分别按最多3只持仓回测。
+主要变化
+1. 股票池：主板/创业板/科创板，明确剔除北交所；保留流通市值200~1000亿元参数。
+2. 科技池：使用申万2021 L2/L3历史成分，不再只用六个过粗的L1行业。
+3. 概念池：THS科技概念仅作为可选的实时雷达补充；历史回测默认关闭，避免未来信息。
+4. 信号：核心条件为硬门槛，其余条件改为质量评分，减少多个AND条件造成的误杀。
+5. 排名：取消对单日涨幅的线性追涨奖励，增加突破质量、量能、K线、MACD、相对强度评分。
+6. 风控：使用信号低点/MA20/ATR构造结构止损，并保留最大风险上限。
+7. 成交：T+1开盘买入，加入滑点、佣金和卖出税费；过滤真正的一字涨停与过度高开。
+8. 统计：退出收益向后延续，另设Eligible/Held字段，修复周度幸存者偏差。
+9. 数据：缓存检查日期覆盖并增量补齐；行业/API失败不再静默放行。
+10. 诊断：输出逐日筛选漏斗、退出周、持仓天数、MFE/MAE等字段。
+11. 门槛：当天80分以上核心信号达到4只时门槛为80分，否则提高到82分，但不禁止开仓。
+12. 环境：取消创业板指/科创50的一刀切暂停开仓，避免误杀弱市中的强势股。
+13. 保本：浮盈首次达到10%后，从下一交易日启用成本上方0.3%的保护止损。
+14. 审计：另行导出全部核心候选及未入选原因，便于核查质量门槛。
+15. 固化：股价不低于20元、流通市值200~1000亿元、关闭大盘硬过滤。
+16. 广度：T+1成交检查后可交易股票少于2只时，全部仅观察而不开仓。
+17. 组合：30万元初始资金、最多3只持仓、单只约10万元，输出组合曲线与真实空仓率。
+18. 断点：改用主键去重和原子覆盖保存，防止续跑时重复记录。
+19. 周线波浪：仅用已完成周K计算周线MACD，标记绿柱缩短、首次翻红、
+    红柱扩张/再加速/衰减和绿柱弱势，本版只诊断、不改变入选与买卖。
+20. 假反弹：记录T+1收盘是否延续，并将“10个交易日内结构止损且最大浮盈
+    不足5%”标记为早期假反弹，用于检验周线波浪假设。
+21. 双周线：W_字段只用完成周K；P_W_字段使用截至信号日收盘的当周临时K线，
+    两者并列导出，既防止把未来周五数据泄漏到回测，又能观察“本周正在翻红”。
+22. 替代入场：主组合仍保持T+1开盘买入；另行诊断T+1收盘延续后T+2开盘买入，
+    以及50% T+1 + 50% T+2的近似分批收益，不影响主组合权益。
+23. 质量平衡：固定82分底线，默认要求信号日涨幅≥3%、高于日MA20≥3%、
+    信号日临时周线偏离MA20≤35%，优先G2绿柱缩短和R1首周翻红。
+24. 热点保留：不限制每日新开仓数，不限制同一申万二级行业持仓；
+    仍允许热点板块联动时同日买入多只，总持仓上限3只不变。
+25. C级剔除：G1绿柱连续缩短、R5红柱衰减在评分和成交前硬剔除；
+    不再仅靠降排名处理，直接减少历史上止损率偏高的弱阶段入选。
+26. 退出还原：取消“T+1未延续时T+2开盘退出”；T+1跟随仅保留诊断，
+    G2/R1/B阶段继续使用原结构止损、成本保护和移动止盈规则。
+27. 评分诊断：同一批核心候选一次性计算完整未来轨迹，同时比较固定82分、
+    固定80分、固定78分和不设固定分数（评分仅排序）四种准入模式。
+28. 公平对照：四种模式共用股票池、T+1成交、TopK、至少2只确认、退出规则
+    和30万元三仓组合；只改变评分准入，避免混入其他变量。
 
 说明
 - 本程序用于研究和回测，不构成投资建议。
@@ -23,11 +50,11 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import json
 import os
 import pickle
-import shutil
 import time
 import traceback
 import warnings
@@ -41,13 +68,10 @@ import tushare as ts
 
 warnings.filterwarnings("ignore")
 
-VERSION = "V41.3"
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-# 每个交易日一个独立缓存分片；路径固定在代码旁，避免启动目录变化导致“缓存消失”。
-CACHE_DIR = os.path.join(APP_DIR, "market_cache_v41_1")
-CACHE_SHARD_PREFIX = "market_"
-LEGACY_CACHE_BASENAME = "market_data_cache_v39_7.pkl"
-TUSHARE_REQUEST_TIMEOUT_SECONDS = 20
+VERSION = "V40.4"
+# 行情结构与V39.7兼容，沿用原缓存可避免重新下载数百个交易日。
+CACHE_FILE_NAME = "market_data_cache_v39_7.pkl"
+MAX_FETCH_WORKERS = 1  # 避免触发Tushare频率限制
 
 pro = None
 GLOBAL_ADJ_FACTOR = pd.DataFrame()
@@ -58,35 +82,43 @@ GLOBAL_TECH_PERIODS: dict[str, list[dict]] = {}
 GLOBAL_THS_TECH_CODES: set[str] = set()
 GLOBAL_BENCHMARK = pd.DataFrame()
 GLOBAL_REGIME_INDICES: dict[str, pd.DataFrame] = {}
-GLOBAL_MARKET_DATES: list[str] = []
-GLOBAL_NEXT_MARKET_DATE: dict[str, str] = {}
 API_ERRORS: list[str] = []
 SINA_STATUS = {"success": 0, "fail": 0}
 
-# 股票池基准参数。
+# 经多轮A/B回测确认后固化的基准参数。
 FIXED_MIN_PRICE = 20.0
 FIXED_MIN_MV = 200.0
 FIXED_MAX_MV = 1000.0
 FIXED_MARKET_FILTER = False
-MIN_TRADABLE_SIGNALS = 1
+MIN_TRADABLE_SIGNALS = 2
 
-# 两种模式使用相同准入、触发、成交和退出规则，只比较同日候选排序。
+# V40.4四模式共用的单股质量默认值。
+DEFAULT_MIN_DAY_GAIN_PCT = 3.0
+DEFAULT_MIN_DAILY_BIAS_PCT = 3.0
+DEFAULT_MAX_WEEKLY_BIAS_PCT = 35.0
+DEFAULT_FIXED_SCORE_FLOOR = 82.0
+
+# 四种评分准入模式。None表示评分不再一票否决，只用于同日排序。
 SCORE_MODES = (
-    ("周线主导", "Mode_Weekly", None),
-    ("周线质量参考", "Mode_Quality", None),
+    ("82分", "Mode_82", 82.0),
+    ("80分", "Mode_80", 80.0),
+    ("78分", "Mode_78", 78.0),
+    ("仅排名", "Mode_RankOnly", None),
 )
 SCORE_MODE_LABELS = tuple(item[0] for item in SCORE_MODES)
 
-QUALITY_RANKING_METHOD = (
-    "已完成周线趋势确认→周MA20斜率分层→临时周线趋势确认→过热项少→"
-    "适度强势项多→非回踩型→同业候选数→原排序"
-)
+# G1/R5为V40.2实证中的C级弱阶段，先硬剔除；其余阶段只改变同日优先顺序。
+EXCLUDED_PROVISIONAL_STAGES = {
+    "G1_绿柱连续缩短",
+    "R5_红柱衰减",
+}
 
 STAGE_PRIORITY = {
-    "R1_首周翻红": (0, "A1_本周首次翻红"),
-    "G1_绿柱连续缩短": (1, "A2_绿柱连续缩短"),
-    "R2_第二根红柱扩张": (2, "B1_第二根红柱"),
-    "G2_绿柱缩短": (3, "B2_单周绿柱缩短"),
+    "G2_绿柱缩短": (0, "A1_G2绿柱缩短"),
+    "R1_首周翻红": (1, "A2_R1首周翻红"),
+    "G3_绿柱扩大/弱势": (2, "B_中性阶段"),
+    "R3_红柱再加速": (2, "B_中性阶段"),
+    "R4_红柱扩张": (2, "B_中性阶段"),
 }
 
 # 真实组合约束。
@@ -154,8 +186,8 @@ DEFAULT_THS_KEYWORDS = (
 # -----------------------------------------------------------------------------
 # 页面
 # -----------------------------------------------------------------------------
-st.set_page_config(page_title=f"周线波浪选股 {VERSION}", layout="wide")
-st.title(f"周线波浪选股 {VERSION}：每日临时周MACD × 日线触发")
+st.set_page_config(page_title=f"选股王 {VERSION} 评分四模式诊断版", layout="wide")
+st.title(f"选股王 {VERSION}：82 / 80 / 78 / 仅排名公平对照")
 
 
 # -----------------------------------------------------------------------------
@@ -519,207 +551,73 @@ def standardize_market_frames(daily: pd.DataFrame, adj: pd.DataFrame):
     return daily, adj
 
 
-def market_frame_dates(frame: pd.DataFrame) -> set[str]:
-    if frame is None or frame.empty or not isinstance(frame.index, pd.MultiIndex):
-        return set()
-    try:
-        return set(frame.index.get_level_values("trade_date").astype(str))
-    except Exception:
-        return set()
-
-
-def filter_market_dates(frame: pd.DataFrame, required: set[str]) -> pd.DataFrame:
-    if frame is None or frame.empty or not isinstance(frame.index, pd.MultiIndex):
-        return pd.DataFrame()
-    mask = frame.index.get_level_values("trade_date").astype(str).isin(required)
-    return frame.loc[mask].copy()
-
-
-def merge_market_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
-    usable = [frame for frame in frames if frame is not None and not frame.empty]
-    if not usable:
-        return pd.DataFrame()
-    merged = pd.concat(usable)
-    return merged[~merged.index.duplicated(keep="last")].sort_index()
-
-
-def cache_shard_path(trade_date: str) -> str:
-    return os.path.join(CACHE_DIR, f"{CACHE_SHARD_PREFIX}{trade_date}.pkl")
-
-
-def atomic_write_pickle(payload: dict, path: str) -> None:
-    """先完整写入临时文件，再原子替换正式缓存，避免中断损坏旧文件。"""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    temp_path = f"{path}.{os.getpid()}.{time.time_ns()}.tmp"
-    try:
-        with open(temp_path, "wb") as file:
-            pickle.dump(payload, file, protocol=pickle.HIGHEST_PROTOCOL)
-            file.flush()
-            os.fsync(file.fileno())
-        os.replace(temp_path, path)
-    finally:
-        if os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except OSError:
-                pass
-
-
-def save_market_cache_shard(
-    trade_date: str,
-    daily: pd.DataFrame,
-    adj: pd.DataFrame,
-) -> None:
-    daily_dates = market_frame_dates(daily)
-    adj_dates = market_frame_dates(adj)
-    if trade_date not in daily_dates or trade_date not in adj_dates:
-        raise ValueError(f"{trade_date} 日行情或复权因子不完整，拒绝写入缓存")
-    atomic_write_pickle(
-        {
-            "version": VERSION,
-            "trade_date": trade_date,
-            "saved_at": datetime.now().isoformat(),
-            "daily": daily,
-            "adj": adj,
-        },
-        cache_shard_path(trade_date),
-    )
-
-
-def load_market_cache_shards(required_dates: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    daily_frames: list[pd.DataFrame] = []
-    adj_frames: list[pd.DataFrame] = []
-    for trade_date in required_dates:
-        path = cache_shard_path(trade_date)
-        if not os.path.exists(path):
-            continue
-        try:
-            with open(path, "rb") as file:
-                payload = pickle.load(file)
-            daily = payload.get("daily", pd.DataFrame())
-            adj = payload.get("adj", pd.DataFrame())
-            if not isinstance(daily.index, pd.MultiIndex) or not isinstance(adj.index, pd.MultiIndex):
-                daily, adj = standardize_market_frames(daily, adj)
-            if trade_date not in market_frame_dates(daily) or trade_date not in market_frame_dates(adj):
-                raise ValueError("分片日期与内容不一致")
-            daily_frames.append(filter_market_dates(daily, {trade_date}))
-            adj_frames.append(filter_market_dates(adj, {trade_date}))
-        except Exception as exc:
-            record_api_error(f"缓存分片 {os.path.basename(path)} 损坏，将重新下载: {exc}")
-    return merge_market_frames(daily_frames), merge_market_frames(adj_frames)
-
-
-def legacy_cache_paths() -> list[str]:
-    candidates = [
-        os.path.join(APP_DIR, LEGACY_CACHE_BASENAME),
-        os.path.join(os.getcwd(), LEGACY_CACHE_BASENAME),
-    ]
-    result = []
-    for path in candidates:
-        normalized = os.path.abspath(path)
-        if normalized not in result:
-            result.append(normalized)
-    return result
-
-
-def load_legacy_market_cache(required: set[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """兼容V39.7/V40/V41.0单文件缓存，避免升级后重新下载。"""
-    for path in legacy_cache_paths():
-        if not os.path.exists(path):
-            continue
-        try:
-            with open(path, "rb") as file:
-                cached = pickle.load(file)
-            daily = cached.get("daily", pd.DataFrame())
-            adj = cached.get("adj", pd.DataFrame())
-            if not isinstance(daily.index, pd.MultiIndex) or not isinstance(adj.index, pd.MultiIndex):
-                daily, adj = standardize_market_frames(daily, adj)
-            daily = filter_market_dates(daily, required)
-            adj = filter_market_dates(adj, required)
-            return daily, adj
-        except Exception as exc:
-            record_api_error(f"旧缓存 {path} 读取失败，忽略并使用分片缓存: {exc}")
-    return pd.DataFrame(), pd.DataFrame()
-
-
-def clear_all_market_caches() -> list[str]:
-    removed: list[str] = []
-    if os.path.isdir(CACHE_DIR):
-        shutil.rmtree(CACHE_DIR)
-        removed.append(CACHE_DIR)
-    for path in legacy_cache_paths():
-        if os.path.isfile(path):
-            os.remove(path)
-            removed.append(path)
-    return removed
-
-
 def load_market_data(required_dates: list[str], use_cache: bool = True) -> None:
     global GLOBAL_ADJ_FACTOR, GLOBAL_DAILY_RAW, GLOBAL_QFQ_BASE_FACTORS
-    global GLOBAL_MARKET_DATES, GLOBAL_NEXT_MARKET_DATE
 
-    required_dates = sorted({normalize_date(date) for date in required_dates if normalize_date(date)})
-    required_set = set(required_dates)
     cached_daily = pd.DataFrame()
     cached_adj = pd.DataFrame()
-    if use_cache:
-        legacy_daily, legacy_adj = load_legacy_market_cache(required_set)
-        shard_daily, shard_adj = load_market_cache_shards(required_dates)
-        cached_daily = merge_market_frames([legacy_daily, shard_daily])
-        cached_adj = merge_market_frames([legacy_adj, shard_adj])
+    if use_cache and os.path.exists(CACHE_FILE_NAME):
+        try:
+            with open(CACHE_FILE_NAME, "rb") as file:
+                cached = pickle.load(file)
+            cached_daily = cached.get("daily", pd.DataFrame())
+            cached_adj = cached.get("adj", pd.DataFrame())
+            if not isinstance(cached_daily.index, pd.MultiIndex):
+                cached_daily, cached_adj = standardize_market_frames(cached_daily, cached_adj)
+        except Exception as exc:
+            record_api_error(f"旧缓存读取失败，将重新下载: {exc}")
+            cached_daily = pd.DataFrame()
+            cached_adj = pd.DataFrame()
 
-    # 只有日行情和复权因子同时存在，才算该交易日缓存完整。
-    cached_dates = market_frame_dates(cached_daily) & market_frame_dates(cached_adj)
-    missing_dates = [date for date in required_dates if date not in cached_dates]
-    if use_cache:
-        st.caption(
-            f"行情缓存：命中 {len(cached_dates)} 个交易日，待下载 {len(missing_dates)} 个；"
-            f"缓存目录：{CACHE_DIR}"
-        )
+    cached_dates = set()
+    if not cached_daily.empty and isinstance(cached_daily.index, pd.MultiIndex):
+        cached_dates = set(cached_daily.index.get_level_values("trade_date").astype(str))
+    missing_dates = [d for d in required_dates if d not in cached_dates]
 
-    new_daily_frames: list[pd.DataFrame] = []
-    new_adj_frames: list[pd.DataFrame] = []
-    failed_dates: list[str] = []
+    new_daily_frames = []
+    new_adj_frames = []
+    failed_dates = []
     if missing_dates:
         progress = st.progress(0, text="正在增量下载行情和复权因子...")
-        # 单线程顺序下载以遵守Tushare频率限制；每成功一天立即原子落盘。
-        for i, trade_date in enumerate(missing_dates):
-            try:
-                _, daily_raw, adj_raw = fetch_daily_bundle(trade_date)
-                if daily_raw.empty or adj_raw.empty:
-                    failed_dates.append(trade_date)
-                else:
-                    daily, adj = standardize_market_frames(daily_raw, adj_raw)
-                    if trade_date not in market_frame_dates(daily) or trade_date not in market_frame_dates(adj):
-                        raise ValueError("接口返回日期不完整")
-                    new_daily_frames.append(daily)
-                    new_adj_frames.append(adj)
-                    if use_cache:
-                        save_market_cache_shard(trade_date, daily, adj)
-            except Exception as exc:
-                failed_dates.append(trade_date)
-                record_api_error(f"下载交易日 {trade_date} 失败: {exc}")
-            progress.progress(
-                (i + 1) / len(missing_dates),
-                text=(
-                    f"行情下载 {i+1}/{len(missing_dates)}；"
-                    f"已缓存成功 {i+1-len(failed_dates)}，失败 {len(failed_dates)}"
-                ),
-            )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_FETCH_WORKERS) as executor:
+            futures = {executor.submit(fetch_daily_bundle, d): d for d in missing_dates}
+            for i, future in enumerate(concurrent.futures.as_completed(futures)):
+                date = futures[future]
+                try:
+                    _, daily, adj = future.result()
+                    if daily.empty or adj.empty:
+                        failed_dates.append(date)
+                    else:
+                        new_daily_frames.append(daily)
+                        new_adj_frames.append(adj)
+                except Exception as exc:
+                    failed_dates.append(date)
+                    record_api_error(f"下载交易日 {date} 失败: {exc}")
+                progress.progress((i + 1) / len(missing_dates), text=f"行情下载 {i+1}/{len(missing_dates)}")
         progress.empty()
 
-    GLOBAL_DAILY_RAW = merge_market_frames([cached_daily, *new_daily_frames])
-    GLOBAL_ADJ_FACTOR = merge_market_frames([cached_adj, *new_adj_frames])
+    new_daily = pd.concat(new_daily_frames, ignore_index=True) if new_daily_frames else pd.DataFrame()
+    new_adj = pd.concat(new_adj_frames, ignore_index=True) if new_adj_frames else pd.DataFrame()
+    new_daily, new_adj = standardize_market_frames(new_daily, new_adj)
+
+    if cached_daily.empty:
+        GLOBAL_DAILY_RAW = new_daily
+    elif new_daily.empty:
+        GLOBAL_DAILY_RAW = cached_daily
+    else:
+        GLOBAL_DAILY_RAW = pd.concat([cached_daily, new_daily])
+        GLOBAL_DAILY_RAW = GLOBAL_DAILY_RAW[~GLOBAL_DAILY_RAW.index.duplicated(keep="last")].sort_index()
+
+    if cached_adj.empty:
+        GLOBAL_ADJ_FACTOR = new_adj
+    elif new_adj.empty:
+        GLOBAL_ADJ_FACTOR = cached_adj
+    else:
+        GLOBAL_ADJ_FACTOR = pd.concat([cached_adj, new_adj])
+        GLOBAL_ADJ_FACTOR = GLOBAL_ADJ_FACTOR[~GLOBAL_ADJ_FACTOR.index.duplicated(keep="last")].sort_index()
 
     if GLOBAL_DAILY_RAW.empty or GLOBAL_ADJ_FACTOR.empty:
         raise RuntimeError("行情或复权数据为空，无法回测")
-
-    # 一次构建交易日索引。后续每个候选只做O(1)字典查询，不再扫描数百万行市场数据。
-    GLOBAL_MARKET_DATES = sorted(market_frame_dates(GLOBAL_DAILY_RAW))
-    GLOBAL_NEXT_MARKET_DATE = {
-        day: GLOBAL_MARKET_DATES[index + 1]
-        for index, day in enumerate(GLOBAL_MARKET_DATES[:-1])
-    }
 
     # 每只股票使用自身最后一个可用复权因子，避免要求所有股票在同一最新日期都有记录
     adj_reset = GLOBAL_ADJ_FACTOR.reset_index().sort_values(["ts_code", "trade_date"])
@@ -727,11 +625,22 @@ def load_market_data(required_dates: list[str], use_cache: bool = True) -> None:
         adj_reset.groupby("ts_code", sort=False).tail(1).set_index("ts_code")["adj_factor"].to_dict()
     )
 
+    try:
+        with open(CACHE_FILE_NAME, "wb") as file:
+            pickle.dump(
+                {
+                    "version": VERSION,
+                    "saved_at": datetime.now().isoformat(),
+                    "daily": GLOBAL_DAILY_RAW,
+                    "adj": GLOBAL_ADJ_FACTOR,
+                },
+                file,
+            )
+    except Exception as exc:
+        record_api_error(f"缓存保存失败: {exc}")
+
     if failed_dates:
-        st.warning(
-            f"有 {len(failed_dates)} 个交易日下载失败；示例: {failed_dates[:8]}。"
-            "已成功日期已经保存，下次运行只会补失败日期。"
-        )
+        st.warning(f"有 {len(failed_dates)} 个交易日下载失败；示例: {failed_dates[:8]}")
 
 
 def load_benchmark(start_date: str, end_date: str) -> None:
@@ -1054,8 +963,6 @@ def compute_trend_indicators(
     min_daily_bias_pct: float,
     max_bias_pct: float,
     max_weekly_bias_pct: float,
-    include_single_green: bool = False,
-    include_second_red: bool = False,
     use_sina: bool = False,
 ) -> dict:
     start_date = (datetime.strptime(end_date, "%Y%m%d") - timedelta(days=450)).strftime("%Y%m%d")
@@ -1070,7 +977,6 @@ def compute_trend_indicators(
     df["ma60"] = df["close"].rolling(60).mean()
     df["ma120"] = df["close"].rolling(120).mean()
     df["ma5_vol"] = df["vol"].shift(1).rolling(5).mean()
-    df["prev5_high"] = df["high"].shift(1).rolling(5).max()
     df["ema12"] = df["close"].ewm(span=12, adjust=False).mean()
     df["ema26"] = df["close"].ewm(span=26, adjust=False).mean()
     df["dif"] = df["ema12"] - df["ema26"]
@@ -1118,15 +1024,15 @@ def compute_trend_indicators(
     w_upper = w_prev["high"] - max(w_prev["open"], w_prev["close"])
     shadow_ratio = w_upper / w_range if w_range > 0 else 0.0
 
-    weekly_safe_diagnostic = (
+    weekly_safe = (
         weekly_bias <= max_weekly_bias_pct / 100.0
         and shadow_ratio < 0.60
     )
     trend_up = row["ma60"] > row["ma120"]
     pulled_back = any(recent_prev["close"] <= recent_prev["ma20"] * 1.01)
     bias = row["close"] / row["ma20"] - 1.0
-    above_ma20 = row["close"] > row["ma20"]
-    not_overextended = True  # V41不再用日MA20乖离率作硬门槛。
+    above_ma20 = bias >= min_daily_bias_pct / 100.0
+    not_overextended = bias <= max_bias_pct / 100.0
     ma20_healthy = row["ma20"] >= prev["ma20"] * 0.995
     vol_ratio = row["vol"] / row["ma5_vol"] if row["ma5_vol"] > 0 else 0.0
     volume_ok = vol_ratio >= min_vol_ratio
@@ -1136,13 +1042,11 @@ def compute_trend_indicators(
     solid_candle = row["close"] > row["open"] and body_ratio >= 0.40 and close_location >= 0.65
     macd_improving = row["dif"] > prev["dif"] and row["macd"] > prev["macd"]
     atr_pct = row["atr14"] / row["close"] * 100.0
-    atr_ok = True  # ATR仅保留为诊断和止损输入，不决定周线策略准入。
+    atr_ok = atr_pct >= min_atr_pct
     day_gain_pct = (row["close"] / prev["close"] - 1.0) * 100.0
-    positive_day = row["close"] > row["open"]
-    daily_breakout = bool(row["close"] > row["prev5_high"])
-    daily_breakout_pct = (
-        (row["close"] / row["prev5_high"] - 1.0) * 100.0
-        if row["prev5_high"] > 0 else np.nan
+    positive_day = (
+        day_gain_pct >= min_day_gain_pct
+        and row["close"] > row["open"]
     )
     stock_return_20 = row["close"] / clean.iloc[-21]["close"] - 1.0 if len(clean) >= 21 else 0.0
     rs20 = stock_return_20 - benchmark_return_20d(end_date)
@@ -1168,31 +1072,20 @@ def compute_trend_indicators(
         - chase_penalty
     )
 
-    provisional_stage = provisional_wave["provisional_macd_stage"]
-    allowed_stages = {"G1_绿柱连续缩短", "R1_首周翻红"}
-    if include_single_green:
-        allowed_stages.add("G2_绿柱缩短")
-    if include_second_red:
-        allowed_stages.add("R2_第二根红柱扩张")
-    weekly_entry_gate = provisional_stage in allowed_stages
-
-    daily_trigger = (
-        positive_day
+    core_signal = (
+        weekly_safe
+        and trend_up
+        and positive_day
         and above_ma20
-        and daily_breakout
+        and not_overextended
         and volume_ok
-        and macd_improving
+        and atr_ok
     )
-    core_signal = weekly_entry_gate and daily_trigger
     result.update(
         {
             "valid": True,
             "is_buy_signal": core_signal,
-            "weekly_safe": weekly_safe_diagnostic,
-            "weekly_entry_gate": weekly_entry_gate,
-            "daily_trigger": daily_trigger,
-            "daily_breakout": daily_breakout,
-            "daily_breakout_pct": float(daily_breakout_pct),
+            "weekly_safe": weekly_safe,
             "trend_up": trend_up,
             "positive_day": positive_day,
             "above_ma20": above_ma20,
@@ -1275,133 +1168,6 @@ def future_result_template(hold_weeks: int = 8) -> dict:
     return result
 
 
-def get_t1_execution_check(
-    ts_code: str,
-    market: str,
-    selection_date: str,
-    signal_close: float,
-    max_gap_pct: float,
-    buy_slippage_pct: float,
-    commission_pct: float,
-    use_sina: bool = False,
-) -> dict:
-    """只检查D1能否成交，不计算8周未来轨迹；用于TopK之前的全候选轻量检查。"""
-    result = {
-        "Exit_Reason": "等待T+1数据",
-        "Entry_Date": "",
-        "Buy_Price": np.nan,
-        "Gap_pct (%)": np.nan,
-        "T1_Close_Price": np.nan,
-        "T1_Close_Return_pct": np.nan,
-        "T1_Close_vs_Signal_pct": np.nan,
-        "T1_Follow_Through": False,
-        "Tradable": False,
-    }
-    d0 = datetime.strptime(selection_date, "%Y%m%d")
-    start_date = (d0 - timedelta(days=10)).strftime("%Y%m%d")
-    end_date = (d0 + timedelta(days=15)).strftime("%Y%m%d")
-    hist = get_qfq_data(ts_code, start_date, end_date, use_sina=use_sina)
-    if hist.empty:
-        result["Exit_Reason"] = "T+1行情缺失"
-        return result
-    future = hist[hist.index > selection_date]
-    if future.empty:
-        result["Exit_Reason"] = "等待T+1数据"
-        return result
-
-    next_row = future.iloc[0]
-    expected_entry_date = GLOBAL_NEXT_MARKET_DATE.get(selection_date, "")
-    if expected_entry_date and normalize_date(next_row.name) != expected_entry_date:
-        result["Exit_Reason"] = "信号后下一交易日停牌/无行情(剔除)"
-        return result
-
-    limit_pct, _, _ = board_parameters(market)
-    raw_open = float(next_row["open"])
-    gap_pct = (raw_open / signal_close - 1.0) * 100.0 if signal_close > 0 else np.nan
-    result["Gap_pct (%)"] = round(gap_pct, 2)
-    at_limit_up = signal_close > 0 and raw_open / signal_close - 1.0 >= limit_pct - 0.005
-    if at_limit_up:
-        result["Exit_Reason"] = "T+1涨停价开盘无法可靠买入(剔除)"
-        return result
-    if pd.notna(gap_pct) and gap_pct > max_gap_pct:
-        result["Exit_Reason"] = f"T+1高开>{max_gap_pct:.1f}%(剔除)"
-        return result
-    if raw_open <= 0 or pd.isna(raw_open):
-        result["Exit_Reason"] = "T+1开盘价无效"
-        return result
-
-    buy_price = raw_open * (1.0 + buy_slippage_pct / 100.0) * (1.0 + commission_pct / 100.0)
-    next_close = float(next_row["close"])
-    result.update(
-        {
-            "Exit_Reason": "T+1可成交-等待TopK未来轨迹",
-            "Entry_Date": normalize_date(next_row.name),
-            "Buy_Price": round(buy_price, 3),
-            "T1_Close_Price": round(next_close, 3),
-            "T1_Close_Return_pct": round((next_close / buy_price - 1.0) * 100.0, 4),
-            "T1_Close_vs_Signal_pct": round(
-                (next_close / signal_close - 1.0) * 100.0 if signal_close > 0 else np.nan,
-                4,
-            ),
-            "T1_Follow_Through": bool(next_close >= signal_close and next_close >= raw_open),
-            "Tradable": True,
-        }
-    )
-    return result
-
-
-def build_weekly_exit_flags(hist: pd.DataFrame) -> dict[str, bool]:
-    """一次性计算全部完整周的退出标记，避免持仓循环里每周重复resample和EMA。"""
-    if hist is None or hist.empty:
-        return {}
-    weekly = hist.reset_index().copy()
-    date_column = "trade_date_str" if "trade_date_str" in weekly.columns else weekly.columns[0]
-    weekly["dt"] = pd.to_datetime(weekly[date_column])
-    weekly = weekly.set_index("dt").resample("W-FRI").agg(
-        {"open": "first", "high": "max", "low": "min", "close": "last", "vol": "sum"}
-    ).dropna(subset=["close"]).reset_index()
-    if len(weekly) < 30:
-        return {}
-    weekly["w_ema12"] = weekly["close"].ewm(span=12, adjust=False).mean()
-    weekly["w_ema26"] = weekly["close"].ewm(span=26, adjust=False).mean()
-    weekly["w_dif"] = weekly["w_ema12"] - weekly["w_ema26"]
-    weekly["w_dea"] = weekly["w_dif"].ewm(span=9, adjust=False).mean()
-    weekly["w_macd"] = (weekly["w_dif"] - weekly["w_dea"]) * 2.0
-
-    flags: dict[str, bool] = {}
-    for position in range(29, len(weekly)):
-        curr = weekly.iloc[position]
-        prev = weekly.iloc[position - 1]
-        prev2 = weekly.iloc[position - 2]
-        hist_now = float(curr["w_macd"])
-        hist_prev = float(prev["w_macd"])
-        hist_prev2 = float(prev2["w_macd"])
-        dif_rising = float(curr["w_dif"]) > float(prev["w_dif"])
-        if hist_now > 0:
-            if hist_prev <= 0:
-                stage = "R1_首周翻红"
-            elif hist_prev > 0 and hist_prev2 <= 0 and hist_now >= hist_prev:
-                stage = "R2_第二根红柱扩张"
-            elif hist_now > hist_prev and hist_prev < hist_prev2:
-                stage = "R3_红柱再加速"
-            elif hist_now >= hist_prev:
-                stage = "R4_红柱扩张"
-            else:
-                stage = "R5_红柱衰减"
-        else:
-            if hist_now > hist_prev and hist_prev > hist_prev2 and dif_rising:
-                stage = "G1_绿柱连续缩短"
-            elif hist_now > hist_prev and dif_rising:
-                stage = "G2_绿柱缩短"
-            else:
-                stage = "G3_绿柱扩大/弱势"
-        trade_date = pd.Timestamp(curr["dt"]).strftime("%Y%m%d")
-        flags[trade_date] = bool(
-            stage in {"R5_红柱衰减", "G3_绿柱扩大/弱势"} and not dif_rising
-        )
-    return flags
-
-
 def get_medium_term_future(
     ts_code: str,
     market: str,
@@ -1421,8 +1187,7 @@ def get_medium_term_future(
     use_sina: bool = False,
 ) -> dict:
     d0 = datetime.strptime(selection_date, "%Y%m%d")
-    # 周线退出需要足够的MACD预热数据。
-    start_date = (d0 - timedelta(days=460)).strftime("%Y%m%d")
+    start_date = (d0 - timedelta(days=70)).strftime("%Y%m%d")
     end_date = (d0 + timedelta(days=110)).strftime("%Y%m%d")
     hist = get_qfq_data(ts_code, start_date, end_date, use_sina=use_sina)
     result = future_result_template(hold_weeks)
@@ -1432,24 +1197,20 @@ def get_medium_term_future(
     future = hist[hist.index > selection_date].copy()
     if future.empty:
         return result
-    weekly_exit_flags = build_weekly_exit_flags(hist)
 
     next_row = future.iloc[0]
-    expected_entry_date = GLOBAL_NEXT_MARKET_DATE.get(selection_date, "")
-    if expected_entry_date and normalize_date(next_row.name) != expected_entry_date:
-        result["Exit_Reason"] = "信号后下一交易日停牌/无行情(剔除)"
-        result["Tradable"] = False
-        return result
-
     limit_pct, min_stop_pct, max_stop_pct = board_parameters(market)
     raw_open = float(next_row["open"])
     gap_pct = (raw_open / signal_close - 1.0) * 100.0 if signal_close > 0 else np.nan
     result["Gap_pct (%)"] = round(gap_pct, 2)
 
+    same_price_all_day = (
+        np.isclose(next_row["open"], next_row["high"])
+        and np.isclose(next_row["open"], next_row["low"])
+    )
     at_limit_up = signal_close > 0 and raw_open / signal_close - 1.0 >= limit_pct - 0.005
-    # 开盘决策不能偷看D1全天最高/最低价；涨停价开盘一律按无法可靠成交处理。
-    if at_limit_up:
-        result["Exit_Reason"] = "T+1涨停价开盘无法可靠买入(剔除)"
+    if same_price_all_day and at_limit_up:
+        result["Exit_Reason"] = "一字涨停无法买入(剔除)"
         result["Tradable"] = False
         return result
     if pd.notna(gap_pct) and gap_pct > max_gap_pct:
@@ -1478,6 +1239,8 @@ def get_medium_term_future(
     risk_pct = float(np.clip(raw_risk_pct, min_stop_pct, max_stop_pct))
     stop_price = buy_price * (1.0 - risk_pct)
     result["Stop_pct (%)"] = round(-risk_pct * 100.0, 2)
+    protection_stop_price = buy_price * (1.0 + protection_buffer_pct / 100.0)
+    protection_active_from_day = None
 
     def net_exit_price(raw_sell_price: float) -> float:
         net_sell = raw_sell_price * (1.0 - sell_slippage_pct / 100.0)
@@ -1510,6 +1273,7 @@ def get_medium_term_future(
             result[f"Held_W{w}"] = False
         return exit_return
 
+    tier = 0
     peak_high = buy_price
     trough_low = buy_price
     pending_reason = None
@@ -1524,29 +1288,40 @@ def get_medium_term_future(
         curr_high = float(row["high"])
         curr_low = float(row["low"])
         curr_close = float(row["close"])
+        peak_high = max(peak_high, curr_high)
+        trough_low = min(trough_low, curr_low)
 
         if pending_reason is not None:
             finalize_exit(curr_open, week, day_count, pending_reason, row.name)
             exited = True
             break
 
-        active_stop = stop_price
-        # A股普通股票当日买入不能当日卖出。D1只记录波动，最早D2执行止损。
-        if day_count >= 2 and curr_low <= active_stop:
+        protection_active = (
+            protection_active_from_day is not None
+            and day_count >= protection_active_from_day
+        )
+        active_stop = max(stop_price, protection_stop_price) if protection_active else stop_price
+        if curr_low <= active_stop:
             raw_exit = curr_open if curr_open < active_stop else active_stop
-            trough_low = min(trough_low, raw_exit)
-            reason = f"结构止损({-risk_pct*100:.1f}%)"
+            if protection_active and protection_stop_price >= stop_price:
+                reason = f"成本保护止损(+{protection_buffer_pct:.1f}%原始价)"
+            else:
+                reason = f"结构止损({-risk_pct*100:.1f}%)"
             finalize_exit(raw_exit, week, day_count, reason, row.name)
             exited = True
             break
 
-        peak_high = max(peak_high, curr_high)
-        trough_low = min(trough_low, curr_low)
-
-        # 周线退出序列已在进入循环前一次性计算；这里只做O(1)查询。
-        row_date = pd.Timestamp(datetime.strptime(normalize_date(row.name), "%Y%m%d"))
-        if row_date.weekday() == 4 and weekly_exit_flags.get(normalize_date(row.name), False):
-            pending_reason = "周线MACD柱与DIF同步转弱-次日开盘退出"
+        peak_profit = peak_high / buy_price - 1.0
+        if tier == 0 and peak_profit >= protection_trigger_pct / 100.0:
+            tier = 1
+            protection_active_from_day = day_count + 1
+            result["Protection_Trigger_Day"] = day_count
+            result["Protection_Stop_Price"] = round(protection_stop_price, 3)
+        if tier == 1:
+            if peak_profit >= 0.20:
+                tier = 2
+        if tier == 2 and (peak_high - curr_close) / peak_high >= 0.15:
+            pending_reason = "移动止盈(峰值回撤15%)-次日开盘退出"
 
         if day_count % 5 == 0:
             result[f"Return_W{week} (%)"] = net_return(curr_close)
@@ -1706,136 +1481,36 @@ def stock_active_on_date(row, trade_date: str) -> bool:
     return list_date <= trade_date < delist_date
 
 
-def add_quality_reference_features(all_candidates: pd.DataFrame) -> pd.DataFrame:
-    """
-    为并行参考模式构建只依赖D0收盘已知数据的排序字段。
-
-    这些字段只改变同日候选的先后顺序，不改变候选准入、T+1可成交判断或退出规则。
-    采用分层排序而不是单一拟合分数，便于审计并降低样本内权重过拟合风险。
-    """
-    if all_candidates is None or all_candidates.empty:
-        return all_candidates
-    out = all_candidates.copy()
-
-    def as_bool(column: str) -> pd.Series:
-        values = out.get(column, pd.Series(False, index=out.index))
-        if pd.api.types.is_bool_dtype(values):
-            return values.fillna(False).astype(bool)
-        return values.astype(str).str.strip().str.lower().isin({"true", "1", "yes"})
-
-    def as_number(column: str) -> pd.Series:
-        return pd.to_numeric(
-            out.get(column, pd.Series(np.nan, index=out.index)), errors="coerce"
-        )
-
-    completed_trend = as_bool("W_Trend_Confirmed")
-    provisional_trend = as_bool("P_W_Trend_Confirmed")
-    pulled_back = as_bool("Pulled_Back")
-    weekly_slope = as_number("W_MA20_Slope_pct")
-    daily_bias = as_number("MA20_Bias_pct")
-    rs20 = as_number("RS20_pct")
-    volume_ratio = as_number("Vol_Ratio")
-    breakout_pct = as_number("Daily_Breakout_pct")
-
-    # 斜率甜蜜区0.5%~2%优先；过快、轻微上升、负斜率依次靠后。
-    slope_tier = np.select(
-        [
-            weekly_slope.ge(0.5) & weekly_slope.lt(2.0),
-            weekly_slope.ge(2.0),
-            weekly_slope.ge(0.0) & weekly_slope.lt(0.5),
-        ],
-        [0, 1, 2],
-        default=3,
-    )
-
-    moderate_strength_count = (
-        (daily_bias.ge(15.0) & daily_bias.lt(30.0)).astype(int)
-        + (rs20.ge(10.0) & rs20.lt(30.0)).astype(int)
-        + (volume_ratio.ge(1.2) & volume_ratio.le(2.0)).astype(int)
-        + (breakout_pct.ge(3.0) & breakout_pct.lt(8.0)).astype(int)
-    )
-    overheat_count = (
-        daily_bias.ge(30.0).astype(int)
-        + rs20.ge(50.0).astype(int)
-        + volume_ratio.gt(2.2).astype(int)
-        + breakout_pct.ge(8.0).astype(int)
-    )
-
-    out["Quality_W_Trend_Confirmed"] = completed_trend
-    out["Quality_W_Slope_Tier"] = pd.Series(slope_tier, index=out.index, dtype="Int64")
-    out["Quality_P_W_Trend_Confirmed"] = provisional_trend
-    out["Quality_Overheat_Count"] = overheat_count.astype("Int64")
-    out["Quality_Moderate_Strength_Count"] = moderate_strength_count.astype("Int64")
-    out["Quality_No_Pullback"] = ~pulled_back
-    out["Quality_Industry_Core_Count"] = (
-        out.groupby(["Trade_Date", "SW_L1"], dropna=False)["ts_code"]
-        .transform("size")
-        .astype("Int64")
-    )
-    out["Quality_Ranking_Method"] = QUALITY_RANKING_METHOD
-    out["Quality_Reference_Label"] = (
-        np.where(completed_trend, "完成周线趋势确认", "完成周线未确认")
-        + "|斜率层" + pd.Series(slope_tier, index=out.index).astype(str)
-        + "|过热" + overheat_count.astype(str)
-        + "|适度强势" + moderate_strength_count.astype(str)
-    )
-    return out
-
-
 def apply_score_modes(
     all_candidates: pd.DataFrame,
     funnel: dict,
     top_k: int,
     min_tradable_signals: int,
 ) -> tuple[pd.DataFrame, dict]:
-    """对周线硬准入且日线已触发的候选执行T+1成交检查与排序。"""
+    """在同一批已完成T+1检查的核心候选上套用四种评分准入模式。"""
     checked = all_candidates["Execution_Checked"].fillna(False).astype(bool)
     tradable = checked & all_candidates["Tradable"].eq(True).fillna(False)
+    scores = pd.to_numeric(all_candidates["Total_Score"], errors="coerce")
 
     for label, prefix, threshold in SCORE_MODES:
         score_eligible = pd.Series(True, index=all_candidates.index)
+        if threshold is not None:
+            score_eligible = scores >= float(threshold)
         mode_tradable = tradable & score_eligible.fillna(False)
         tradable_indices = all_candidates.index[mode_tradable].tolist()
         tradable_count = len(tradable_indices)
         breadth_confirmed = tradable_count >= int(min_tradable_signals)
 
         if breadth_confirmed:
-            if prefix == "Mode_Quality":
-                sort_columns = [
-                    "Quality_W_Trend_Confirmed",
-                    "Quality_W_Slope_Tier",
-                    "Quality_P_W_Trend_Confirmed",
-                    "Quality_Overheat_Count",
-                    "Quality_Moderate_Strength_Count",
-                    "Quality_No_Pullback",
-                    "Quality_Industry_Core_Count",
-                    "Stage_Priority",
-                    "Daily_Breakout_pct",
-                    "Vol_Ratio",
-                    "RS20_pct",
-                    "ts_code",
-                ]
-                sort_ascending = [
-                    False, True, False, True, False, False,
-                    False, True, False, False, False, True,
-                ]
-            else:
-                # V41.2原始排序保持逐字段不变，作为严格对照组。
-                sort_columns = [
-                    "Stage_Priority", "Daily_Breakout_pct", "Vol_Ratio", "RS20_pct"
-                ]
-                sort_ascending = [True, False, False, False]
-            ranked_candidates = all_candidates.loc[tradable_indices]
-            if prefix == "Mode_Quality":
-                ranked_candidates = ranked_candidates.sort_values(
-                    sort_columns, ascending=sort_ascending, kind="mergesort"
+            selected_indices = (
+                all_candidates.loc[tradable_indices]
+                .sort_values(
+                    ["Stage_Priority", "Total_Score", "ATR_pct"],
+                    ascending=[True, False, False],
                 )
-            else:
-                # 不指定排序算法，保持V41.2原调用语义，包括完全并列时的处理。
-                ranked_candidates = ranked_candidates.sort_values(
-                    sort_columns, ascending=sort_ascending
-                )
-            selected_indices = ranked_candidates.head(int(top_k)).index.tolist()
+                .head(int(top_k))
+                .index.tolist()
+            )
         else:
             selected_indices = []
 
@@ -1848,7 +1523,9 @@ def apply_score_modes(
         all_candidates[f"{prefix}_Rank"] = all_candidates.index.map(rank_map).astype("Int64")
 
         status_col = f"{prefix}_Status"
-        all_candidates[status_col] = "周线准入且日线触发"
+        all_candidates[status_col] = "未达到本模式分数准入"
+        if threshold is None:
+            all_candidates[status_col] = "仅排名模式核心候选"
         all_candidates.loc[score_eligible & ~checked, status_col] = "未完成T+1成交检查"
         all_candidates.loc[score_eligible & checked & ~tradable, status_col] = (
             all_candidates.loc[score_eligible & checked & ~tradable, "Exit_Reason"]
@@ -1856,7 +1533,7 @@ def apply_score_modes(
         )
         if 0 < tradable_count < int(min_tradable_signals):
             all_candidates.loc[mode_tradable, status_col] = (
-                f"可成交仅{tradable_count}只<"
+                f"本模式可成交仅{tradable_count}只<"
                 f"{int(min_tradable_signals)}只，观察不买"
             )
         elif breadth_confirmed:
@@ -1871,18 +1548,19 @@ def apply_score_modes(
         )
         funnel[f"{prefix}_Selected_TopK"] = len(selected_indices)
 
-    funnel["Base_Score_Pass"] = funnel["Mode_Weekly_Score_Eligible"]
-    funnel["Dynamic_Score_Pass"] = funnel["Mode_Weekly_Score_Eligible"]
-    funnel["Final_Signal"] = funnel["Mode_Weekly_Score_Eligible"]
-    funnel["Tradable_Signal"] = funnel["Mode_Weekly_Tradable"]
-    funnel["Breadth_Confirmed"] = funnel["Mode_Weekly_Breadth_Confirmed"]
-    funnel["Scarce_Tradable_Skipped"] = funnel["Mode_Weekly_Scarce_Skipped"]
-    funnel["Selected_TopK"] = funnel["Mode_Weekly_Selected_TopK"]
+    # 旧字段固定映射到82分模式，方便与V40.3漏斗直接比较。
+    funnel["Base_Score_Pass"] = funnel["Mode_82_Score_Eligible"]
+    funnel["Dynamic_Score_Pass"] = funnel["Mode_82_Score_Eligible"]
+    funnel["Final_Signal"] = funnel["Mode_82_Score_Eligible"]
+    funnel["Tradable_Signal"] = funnel["Mode_82_Tradable"]
+    funnel["Breadth_Confirmed"] = funnel["Mode_82_Breadth_Confirmed"]
+    funnel["Scarce_Tradable_Skipped"] = funnel["Mode_82_Scarce_Skipped"]
+    funnel["Selected_TopK"] = funnel["Mode_82_Selected_TopK"]
     return all_candidates, funnel
 
 
 def collect_mode_results(all_candidates: pd.DataFrame) -> pd.DataFrame:
-    """把原排序与周线质量参考排序的入选记录展开为报表长表。"""
+    """把四种模式的入选记录展开为带Diagnostic_Mode的长表。"""
     frames = []
     for label, prefix, threshold in SCORE_MODES:
         selected = all_candidates[f"{prefix}_Selected"].fillna(False).astype(bool)
@@ -1925,14 +1603,10 @@ def run_backtest_for_day(
     breadth_threshold: int,
     min_tradable_signals: int,
     enable_market_filter: bool,
-    include_single_green: bool,
-    include_second_red: bool,
     protection_trigger_pct: float,
     protection_buffer_pct: float,
-    enable_t2_diagnostic: bool = False,
     use_sina: bool = False,
 ):
-    day_started = time.perf_counter()
     query_date = trade_date
     daily = safe_get("daily", trade_date=query_date)
     # 盘中daily/daily_basic通常尚未发布：用最近完整交易日构建基础股票池，
@@ -1999,9 +1673,6 @@ def run_backtest_for_day(
         "Pass_Above_MA20",
         "Pass_Not_Overextended",
         "Pass_Volume",
-        "Pass_Daily_Breakout",
-        "Pass_Daily_MACD",
-        "Pass_Daily_Trigger",
         "Pass_Weekly_Stage",
         "Excluded_Weak_Weekly_Stage",
         "Core_Signal",
@@ -2034,8 +1705,6 @@ def run_backtest_for_day(
             min_daily_bias_pct=min_daily_bias_pct,
             max_bias_pct=max_bias_pct,
             max_weekly_bias_pct=max_weekly_bias_pct,
-            include_single_green=include_single_green,
-            include_second_red=include_second_red,
             use_sina=use_sina,
         )
         if not indicators.get("valid"):
@@ -2048,17 +1717,21 @@ def run_backtest_for_day(
         funnel["Pass_Above_MA20"] += int(indicators["above_ma20"])
         funnel["Pass_Not_Overextended"] += int(indicators["not_overextended"])
         funnel["Pass_Volume"] += int(indicators["volume_ok"])
-        funnel["Pass_Daily_Breakout"] += int(indicators["daily_breakout"])
-        funnel["Pass_Daily_MACD"] += int(indicators["macd_improving"])
-        funnel["Pass_Daily_Trigger"] += int(indicators["daily_trigger"])
-        funnel["Pass_Weekly_Stage"] += int(indicators["weekly_entry_gate"])
-        funnel["Excluded_Weak_Weekly_Stage"] += int(not indicators["weekly_entry_gate"])
         if not indicators["is_buy_signal"]:
+            continue
+
+        stage_allowed = (
+            indicators["provisional_macd_stage"]
+            not in EXCLUDED_PROVISIONAL_STAGES
+        )
+        funnel["Pass_Weekly_Stage"] += int(stage_allowed)
+        funnel["Excluded_Weak_Weekly_Stage"] += int(not stage_allowed)
+        if not stage_allowed:
             continue
         funnel["Core_Signal"] += 1
 
         stage_priority, stage_priority_label = STAGE_PRIORITY.get(
-            indicators["provisional_macd_stage"], (9, "Z_非准入阶段")
+            indicators["provisional_macd_stage"], (2, "B_中性阶段")
         )
 
         record = {
@@ -2082,10 +1755,6 @@ def run_backtest_for_day(
             "RS20_S": round(indicators["score_rs"], 2),
             "Chase_Penalty": round(indicators["chase_penalty"], 2),
             "Day_Gain_pct": round(indicators["day_gain_pct"], 2),
-            "Daily_Breakout": indicators["daily_breakout"],
-            "Daily_Breakout_pct": round(indicators["daily_breakout_pct"], 3),
-            "Daily_Trigger": indicators["daily_trigger"],
-            "Weekly_Entry_Gate": indicators["weekly_entry_gate"],
             "MA20_Bias_pct": round(indicators["bias_pct"], 2),
             "ATR_pct": round(indicators["atr_pct"], 2),
             "Vol_Ratio": round(indicators["vol_ratio"], 2),
@@ -2153,19 +1822,16 @@ def run_backtest_for_day(
 
     if not records:
         funnel["Day_Base_Signal_Count"] = 0
-        funnel["Required_Score"] = 0.0
-        funnel["Core_Candidate_Count"] = 0
-        funnel["Full_Future_Count"] = 0
-        funnel["Time_Total_S"] = round(time.perf_counter() - day_started, 3)
+        funnel["Required_Score"] = max(min_total_score, scarce_total_score)
         return pd.DataFrame(), funnel, pd.DataFrame()
 
-    all_candidates = add_quality_reference_features(pd.DataFrame(records))
-    # V41没有固定评分门槛：所有记录都已经同时通过周线硬准入和日线触发。
-    required_score = 0.0
-    base_count = len(all_candidates)
+    all_candidates = pd.DataFrame(records)
+    # 保留V40.3的82分字段作为基准；四种模式各自的准入结果另列导出。
+    required_score = max(min_total_score, scarce_total_score)
+    base_count = int((all_candidates["Total_Score"] >= required_score).sum())
     all_candidates["Day_Base_Signal_Count"] = base_count
     all_candidates["Required_Score"] = required_score
-    all_candidates["Score_Pass"] = True
+    all_candidates["Score_Pass"] = all_candidates["Total_Score"] >= required_score
     all_candidates["Market_Regime"] = regime["Market_Regime"]
     all_candidates["Market_Weak_Block"] = bool(regime["Market_Weak_Block"])
     all_candidates["CYB_Close"] = regime["CYB_Close"]
@@ -2211,30 +1877,37 @@ def run_backtest_for_day(
     if regime["Market_Weak_Block"]:
         all_candidates["Selection_Status"] = "双指数弱势-暂停开仓"
     else:
-        # TopK前只复现原有D1成交条件；未来8周收益从不参与排序，不应为全候选计算。
+        # 四模式诊断必须给所有核心候选计算同一套未来轨迹；否则无法知道
+        # 82分以下候选的真实收益与止损表现。
         eligible_indices = all_candidates.index.tolist()
         funnel["After_Market_Filter"] = len(eligible_indices)
-        t1_started = time.perf_counter()
         for idx in eligible_indices:
             candidate = all_candidates.loc[idx]
-            execution = get_t1_execution_check(
+            future = get_medium_term_future(
                 candidate["ts_code"],
                 candidate["market"],
                 trade_date,
                 float(candidate["Signal_Close"]),
+                float(candidate["_Signal_Low"]),
+                float(candidate["_Signal_MA20"]),
+                float(candidate["_ATR14"]),
+                hold_weeks=8,
                 max_gap_pct=max_gap_pct,
                 buy_slippage_pct=buy_slippage_pct,
+                sell_slippage_pct=sell_slippage_pct,
                 commission_pct=commission_pct,
+                sell_tax_pct=sell_tax_pct,
+                protection_trigger_pct=protection_trigger_pct,
+                protection_buffer_pct=protection_buffer_pct,
                 use_sina=use_sina,
             )
-            for key, value in execution.items():
+            for key, value in future.items():
                 all_candidates.loc[idx, key] = value
             all_candidates.loc[idx, "Execution_Checked"] = True
-            if execution["Tradable"]:
-                all_candidates.loc[idx, "Selection_Status"] = "T+1可成交-等待TopK"
+            if future["Tradable"]:
+                all_candidates.loc[idx, "Selection_Status"] = "全量诊断可成交"
             else:
-                all_candidates.loc[idx, "Selection_Status"] = str(execution["Exit_Reason"])
-        funnel["Time_T1_Check_S"] = round(time.perf_counter() - t1_started, 3)
+                all_candidates.loc[idx, "Selection_Status"] = str(future["Exit_Reason"])
 
     checked_mask = all_candidates["Execution_Checked"].fillna(False).astype(bool)
     tradable_mask = checked_mask & all_candidates["Tradable"].eq(True).fillna(False)
@@ -2248,22 +1921,20 @@ def run_backtest_for_day(
         min_tradable_signals=min_tradable_signals,
     )
 
-    # 完整8周轨迹只计算至少被一种模式选中的并集；这发生在排名之后，且不反向改选股结果。
+    # T2延续与分批诊断只计算至少被一种模式选中的并集，减少重复行情读取。
     selected_union = pd.Series(False, index=all_candidates.index)
     for _, prefix, _ in SCORE_MODES:
         selected_union |= all_candidates[f"{prefix}_Selected"].fillna(False).astype(bool)
-    future_started = time.perf_counter()
     for idx in all_candidates.index[selected_union]:
         candidate = all_candidates.loc[idx]
-        main_result = get_medium_term_future(
-            candidate["ts_code"],
-            candidate["market"],
-            trade_date,
-            float(candidate["Signal_Close"]),
-            float(candidate["_Signal_Low"]),
-            float(candidate["_Signal_MA20"]),
-            float(candidate["_ATR14"]),
-            hold_weeks=8,
+        main_result = {key: candidate.get(key, value) for key, value in future_result_template(8).items()}
+        alternative = build_alternative_entry_diagnostics(
+            main_result=main_result,
+            ts_code=str(candidate["ts_code"]),
+            market=str(candidate["market"]),
+            signal_low=float(candidate["_Signal_Low"]),
+            signal_ma20=float(candidate["_Signal_MA20"]),
+            atr14=float(candidate["_ATR14"]),
             max_gap_pct=max_gap_pct,
             buy_slippage_pct=buy_slippage_pct,
             sell_slippage_pct=sell_slippage_pct,
@@ -2273,45 +1944,13 @@ def run_backtest_for_day(
             protection_buffer_pct=protection_buffer_pct,
             use_sina=use_sina,
         )
-        for key, value in main_result.items():
+        for key, value in alternative.items():
             all_candidates.loc[idx, key] = value
-        if bool(main_result.get("Tradable", False)):
-            all_candidates.loc[idx, "Selection_Status"] = "TopK完整未来轨迹已计算"
-        else:
-            # 理论上不会发生：轻量检查与完整函数使用同一套T+1规则。保留审计字段便于发现数据异常。
-            all_candidates.loc[idx, "Selection_Status"] = (
-                "T+1等价检查异常:" + str(main_result.get("Exit_Reason", "不可成交"))
-            )
 
-        # T2只是事后诊断，从不参与选股；默认关闭以避免额外一次完整未来轨迹计算。
-        if enable_t2_diagnostic:
-            alternative = build_alternative_entry_diagnostics(
-                main_result=main_result,
-                ts_code=str(candidate["ts_code"]),
-                market=str(candidate["market"]),
-                signal_low=float(candidate["_Signal_Low"]),
-                signal_ma20=float(candidate["_Signal_MA20"]),
-                atr14=float(candidate["_ATR14"]),
-                max_gap_pct=max_gap_pct,
-                buy_slippage_pct=buy_slippage_pct,
-                sell_slippage_pct=sell_slippage_pct,
-                commission_pct=commission_pct,
-                sell_tax_pct=sell_tax_pct,
-                protection_trigger_pct=protection_trigger_pct,
-                protection_buffer_pct=protection_buffer_pct,
-                use_sina=use_sina,
-            )
-            for key, value in alternative.items():
-                all_candidates.loc[idx, key] = value
-
-    funnel["Core_Candidate_Count"] = len(all_candidates)
-    funnel["Full_Future_Count"] = int(selected_union.sum())
-    funnel["Time_Future_Selected_S"] = round(time.perf_counter() - future_started, 3)
-    funnel["Time_Total_S"] = round(time.perf_counter() - day_started, 3)
-
-    all_candidates["Day_Tradable_Signal_Count"] = all_candidates["Mode_Weekly_Day_Tradable_Count"]
-    all_candidates["Breadth_Confirmed"] = all_candidates["Mode_Weekly_Breadth_Confirmed"]
-    all_candidates["Selected"] = all_candidates["Mode_Weekly_Selected"]
+    # 旧通用列映射到82分模式，候选CSV仍可与V40.3直接对照。
+    all_candidates["Day_Tradable_Signal_Count"] = all_candidates["Mode_82_Day_Tradable_Count"]
+    all_candidates["Breadth_Confirmed"] = all_candidates["Mode_82_Breadth_Confirmed"]
+    all_candidates["Selected"] = all_candidates["Mode_82_Selected"]
 
     internal_cols = ["_Signal_Low", "_Signal_MA20", "_ATR14"]
     final = collect_mode_results(all_candidates)
@@ -2698,57 +2337,9 @@ def show_quality_priority_report(all_results: pd.DataFrame) -> None:
         hide_index=True,
     )
     st.caption(
-        "A1=临时周MACD本周首次翻红，A2=临时周绿柱连续缩短；"
-        "只有勾选扩展选项时才纳入R2第二根红柱或G2单周绿柱缩短。"
+        "A1=G2绿柱缩短，A2=R1首周翻红，B=G3/R3/R4中性阶段；"
+        "G1绿柱连续缩短与R5红柱衰减已在候选评分和成交前硬剔除。"
     )
-
-
-def show_quality_reference_report(all_results: pd.DataFrame) -> None:
-    st.subheader("🧭 周线质量参考分层")
-    required = {
-        "Quality_W_Trend_Confirmed", "Quality_W_Slope_Tier",
-        "Quality_Overheat_Count", "Quality_Moderate_Strength_Count",
-        "Realized_Return (%)", "Exit_Reason", "Held_W8",
-    }
-    if all_results.empty or not required.issubset(all_results.columns):
-        st.info("暂无周线质量参考字段。")
-        return
-    data = all_results.copy()
-    data["_ret"] = pd.to_numeric(data["Realized_Return (%)"], errors="coerce")
-    data = data[data["_ret"].notna()].copy()
-    if data.empty:
-        st.info("当前质量参考样本尚未成熟。")
-        return
-    data["_完成周趋势"] = bool_series(data["Quality_W_Trend_Confirmed"])
-    data["_W8"] = bool_series(data["Held_W8"])
-    data["_止损"] = data["Exit_Reason"].fillna("").astype(str).str.startswith("结构止损")
-    slope_labels = {
-        0: "0.5%~2%",
-        1: "≥2%",
-        2: "0%~0.5%",
-        3: "<0%/缺失",
-    }
-    data["_斜率层"] = (
-        pd.to_numeric(data["Quality_W_Slope_Tier"], errors="coerce")
-        .map(slope_labels).fillna("缺失")
-    )
-    rows = []
-    for (trend, slope), group in data.groupby(["_完成周趋势", "_斜率层"], dropna=False):
-        rows.append(
-            {
-                "完成周趋势确认": "是" if trend else "否",
-                "周MA20斜率层": slope,
-                "成熟样本": len(group),
-                "平均收益(%)": round(group["_ret"].mean(), 2),
-                "中位收益(%)": round(group["_ret"].median(), 2),
-                "盈利率(%)": round((group["_ret"] > 0).mean() * 100.0, 1),
-                "大涨≥30%(%)": round((group["_ret"] >= 30).mean() * 100.0, 1),
-                "W8生存率(%)": round(group["_W8"].mean() * 100.0, 1),
-                "结构止损率(%)": round(group["_止损"].mean() * 100.0, 1),
-            }
-        )
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-    st.caption("参考排序方法：" + QUALITY_RANKING_METHOD + "。所有字段均为D0收盘时已知。")
 
 
 def show_weekly_report(all_results: pd.DataFrame) -> None:
@@ -2867,16 +2458,16 @@ def build_mode_comparison(
 
 
 def show_mode_comparison(comparison: pd.DataFrame) -> None:
-    st.subheader("🧪 原排序 vs 周线质量参考排序")
+    st.subheader("🧪 四种评分准入模式总对照")
     st.caption(
-        "两种模式使用相同候选池、成交与退出规则，并分别按30万元、最多3只持仓运行；"
-        "差异只有同日候选排序。"
+        "四种模式共用同一核心候选、T+1成交、至少2只确认、TopK、退出规则和三仓组合；"
+        "仅改变固定评分准入。"
     )
     st.dataframe(comparison, use_container_width=True, hide_index=True)
 
 
 def show_weekly_wave_report(all_results: pd.DataFrame) -> None:
-    st.subheader("🌊 上一个完整周MACD阶段诊断")
+    st.subheader("🌊 周线MACD波浪阶段验证（只诊断，未参与选股）")
     required = {"W_MACD_Stage", "Realized_Return (%)", "Exit_Reason"}
     if all_results.empty or not required.issubset(all_results.columns):
         st.info("暂无周线波浪诊断样本。")
@@ -3114,7 +2705,7 @@ def style_exit(value):
 with st.sidebar:
     st.header(f"{VERSION} 回测参数")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
-    BACKTEST_DAYS = st.number_input("分析交易日数", min_value=1, value=250, step=50)
+    BACKTEST_DAYS = st.number_input("分析交易日数", min_value=1, value=100, step=10)
     TOP_BACKTEST = st.number_input(
         "每日优选 TopK", min_value=2, max_value=20, value=5, step=1,
         help="TopK用于保留候选广度；真实同时持仓仍由组合引擎限制为3只。",
@@ -3127,79 +2718,67 @@ with st.sidebar:
     ENABLE_MARKET_FILTER = FIXED_MARKET_FILTER
     st.info(
         "股价≥20元；流通市值200~1000亿元；大盘硬过滤关闭；"
-        "周线与日线同时触发即可进入成交检查，不再要求至少2只确认。"
+        "T+1实际可成交不足2只时观察不买。"
     )
     st.caption("组合：初始30万元，最多3只，单只目标约10万元。")
     st.info(
-        "V41以每日临时周MACD作为硬准入：默认只允许绿柱连续缩短和本周首次翻红；"
-        "日线只负责触发，不再使用82分门槛。"
-    )
-    st.caption(
-        "本版并行比较原排序与周线质量参考排序；两套组合都固定最多持有3只，"
-        "不会增加实盘持仓数量。"
+        "V40.4同时比较82分、80分、78分与仅排名四种准入；"
+        "继续硬剔除G1绿柱连续缩短和R5红柱衰减；"
+        "不限制每日新开仓数，不限制同一申万行业，保留热点板块联动。"
     )
     DETAIL_MODE = st.selectbox(
         "详细报告显示模式",
         options=list(SCORE_MODE_LABELS),
         index=0,
-        help="原模式保持V41.2排序；参考模式优先已完成周线趋势和周MA20斜率。",
+        help="只影响页面详细图表；四种模式都会同时计算并导出。",
     )
     ENABLE_THS = st.checkbox("实时雷达启用THS概念补充(需6000积分)", value=False)
     THS_KEYWORDS_TEXT = st.text_area("THS科技概念关键词", value=DEFAULT_THS_KEYWORDS, height=100)
 
-    st.subheader("周线硬准入")
-    INCLUDE_SINGLE_GREEN = st.checkbox(
-        "同时允许仅缩短一周的绿柱(G2)", value=False,
-        help="默认关闭；开启后更早但临时周线假转折可能增加。",
+    st.subheader("单股质量（四模式共用）")
+    MIN_ATR_PCT = st.number_input("ATR14/股价最低(%)", min_value=0.0, value=2.5, step=0.1)
+    MIN_VOL_RATIO = st.number_input("最低量比", min_value=0.5, value=1.10, step=0.05)
+    MIN_DAY_GAIN_PCT = st.number_input(
+        "信号日最低涨幅(%)", min_value=0.0,
+        value=DEFAULT_MIN_DAY_GAIN_PCT, step=0.5,
     )
-    INCLUDE_SECOND_RED = st.checkbox(
-        "同时允许第二根扩张红柱(R2)", value=False,
-        help="默认关闭；用于减少第一根红柱期间没有日线买点造成的漏选。",
+    MIN_DAILY_BIAS_PCT = st.number_input(
+        "信号日高于日MA20最低(%)", min_value=0.0,
+        value=DEFAULT_MIN_DAILY_BIAS_PCT, step=0.5,
     )
-
-    st.subheader("日线买点触发")
-    MIN_VOL_RATIO = st.number_input("当日量/此前5日均量最低", min_value=0.5, value=1.00, step=0.05)
+    MAX_BIAS_PCT = st.number_input("相对MA20最大偏离(%)", min_value=1.0, value=8.0, step=0.5)
+    MAX_WEEKLY_BIAS_PCT = st.number_input(
+        "信号日临时周线高于周MA20最大(%)", min_value=5.0,
+        value=DEFAULT_MAX_WEEKLY_BIAS_PCT, step=5.0,
+    )
     MAX_GAP_PCT = st.number_input("T+1最大允许高开(%)", min_value=0.0, value=8.0, step=0.5)
-    st.caption("固定触发：收阳、站上MA20、突破此前5日最高价、量能达标、日MACD改善。")
-    # 以下参数只为兼容旧函数签名；V41均不再作为准入条件。
-    MIN_ATR_PCT = 0.0
-    MIN_DAY_GAIN_PCT = 0.0
-    MIN_DAILY_BIAS_PCT = 0.0
-    MAX_BIAS_PCT = 999.0
-    MAX_WEEKLY_BIAS_PCT = 999.0
-    MIN_TOTAL_SCORE = 0.0
-    SCARCE_TOTAL_SCORE = 0.0
-    BREADTH_THRESHOLD = 1
+    FIXED_SCORE_FLOOR = DEFAULT_FIXED_SCORE_FLOOR
+    st.caption("评分准入固定对照：82分、80分、78分、仅排名；不在侧边栏改数值。")
+    MIN_TOTAL_SCORE = FIXED_SCORE_FLOOR
+    SCARCE_TOTAL_SCORE = FIXED_SCORE_FLOOR
+    BREADTH_THRESHOLD = 4  # 仅为兼容旧函数入参，V40.4不再用它降分。
 
     st.subheader("市场环境")
     st.caption("双指数仅保留为诊断字段，不再一刀切暂停开仓。")
 
-    st.subheader("成交成本与退出")
+    st.subheader("成交成本与保护止损")
     BUY_SLIPPAGE = st.number_input("买入滑点(%)", min_value=0.0, value=0.20, step=0.05)
     SELL_SLIPPAGE = st.number_input("卖出滑点(%)", min_value=0.0, value=0.20, step=0.05)
     COMMISSION = st.number_input("单边佣金(%)", min_value=0.0, value=0.03, step=0.01)
     SELL_TAX = st.number_input("卖出税费(%)", min_value=0.0, value=0.05, step=0.01)
-    PROTECTION_TRIGGER = 999.0  # V41关闭旧浮盈保护，仅保留函数兼容入参。
-    PROTECTION_BUFFER = 0.0
+    PROTECTION_TRIGGER = st.number_input("保护止损触发浮盈(%)", min_value=1.0, value=10.0, step=1.0)
+    PROTECTION_BUFFER = st.number_input("保护止损原始价高于成本(%)", min_value=0.0, value=0.30, step=0.10)
     st.caption(
-        "退出采用结构止损，或周五确认MACD柱与DIF同步转弱后在下一交易日开盘卖出；"
-        "买入当天禁止卖出。完整观察期仍保留8周上限，便于统一比较。"
-    )
-    ENABLE_T2_DIAGNOSTIC = st.checkbox(
-        "计算T+2延续/分批买入诊断（较慢）",
-        value=False,
-        help="仅生成事后诊断字段，不参与周线准入、日线触发、TopK排序或主组合回测。",
+        "T+1是否延续只保留为诊断字段，不触发提前卖出；"
+        "历史对照显示强制T+2退出会误杀后续大幅盈利股。"
     )
 
     RESUME_CHECKPOINT = st.checkbox("开启参数隔离的断点续传", value=True)
-    USE_CACHE = st.checkbox("使用断点续传行情缓存", value=True)
-    st.caption("每成功下载一个交易日就立即原子保存；中断后只补缺失日期。")
-    if st.button("清除全部行情缓存（含旧版单文件缓存）"):
-        removed_paths = clear_all_market_caches()
-        if removed_paths:
-            st.success(f"已清除 {len(removed_paths)} 个缓存位置")
-        else:
-            st.info("没有找到可清除的行情缓存")
+    USE_CACHE = st.checkbox("使用并增量更新行情缓存", value=True)
+    if st.button("清除V39.7/V39.9/V40.x共享行情缓存"):
+        if os.path.exists(CACHE_FILE_NAME):
+            os.remove(CACHE_FILE_NAME)
+            st.success("缓存已清除")
 
 
 TS_TOKEN = st.text_input("Tushare Token", type="password")
@@ -3208,18 +2787,17 @@ if not TS_TOKEN:
     st.stop()
 ts.set_token(TS_TOKEN)
 pro = ts.pro_api()
-try:
-    # Tushare官方DataApi内部使用requests超时；显式设定，避免网络波动时长时间等待。
-    setattr(pro, "_DataApi__timeout", TUSHARE_REQUEST_TIMEOUT_SECONDS)
-except Exception as exc:
-    record_api_error(f"无法设置Tushare请求超时，将使用SDK默认值: {exc}")
 
 
-if st.button(f"🚀 启动 {VERSION} 周线波浪回测"):
+if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
     API_ERRORS.clear()
     SINA_STATUS = {"success": 0, "fail": 0}
     is_realtime = int(BACKTEST_DAYS) == 1
     try:
+        if SCARCE_TOTAL_SCORE < MIN_TOTAL_SCORE:
+            raise ValueError("信号稀少时最低总分不能低于常规最低总分")
+        if MIN_DAILY_BIAS_PCT >= MAX_BIAS_PCT:
+            raise ValueError("日MA20最低偏离必须小于最大偏离")
         GLOBAL_STOCK_BASIC = load_stock_basic()
         memberships = load_sw_tech_memberships()
         GLOBAL_TECH_PERIODS = build_tech_period_index(memberships)
@@ -3263,9 +2841,10 @@ if st.button(f"🚀 启动 {VERSION} 周线波浪回测"):
             "max_mv": MAX_MV,
             "min_atr": MIN_ATR_PCT,
             "min_vol": MIN_VOL_RATIO,
-            "weekly_include_single_green": bool(INCLUDE_SINGLE_GREEN),
-            "weekly_include_second_red": bool(INCLUDE_SECOND_RED),
-            "daily_trigger": "close>ma20 & close>prev5high & vol>=prev5avg & daily_macd_improving & bullish",
+            "min_day_gain": MIN_DAY_GAIN_PCT,
+            "min_daily_bias": MIN_DAILY_BIAS_PCT,
+            "max_bias": MAX_BIAS_PCT,
+            "max_weekly_bias": MAX_WEEKLY_BIAS_PCT,
             "max_gap": MAX_GAP_PCT,
             "min_score": MIN_TOTAL_SCORE,
             "scarce_score": SCARCE_TOTAL_SCORE,
@@ -3273,7 +2852,6 @@ if st.button(f"🚀 启动 {VERSION} 周线波浪回测"):
                 {"label": label, "threshold": threshold}
                 for label, _, threshold in SCORE_MODES
             ],
-            "quality_ranking_method": QUALITY_RANKING_METHOD,
             "breadth_threshold": int(BREADTH_THRESHOLD),
             "min_tradable_signals": MIN_TRADABLE_SIGNALS,
             "market_filter": bool(ENABLE_MARKET_FILTER),
@@ -3283,7 +2861,6 @@ if st.button(f"🚀 启动 {VERSION} 周线波浪回测"):
             "sell_tax": SELL_TAX,
             "protection_trigger": PROTECTION_TRIGGER,
             "protection_buffer": PROTECTION_BUFFER,
-            "t2_diagnostic": bool(ENABLE_T2_DIAGNOSTIC),
             "initial_capital": INITIAL_CAPITAL,
             "max_positions": MAX_PORTFOLIO_POSITIONS,
             "position_budget": POSITION_BUDGET,
@@ -3361,11 +2938,8 @@ if st.button(f"🚀 启动 {VERSION} 周线波浪回测"):
                 breadth_threshold=int(BREADTH_THRESHOLD),
                 min_tradable_signals=MIN_TRADABLE_SIGNALS,
                 enable_market_filter=bool(ENABLE_MARKET_FILTER),
-                include_single_green=bool(INCLUDE_SINGLE_GREEN),
-                include_second_red=bool(INCLUDE_SECOND_RED),
                 protection_trigger_pct=float(PROTECTION_TRIGGER),
                 protection_buffer_pct=float(PROTECTION_BUFFER),
-                enable_t2_diagnostic=bool(ENABLE_T2_DIAGNOSTIC),
                 use_sina=use_sina,
             )
             results_store = replace_trade_date_records(
@@ -3400,7 +2974,7 @@ if st.button(f"🚀 启动 {VERSION} 周线波浪回测"):
             candidates_store, ["Trade_Date", "ts_code"]
         )
 
-        st.subheader("🧭 周线准入与日线触发漏斗")
+        st.subheader("🧭 四种评分准入的逐日漏斗")
         if not funnel_df.empty:
             mode_funnel_rows = []
             for label, prefix, threshold in SCORE_MODES:
@@ -3414,17 +2988,17 @@ if st.button(f"🚀 启动 {VERSION} 周线波浪回测"):
                 mode_funnel_rows.append(
                     {
                         "模式": label,
-                        "准入方式": "周线硬准入+日线触发",
-                        "核心信号样本": int(pd.to_numeric(
+                        "分数门槛": "仅排名" if threshold is None else threshold,
+                        "分数准入样本": int(pd.to_numeric(
                             funnel_df[f"{prefix}_Score_Eligible"], errors="coerce"
                         ).fillna(0).sum()),
                         "可成交样本": int(pd.to_numeric(
                             funnel_df[f"{prefix}_Tradable"], errors="coerce"
                         ).fillna(0).sum()),
-                        "至少1只日期": int(pd.to_numeric(
+                        "至少2只日期": int(pd.to_numeric(
                             funnel_df[f"{prefix}_Breadth_Confirmed"], errors="coerce"
                         ).fillna(0).sum()),
-                        "因广度放弃日期": int((pd.to_numeric(
+                        "仅1只放弃日期": int((pd.to_numeric(
                             funnel_df[f"{prefix}_Scarce_Skipped"], errors="coerce"
                         ).fillna(0) > 0).sum()),
                         "最终入选样本": int(pd.to_numeric(
@@ -3492,7 +3066,6 @@ if st.button(f"🚀 启动 {VERSION} 周线波浪回测"):
                 detail_curve, detail_ledger, detail_orders, detail_summary
             )
             show_quality_priority_report(detail_results)
-            show_quality_reference_report(detail_results)
             show_weekly_report(detail_results)
             show_weekly_wave_report(detail_results)
             show_provisional_weekly_report(detail_results)
@@ -3522,55 +3095,55 @@ if st.button(f"🚀 启动 {VERSION} 周线波浪回测"):
                 )
 
             st.download_button(
-                "📥 下载V41周线策略总览CSV",
+                "📥 下载V40.4四模式总对照CSV",
                 mode_comparison.to_csv(index=False).encode("utf-8-sig"),
-                f"weekly_summary_v41_3_{config_hash}.csv",
+                f"mode_comparison_v40_4_{config_hash}.csv",
                 "text/csv",
             )
             st.download_button(
-                "📥 下载V41全部入选轨迹CSV",
+                "📥 下载V40.4四模式全部入选轨迹CSV",
                 all_results.to_csv(index=False).encode("utf-8-sig"),
-                f"weekly_signals_v41_3_{config_hash}.csv",
+                f"export_v40_4_{config_hash}.csv",
                 "text/csv",
             )
             if not portfolio_curve.empty:
                 st.download_button(
-                    "📥 下载V41组合每日权益CSV",
+                    "📥 下载V40.4四模式组合每日权益CSV",
                     portfolio_curve.to_csv(index=False).encode("utf-8-sig"),
-                    f"portfolio_curve_v41_3_{config_hash}.csv",
+                    f"portfolio_curve_v40_4_{config_hash}.csv",
                     "text/csv",
                 )
             if not portfolio_ledger.empty:
                 st.download_button(
-                    "📥 下载V41组合成交账本CSV",
+                    "📥 下载V40.4四模式组合成交账本CSV",
                     portfolio_ledger.to_csv(index=False).encode("utf-8-sig"),
-                    f"portfolio_ledger_v41_3_{config_hash}.csv",
+                    f"portfolio_ledger_v40_4_{config_hash}.csv",
                     "text/csv",
                 )
             if not portfolio_orders.empty:
                 st.download_button(
-                    "📥 下载V41信号执行审计CSV",
+                    "📥 下载V40.4四模式信号执行审计CSV",
                     portfolio_orders.to_csv(index=False).encode("utf-8-sig"),
-                    f"portfolio_orders_v41_3_{config_hash}.csv",
+                    f"portfolio_orders_v40_4_{config_hash}.csv",
                     "text/csv",
                 )
         else:
-            st.warning("本次两种排序模式都没有产生可交易信号，请先查看筛选漏斗。")
+            st.warning("本次四种模式都没有产生可交易信号，请先查看筛选漏斗。")
 
         if not all_candidates_export.empty:
             candidate_csv = all_candidates_export.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
-                "📥 下载V41全部核心候选诊断CSV",
+                "📥 下载V40.4全部核心候选及四模式诊断CSV",
                 candidate_csv,
-                f"candidates_v41_3_{config_hash}.csv",
+                f"candidates_v40_4_{config_hash}.csv",
                 "text/csv",
             )
         if not funnel_df.empty:
             funnel_csv = funnel_df.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
-                "📥 下载V41逐日筛选漏斗CSV",
+                "📥 下载V40.4四模式逐日筛选漏斗CSV",
                 funnel_csv,
-                f"funnel_v41_3_{config_hash}.csv",
+                f"funnel_v40_4_{config_hash}.csv",
                 "text/csv",
             )
 
