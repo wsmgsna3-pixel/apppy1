@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-周线波浪选股 V41.2 · 逐日分析性能优化版
+周线波浪选股 V41.3 · 三仓位周线质量对照版
 ============================================================
 核心原则
 1. 每个交易日收盘后运行；周一至周四使用截至当日的临时周K，周五使用完整周K。
@@ -13,6 +13,7 @@
 7. 行情按交易日分片原子保存；网络中断后只补缺失日期，不再重下已成功日期。
 8. 恢复V40.4的轻量执行理念：先做T+1成交确认和TopK，再只为入选股计算完整未来轨迹。
 9. 全市场交易日索引只构建一次；周线退出序列每只入选股只计算一次。
+10. 原“周线主导”排序保持不变，新增“周线质量参考”并行模式；两种模式分别按最多3只持仓回测。
 
 说明
 - 本程序用于研究和回测，不构成投资建议。
@@ -40,7 +41,7 @@ import tushare as ts
 
 warnings.filterwarnings("ignore")
 
-VERSION = "V41.2"
+VERSION = "V41.3"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 # 每个交易日一个独立缓存分片；路径固定在代码旁，避免启动目录变化导致“缓存消失”。
 CACHE_DIR = os.path.join(APP_DIR, "market_cache_v41_1")
@@ -69,9 +70,17 @@ FIXED_MAX_MV = 1000.0
 FIXED_MARKET_FILTER = False
 MIN_TRADABLE_SIGNALS = 1
 
-# 复用原长表/组合报表结构，但V41只有一个“周线主导”模式且没有分数门槛。
-SCORE_MODES = (("周线主导", "Mode_Weekly", None),)
+# 两种模式使用相同准入、触发、成交和退出规则，只比较同日候选排序。
+SCORE_MODES = (
+    ("周线主导", "Mode_Weekly", None),
+    ("周线质量参考", "Mode_Quality", None),
+)
 SCORE_MODE_LABELS = tuple(item[0] for item in SCORE_MODES)
+
+QUALITY_RANKING_METHOD = (
+    "已完成周线趋势确认→周MA20斜率分层→临时周线趋势确认→过热项少→"
+    "适度强势项多→非回踩型→同业候选数→原排序"
+)
 
 STAGE_PRIORITY = {
     "R1_首周翻红": (0, "A1_本周首次翻红"),
@@ -1697,6 +1706,82 @@ def stock_active_on_date(row, trade_date: str) -> bool:
     return list_date <= trade_date < delist_date
 
 
+def add_quality_reference_features(all_candidates: pd.DataFrame) -> pd.DataFrame:
+    """
+    为并行参考模式构建只依赖D0收盘已知数据的排序字段。
+
+    这些字段只改变同日候选的先后顺序，不改变候选准入、T+1可成交判断或退出规则。
+    采用分层排序而不是单一拟合分数，便于审计并降低样本内权重过拟合风险。
+    """
+    if all_candidates is None or all_candidates.empty:
+        return all_candidates
+    out = all_candidates.copy()
+
+    def as_bool(column: str) -> pd.Series:
+        values = out.get(column, pd.Series(False, index=out.index))
+        if pd.api.types.is_bool_dtype(values):
+            return values.fillna(False).astype(bool)
+        return values.astype(str).str.strip().str.lower().isin({"true", "1", "yes"})
+
+    def as_number(column: str) -> pd.Series:
+        return pd.to_numeric(
+            out.get(column, pd.Series(np.nan, index=out.index)), errors="coerce"
+        )
+
+    completed_trend = as_bool("W_Trend_Confirmed")
+    provisional_trend = as_bool("P_W_Trend_Confirmed")
+    pulled_back = as_bool("Pulled_Back")
+    weekly_slope = as_number("W_MA20_Slope_pct")
+    daily_bias = as_number("MA20_Bias_pct")
+    rs20 = as_number("RS20_pct")
+    volume_ratio = as_number("Vol_Ratio")
+    breakout_pct = as_number("Daily_Breakout_pct")
+
+    # 斜率甜蜜区0.5%~2%优先；过快、轻微上升、负斜率依次靠后。
+    slope_tier = np.select(
+        [
+            weekly_slope.ge(0.5) & weekly_slope.lt(2.0),
+            weekly_slope.ge(2.0),
+            weekly_slope.ge(0.0) & weekly_slope.lt(0.5),
+        ],
+        [0, 1, 2],
+        default=3,
+    )
+
+    moderate_strength_count = (
+        (daily_bias.ge(15.0) & daily_bias.lt(30.0)).astype(int)
+        + (rs20.ge(10.0) & rs20.lt(30.0)).astype(int)
+        + (volume_ratio.ge(1.2) & volume_ratio.le(2.0)).astype(int)
+        + (breakout_pct.ge(3.0) & breakout_pct.lt(8.0)).astype(int)
+    )
+    overheat_count = (
+        daily_bias.ge(30.0).astype(int)
+        + rs20.ge(50.0).astype(int)
+        + volume_ratio.gt(2.2).astype(int)
+        + breakout_pct.ge(8.0).astype(int)
+    )
+
+    out["Quality_W_Trend_Confirmed"] = completed_trend
+    out["Quality_W_Slope_Tier"] = pd.Series(slope_tier, index=out.index, dtype="Int64")
+    out["Quality_P_W_Trend_Confirmed"] = provisional_trend
+    out["Quality_Overheat_Count"] = overheat_count.astype("Int64")
+    out["Quality_Moderate_Strength_Count"] = moderate_strength_count.astype("Int64")
+    out["Quality_No_Pullback"] = ~pulled_back
+    out["Quality_Industry_Core_Count"] = (
+        out.groupby(["Trade_Date", "SW_L1"], dropna=False)["ts_code"]
+        .transform("size")
+        .astype("Int64")
+    )
+    out["Quality_Ranking_Method"] = QUALITY_RANKING_METHOD
+    out["Quality_Reference_Label"] = (
+        np.where(completed_trend, "完成周线趋势确认", "完成周线未确认")
+        + "|斜率层" + pd.Series(slope_tier, index=out.index).astype(str)
+        + "|过热" + overheat_count.astype(str)
+        + "|适度强势" + moderate_strength_count.astype(str)
+    )
+    return out
+
+
 def apply_score_modes(
     all_candidates: pd.DataFrame,
     funnel: dict,
@@ -1715,15 +1800,42 @@ def apply_score_modes(
         breadth_confirmed = tradable_count >= int(min_tradable_signals)
 
         if breadth_confirmed:
-            selected_indices = (
-                all_candidates.loc[tradable_indices]
-                .sort_values(
-                    ["Stage_Priority", "Daily_Breakout_pct", "Vol_Ratio", "RS20_pct"],
-                    ascending=[True, False, False, False],
+            if prefix == "Mode_Quality":
+                sort_columns = [
+                    "Quality_W_Trend_Confirmed",
+                    "Quality_W_Slope_Tier",
+                    "Quality_P_W_Trend_Confirmed",
+                    "Quality_Overheat_Count",
+                    "Quality_Moderate_Strength_Count",
+                    "Quality_No_Pullback",
+                    "Quality_Industry_Core_Count",
+                    "Stage_Priority",
+                    "Daily_Breakout_pct",
+                    "Vol_Ratio",
+                    "RS20_pct",
+                    "ts_code",
+                ]
+                sort_ascending = [
+                    False, True, False, True, False, False,
+                    False, True, False, False, False, True,
+                ]
+            else:
+                # V41.2原始排序保持逐字段不变，作为严格对照组。
+                sort_columns = [
+                    "Stage_Priority", "Daily_Breakout_pct", "Vol_Ratio", "RS20_pct"
+                ]
+                sort_ascending = [True, False, False, False]
+            ranked_candidates = all_candidates.loc[tradable_indices]
+            if prefix == "Mode_Quality":
+                ranked_candidates = ranked_candidates.sort_values(
+                    sort_columns, ascending=sort_ascending, kind="mergesort"
                 )
-                .head(int(top_k))
-                .index.tolist()
-            )
+            else:
+                # 不指定排序算法，保持V41.2原调用语义，包括完全并列时的处理。
+                ranked_candidates = ranked_candidates.sort_values(
+                    sort_columns, ascending=sort_ascending
+                )
+            selected_indices = ranked_candidates.head(int(top_k)).index.tolist()
         else:
             selected_indices = []
 
@@ -1770,7 +1882,7 @@ def apply_score_modes(
 
 
 def collect_mode_results(all_candidates: pd.DataFrame) -> pd.DataFrame:
-    """把周线主导模式的入选记录展开为报表长表。"""
+    """把原排序与周线质量参考排序的入选记录展开为报表长表。"""
     frames = []
     for label, prefix, threshold in SCORE_MODES:
         selected = all_candidates[f"{prefix}_Selected"].fillna(False).astype(bool)
@@ -2047,7 +2159,7 @@ def run_backtest_for_day(
         funnel["Time_Total_S"] = round(time.perf_counter() - day_started, 3)
         return pd.DataFrame(), funnel, pd.DataFrame()
 
-    all_candidates = pd.DataFrame(records)
+    all_candidates = add_quality_reference_features(pd.DataFrame(records))
     # V41没有固定评分门槛：所有记录都已经同时通过周线硬准入和日线触发。
     required_score = 0.0
     base_count = len(all_candidates)
@@ -2591,6 +2703,54 @@ def show_quality_priority_report(all_results: pd.DataFrame) -> None:
     )
 
 
+def show_quality_reference_report(all_results: pd.DataFrame) -> None:
+    st.subheader("🧭 周线质量参考分层")
+    required = {
+        "Quality_W_Trend_Confirmed", "Quality_W_Slope_Tier",
+        "Quality_Overheat_Count", "Quality_Moderate_Strength_Count",
+        "Realized_Return (%)", "Exit_Reason", "Held_W8",
+    }
+    if all_results.empty or not required.issubset(all_results.columns):
+        st.info("暂无周线质量参考字段。")
+        return
+    data = all_results.copy()
+    data["_ret"] = pd.to_numeric(data["Realized_Return (%)"], errors="coerce")
+    data = data[data["_ret"].notna()].copy()
+    if data.empty:
+        st.info("当前质量参考样本尚未成熟。")
+        return
+    data["_完成周趋势"] = bool_series(data["Quality_W_Trend_Confirmed"])
+    data["_W8"] = bool_series(data["Held_W8"])
+    data["_止损"] = data["Exit_Reason"].fillna("").astype(str).str.startswith("结构止损")
+    slope_labels = {
+        0: "0.5%~2%",
+        1: "≥2%",
+        2: "0%~0.5%",
+        3: "<0%/缺失",
+    }
+    data["_斜率层"] = (
+        pd.to_numeric(data["Quality_W_Slope_Tier"], errors="coerce")
+        .map(slope_labels).fillna("缺失")
+    )
+    rows = []
+    for (trend, slope), group in data.groupby(["_完成周趋势", "_斜率层"], dropna=False):
+        rows.append(
+            {
+                "完成周趋势确认": "是" if trend else "否",
+                "周MA20斜率层": slope,
+                "成熟样本": len(group),
+                "平均收益(%)": round(group["_ret"].mean(), 2),
+                "中位收益(%)": round(group["_ret"].median(), 2),
+                "盈利率(%)": round((group["_ret"] > 0).mean() * 100.0, 1),
+                "大涨≥30%(%)": round((group["_ret"] >= 30).mean() * 100.0, 1),
+                "W8生存率(%)": round(group["_W8"].mean() * 100.0, 1),
+                "结构止损率(%)": round(group["_止损"].mean() * 100.0, 1),
+            }
+        )
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.caption("参考排序方法：" + QUALITY_RANKING_METHOD + "。所有字段均为D0收盘时已知。")
+
+
 def show_weekly_report(all_results: pd.DataFrame) -> None:
     st.subheader("🗓️ 全样本周度收益与真实持仓生存")
     row1 = st.columns(4)
@@ -2707,9 +2867,10 @@ def build_mode_comparison(
 
 
 def show_mode_comparison(comparison: pd.DataFrame) -> None:
-    st.subheader("🧪 周线主导策略总览")
+    st.subheader("🧪 原排序 vs 周线质量参考排序")
     st.caption(
-        "临时周MACD负责硬准入，日线负责触发；无固定评分门槛。"
+        "两种模式使用相同候选池、成交与退出规则，并分别按30万元、最多3只持仓运行；"
+        "差异只有同日候选排序。"
     )
     st.dataframe(comparison, use_container_width=True, hide_index=True)
 
@@ -2973,11 +3134,15 @@ with st.sidebar:
         "V41以每日临时周MACD作为硬准入：默认只允许绿柱连续缩短和本周首次翻红；"
         "日线只负责触发，不再使用82分门槛。"
     )
+    st.caption(
+        "本版并行比较原排序与周线质量参考排序；两套组合都固定最多持有3只，"
+        "不会增加实盘持仓数量。"
+    )
     DETAIL_MODE = st.selectbox(
         "详细报告显示模式",
         options=list(SCORE_MODE_LABELS),
         index=0,
-        help="V41只有周线主导模式。",
+        help="原模式保持V41.2排序；参考模式优先已完成周线趋势和周MA20斜率。",
     )
     ENABLE_THS = st.checkbox("实时雷达启用THS概念补充(需6000积分)", value=False)
     THS_KEYWORDS_TEXT = st.text_area("THS科技概念关键词", value=DEFAULT_THS_KEYWORDS, height=100)
@@ -3108,6 +3273,7 @@ if st.button(f"🚀 启动 {VERSION} 周线波浪回测"):
                 {"label": label, "threshold": threshold}
                 for label, _, threshold in SCORE_MODES
             ],
+            "quality_ranking_method": QUALITY_RANKING_METHOD,
             "breadth_threshold": int(BREADTH_THRESHOLD),
             "min_tradable_signals": MIN_TRADABLE_SIGNALS,
             "market_filter": bool(ENABLE_MARKET_FILTER),
@@ -3326,6 +3492,7 @@ if st.button(f"🚀 启动 {VERSION} 周线波浪回测"):
                 detail_curve, detail_ledger, detail_orders, detail_summary
             )
             show_quality_priority_report(detail_results)
+            show_quality_reference_report(detail_results)
             show_weekly_report(detail_results)
             show_weekly_wave_report(detail_results)
             show_provisional_weekly_report(detail_results)
@@ -3357,45 +3524,45 @@ if st.button(f"🚀 启动 {VERSION} 周线波浪回测"):
             st.download_button(
                 "📥 下载V41周线策略总览CSV",
                 mode_comparison.to_csv(index=False).encode("utf-8-sig"),
-                f"weekly_summary_v41_2_{config_hash}.csv",
+                f"weekly_summary_v41_3_{config_hash}.csv",
                 "text/csv",
             )
             st.download_button(
                 "📥 下载V41全部入选轨迹CSV",
                 all_results.to_csv(index=False).encode("utf-8-sig"),
-                f"weekly_signals_v41_2_{config_hash}.csv",
+                f"weekly_signals_v41_3_{config_hash}.csv",
                 "text/csv",
             )
             if not portfolio_curve.empty:
                 st.download_button(
                     "📥 下载V41组合每日权益CSV",
                     portfolio_curve.to_csv(index=False).encode("utf-8-sig"),
-                    f"portfolio_curve_v41_2_{config_hash}.csv",
+                    f"portfolio_curve_v41_3_{config_hash}.csv",
                     "text/csv",
                 )
             if not portfolio_ledger.empty:
                 st.download_button(
                     "📥 下载V41组合成交账本CSV",
                     portfolio_ledger.to_csv(index=False).encode("utf-8-sig"),
-                    f"portfolio_ledger_v41_2_{config_hash}.csv",
+                    f"portfolio_ledger_v41_3_{config_hash}.csv",
                     "text/csv",
                 )
             if not portfolio_orders.empty:
                 st.download_button(
                     "📥 下载V41信号执行审计CSV",
                     portfolio_orders.to_csv(index=False).encode("utf-8-sig"),
-                    f"portfolio_orders_v41_2_{config_hash}.csv",
+                    f"portfolio_orders_v41_3_{config_hash}.csv",
                     "text/csv",
                 )
         else:
-            st.warning("本次没有产生可交易的周线主导信号，请先查看筛选漏斗。")
+            st.warning("本次两种排序模式都没有产生可交易信号，请先查看筛选漏斗。")
 
         if not all_candidates_export.empty:
             candidate_csv = all_candidates_export.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
                 "📥 下载V41全部核心候选诊断CSV",
                 candidate_csv,
-                f"candidates_v41_2_{config_hash}.csv",
+                f"candidates_v41_3_{config_hash}.csv",
                 "text/csv",
             )
         if not funnel_df.empty:
@@ -3403,7 +3570,7 @@ if st.button(f"🚀 启动 {VERSION} 周线波浪回测"):
             st.download_button(
                 "📥 下载V41逐日筛选漏斗CSV",
                 funnel_csv,
-                f"funnel_v41_2_{config_hash}.csv",
+                f"funnel_v41_3_{config_hash}.csv",
                 "text/csv",
             )
 
