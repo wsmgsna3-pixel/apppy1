@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-周线波浪选股 V41.1 · 断点续传缓存增强版
+周线波浪选股 V41.2 · 逐日分析性能优化版
 ============================================================
 核心原则
 1. 每个交易日收盘后运行；周一至周四使用截至当日的临时周K，周五使用完整周K。
@@ -11,6 +11,8 @@
 5. D0收盘产生信号，D1开盘成交；D1买入当天禁止卖出，最早D2执行止损。
 6. 股票池、历史行业成分、复权、交易成本、组合约束、候选审计和回测报表继续保留。
 7. 行情按交易日分片原子保存；网络中断后只补缺失日期，不再重下已成功日期。
+8. 恢复V40.4的轻量执行理念：先做T+1成交确认和TopK，再只为入选股计算完整未来轨迹。
+9. 全市场交易日索引只构建一次；周线退出序列每只入选股只计算一次。
 
 说明
 - 本程序用于研究和回测，不构成投资建议。
@@ -38,7 +40,7 @@ import tushare as ts
 
 warnings.filterwarnings("ignore")
 
-VERSION = "V41.1"
+VERSION = "V41.2"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 # 每个交易日一个独立缓存分片；路径固定在代码旁，避免启动目录变化导致“缓存消失”。
 CACHE_DIR = os.path.join(APP_DIR, "market_cache_v41_1")
@@ -55,6 +57,8 @@ GLOBAL_TECH_PERIODS: dict[str, list[dict]] = {}
 GLOBAL_THS_TECH_CODES: set[str] = set()
 GLOBAL_BENCHMARK = pd.DataFrame()
 GLOBAL_REGIME_INDICES: dict[str, pd.DataFrame] = {}
+GLOBAL_MARKET_DATES: list[str] = []
+GLOBAL_NEXT_MARKET_DATE: dict[str, str] = {}
 API_ERRORS: list[str] = []
 SINA_STATUS = {"success": 0, "fail": 0}
 
@@ -643,6 +647,7 @@ def clear_all_market_caches() -> list[str]:
 
 def load_market_data(required_dates: list[str], use_cache: bool = True) -> None:
     global GLOBAL_ADJ_FACTOR, GLOBAL_DAILY_RAW, GLOBAL_QFQ_BASE_FACTORS
+    global GLOBAL_MARKET_DATES, GLOBAL_NEXT_MARKET_DATE
 
     required_dates = sorted({normalize_date(date) for date in required_dates if normalize_date(date)})
     required_set = set(required_dates)
@@ -699,6 +704,13 @@ def load_market_data(required_dates: list[str], use_cache: bool = True) -> None:
 
     if GLOBAL_DAILY_RAW.empty or GLOBAL_ADJ_FACTOR.empty:
         raise RuntimeError("行情或复权数据为空，无法回测")
+
+    # 一次构建交易日索引。后续每个候选只做O(1)字典查询，不再扫描数百万行市场数据。
+    GLOBAL_MARKET_DATES = sorted(market_frame_dates(GLOBAL_DAILY_RAW))
+    GLOBAL_NEXT_MARKET_DATE = {
+        day: GLOBAL_MARKET_DATES[index + 1]
+        for index, day in enumerate(GLOBAL_MARKET_DATES[:-1])
+    }
 
     # 每只股票使用自身最后一个可用复权因子，避免要求所有股票在同一最新日期都有记录
     adj_reset = GLOBAL_ADJ_FACTOR.reset_index().sort_values(["ts_code", "trade_date"])
@@ -1254,6 +1266,133 @@ def future_result_template(hold_weeks: int = 8) -> dict:
     return result
 
 
+def get_t1_execution_check(
+    ts_code: str,
+    market: str,
+    selection_date: str,
+    signal_close: float,
+    max_gap_pct: float,
+    buy_slippage_pct: float,
+    commission_pct: float,
+    use_sina: bool = False,
+) -> dict:
+    """只检查D1能否成交，不计算8周未来轨迹；用于TopK之前的全候选轻量检查。"""
+    result = {
+        "Exit_Reason": "等待T+1数据",
+        "Entry_Date": "",
+        "Buy_Price": np.nan,
+        "Gap_pct (%)": np.nan,
+        "T1_Close_Price": np.nan,
+        "T1_Close_Return_pct": np.nan,
+        "T1_Close_vs_Signal_pct": np.nan,
+        "T1_Follow_Through": False,
+        "Tradable": False,
+    }
+    d0 = datetime.strptime(selection_date, "%Y%m%d")
+    start_date = (d0 - timedelta(days=10)).strftime("%Y%m%d")
+    end_date = (d0 + timedelta(days=15)).strftime("%Y%m%d")
+    hist = get_qfq_data(ts_code, start_date, end_date, use_sina=use_sina)
+    if hist.empty:
+        result["Exit_Reason"] = "T+1行情缺失"
+        return result
+    future = hist[hist.index > selection_date]
+    if future.empty:
+        result["Exit_Reason"] = "等待T+1数据"
+        return result
+
+    next_row = future.iloc[0]
+    expected_entry_date = GLOBAL_NEXT_MARKET_DATE.get(selection_date, "")
+    if expected_entry_date and normalize_date(next_row.name) != expected_entry_date:
+        result["Exit_Reason"] = "信号后下一交易日停牌/无行情(剔除)"
+        return result
+
+    limit_pct, _, _ = board_parameters(market)
+    raw_open = float(next_row["open"])
+    gap_pct = (raw_open / signal_close - 1.0) * 100.0 if signal_close > 0 else np.nan
+    result["Gap_pct (%)"] = round(gap_pct, 2)
+    at_limit_up = signal_close > 0 and raw_open / signal_close - 1.0 >= limit_pct - 0.005
+    if at_limit_up:
+        result["Exit_Reason"] = "T+1涨停价开盘无法可靠买入(剔除)"
+        return result
+    if pd.notna(gap_pct) and gap_pct > max_gap_pct:
+        result["Exit_Reason"] = f"T+1高开>{max_gap_pct:.1f}%(剔除)"
+        return result
+    if raw_open <= 0 or pd.isna(raw_open):
+        result["Exit_Reason"] = "T+1开盘价无效"
+        return result
+
+    buy_price = raw_open * (1.0 + buy_slippage_pct / 100.0) * (1.0 + commission_pct / 100.0)
+    next_close = float(next_row["close"])
+    result.update(
+        {
+            "Exit_Reason": "T+1可成交-等待TopK未来轨迹",
+            "Entry_Date": normalize_date(next_row.name),
+            "Buy_Price": round(buy_price, 3),
+            "T1_Close_Price": round(next_close, 3),
+            "T1_Close_Return_pct": round((next_close / buy_price - 1.0) * 100.0, 4),
+            "T1_Close_vs_Signal_pct": round(
+                (next_close / signal_close - 1.0) * 100.0 if signal_close > 0 else np.nan,
+                4,
+            ),
+            "T1_Follow_Through": bool(next_close >= signal_close and next_close >= raw_open),
+            "Tradable": True,
+        }
+    )
+    return result
+
+
+def build_weekly_exit_flags(hist: pd.DataFrame) -> dict[str, bool]:
+    """一次性计算全部完整周的退出标记，避免持仓循环里每周重复resample和EMA。"""
+    if hist is None or hist.empty:
+        return {}
+    weekly = hist.reset_index().copy()
+    date_column = "trade_date_str" if "trade_date_str" in weekly.columns else weekly.columns[0]
+    weekly["dt"] = pd.to_datetime(weekly[date_column])
+    weekly = weekly.set_index("dt").resample("W-FRI").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last", "vol": "sum"}
+    ).dropna(subset=["close"]).reset_index()
+    if len(weekly) < 30:
+        return {}
+    weekly["w_ema12"] = weekly["close"].ewm(span=12, adjust=False).mean()
+    weekly["w_ema26"] = weekly["close"].ewm(span=26, adjust=False).mean()
+    weekly["w_dif"] = weekly["w_ema12"] - weekly["w_ema26"]
+    weekly["w_dea"] = weekly["w_dif"].ewm(span=9, adjust=False).mean()
+    weekly["w_macd"] = (weekly["w_dif"] - weekly["w_dea"]) * 2.0
+
+    flags: dict[str, bool] = {}
+    for position in range(29, len(weekly)):
+        curr = weekly.iloc[position]
+        prev = weekly.iloc[position - 1]
+        prev2 = weekly.iloc[position - 2]
+        hist_now = float(curr["w_macd"])
+        hist_prev = float(prev["w_macd"])
+        hist_prev2 = float(prev2["w_macd"])
+        dif_rising = float(curr["w_dif"]) > float(prev["w_dif"])
+        if hist_now > 0:
+            if hist_prev <= 0:
+                stage = "R1_首周翻红"
+            elif hist_prev > 0 and hist_prev2 <= 0 and hist_now >= hist_prev:
+                stage = "R2_第二根红柱扩张"
+            elif hist_now > hist_prev and hist_prev < hist_prev2:
+                stage = "R3_红柱再加速"
+            elif hist_now >= hist_prev:
+                stage = "R4_红柱扩张"
+            else:
+                stage = "R5_红柱衰减"
+        else:
+            if hist_now > hist_prev and hist_prev > hist_prev2 and dif_rising:
+                stage = "G1_绿柱连续缩短"
+            elif hist_now > hist_prev and dif_rising:
+                stage = "G2_绿柱缩短"
+            else:
+                stage = "G3_绿柱扩大/弱势"
+        trade_date = pd.Timestamp(curr["dt"]).strftime("%Y%m%d")
+        flags[trade_date] = bool(
+            stage in {"R5_红柱衰减", "G3_绿柱扩大/弱势"} and not dif_rising
+        )
+    return flags
+
+
 def get_medium_term_future(
     ts_code: str,
     market: str,
@@ -1284,15 +1423,10 @@ def get_medium_term_future(
     future = hist[hist.index > selection_date].copy()
     if future.empty:
         return result
+    weekly_exit_flags = build_weekly_exit_flags(hist)
 
     next_row = future.iloc[0]
-    market_dates = []
-    if isinstance(GLOBAL_DAILY_RAW.index, pd.MultiIndex):
-        market_dates = sorted(
-            set(GLOBAL_DAILY_RAW.index.get_level_values("trade_date").astype(str))
-        )
-    expected_dates = [date for date in market_dates if date > selection_date]
-    expected_entry_date = expected_dates[0] if expected_dates else ""
+    expected_entry_date = GLOBAL_NEXT_MARKET_DATE.get(selection_date, "")
     if expected_entry_date and normalize_date(next_row.name) != expected_entry_date:
         result["Exit_Reason"] = "信号后下一交易日停牌/无行情(剔除)"
         result["Tradable"] = False
@@ -1400,25 +1534,10 @@ def get_medium_term_future(
         peak_high = max(peak_high, curr_high)
         trough_low = min(trough_low, curr_low)
 
-        # 周五收盘后，用当时已经完成的周K判断波段是否转弱；次一交易日开盘退出。
-        # 只有MACD柱与DIF同时走弱才退出，避免单周轻微收缩造成过早卖出。
+        # 周线退出序列已在进入循环前一次性计算；这里只做O(1)查询。
         row_date = pd.Timestamp(datetime.strptime(normalize_date(row.name), "%Y%m%d"))
-        if row_date.weekday() == 4:
-            weekly_source = hist[hist.index <= normalize_date(row.name)].reset_index().copy()
-            weekly_source["dt"] = pd.to_datetime(weekly_source["trade_date_str"])
-            weekly_exit_frame = weekly_source.set_index("dt").resample("W-FRI").agg(
-                {"open": "first", "high": "max", "low": "min", "close": "last", "vol": "sum"}
-            ).dropna(subset=["close"]).reset_index()
-            weekly_exit_frame["w_ma20"] = weekly_exit_frame["close"].rolling(20).mean()
-            exit_wave = classify_completed_weekly_macd(
-                weekly_exit_frame, normalize_date(row.name)
-            )
-            weekly_turn_down = (
-                exit_wave["weekly_macd_stage"] in {"R5_红柱衰减", "G3_绿柱扩大/弱势"}
-                and not exit_wave["weekly_dif_rising"]
-            )
-            if weekly_turn_down:
-                pending_reason = "周线MACD柱与DIF同步转弱-次日开盘退出"
+        if row_date.weekday() == 4 and weekly_exit_flags.get(normalize_date(row.name), False):
+            pending_reason = "周线MACD柱与DIF同步转弱-次日开盘退出"
 
         if day_count % 5 == 0:
             result[f"Return_W{week} (%)"] = net_return(curr_close)
@@ -1698,8 +1817,10 @@ def run_backtest_for_day(
     include_second_red: bool,
     protection_trigger_pct: float,
     protection_buffer_pct: float,
+    enable_t2_diagnostic: bool = False,
     use_sina: bool = False,
 ):
+    day_started = time.perf_counter()
     query_date = trade_date
     daily = safe_get("daily", trade_date=query_date)
     # 盘中daily/daily_basic通常尚未发布：用最近完整交易日构建基础股票池，
@@ -1921,6 +2042,9 @@ def run_backtest_for_day(
     if not records:
         funnel["Day_Base_Signal_Count"] = 0
         funnel["Required_Score"] = 0.0
+        funnel["Core_Candidate_Count"] = 0
+        funnel["Full_Future_Count"] = 0
+        funnel["Time_Total_S"] = round(time.perf_counter() - day_started, 3)
         return pd.DataFrame(), funnel, pd.DataFrame()
 
     all_candidates = pd.DataFrame(records)
@@ -1975,36 +2099,30 @@ def run_backtest_for_day(
     if regime["Market_Weak_Block"]:
         all_candidates["Selection_Status"] = "双指数弱势-暂停开仓"
     else:
-        # 给所有周线准入且日线触发的候选计算同一套未来轨迹。
+        # TopK前只复现原有D1成交条件；未来8周收益从不参与排序，不应为全候选计算。
         eligible_indices = all_candidates.index.tolist()
         funnel["After_Market_Filter"] = len(eligible_indices)
+        t1_started = time.perf_counter()
         for idx in eligible_indices:
             candidate = all_candidates.loc[idx]
-            future = get_medium_term_future(
+            execution = get_t1_execution_check(
                 candidate["ts_code"],
                 candidate["market"],
                 trade_date,
                 float(candidate["Signal_Close"]),
-                float(candidate["_Signal_Low"]),
-                float(candidate["_Signal_MA20"]),
-                float(candidate["_ATR14"]),
-                hold_weeks=8,
                 max_gap_pct=max_gap_pct,
                 buy_slippage_pct=buy_slippage_pct,
-                sell_slippage_pct=sell_slippage_pct,
                 commission_pct=commission_pct,
-                sell_tax_pct=sell_tax_pct,
-                protection_trigger_pct=protection_trigger_pct,
-                protection_buffer_pct=protection_buffer_pct,
                 use_sina=use_sina,
             )
-            for key, value in future.items():
+            for key, value in execution.items():
                 all_candidates.loc[idx, key] = value
             all_candidates.loc[idx, "Execution_Checked"] = True
-            if future["Tradable"]:
-                all_candidates.loc[idx, "Selection_Status"] = "全量诊断可成交"
+            if execution["Tradable"]:
+                all_candidates.loc[idx, "Selection_Status"] = "T+1可成交-等待TopK"
             else:
-                all_candidates.loc[idx, "Selection_Status"] = str(future["Exit_Reason"])
+                all_candidates.loc[idx, "Selection_Status"] = str(execution["Exit_Reason"])
+        funnel["Time_T1_Check_S"] = round(time.perf_counter() - t1_started, 3)
 
     checked_mask = all_candidates["Execution_Checked"].fillna(False).astype(bool)
     tradable_mask = checked_mask & all_candidates["Tradable"].eq(True).fillna(False)
@@ -2018,20 +2136,22 @@ def run_backtest_for_day(
         min_tradable_signals=min_tradable_signals,
     )
 
-    # T2延续与分批诊断只计算至少被一种模式选中的并集，减少重复行情读取。
+    # 完整8周轨迹只计算至少被一种模式选中的并集；这发生在排名之后，且不反向改选股结果。
     selected_union = pd.Series(False, index=all_candidates.index)
     for _, prefix, _ in SCORE_MODES:
         selected_union |= all_candidates[f"{prefix}_Selected"].fillna(False).astype(bool)
+    future_started = time.perf_counter()
     for idx in all_candidates.index[selected_union]:
         candidate = all_candidates.loc[idx]
-        main_result = {key: candidate.get(key, value) for key, value in future_result_template(8).items()}
-        alternative = build_alternative_entry_diagnostics(
-            main_result=main_result,
-            ts_code=str(candidate["ts_code"]),
-            market=str(candidate["market"]),
-            signal_low=float(candidate["_Signal_Low"]),
-            signal_ma20=float(candidate["_Signal_MA20"]),
-            atr14=float(candidate["_ATR14"]),
+        main_result = get_medium_term_future(
+            candidate["ts_code"],
+            candidate["market"],
+            trade_date,
+            float(candidate["Signal_Close"]),
+            float(candidate["_Signal_Low"]),
+            float(candidate["_Signal_MA20"]),
+            float(candidate["_ATR14"]),
+            hold_weeks=8,
             max_gap_pct=max_gap_pct,
             buy_slippage_pct=buy_slippage_pct,
             sell_slippage_pct=sell_slippage_pct,
@@ -2041,8 +2161,41 @@ def run_backtest_for_day(
             protection_buffer_pct=protection_buffer_pct,
             use_sina=use_sina,
         )
-        for key, value in alternative.items():
+        for key, value in main_result.items():
             all_candidates.loc[idx, key] = value
+        if bool(main_result.get("Tradable", False)):
+            all_candidates.loc[idx, "Selection_Status"] = "TopK完整未来轨迹已计算"
+        else:
+            # 理论上不会发生：轻量检查与完整函数使用同一套T+1规则。保留审计字段便于发现数据异常。
+            all_candidates.loc[idx, "Selection_Status"] = (
+                "T+1等价检查异常:" + str(main_result.get("Exit_Reason", "不可成交"))
+            )
+
+        # T2只是事后诊断，从不参与选股；默认关闭以避免额外一次完整未来轨迹计算。
+        if enable_t2_diagnostic:
+            alternative = build_alternative_entry_diagnostics(
+                main_result=main_result,
+                ts_code=str(candidate["ts_code"]),
+                market=str(candidate["market"]),
+                signal_low=float(candidate["_Signal_Low"]),
+                signal_ma20=float(candidate["_Signal_MA20"]),
+                atr14=float(candidate["_ATR14"]),
+                max_gap_pct=max_gap_pct,
+                buy_slippage_pct=buy_slippage_pct,
+                sell_slippage_pct=sell_slippage_pct,
+                commission_pct=commission_pct,
+                sell_tax_pct=sell_tax_pct,
+                protection_trigger_pct=protection_trigger_pct,
+                protection_buffer_pct=protection_buffer_pct,
+                use_sina=use_sina,
+            )
+            for key, value in alternative.items():
+                all_candidates.loc[idx, key] = value
+
+    funnel["Core_Candidate_Count"] = len(all_candidates)
+    funnel["Full_Future_Count"] = int(selected_union.sum())
+    funnel["Time_Future_Selected_S"] = round(time.perf_counter() - future_started, 3)
+    funnel["Time_Total_S"] = round(time.perf_counter() - day_started, 3)
 
     all_candidates["Day_Tradable_Signal_Count"] = all_candidates["Mode_Weekly_Day_Tradable_Count"]
     all_candidates["Breadth_Confirmed"] = all_candidates["Mode_Weekly_Breadth_Confirmed"]
@@ -2800,7 +2953,7 @@ def style_exit(value):
 with st.sidebar:
     st.header(f"{VERSION} 回测参数")
     backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
-    BACKTEST_DAYS = st.number_input("分析交易日数", min_value=1, value=500, step=50)
+    BACKTEST_DAYS = st.number_input("分析交易日数", min_value=1, value=250, step=50)
     TOP_BACKTEST = st.number_input(
         "每日优选 TopK", min_value=2, max_value=20, value=5, step=1,
         help="TopK用于保留候选广度；真实同时持仓仍由组合引擎限制为3只。",
@@ -2866,6 +3019,11 @@ with st.sidebar:
     st.caption(
         "退出采用结构止损，或周五确认MACD柱与DIF同步转弱后在下一交易日开盘卖出；"
         "买入当天禁止卖出。完整观察期仍保留8周上限，便于统一比较。"
+    )
+    ENABLE_T2_DIAGNOSTIC = st.checkbox(
+        "计算T+2延续/分批买入诊断（较慢）",
+        value=False,
+        help="仅生成事后诊断字段，不参与周线准入、日线触发、TopK排序或主组合回测。",
     )
 
     RESUME_CHECKPOINT = st.checkbox("开启参数隔离的断点续传", value=True)
@@ -2959,6 +3117,7 @@ if st.button(f"🚀 启动 {VERSION} 周线波浪回测"):
             "sell_tax": SELL_TAX,
             "protection_trigger": PROTECTION_TRIGGER,
             "protection_buffer": PROTECTION_BUFFER,
+            "t2_diagnostic": bool(ENABLE_T2_DIAGNOSTIC),
             "initial_capital": INITIAL_CAPITAL,
             "max_positions": MAX_PORTFOLIO_POSITIONS,
             "position_budget": POSITION_BUDGET,
@@ -3040,6 +3199,7 @@ if st.button(f"🚀 启动 {VERSION} 周线波浪回测"):
                 include_second_red=bool(INCLUDE_SECOND_RED),
                 protection_trigger_pct=float(PROTECTION_TRIGGER),
                 protection_buffer_pct=float(PROTECTION_BUFFER),
+                enable_t2_diagnostic=bool(ENABLE_T2_DIAGNOSTIC),
                 use_sina=use_sina,
             )
             results_store = replace_trade_date_records(
@@ -3197,34 +3357,34 @@ if st.button(f"🚀 启动 {VERSION} 周线波浪回测"):
             st.download_button(
                 "📥 下载V41周线策略总览CSV",
                 mode_comparison.to_csv(index=False).encode("utf-8-sig"),
-                f"weekly_summary_v41_1_{config_hash}.csv",
+                f"weekly_summary_v41_2_{config_hash}.csv",
                 "text/csv",
             )
             st.download_button(
                 "📥 下载V41全部入选轨迹CSV",
                 all_results.to_csv(index=False).encode("utf-8-sig"),
-                f"weekly_signals_v41_1_{config_hash}.csv",
+                f"weekly_signals_v41_2_{config_hash}.csv",
                 "text/csv",
             )
             if not portfolio_curve.empty:
                 st.download_button(
                     "📥 下载V41组合每日权益CSV",
                     portfolio_curve.to_csv(index=False).encode("utf-8-sig"),
-                    f"portfolio_curve_v41_1_{config_hash}.csv",
+                    f"portfolio_curve_v41_2_{config_hash}.csv",
                     "text/csv",
                 )
             if not portfolio_ledger.empty:
                 st.download_button(
                     "📥 下载V41组合成交账本CSV",
                     portfolio_ledger.to_csv(index=False).encode("utf-8-sig"),
-                    f"portfolio_ledger_v41_1_{config_hash}.csv",
+                    f"portfolio_ledger_v41_2_{config_hash}.csv",
                     "text/csv",
                 )
             if not portfolio_orders.empty:
                 st.download_button(
                     "📥 下载V41信号执行审计CSV",
                     portfolio_orders.to_csv(index=False).encode("utf-8-sig"),
-                    f"portfolio_orders_v41_1_{config_hash}.csv",
+                    f"portfolio_orders_v41_2_{config_hash}.csv",
                     "text/csv",
                 )
         else:
@@ -3235,7 +3395,7 @@ if st.button(f"🚀 启动 {VERSION} 周线波浪回测"):
             st.download_button(
                 "📥 下载V41全部核心候选诊断CSV",
                 candidate_csv,
-                f"candidates_v41_1_{config_hash}.csv",
+                f"candidates_v41_2_{config_hash}.csv",
                 "text/csv",
             )
         if not funnel_df.empty:
@@ -3243,7 +3403,7 @@ if st.button(f"🚀 启动 {VERSION} 周线波浪回测"):
             st.download_button(
                 "📥 下载V41逐日筛选漏斗CSV",
                 funnel_csv,
-                f"funnel_v41_1_{config_hash}.csv",
+                f"funnel_v41_2_{config_hash}.csv",
                 "text/csv",
             )
 
