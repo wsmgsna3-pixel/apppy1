@@ -6,3 +6,6 @@ joblib
 scipy
 tenacity
 yfinance
+matplotlib
+yfinance
+scikit-learn
