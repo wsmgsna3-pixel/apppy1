@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-选股王 V40.4-C · V40.4原策略缓存精简版
+选股王 V40.4-D · V40.4原策略缓存精简版
 ============================================================
 主要变化
 1. 股票池：主板/创业板/科创板，明确剔除北交所；保留流通市值200~1000亿元参数。
@@ -41,6 +41,8 @@
     计算、页面、漏斗与导出内容，减少无效诊断开销。
 28. 回测口径：股票池、硬门槛、评分公式、82分准入、T+1成交、TopK、至少2只
     确认、退出规则和30万元三仓组合均保持V40.4原样。
+29. 容错：盘中尚未发布、网络波动或接口缺失的交易日自动跳过；多日回测自动向前
+    补足相同数量的完整信号日，缺失日期保留警告但不再终止整次回测。
 
 说明
 - 本程序用于研究和回测，不构成投资建议。
@@ -59,6 +61,7 @@ import time
 import traceback
 import warnings
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -68,7 +71,7 @@ import tushare as ts
 
 warnings.filterwarnings("ignore")
 
-VERSION = "V40.4-C"
+VERSION = "V40.4-D"
 EXPORT_TAG = "v40_4_cache"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 # 与周线1.0共用相同原始行情分片，切换策略不重复下载。
@@ -86,6 +89,8 @@ GLOBAL_TECH_PERIODS: dict[str, list[dict]] = {}
 GLOBAL_THS_TECH_CODES: set[str] = set()
 GLOBAL_BENCHMARK = pd.DataFrame()
 GLOBAL_REGIME_INDICES: dict[str, pd.DataFrame] = {}
+GLOBAL_MARKET_MISSING_DATES: set[str] = set()
+GLOBAL_REQUIRED_MARKET_DATES: set[str] = set()
 API_ERRORS: list[str] = []
 SINA_STATUS = {"success": 0, "fail": 0}
 
@@ -242,6 +247,11 @@ def normalize_date(value, default: str = "") -> str:
     return text if len(text) == 8 and text.isdigit() else default
 
 
+def market_now() -> datetime:
+    """A股市场时区时间；转为无时区对象以兼容现有日期计算。"""
+    return datetime.now(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
+
+
 def canonicalize_records(df: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
     """统一断点文件的主键类型并去重。
 
@@ -345,6 +355,23 @@ def get_open_dates(start_date: str, end_date: str) -> list[str]:
     return sorted(cal.loc[cal["is_open"] == 1, "cal_date"].astype(str).tolist())
 
 
+def choose_effective_trade_days(
+    available_dates: set[str],
+    end_date_str: str,
+    num_days: int,
+) -> list[str]:
+    """从真实完整行情中选择截至指定日最近N天，缺失日自动由更早日期补足。"""
+    usable = sorted(
+        {
+            normalize_date(date)
+            for date in available_dates
+            if normalize_date(date) and normalize_date(date) <= end_date_str
+        },
+        reverse=True,
+    )
+    return usable[: int(num_days)]
+
+
 def get_sina_realtime_kline(ts_code: str):
     global SINA_STATUS
     code_split = ts_code.split(".")
@@ -361,7 +388,7 @@ def get_sina_realtime_kline(ts_code: str):
             SINA_STATUS["fail"] += 1
             return None
         data = data_str.split(",")
-        now = datetime.now()
+        now = market_now()
         elapsed = 0
         morning_start = now.replace(hour=9, minute=30, second=0, microsecond=0)
         morning_end = now.replace(hour=11, minute=30, second=0, microsecond=0)
@@ -561,6 +588,20 @@ def market_frame_dates(frame: pd.DataFrame) -> set[str]:
         return set()
 
 
+def market_frame_for_date(frame: pd.DataFrame, trade_date: str) -> pd.DataFrame:
+    """从已下载/缓存的全市场数据中取出单日记录，供接口临时失败时降级使用。"""
+    if frame is None or frame.empty or not isinstance(frame.index, pd.MultiIndex):
+        return pd.DataFrame()
+    try:
+        mask = frame.index.get_level_values("trade_date").astype(str) == str(trade_date)
+        if not mask.any():
+            return pd.DataFrame()
+        return frame.loc[mask].reset_index().copy()
+    except Exception as exc:
+        record_api_error(f"读取缓存交易日 {trade_date} 失败: {exc}")
+        return pd.DataFrame()
+
+
 def filter_market_dates(frame: pd.DataFrame, required: set[str]) -> pd.DataFrame:
     if frame is None or frame.empty or not isinstance(frame.index, pd.MultiIndex):
         return pd.DataFrame()
@@ -685,9 +726,11 @@ def clear_all_market_caches() -> list[str]:
 
 def load_market_data(required_dates: list[str], use_cache: bool = True) -> list[str]:
     global GLOBAL_ADJ_FACTOR, GLOBAL_DAILY_RAW, GLOBAL_QFQ_BASE_FACTORS
+    global GLOBAL_MARKET_MISSING_DATES, GLOBAL_REQUIRED_MARKET_DATES
 
     required_dates = sorted({normalize_date(date) for date in required_dates if normalize_date(date)})
     required_set = set(required_dates)
+    GLOBAL_REQUIRED_MARKET_DATES = required_set
     cached_daily = pd.DataFrame()
     cached_adj = pd.DataFrame()
     if use_cache:
@@ -746,10 +789,11 @@ def load_market_data(required_dates: list[str], use_cache: bool = True) -> list[
         adj_reset.groupby("ts_code", sort=False).tail(1).set_index("ts_code")["adj_factor"].to_dict()
     )
 
+    GLOBAL_MARKET_MISSING_DATES = set(failed_dates)
     if failed_dates:
         st.warning(
-            f"有 {len(failed_dates)} 个交易日下载失败；示例: {failed_dates[:8]}。"
-            "已成功日期已经保存，下次运行只补失败日期。"
+            f"有 {len(failed_dates)} 个交易日未取得完整行情；示例: {failed_dates[:8]}。"
+            "本次将自动跳过，不会终止回测；已成功日期均已缓存，下次运行只补缺失日期。"
         )
     return failed_dates
 
@@ -878,7 +922,7 @@ def get_qfq_data(ts_code: str, start_date: str, end_date: str, use_sina: bool = 
     df = df.sort_values("trade_date_str").set_index("trade_date_str")
     result = df[["open", "high", "low", "close", "pre_close", "vol"]].copy()
 
-    if use_sina and end_date == datetime.now().strftime("%Y%m%d"):
+    if use_sina and end_date == market_now().strftime("%Y%m%d"):
         realtime = get_sina_realtime_kline(ts_code)
         if realtime and realtime["close"] > 0:
             today = realtime.pop("trade_date_str")
@@ -1273,7 +1317,9 @@ def future_result_template(hold_weeks: int = 8) -> dict:
             "T1_Follow_Through": False,
             "Early_Structural_Stop_10D": False,
             "False_Rebound_10D": False,
-            "Tradable": True,
+            "Skipped_Market_Day_Count": 0,
+            "Skipped_Market_Dates": "",
+            "Tradable": False,
         }
     )
     return result
@@ -1310,6 +1356,17 @@ def get_medium_term_future(
         return result
 
     next_row = future.iloc[0]
+    expected_future_dates = sorted(
+        date for date in GLOBAL_REQUIRED_MARKET_DATES if date > selection_date
+    )
+    expected_entry_date = expected_future_dates[0] if expected_future_dates else ""
+    actual_entry_date = normalize_date(next_row.name)
+    if expected_entry_date and actual_entry_date != expected_entry_date:
+        result["Exit_Reason"] = f"T+1行情缺失({expected_entry_date})-跳过该信号"
+        result["Skipped_Market_Day_Count"] = 1
+        result["Skipped_Market_Dates"] = expected_entry_date
+        return result
+
     limit_pct, min_stop_pct, max_stop_pct = board_parameters(market)
     raw_open = float(next_row["open"])
     gap_pct = (raw_open / signal_close - 1.0) * 100.0 if signal_close > 0 else np.nan
@@ -1333,6 +1390,7 @@ def get_medium_term_future(
         result["Tradable"] = False
         return result
 
+    result["Tradable"] = True
     buy_price = raw_open * (1.0 + buy_slippage_pct / 100.0) * (1.0 + commission_pct / 100.0)
     result["Entry_Date"] = normalize_date(next_row.name)
     result["Buy_Price"] = round(buy_price, 3)
@@ -1390,6 +1448,17 @@ def get_medium_term_future(
     pending_reason = None
     exited = False
     observed_days = min(len(future), hold_weeks * 5)
+
+    # 只记录真正落在已有观察区间内部的全市场缺口。观察期末端尚未发布的数据
+    # 属于“样本未成熟”，不虚构为历史缺口，也不妨碍本次回测完成。
+    if observed_days > 0:
+        observation_end = normalize_date(future.iloc[observed_days - 1].name)
+        skipped_dates = sorted(
+            date for date in GLOBAL_MARKET_MISSING_DATES
+            if selection_date < date <= observation_end
+        )
+        result["Skipped_Market_Day_Count"] = len(skipped_dates)
+        result["Skipped_Market_Dates"] = ",".join(skipped_dates)
 
     for i in range(observed_days):
         row = future.iloc[i]
@@ -1717,6 +1786,9 @@ def run_backtest_for_day(
     day_started = time.perf_counter()
     query_date = trade_date
     daily = safe_get("daily", trade_date=query_date)
+    # 网络临时失败时优先复用刚刚载入的完整分片，避免重复请求导致整日被跳过。
+    if daily.empty:
+        daily = market_frame_for_date(GLOBAL_DAILY_RAW, query_date)
     # 盘中daily/daily_basic通常尚未发布：用最近完整交易日构建基础股票池，
     # 个股技术指标仍由新浪实时行补到trade_date。
     if use_sina and daily.empty:
@@ -1725,6 +1797,8 @@ def run_backtest_for_day(
                 datetime.strptime(trade_date, "%Y%m%d") - timedelta(days=offset)
             ).strftime("%Y%m%d")
             daily = safe_get("daily", trade_date=candidate_date)
+            if daily.empty:
+                daily = market_frame_for_date(GLOBAL_DAILY_RAW, candidate_date)
             if not daily.empty:
                 query_date = candidate_date
                 break
@@ -1734,11 +1808,16 @@ def run_backtest_for_day(
         fields="ts_code,trade_date,turnover_rate,turnover_rate_f,circ_mv,total_mv",
     )
     if daily.empty or daily_basic.empty:
+        missing_parts = []
+        if daily.empty:
+            missing_parts.append("daily")
+        if daily_basic.empty:
+            missing_parts.append("daily_basic")
         return (
             pd.DataFrame(),
             {
                 "Trade_Date": trade_date,
-                "Error": "daily/daily_basic缺失",
+                "Error": f"{'/'.join(missing_parts)}缺失-本日已自动跳过",
                 "Time_Total_S": round(time.perf_counter() - day_started, 3),
             },
             pd.DataFrame(),
@@ -1967,7 +2046,7 @@ def run_backtest_for_day(
                 }
             ):
                 all_candidates[key] = pd.Series(pd.NA, index=all_candidates.index, dtype="boolean")
-            elif key in ["Exit_Reason", "Entry_Date", "Exit_Date"]:
+            elif key in ["Exit_Reason", "Entry_Date", "Exit_Date", "Skipped_Market_Dates"]:
                 all_candidates[key] = pd.Series(None, index=all_candidates.index, dtype="object")
             else:
                 all_candidates[key] = np.nan
@@ -2830,7 +2909,7 @@ def style_exit(value):
 # -----------------------------------------------------------------------------
 with st.sidebar:
     st.header(f"{VERSION} 回测参数")
-    backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
+    backtest_date_end = st.date_input("分析截止日期", value=market_now().date())
     BACKTEST_DAYS = st.number_input("分析交易日数", min_value=1, value=250, step=50)
     TOP_BACKTEST = st.number_input(
         "每日优选 TopK", min_value=2, max_value=20, value=5, step=1,
@@ -2945,20 +3024,57 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
             GLOBAL_THS_TECH_CODES = set()
 
         end_str = backtest_date_end.strftime("%Y%m%d")
-        trade_days = get_trade_days(end_str, int(BACKTEST_DAYS))
-        if not trade_days:
+        requested_trade_days = get_trade_days(end_str, int(BACKTEST_DAYS))
+        if not requested_trade_days:
             raise RuntimeError("未取得回测交易日")
-        earliest_signal = min(trade_days)
-        latest_signal = max(trade_days)
+        earliest_signal = min(requested_trade_days)
+        latest_signal = max(requested_trade_days)
         fetch_start = (datetime.strptime(earliest_signal, "%Y%m%d") - timedelta(days=460)).strftime("%Y%m%d")
         theoretical_end = datetime.strptime(latest_signal, "%Y%m%d") + timedelta(days=110)
-        fetch_end = min(theoretical_end, datetime.now()).strftime("%Y%m%d")
+        fetch_end = min(theoretical_end, market_now()).strftime("%Y%m%d")
         required_dates = get_open_dates(fetch_start, fetch_end)
         market_download_failures = load_market_data(required_dates, use_cache=USE_CACHE)
-        if market_download_failures and not is_realtime:
-            raise RuntimeError(
-                f"仍有 {len(market_download_failures)} 个交易日行情不完整，本次不开始逐日分析。"
-                "已下载成功的日期均已缓存，请直接再次运行补齐缺失日期。"
+
+        complete_market_dates = (
+            market_frame_dates(GLOBAL_DAILY_RAW)
+            & market_frame_dates(GLOBAL_ADJ_FACTOR)
+        )
+        if is_realtime:
+            # 单日模式保留今天，由新浪实时探针补临时K线；失败时该日也只跳过、不终止。
+            trade_days = requested_trade_days
+        else:
+            # 多日回测只选真实完整的信号日。若今天尚未发布或历史某日下载失败，
+            # 自动用更早的完整交易日补足，尽量保持用户要求的回测天数不变。
+            trade_days = choose_effective_trade_days(
+                complete_market_dates,
+                end_str,
+                int(BACKTEST_DAYS),
+            )
+        if not trade_days:
+            raise RuntimeError("没有任何完整行情可供逐日分析")
+
+        skipped_requested_dates = sorted(set(requested_trade_days) - set(trade_days))
+        substituted_dates = sorted(set(trade_days) - set(requested_trade_days))
+        if skipped_requested_dates:
+            st.warning(
+                f"请求区间内有 {len(skipped_requested_dates)} 个交易日行情不完整，已自动跳过；"
+                f"示例: {skipped_requested_dates[:8]}。"
+            )
+        if substituted_dates:
+            st.info(
+                f"已用更早的 {len(substituted_dates)} 个完整交易日补足样本；"
+                f"本次实际回测 {len(trade_days)} 个交易日，"
+                f"实际区间 {min(trade_days)}—{max(trade_days)}。"
+            )
+        elif len(trade_days) < int(BACKTEST_DAYS):
+            st.warning(
+                f"当前只有 {len(trade_days)} 个完整交易日可用，少于请求的 {int(BACKTEST_DAYS)} 天；"
+                "本次仍继续完成可用区间的回测。"
+            )
+        elif market_download_failures:
+            st.info(
+                "缺失日期不在本次信号日范围内，或只影响尚未成熟的未来观察期；"
+                "程序将跳过缺口并继续完成回测。"
             )
         load_benchmark(fetch_start, fetch_end)
         # 市场硬过滤已经固化关闭，不再额外请求双指数数据。
@@ -2968,6 +3084,13 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
             "version": VERSION,
             "end": end_str,
             "days": int(BACKTEST_DAYS),
+            "effective_start": min(trade_days),
+            "effective_end": max(trade_days),
+            "effective_days": len(trade_days),
+            "effective_trade_days_sha1": hashlib.sha1(
+                "|".join(sorted(trade_days)).encode()
+            ).hexdigest()[:12],
+            "skipped_requested_dates": skipped_requested_dates,
             "topk": int(TOP_BACKTEST),
             "min_price": MIN_PRICE,
             "min_mv": MIN_MV,
@@ -3022,6 +3145,15 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
                 # 每个交易日必须有一条漏斗记录；只有state而没有漏斗快照的日期重跑。
                 funnel_dates = set(funnel_store.get("Trade_Date", pd.Series(dtype=str)).astype(str))
                 processed = state_processed & funnel_dates
+                # 上次因单日接口缺失而跳过的日期不视为永久完成；本次自动重试，
+                # 若仍失败也只跳过该日，不影响其余日期和最终报表。
+                if "Error" in funnel_store.columns:
+                    retry_dates = set(
+                        funnel_store.loc[
+                            funnel_store["Error"].notna(), "Trade_Date"
+                        ].astype(str)
+                    )
+                    processed -= retry_dates
 
                 # 读取旧断点后立即紧缩为唯一主键快照，从源头消除历史重复。
                 if not results_store.empty:
@@ -3046,9 +3178,10 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
                     os.remove(exact_path)
 
         dates_to_run = [d for d in trade_days if d not in processed]
+        analysis_skipped_dates: list[str] = []
         progress = st.progress(0, text="开始逐日计算科技信号...")
         for i, trade_date in enumerate(dates_to_run):
-            use_sina = is_realtime and trade_date == datetime.now().strftime("%Y%m%d")
+            use_sina = is_realtime and trade_date == market_now().strftime("%Y%m%d")
             day_result, funnel, day_candidates = run_backtest_for_day(
                 trade_date=trade_date,
                 top_k=int(TOP_BACKTEST),
@@ -3093,18 +3226,37 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
             )
             candidates_store = atomic_write_csv(candidates_store, candidate_file, ["Trade_Date", "ts_code"])
             funnel_store = atomic_write_csv(funnel_store, funnel_file, ["Trade_Date"])
-            processed.add(trade_date)
+            if funnel.get("Error"):
+                analysis_skipped_dates.append(trade_date)
+                processed.discard(trade_date)
+            else:
+                processed.add(trade_date)
             atomic_write_json(
                 {"config": config, "processed_dates": sorted(processed)},
                 state_file,
             )
             progress.progress((i + 1) / max(len(dates_to_run), 1), text=f"分析 {trade_date}")
         progress.empty()
+        if analysis_skipped_dates:
+            st.warning(
+                f"逐日分析中有 {len(analysis_skipped_dates)} 天因接口数据缺失自动跳过："
+                f"{analysis_skipped_dates[:8]}。其余日期已完成；下次运行会自动重试这些日期。"
+            )
 
         st.header(f"📊 {VERSION} 回测结果")
         funnel_df = canonicalize_records(funnel_store, ["Trade_Date"])
         all_candidates_export = canonicalize_records(
             candidates_store, ["Trade_Date", "ts_code"]
+        )
+        report_trade_days = list(trade_days)
+        if not funnel_df.empty and "Error" in funnel_df.columns:
+            error_dates = set(
+                funnel_df.loc[funnel_df["Error"].notna(), "Trade_Date"].astype(str)
+            )
+            report_trade_days = [day for day in trade_days if day not in error_dates]
+        st.caption(
+            f"请求回测 {int(BACKTEST_DAYS)} 天；本次纳入统计 {len(report_trade_days)} 个完整分析日；"
+            f"行情下载缺口 {len(market_download_failures)} 天。"
         )
 
         st.subheader("🧭 V40.4原始82分准入逐日漏斗")
@@ -3163,7 +3315,7 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
                 mode_signals = all_results[all_results["Diagnostic_Mode"] == label].copy()
                 curve, ledger, orders, summary = build_portfolio_backtest(
                     mode_signals,
-                    trade_days,
+                    report_trade_days,
                     initial_capital=INITIAL_CAPITAL,
                     max_positions=MAX_PORTFOLIO_POSITIONS,
                     position_budget=POSITION_BUDGET,
@@ -3182,7 +3334,7 @@ if st.button(f"🚀 启动 {VERSION} 科技增强回测"):
             portfolio_curve = pd.concat(curve_frames, ignore_index=True) if curve_frames else pd.DataFrame()
             portfolio_ledger = pd.concat(ledger_frames, ignore_index=True) if ledger_frames else pd.DataFrame()
             portfolio_orders = pd.concat(order_frames, ignore_index=True) if order_frames else pd.DataFrame()
-            comparison_trade_days = trade_days
+            comparison_trade_days = report_trade_days
             if not funnel_df.empty and "Error" in funnel_df.columns:
                 valid_funnel_days = funnel_df[funnel_df["Error"].isna()]["Trade_Date"].tolist()
                 if valid_funnel_days:
