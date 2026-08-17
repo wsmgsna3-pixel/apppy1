@@ -1,7 +1,7 @@
 
-pandas
-numpy
-tushare
+
+
+
 joblib
 scipy
 tenacity
