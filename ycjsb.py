@@ -320,7 +320,7 @@ def compute_daily_resonance_signal(ts_code, end_date, stock_qfq_dict):
     weekly_df['week_k'] = rsv_w.ewm(span=3, adjust=False).mean().ewm(span=3, adjust=False).mean()
     
     # 获取属于“上一个完整交易周”的数据
-    curr_week_str = curr_d['year_week']
+    curr_week_str = df.iloc[-1]['year_week']
     prev_weeks = weekly_df[weekly_df['year_week'] < curr_week_str]
     
     prev_wk_k = np.nan
