@@ -350,8 +350,6 @@ def compute_daily_sniper_signal(ts_code, end_date, stock_qfq_dict):
     res['signal_close'] = curr_d['close']
     
     return res
-
-# === 第一部分结束，请等待第二部分 ===
 # ---------------------------
 # 🚀 极速出局系统：全域一字板拦截 + 4周强制平仓 + -5%铁血止损 + 移动止盈
 # ---------------------------
