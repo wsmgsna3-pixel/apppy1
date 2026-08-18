@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-日线 SKDJ 波段狙击系统 (V16.1 严苛防线版)
+日线 SKDJ 波段狙击系统 (V16.1 严苛防线完整版)
 ------------------------------------------------
-1. 【周线多头铁律】：新增要求“当下周线必须保持金叉(K>D)”，彻底剔除周线死叉的“伪回踩”！
+1. 【周线多头铁律】：当下周线必须保持金叉(K>D)，拒绝周线死叉的“伪回踩”。
 2. 【周线强过滤】：强制要求 8 周内探底(K<25) + 最新 K>40，锁定出坑主升浪。
 3. 【日线黄金坑】：仅在日线 K 值回落至 [15, 30] 区间时，捕获金叉买点。
 4. 【极速快刀流】：持仓最长 4 周，硬止损 -5%。
@@ -311,7 +311,6 @@ def compute_daily_sniper_signal(ts_code, end_date, stock_qfq_dict):
     
     if len(weekly_df) < 15: return res
 
-    # 🌟 修复：不仅计算周线 K，同时计算周线 D 以判断多空死叉
     lowv_w = weekly_df['low'].rolling(window=9).min()
     highv_w = weekly_df['high'].rolling(window=9).max()
     diff_w = (highv_w - lowv_w).replace(0, 0.001)
@@ -330,15 +329,14 @@ def compute_daily_sniper_signal(ts_code, end_date, stock_qfq_dict):
     if pd.isna(last_week_k) or last_week_k <= 40.0:
         return res
 
-    # 🌟🌟🌟 核心防线修复：当下的周线绝对不能死叉！
+    # 核心防线修复：当下的周线绝对不能死叉！
     curr_week_row = weekly_df.iloc[-1]
     if pd.isna(curr_week_row['week_k']) or pd.isna(curr_week_row['week_d']):
         return res
     if curr_week_row['week_k'] <= curr_week_row['week_d']:
-        # 一旦周线死叉，说明这几天的日线下跌已经把大趋势拉崩了，坚决放弃这把飞刀！
         return res
         
-    # 过滤条件 3：过去 8 周内必须有周线 K < 25 (确保是在做主升浪启动段)
+    # 过滤条件 3：过去 8 周内必须有周线 K < 25
     recent_8_weeks_k = prev_weeks['week_k'].tail(8)
     if not (recent_8_weeks_k < 25.0).any():
         return res
@@ -346,10 +344,11 @@ def compute_daily_sniper_signal(ts_code, end_date, stock_qfq_dict):
     res['is_buy_signal'] = True
     res['Daily_K'] = round(curr_d['day_k'], 2)
     res['Prev_Week_K'] = round(last_week_k, 2)
-    res['Current_Week_K'] = round(curr_week_row['week_k'], 2) # 新增快照展示
+    res['Current_Week_K'] = round(curr_week_row['week_k'], 2)
     res['signal_close'] = curr_d['close']
     
     return res
+
 # ---------------------------
 # 🚀 极速出局系统：全域一字板拦截 + 4周强制平仓 + -5%铁血止损 + 移动止盈
 # ---------------------------
@@ -405,7 +404,6 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
     peak_price = buy_price
     pending_exit_reason = None  
     
-    # 铁血止损：-5%
     hard_stop_limit = -0.05 
     max_days = hold_weeks * 5  
     
@@ -418,7 +416,6 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
         curr_open, curr_close, curr_high, curr_low = row['open'], row['close'], row['high'], row['low']
         curr_date = hist_future.index[i]
         
-        # 1. 挂单止盈/保本执行 (T+1 开盘)
         if pending_exit_reason is not None and day_count >= 2:
             if "保本" in pending_exit_reason:
                 final_return = 1.0  
@@ -436,7 +433,6 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
         peak_price = max(peak_price, curr_high)
         peak_profit_pct = (peak_price - buy_price) / buy_price
         
-        # 2. T+1 日线硬止损 (-5%) 铁血执行
         if day_count >= 2:
             if (curr_low - buy_price) / buy_price <= hard_stop_limit:
                 final_return = min(hard_stop_limit * 100, (curr_open - buy_price) / buy_price * 100)
@@ -448,7 +444,6 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
                 results[f'Return_W{current_week} (%)'] = round(final_return, 2)
                 break
         
-        # 3. 动态阶梯状态机：波段战法
         if tier == 0 and peak_profit_pct >= 0.08:  
             tier = 1  
             
@@ -466,7 +461,6 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
         if day_count % 5 == 0:
             results[f'Return_W{current_week} (%)'] = round((curr_close - buy_price) / buy_price * 100.0, 2)
             
-    # 4. 4周期满强制平仓（换股）
     if not exit_triggered and len(hist_future) >= max_days:
         last_price = hist_future.iloc[max_days - 1]['close']
         final_return = (last_price - buy_price) / buy_price * 100.0
@@ -547,6 +541,124 @@ with st.sidebar:
 token_clean = clean_token_str(TS_TOKEN_INPUT)
 
 # ---------------------------
+# 主流程：启动日线黄金坑扫描
+# ---------------------------
+if st.button("🚀 启动日线波段狙击 (严苛防线版)"):
+    is_valid, msg = verify_token_connection(token_clean)
+    if not is_valid:
+        st.error(f"❌ **Token 预检拦截**：{msg}")
+    else:
+        try:
+            ts.set_token(token_clean)
+            pro = ts.pro_api(token_clean)
+            
+            with st.spinner("正在精准筛选科技池白名单标的..."):
+                whitelist_set, basic_name_map = load_custom_tech_whitelist(token_clean)
+                whitelist_keys = tuple(sorted(whitelist_set))
+                
+            if not whitelist_keys:
+                st.error("❌ 未能获取到科技白名单股票，请检查 Token 积分或网络。")
+            else:
+                st.info(f"💡 成功锁定科技白名单股票池：共 **{len(whitelist_keys)}** 只标的。")
+                
+                lookback_days = max(int(BACKTEST_DAYS) * 3, 300) 
+                start_cal = (datetime.strptime(backtest_date_end.strftime("%Y%m%d"), "%Y%m%d") - timedelta(days=lookback_days)).strftime("%Y%m%d")
+                end_cal = backtest_date_end.strftime("%Y%m%d")
+                
+                cal_raw = safe_tushare_call(pro.trade_cal, exchange='SSE', start_date=start_cal, end_date=end_cal)
+                if cal_raw.empty:
+                    st.error("❌ 无法获取交易日历。")
+                else:
+                    cal_open = cal_raw[cal_raw['is_open'] == 1].sort_values('cal_date', ascending=True)
+                    trade_days_list = cal_open['cal_date'].tolist()
+                    
+                    if not trade_days_list:
+                        st.error("❌ 未获取到有效交易日。")
+                    else:
+                        processed_dates = set()
+                        if os.path.exists(CHECKPOINT_FILE):
+                            try:
+                                existing_df = pd.read_csv(CHECKPOINT_FILE)
+                                existing_df['Trade_Date'] = existing_df['Trade_Date'].astype(str)
+                                processed_dates = set(existing_df['Trade_Date'].unique())
+                            except Exception:
+                                pass
+                                
+                        recent_trade_days = trade_days_list[-int(BACKTEST_DAYS):]
+                        dates_to_run = [d for d in recent_trade_days if d not in processed_dates]
+                        dates_to_run.sort()
+                        
+                        if not dates_to_run:
+                            st.success("🎉 指定区间数据已全部完成！请查看下方实战报告。")
+                        else:
+                            fetch_start = (datetime.strptime(min(dates_to_run), "%Y%m%d") - timedelta(days=300)).strftime("%Y%m%d")
+                            fetch_end = (datetime.strptime(max(dates_to_run), "%Y%m%d") + timedelta(days=200)).strftime("%Y%m%d")
+                            
+                            dummy_trigger = time.time()
+                            stock_qfq_dict, basic_indexed = load_optimized_market_data(fetch_start, fetch_end, token_clean, whitelist_keys, dummy_trigger)
+                            
+                            if not stock_qfq_dict:
+                                st.warning("⚠️ 未能加载到行情数据，请重试。")
+                            else:
+                                bar = st.progress(0, text="执行 V16.1 严苛防线扫描...")
+                                
+                                for i, date in enumerate(dates_to_run):
+                                    records = []
+                                    
+                                    for ts_code in whitelist_keys:
+                                        if ts_code not in stock_qfq_dict:
+                                            continue
+                                            
+                                        df_stock = stock_qfq_dict[ts_code]
+                                        if date not in df_stock.index:
+                                            continue
+                                            
+                                        row_latest = df_stock.loc[date]
+                                        if isinstance(row_latest, pd.DataFrame):
+                                            row_latest = row_latest.iloc[-1]
+                                            
+                                        curr_close = row_latest['close']
+                                        if curr_close < MIN_PRICE:
+                                            continue
+                                            
+                                        circ_mv_billion = np.nan
+                                        if not basic_indexed.empty and (date, ts_code) in basic_indexed.index:
+                                            circ_mv_billion = basic_indexed.loc[(date, ts_code)]['circ_mv'] / 10000.0
+                                        
+                                        if pd.notna(circ_mv_billion):
+                                            if circ_mv_billion < MIN_MV or circ_mv_billion > MAX_MV:
+                                                continue
+                                        
+                                        ind = compute_daily_sniper_signal(ts_code, date, stock_qfq_dict)
+                                        if not ind or not ind.get('is_buy_signal'): 
+                                            continue
+                                            
+                                        future_returns = track_future_performance(ts_code, date, ind['signal_close'], stock_qfq_dict, hold_weeks=4)
+                                        
+                                        stock_name = basic_name_map.get(ts_code, ts_code)
+                                        record_dict = {
+                                            'Trade_Date': date, 'ts_code': ts_code, 'name': stock_name, 
+                                            'Current_Week_K': ind['Current_Week_K'],
+                                            'Prev_Week_K': ind['Prev_Week_K'], 
+                                            'Daily_K': ind['Daily_K'], 
+                                            'Signal_Close': ind['signal_close']
+                                        }
+                                        record_dict.update(future_returns)
+                                        records.append(record_dict)
+                                            
+                                    if records:
+                                        fdf = pd.DataFrame(records)
+                                        is_first = not os.path.exists(CHECKPOINT_FILE)
+                                        fdf.to_csv(CHECKPOINT_FILE, mode='a', index=False, header=is_first, encoding='utf-8-sig')
+                                        
+                                    bar.progress((i+1)/len(dates_to_run), text=f"扫描中: {date} (捕获 {len(records)} 次防线内金叉)")
+                                    
+                                bar.empty()
+                                st.success("🎉 严苛防线战法数据已全部处理完毕！")
+        except Exception as e:
+            st.error(f"❌ **运行异常拦截**：{str(e)}")
+
+# ---------------------------
 # 全景分析展示区
 # ---------------------------
 if os.path.exists(CHECKPOINT_FILE):
@@ -558,7 +670,7 @@ if os.path.exists(CHECKPOINT_FILE):
         repaired_res = repair_checkpoint_df(raw_res)
         valid_signals = repaired_res[~repaired_res['Exit_Reason'].astype(str).str.contains('剔除', na=False)].copy()
         
-        st.header("📈 V16.1 严苛防线快刀流实战报告")
+        st.header("📈 V16.1 严苛防线版实战报告")
         
         if not valid_signals.empty:
             comp_trades = valid_signals[valid_signals['Exit_Reason'] != '持仓中'].copy()
@@ -571,7 +683,7 @@ if os.path.exists(CHECKPOINT_FILE):
                 global_mean_ret = comp_trades['Final_Return (%)'].mean()
                 
                 col_m1, col_m2, col_m3 = st.columns(3)
-                col_m1.metric("高纯度波段捕获总数", f"{total_executed} 笔")
+                col_m1.metric("防线内波段捕获总数", f"{total_executed} 笔")
                 col_m2.metric("4周内实战绝对胜率", f"{global_win_rate:.1f}%", f"{win_count}胜")
                 col_m3.metric("波段单笔平均净收益", f"{global_mean_ret:.2f}%")
                 
@@ -621,7 +733,7 @@ if os.path.exists(CHECKPOINT_FILE):
                 
             csv_data = valid_signals.to_csv(index=False).encode('utf-8-sig')
             st.download_button(
-                label="📥 导出日线防线版流水 (CSV)", 
+                label="📥 导出严苛防线流水 (CSV)", 
                 data=csv_data, 
                 file_name="skdj_v16_1_sniper_strict.csv", 
                 mime="text/csv"
