@@ -7,8 +7,10 @@
 """
 from __future__ import annotations
 
+import base64
 import glob
 import hashlib
+import html
 import io
 import json
 import math
@@ -27,6 +29,7 @@ import tushare as ts
 
 TITLE = "周线SKDJ N=6/7上穿25快速审计 V4.8"
 VERSION = "V4.8-WEEKLY-SKDJ-N6-N7-K-CROSS-25-NO-ML"
+UI_PATCH = "V4.8.1-NATIVE-DOWNLOAD-FIX"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # 沿用旧行情缓存目录，以便直接复用V4.7已经下载的更长历史数据。
@@ -34,6 +37,7 @@ PRICE_CACHE_DIR = os.path.join(APP_DIR, "weekly_macd_validation_cache_v1_1")
 CHECKPOINT_DIR = os.path.join(APP_DIR, "weekly_skdj_v4_8_checkpoints")
 RESULT_DIR = os.path.join(APP_DIR, "weekly_skdj_v4_8_results")
 JOB_DIR = os.path.join(APP_DIR, "weekly_skdj_v4_8_jobs")
+STATIC_DOWNLOAD_DIR = os.path.join(APP_DIR, "static", "v4_8_downloads")
 
 SKDJ_NS = (6, 7)
 SKDJ_M = 3
@@ -230,6 +234,54 @@ def make_zip(files: dict[str, pd.DataFrame]) -> bytes:
         for name, frame in files.items():
             archive.writestr(name, csv_bytes(frame))
     return buffer.getvalue()
+
+
+def render_plain_table(frame: pd.DataFrame, max_rows: int = 200) -> None:
+    """Render without st.dataframe's separately loaded frontend module."""
+    if frame.empty:
+        st.caption("无数据")
+        return
+    shown = frame.head(int(max_rows)).copy()
+    table_html = shown.to_html(
+        index=False, border=0, na_rep="", float_format=lambda value: f"{value:.4f}")
+    st.markdown(
+        "<div style='overflow-x:auto;font-size:0.88rem'>"
+        + table_html + "</div>", unsafe_allow_html=True)
+    if len(frame) > len(shown):
+        st.caption(f"页面仅显示前{len(shown)}行；完整内容在结果ZIP中。")
+
+
+def publish_static_result(payload: bytes, signature: str) -> str:
+    """Create a same-origin file for a browser-native backup download."""
+    static_name = f"weekly_skdj_v4_8_{signature}.zip"
+    static_path = os.path.join(STATIC_DOWNLOAD_DIR, static_name)
+    atomic_bytes(payload, static_path)
+    return f"app/static/v4_8_downloads/{static_name}"
+
+
+def render_native_download(payload: bytes, filename: str, signature: str) -> None:
+    """Avoid Streamlit's downloadable frontend module and transient endpoint."""
+    safe_filename = html.escape(filename, quote=True)
+    # Safari与Streamlit连接中断时，data URL不再向服务器发起第二次请求。
+    if len(payload) <= 12 * 1024 * 1024:
+        encoded = base64.b64encode(payload).decode("ascii")
+        st.markdown(
+            "<a href='data:application/zip;base64," + encoded + "' download='"
+            + safe_filename + "' "
+            "style='display:inline-block;padding:0.72rem 1rem;background:#ff4b4b;"
+            "color:white;text-decoration:none;border-radius:0.5rem;font-weight:600'>"
+            "离线直接下载结果ZIP</a>", unsafe_allow_html=True)
+    try:
+        static_href = publish_static_result(payload, signature)
+        st.markdown(
+            "<a href='" + static_href + "' download='" + safe_filename + "' "
+            "style='display:inline-block;margin-top:0.65rem;padding:0.58rem 0.9rem;"
+            "border:1px solid #888;border-radius:0.5rem;text-decoration:none'>"
+            "备用静态下载</a>", unsafe_allow_html=True)
+    except Exception as exc:
+        record_error(f"静态下载副本生成失败: {exc}")
+    st.caption(
+        f"结果大小：{len(payload) / 1024 / 1024:.2f} MB。以上链接不使用Streamlit下载组件。")
 
 
 @st.cache_data(ttl=24 * 3600)
@@ -756,7 +808,9 @@ def main() -> None:
     global pro, API_ERRORS
     st.set_page_config(page_title=TITLE, layout="wide")
     st.title(TITLE)
-    st.caption("只验证K线上穿25；N=6和N=7同场计算；机器学习、评分、TopK和三仓已暂停。")
+    st.caption(
+        f"{UI_PATCH}｜只验证K线上穿25；N=6和N=7同场计算；"
+        "机器学习、评分、TopK和三仓已暂停。")
     with st.expander("本版口径", expanded=True):
         st.markdown(f"""
 - **信号**：上一完整周K＜25，本完整周K≥25；不要求低位金叉，不要求K>D。
@@ -791,6 +845,7 @@ def main() -> None:
             shutil.rmtree(CHECKPOINT_DIR, ignore_errors=True)
             shutil.rmtree(RESULT_DIR, ignore_errors=True)
             shutil.rmtree(JOB_DIR, ignore_errors=True)
+            shutil.rmtree(STATIC_DOWNLOAD_DIR, ignore_errors=True)
             st.success("V4.8检查点和结果已清除；旧行情缓存保留")
 
     request_payload = {
@@ -811,10 +866,8 @@ def main() -> None:
             completed_available = True
             clear_job_active(request_signature)
             st.success("发现相同参数的已完成结果，可直接下载。")
-            st.download_button(
-                "下载已保存结果ZIP", saved_result, file_name=result_name,
-                mime="application/zip", type="primary",
-                key=f"v48_saved_{request_signature}", on_click="ignore")
+            render_native_download(
+                saved_result, result_name, request_signature)
         except Exception as exc:
             st.warning(f"旧结果读取失败：{exc}")
 
@@ -1025,16 +1078,14 @@ def main() -> None:
         f"实际行情约{round((market_end_date - data_start_date).days / 7, 1)}周；"
         f"结果{'已保存' if persisted else '仅当前页面可下载'}。")
     st.subheader("N=6 / N=7运行摘要")
-    st.dataframe(run_summary, use_container_width=True, hide_index=True)
+    render_plain_table(run_summary)
     st.subheader("爆发力与持续性")
-    st.dataframe(behavior, use_container_width=True, hide_index=True)
+    render_plain_table(behavior)
     st.subheader("止盈与-10%先后顺序")
-    st.dataframe(first_hits, use_container_width=True, hide_index=True)
+    render_plain_table(first_hits)
     st.subheader("N=6与N=7信号领先关系")
-    st.dataframe(pair_summary, use_container_width=True, hide_index=True)
-    st.download_button(
-        "下载V4.8全部结果ZIP", result_zip, file_name=result_name,
-        mime="application/zip", type="primary", key="v48_download", on_click="ignore")
+    render_plain_table(pair_summary)
+    render_native_download(result_zip, result_name, request_signature)
 
 
 if __name__ == "__main__":
