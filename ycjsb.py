@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""周线SKDJ N=6/7 K线上穿25快速审计 V4.8。
+"""周线SKDJ N=6/7 上穿25趋势、洗盘路径与量价因子审计 V4.9。
 
 本版只研究K线从25下方向上穿过25，不要求此前低位金叉，也不要求K>D。
-同一份行情同时计算N=6和N=7，暂停机器学习、评分、TopK与三仓组合。
+同一份行情同时计算N=6和N=7；先检验候选因子，不预设100分评分权重。
 正式信号窗口默认250个交易日，开始前只保留30周指标预热，信号后观察W1-W8。
 """
 from __future__ import annotations
@@ -25,16 +25,16 @@ import pandas as pd
 import streamlit as st
 import tushare as ts
 
-TITLE = "周线SKDJ N=6/7上穿25快速审计 V4.8"
-VERSION = "V4.8-WEEKLY-SKDJ-N6-N7-K-CROSS-25-NO-ML"
-UI_PATCH = "V4.8.4-RUNTIME-STABILITY"
+TITLE = "周线SKDJ N=6/7多因子透明审计 V4.9"
+VERSION = "V4.9-WEEKLY-SKDJ-FACTOR-AUDIT-NO-SCORE"
+UI_PATCH = "V4.9.0-FACTOR-AUDIT-RUNTIME-STABILITY"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # 沿用旧行情缓存目录，以便直接复用V4.7已经下载的更长历史数据。
 PRICE_CACHE_DIR = os.path.join(APP_DIR, "weekly_macd_validation_cache_v1_1")
-CHECKPOINT_DIR = os.path.join(APP_DIR, "weekly_skdj_v4_8_checkpoints")
-RESULT_DIR = os.path.join(APP_DIR, "weekly_skdj_v4_8_results")
-JOB_DIR = os.path.join(APP_DIR, "weekly_skdj_v4_8_jobs")
+CHECKPOINT_DIR = os.path.join(APP_DIR, "weekly_skdj_v4_9_checkpoints")
+RESULT_DIR = os.path.join(APP_DIR, "weekly_skdj_v4_9_results")
+JOB_DIR = os.path.join(APP_DIR, "weekly_skdj_v4_9_jobs")
 
 SKDJ_NS = (6, 7)
 SKDJ_M = 3
@@ -512,7 +512,67 @@ def add_skdj(weekly: pd.DataFrame, n: int) -> pd.DataFrame:
     work["K_Change_1W"] = work["K"].diff()
     work["KD_Spread"] = work["K"] - work["D"]
     work["K_Cross_25"] = work["K"].ge(SKDJ_BOTTOM) & work["K"].shift(1).lt(SKDJ_BOTTOM)
+
+    # 只使用信号当周及此前完整周；所有“过去窗口”都先shift(1)，不把信号周混入历史。
+    work["MA20"] = work["close"].rolling(20, min_periods=20).mean()
+    work["Close_to_MA20_pct"] = (work["close"] / work["MA20"] - 1.0) * 100.0
+    work["MA20_Slope_4W_pct"] = (work["MA20"] / work["MA20"].shift(4) - 1.0) * 100.0
+    work["Prior15_Min_K"] = work["K"].shift(1).rolling(15, min_periods=15).min()
+    work["Prior15_Max_K"] = work["K"].shift(1).rolling(15, min_periods=15).max()
+    work["Prior15_Below25_Weeks"] = (
+        work["K"].shift(1).lt(SKDJ_BOTTOM).astype(float)
+        .rolling(15, min_periods=15).sum()
+    )
+    below_streak: list[int] = []
+    current_streak = 0
+    for is_below in work["K"].lt(SKDJ_BOTTOM).fillna(False).tolist():
+        current_streak = current_streak + 1 if bool(is_below) else 0
+        below_streak.append(current_streak)
+    work["Prior_Below25_Streak"] = pd.Series(
+        below_streak, index=work.index, dtype=float).shift(1)
+
+    prior_volume_ma5 = work["vol"].shift(1).rolling(5, min_periods=5).mean()
+    work["Volume_Ratio_5W"] = work["vol"] / prior_volume_ma5.replace(0, np.nan)
+    work["Signal_Week_Return_pct"] = work["close"].pct_change() * 100.0
+    price_range = (work["high"] - work["low"]).replace(0, np.nan)
+    work["Signal_Close_Location_pct"] = (
+        (work["close"] - work["low"]) / price_range * 100.0)
+    work["Signal_Upper_Shadow_pct"] = (
+        (work["high"] - work[["open", "close"]].max(axis=1))
+        / price_range * 100.0)
     return work
+
+
+def trend_state(signal: pd.Series) -> str:
+    distance = finite_num(signal.get("Close_to_MA20_pct"))
+    slope = finite_num(signal.get("MA20_Slope_4W_pct"))
+    if not math.isfinite(distance) or not math.isfinite(slope):
+        return "数据不足"
+    if distance >= 0 and slope > 0:
+        return "站上MA20且MA20向上"
+    if distance >= 0:
+        return "站上MA20但MA20未向上"
+    if slope > 0:
+        return "MA20下方但MA20向上"
+    return "MA20下方且MA20未向上"
+
+
+def volume_price_state(signal: pd.Series) -> str:
+    ratio = finite_num(signal.get("Volume_Ratio_5W"))
+    weekly_return = finite_num(signal.get("Signal_Week_Return_pct"))
+    close_location = finite_num(signal.get("Signal_Close_Location_pct"))
+    upper_shadow = finite_num(signal.get("Signal_Upper_Shadow_pct"))
+    if not all(math.isfinite(value) for value in (
+            ratio, weekly_return, close_location, upper_shadow)):
+        return "数据不足"
+    strong_close = weekly_return > 0 and close_location >= 60 and upper_shadow < 35
+    if ratio < 1.0:
+        return "缩量强收" if strong_close else "缩量一般"
+    if ratio <= 2.5:
+        return "温和放量强收" if strong_close else "温和放量一般"
+    if ratio <= 4.0:
+        return "明显放量强收" if strong_close else "明显放量一般"
+    return "爆量强收" if strong_close else "爆量弱收"
 
 
 def market_snapshot(basic: pd.DataFrame, trade_date: str) -> dict[str, float]:
@@ -657,6 +717,23 @@ def analyze_stock(stock: pd.Series, periods: list[dict[str, str]], daily: pd.Dat
             "Signal_KD_Spread": finite_num(signal["KD_Spread"]),
             "Signal_K_Change_1W": finite_num(signal["K_Change_1W"]),
             "Signal_K_Above_D": finite_num(signal["K"]) > finite_num(signal["D"]),
+            "Signal_MA20": finite_num(signal.get("MA20")),
+            "Signal_Close_to_MA20_pct": finite_num(signal.get("Close_to_MA20_pct")),
+            "Signal_MA20_Slope_4W_pct": finite_num(signal.get("MA20_Slope_4W_pct")),
+            "Signal_Trend_State": trend_state(signal),
+            "Signal_Prior15_Min_K": finite_num(signal.get("Prior15_Min_K")),
+            "Signal_Prior15_Max_K": finite_num(signal.get("Prior15_Max_K")),
+            "Signal_Prior15_Below25_Weeks": finite_num(
+                signal.get("Prior15_Below25_Weeks")),
+            "Signal_Prior_Below25_Streak": finite_num(
+                signal.get("Prior_Below25_Streak")),
+            "Signal_Volume_Ratio_5W": finite_num(signal.get("Volume_Ratio_5W")),
+            "Signal_Week_Return_pct": finite_num(signal.get("Signal_Week_Return_pct")),
+            "Signal_Close_Location_pct": finite_num(
+                signal.get("Signal_Close_Location_pct")),
+            "Signal_Upper_Shadow_pct": finite_num(
+                signal.get("Signal_Upper_Shadow_pct")),
+            "Signal_Volume_Price_State": volume_price_state(signal),
             "SW_L1": membership["l1"], "SW_L2": membership["l2"], "SW_L3": membership["l3"],
             **snapshot,
         }
@@ -741,39 +818,234 @@ def first_hit_audit(events: pd.DataFrame) -> pd.DataFrame:
                 f"Entry_First_Hit_{int(level)}_vs_Minus10_W8",
                 pd.Series(index=group.index, dtype=str)).astype(str)
             row[f"先到+{int(level)}比例%"] = values.eq(f"先到+{int(level)}%").mean() * 100
-            row[f"先到-10比例%_对比{int(level)}"] = values.eq("先到-10%").mean() * 100
+            conservative_stop = values.eq("先到-10%") | values.str.startswith("同日同时触发")
+            row[f"先到-10比例%_对比{int(level)}"] = conservative_stop.mean() * 100
         rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def outcome_audit_row(n: int, factor: str, group_name: str,
+                      selected: pd.DataFrame, base_count: int,
+                      total_weeks: int) -> dict[str, Any]:
+    w1_mfe = numeric(selected, "Entry_W1_MFE_Net_pct")
+    w3_mfe = numeric(selected, "Entry_W3_MFE_Net_pct")
+    w8_mfe = numeric(selected, "Entry_W8_MFE_Net_pct")
+    w8_mae = numeric(selected, "Entry_W8_MAE_Raw_pct")
+    w8_close = numeric(selected, "Entry_W8_Close_Return_Net_pct")
+    hit10 = selected.get(
+        "Entry_First_Hit_10_vs_Minus10_W8",
+        pd.Series(index=selected.index, dtype=str)).astype(str)
+    hit20 = selected.get(
+        "Entry_First_Hit_20_vs_Minus10_W8",
+        pd.Series(index=selected.index, dtype=str)).astype(str)
+    stop10 = hit10.eq("先到-10%") | hit10.str.startswith("同日同时触发")
+    signal_weeks = (
+        pd.to_datetime(selected["Signal_Date"].astype(str), format="%Y%m%d")
+        .dt.to_period("W-FRI").nunique()
+        if not selected.empty else 0)
+    return {
+        "SKDJ_N": n, "因子": factor, "分组": group_name,
+        "事件数": len(selected),
+        "保留事件比例%": len(selected) / base_count * 100 if base_count else np.nan,
+        "不同股票": selected["ts_code"].nunique() if not selected.empty else 0,
+        "有信号周": signal_weeks,
+        "空窗周": max(total_weeks - signal_weeks, 0),
+        "W1最大浮盈中位%": w1_mfe.median(),
+        "W3最大浮盈中位%": w3_mfe.median(),
+        "W8最大浮盈均值%": w8_mfe.mean(),
+        "W8最大浮盈中位%": w8_mfe.median(),
+        "W8收盘平均净收益%": w8_close.mean(),
+        "W8收盘中位净收益%": w8_close.median(),
+        "W8收盘胜率%": w8_close.gt(0).mean() * 100,
+        "W8最大回撤中位%": w8_mae.median(),
+        "W8触及-10%比例%": w8_mae.le(-10).mean() * 100,
+        "先到+10比例%": hit10.eq("先到+10%").mean() * 100,
+        "先到-10比例%_对比10": stop10.mean() * 100,
+        "先到+20比例%": hit20.eq("先到+20%").mean() * 100,
+    }
+
+
+def feature_bucket_audit(events: pd.DataFrame, total_weeks: int) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    numeric_specs = [
+        ("突破K值", "Signal_K", [-np.inf, 28, 32, 38, np.inf],
+         ["≤28", "28～32", "32～38", ">38"]),
+        ("收盘相对MA20", "Signal_Close_to_MA20_pct", [-np.inf, 0, 5, 15, np.inf],
+         ["MA20下方", "上方0～5%", "上方5～15%", "上方>15%"]),
+        ("MA20近4周斜率", "Signal_MA20_Slope_4W_pct", [-np.inf, -3, 0, 3, np.inf],
+         ["<-3%", "-3%～0", "0～3%", ">3%"]),
+        ("此前15周最低K", "Signal_Prior15_Min_K", [-np.inf, 5, 15, 22, 25, np.inf],
+         ["<5", "5～15", "15～22", "22～25", "≥25"]),
+        ("连续处于25下方周数", "Signal_Prior_Below25_Streak",
+         [0, 2, 5, 9, np.inf], ["1～2周", "3～5周", "6～9周", "≥10周"]),
+        ("当周量比/此前5周", "Signal_Volume_Ratio_5W",
+         [-np.inf, 1, 2.5, 4, np.inf], ["<1", "1～2.5", "2.5～4", ">4"]),
+        ("信号周涨幅", "Signal_Week_Return_pct", [-np.inf, 0, 5, 10, np.inf],
+         ["≤0", "0～5%", "5～10%", ">10%"]),
+        ("信号周收盘位置", "Signal_Close_Location_pct", [-np.inf, 40, 60, 80, np.inf],
+         ["≤40", "40～60", "60～80", ">80"]),
+        ("信号周上影占振幅", "Signal_Upper_Shadow_pct", [-np.inf, 10, 25, 40, np.inf],
+         ["≤10", "10～25", "25～40", ">40"]),
+    ]
+    categorical_specs = [
+        ("趋势组合状态", "Signal_Trend_State"),
+        ("量价组合状态", "Signal_Volume_Price_State"),
+    ]
+    for n in SKDJ_NS:
+        base = events[events["SKDJ_N"].eq(n)].copy()
+        base_count = len(base)
+        rows.append(outcome_audit_row(
+            n, "基准", "全部事件", base, base_count, total_weeks))
+        for factor, column, bins, labels in numeric_specs:
+            values = numeric(base, column)
+            groups = pd.cut(values, bins=bins, labels=labels, right=True)
+            for label in labels:
+                selected = base[groups.eq(label)]
+                rows.append(outcome_audit_row(
+                    n, factor, label, selected, base_count, total_weeks))
+            missing = base[values.isna()]
+            if not missing.empty:
+                rows.append(outcome_audit_row(
+                    n, factor, "数据不足", missing, base_count, total_weeks))
+        for factor, column in categorical_specs:
+            for label in base[column].fillna("数据不足").drop_duplicates().tolist():
+                selected = base[base[column].fillna("数据不足").eq(label)]
+                rows.append(outcome_audit_row(
+                    n, factor, str(label), selected, base_count, total_weeks))
+    return pd.DataFrame(rows)
+
+
+def combination_audit(events: pd.DataFrame, total_weeks: int) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for n in SKDJ_NS:
+        base = events[events["SKDJ_N"].eq(n)].copy()
+        base_count = len(base)
+        distance = numeric(base, "Signal_Close_to_MA20_pct")
+        slope = numeric(base, "Signal_MA20_Slope_4W_pct")
+        k_value = numeric(base, "Signal_K")
+        prior_min = numeric(base, "Signal_Prior15_Min_K")
+        duration = numeric(base, "Signal_Prior_Below25_Streak")
+        volume_ratio = numeric(base, "Signal_Volume_Ratio_5W")
+        week_return = numeric(base, "Signal_Week_Return_pct")
+        close_location = numeric(base, "Signal_Close_Location_pct")
+        upper_shadow = numeric(base, "Signal_Upper_Shadow_pct")
+        trend_confirmed = distance.ge(0) & slope.gt(0)
+        strong_close = week_return.gt(0) & close_location.ge(60) & upper_shadow.lt(35)
+        gentle_volume = volume_ratio.between(1.0, 2.5, inclusive="both")
+        definitions = [
+            ("基准", "全部事件", pd.Series(True, index=base.index)),
+            ("趋势", "站上MA20且MA20向上", trend_confirmed),
+            ("K位置", "K在28～32", k_value.gt(28) & k_value.le(32)),
+            ("K位置", "K>38_不预设为坏", k_value.gt(38)),
+            ("此前最低K", "最低K在22～25", prior_min.ge(22) & prior_min.lt(25)),
+            ("此前最低K", "最低K<15", prior_min.lt(15)),
+            ("潜伏时间", "连续1～2周", duration.between(1, 2, inclusive="both")),
+            ("潜伏时间", "连续≥10周", duration.ge(10)),
+            ("量能", "量比1～2.5", gentle_volume),
+            ("量价", "温和放量且强收盘", gentle_volume & strong_close),
+            ("量价", "爆量但强收盘", volume_ratio.gt(4) & strong_close),
+            ("量价", "爆量且弱收盘", volume_ratio.gt(4) & ~strong_close),
+            ("组合", "趋势确认+温和放量强收盘",
+             trend_confirmed & gentle_volume & strong_close),
+            ("组合", "趋势确认+任意量能强收盘", trend_confirmed & strong_close),
+        ]
+        for factor, label, mask in definitions:
+            rows.append(outcome_audit_row(
+                n, factor, label, base[mask.fillna(False)], base_count, total_weeks))
+    return pd.DataFrame(rows)
+
+
+def winner_loser_feature_audit(events: pd.DataFrame) -> pd.DataFrame:
+    feature_columns = [
+        ("突破K", "Signal_K"),
+        ("突破D", "Signal_D"),
+        ("当周KD差", "Signal_KD_Spread"),
+        ("K一周变化", "Signal_K_Change_1W"),
+        ("收盘相对MA20%", "Signal_Close_to_MA20_pct"),
+        ("MA20近4周斜率%", "Signal_MA20_Slope_4W_pct"),
+        ("此前15周最低K", "Signal_Prior15_Min_K"),
+        ("此前15周最高K", "Signal_Prior15_Max_K"),
+        ("此前15周低于25周数", "Signal_Prior15_Below25_Weeks"),
+        ("连续低于25周数", "Signal_Prior_Below25_Streak"),
+        ("当周量比/此前5周", "Signal_Volume_Ratio_5W"),
+        ("信号周涨幅%", "Signal_Week_Return_pct"),
+        ("信号周收盘位置%", "Signal_Close_Location_pct"),
+        ("信号周上影占振幅%", "Signal_Upper_Shadow_pct"),
+        ("信号日股价", "Raw_Close"),
+        ("信号日流通市值亿元", "Circ_MV_Billion"),
+        ("信号日换手率%", "Turnover_Rate"),
+    ]
+    rows: list[dict[str, Any]] = []
+    for n in SKDJ_NS:
+        base = events[events["SKDJ_N"].eq(n)].copy()
+        w8_close = numeric(base, "Entry_W8_Close_Return_Net_pct")
+        w8_mfe = numeric(base, "Entry_W8_MFE_Net_pct")
+        hit10 = base.get(
+            "Entry_First_Hit_10_vs_Minus10_W8",
+            pd.Series(index=base.index, dtype=str)).astype(str)
+        outcome_groups = [
+            ("W8收盘盈亏", "盈利", w8_close.gt(0)),
+            ("W8收盘盈亏", "亏损或持平", w8_close.le(0)),
+            ("+10与-10先后", "先到+10", hit10.eq("先到+10%")),
+            ("+10与-10先后", "先到-10_含同日保守",
+             hit10.eq("先到-10%") | hit10.str.startswith("同日同时触发")),
+            ("W8是否达到20%", "达到20%", w8_mfe.ge(20)),
+            ("W8是否达到20%", "未达到20%", w8_mfe.lt(20)),
+        ]
+        for outcome, label, mask in outcome_groups:
+            selected = base[mask.fillna(False)]
+            for feature_name, column in feature_columns:
+                values = numeric(selected, column).dropna()
+                rows.append({
+                    "SKDJ_N": n, "结果定义": outcome, "结果分组": label,
+                    "事件数": len(selected), "特征": feature_name,
+                    "有效样本": len(values), "均值": values.mean(),
+                    "中位数": values.median(), "P25": values.quantile(0.25),
+                    "P75": values.quantile(0.75),
+                })
     return pd.DataFrame(rows)
 
 
 def pair_signals(events: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     n6 = events[events["SKDJ_N"].eq(6)].copy()
     n7 = events[events["SKDJ_N"].eq(7)].copy()
-    n7_groups = {code: group.copy() for code, group in n7.groupby("ts_code")}
-    details = []
-    for row in n6.itertuples(index=False):
-        candidates = n7_groups.get(str(row.ts_code))
-        if candidates is None or candidates.empty:
+    n7_groups = {str(code): group.copy() for code, group in n7.groupby("ts_code")}
+    details: list[dict[str, Any]] = []
+    for code, group6 in n6.groupby("ts_code"):
+        group7 = n7_groups.get(str(code))
+        if group7 is None or group7.empty:
             continue
-        date6 = pd.to_datetime(str(row.Signal_Date), format="%Y%m%d")
-        dates7 = pd.to_datetime(candidates["Signal_Date"].astype(str), format="%Y%m%d")
-        gaps = (dates7 - date6).dt.days
-        eligible = gaps.abs().le(56)
-        if not eligible.any():
-            continue
-        nearest_index = gaps[eligible].abs().idxmin()
-        nearest = candidates.loc[nearest_index]
-        details.append({
-            "ts_code": row.ts_code, "name": row.name,
-            "N6_Signal_Date": str(row.Signal_Date),
-            "N7_Signal_Date": str(nearest["Signal_Date"]),
-            "N7_Minus_N6_Calendar_Days": int(gaps.loc[nearest_index]),
-            "Exact_Same_Date": int(gaps.loc[nearest_index]) == 0,
-        })
+        candidates: list[tuple[int, int, int, int]] = []
+        for index6, row6 in group6.iterrows():
+            date6 = pd.to_datetime(str(row6["Signal_Date"]), format="%Y%m%d")
+            for index7, row7 in group7.iterrows():
+                date7 = pd.to_datetime(str(row7["Signal_Date"]), format="%Y%m%d")
+                gap = int((date7 - date6).days)
+                if abs(gap) <= 56:
+                    candidates.append((abs(gap), gap, int(index6), int(index7)))
+        # 全股票内按最近日期贪心一对一匹配，禁止同一条N=7信号被重复使用。
+        used6: set[int] = set()
+        used7: set[int] = set()
+        for _, gap, index6, index7 in sorted(
+                candidates, key=lambda item: (item[0], abs(item[1]), item[1])):
+            if index6 in used6 or index7 in used7:
+                continue
+            used6.add(index6)
+            used7.add(index7)
+            row6, row7 = n6.loc[index6], n7.loc[index7]
+            details.append({
+                "ts_code": str(code), "name": str(row6["name"]),
+                "N6_Signal_Date": str(row6["Signal_Date"]),
+                "N7_Signal_Date": str(row7["Signal_Date"]),
+                "N7_Minus_N6_Calendar_Days": gap,
+                "Exact_Same_Date": gap == 0,
+            })
     detail = pd.DataFrame(details)
     summary = pd.DataFrame([{
         "N6事件": len(n6), "N7事件": len(n7),
         "N6与N7同股票8周内匹配": len(detail),
+        "匹配中N6唯一信号": detail[["ts_code", "N6_Signal_Date"]].drop_duplicates().shape[0] if not detail.empty else 0,
+        "匹配中N7唯一信号": detail[["ts_code", "N7_Signal_Date"]].drop_duplicates().shape[0] if not detail.empty else 0,
         "完全同日": int(true_mask(detail, "Exact_Same_Date").sum()) if not detail.empty else 0,
         "N6更早比例%": numeric(detail, "N7_Minus_N6_Calendar_Days").gt(0).mean() * 100 if not detail.empty else np.nan,
         "N7更早比例%": numeric(detail, "N7_Minus_N6_Calendar_Days").lt(0).mean() * 100 if not detail.empty else np.nan,
@@ -788,8 +1060,8 @@ def main() -> None:
     st.title(TITLE)
     streamlit_version = str(getattr(st, "__version__", "unknown"))
     st.caption(
-        f"{UI_PATCH}｜只验证K线上穿25；N=6和N=7同场计算；"
-        f"机器学习、评分、TopK和三仓已暂停。｜Streamlit {streamlit_version}")
+        f"{UI_PATCH}｜N=6和N=7同场计算；新增趋势、SKDJ路径与量价透明审计；"
+        f"不预设总分，不做TopK或三仓。｜Streamlit {streamlit_version}")
     if streamlit_version.startswith("1.62"):
         st.error(
             "检测到Streamlit 1.62.x。该环境与本次约32秒断线重连日志一致；"
@@ -802,33 +1074,36 @@ def main() -> None:
 - **数据长度**：默认正式窗口250个交易日（约52周）＋开始前{WARMUP_WEEKS}周预热＋截止后W1-W8观察；通常约90～100周，而不是120周或290周。
 - **过滤**：每个历史信号日分别检查当时科技行业归属、股价≥10元、流通市值≥100亿元，避免使用今天状态回看历史。
 - **比较**：同一次运行同时计算N=6和N=7，比较信号覆盖、W1-W8爆发力、持续性、回撤和先到止盈/止损。
+- **新增因子**：股价相对MA20、MA20近4周斜率、此前15周最低K、连续处于25下方周数、当周量比/涨幅/收盘位置/上影线。
+- **防泄漏**：历史最低K和5周均量均只使用信号周以前的完整周；信号当周只使用本周已经收盘的数据。
+- **本版目的**：分别检验每个因子及少数组合是否改善收益、胜率和回撤，同时保留多少事件与信号周；不把未经验证的说法先写成100分权重。
 """)
     with st.sidebar:
         st.header("运行参数")
         backtest_days = st.number_input(
-            "回测交易日数", 100, 1000, 250, 50, key="v48_days")
+            "回测交易日数", 100, 1000, 250, 50, key="v49_days")
         signal_end_date = st.date_input(
-            "买入信号截止", date(2026, 6, 5), key="v48_signal_end")
+            "买入信号截止", date(2026, 6, 5), key="v49_signal_end")
         market_end_date = st.date_input(
-            "行情观察截止", date.today(), key="v48_market_end")
+            "行情观察截止", date.today(), key="v49_market_end")
         pause = st.number_input(
-            "接口间隔(秒)", 0.0, 2.0, 0.12, 0.02, key="v48_pause")
-        use_cache = st.checkbox("复用行情缓存", True, key="v48_cache")
+            "接口间隔(秒)", 0.0, 2.0, 0.12, 0.02, key="v49_pause")
+        use_cache = st.checkbox("复用行情缓存", True, key="v49_cache")
         st.divider()
         commission_pct = st.number_input(
             "佣金率(%)", 0.0, 0.20, 0.025, 0.005,
-            format="%.3f", key="v48_commission")
+            format="%.3f", key="v49_commission")
         stamp_duty_pct = st.number_input(
             "卖出印花税率(%)", 0.0, 0.20, 0.05, 0.01,
-            format="%.3f", key="v48_stamp")
+            format="%.3f", key="v49_stamp")
         transfer_fee_pct = st.number_input(
             "过户费率(%)", 0.0, 0.05, 0.001, 0.001,
-            format="%.3f", key="v48_transfer")
-        if st.button("清除V4.8检查点和结果", key="v48_clear"):
+            format="%.3f", key="v49_transfer")
+        if st.button("清除V4.9检查点和结果", key="v49_clear"):
             shutil.rmtree(CHECKPOINT_DIR, ignore_errors=True)
             shutil.rmtree(RESULT_DIR, ignore_errors=True)
             shutil.rmtree(JOB_DIR, ignore_errors=True)
-            st.success("V4.8检查点和结果已清除；旧行情缓存保留")
+            st.success("V4.9检查点和结果已清除；旧行情缓存保留")
 
     request_payload = {
         "version": VERSION, "days": int(backtest_days),
@@ -839,7 +1114,7 @@ def main() -> None:
     }
     request_signature = stable_signature(request_payload)
     result_path = os.path.join(RESULT_DIR, f"{request_signature}.zip")
-    result_name = f"weekly_skdj_n6_n7_k_cross25_fast_v4_8_{int(backtest_days)}d.zip"
+    result_name = f"weekly_skdj_factor_audit_v4_9_{int(backtest_days)}d.zip"
     completed_available = False
     if os.path.exists(result_path):
         try:
@@ -849,7 +1124,7 @@ def main() -> None:
             clear_job_active(request_signature)
             st.success("发现相同参数的已完成结果，可直接下载。")
             render_download(
-                saved_result, result_name, f"v48_saved_{request_signature}")
+                saved_result, result_name, f"v49_saved_{request_signature}")
         except Exception as exc:
             st.warning(f"旧结果读取失败：{exc}")
 
@@ -858,14 +1133,14 @@ def main() -> None:
         token = secret_token
         st.caption("已从Streamlit Secrets读取TUSHARE_TOKEN。")
     else:
-        token = st.text_input("Tushare Token", type="password", key="v48_token")
+        token = st.text_input("Tushare Token", type="password", key="v49_token")
 
     job_active = is_job_active(request_signature)
     left, right = st.columns(2)
     with left:
-        start_clicked = st.button("开始/重新运行V4.8", type="primary", key="v48_run")
+        start_clicked = st.button("开始/重新运行V4.9", type="primary", key="v49_run")
     with right:
-        stop_clicked = st.button("停止自动续跑", disabled=not job_active, key="v48_stop")
+        stop_clicked = st.button("停止自动续跑", disabled=not job_active, key="v49_stop")
     if stop_clicked:
         clear_job_active(request_signature)
         st.success("已停止；逐股票检查点保留。")
@@ -996,6 +1271,9 @@ def main() -> None:
     calendar = signal_calendar(open_dates, signal_start, signal_end, events_all)
     behavior = behavior_audit(mature)
     first_hits = first_hit_audit(mature)
+    factor_buckets = feature_bucket_audit(mature, len(calendar))
+    factor_combinations = combination_audit(mature, len(calendar))
+    winner_loser_features = winner_loser_feature_audit(mature)
     pair_summary, pair_details = pair_signals(mature)
     summary_rows = []
     for n in SKDJ_NS:
@@ -1026,25 +1304,35 @@ def main() -> None:
         ("重复信号", "以后跌回25下方再上穿时重新计为新事件"),
         ("参数", "同一次运行分别计算N=6、N=7；M固定为3"),
         ("数据窗口", f"正式{int(backtest_days)}个交易日；开始前{WARMUP_WEEKS}周预热；截止后观察W1-W8"),
-        ("暂停功能", "机器学习、评分、TopK、三仓组合全部暂停"),
+        ("审计定位", "先检验原始因子及透明组合，不预设100分权重；机器学习、TopK、三仓组合暂停"),
+        ("趋势字段", "信号周收盘相对20周均线距离；20周均线相对4周前的斜率"),
+        ("SKDJ路径字段", "信号前15个完整周最低/最高K、低于25的总周数、紧邻信号前连续低于25的周数"),
+        ("量价字段", "信号周成交量/此前5个完整周均量；信号周涨幅、收盘位置和上影线比例"),
+        ("防未来数据", "历史窗口均shift(1)排除信号周；买入及W1-W8结果不参与因子定义"),
+        ("组合报告", "仅作分组比较；报告保留事件比例、有信号周、收益、胜率、回撤和止盈止损先后"),
+        ("K值说明", "单列28～32和>38组；不预设K>38为坏信号"),
         ("历史过滤", "每个信号日使用当时科技行业归属、股价和流通市值"),
         ("买入", "信号完整周结束后的下一市场交易日开盘"),
         ("成本", "买卖0.2%滑点、佣金、过户费；卖出另计印花税"),
+        ("N6/N7配对", "同一股票8周内按日期最近进行一对一匹配，禁止重复使用同一条信号"),
         ("运行环境", f"Streamlit {streamlit_version}；运行稳定版要求requirements锁定1.61.0"),
     ], columns=["项目", "说明"])
     files = {
-        "01_run_summary_v4_8.csv": run_summary,
-        "02_n6_n7_behavior_w1_w8_v4_8.csv": behavior,
-        "03_first_hit_profit_vs_stop_v4_8.csv": first_hits,
-        "04_weekly_signal_calendar_v4_8.csv": calendar,
-        "05_n6_n7_pair_summary_v4_8.csv": pair_summary,
-        "06_n6_n7_pair_details_v4_8.csv": pair_details,
-        "07_all_mature_events_v4_8.csv": mature,
-        "08_all_filtered_events_including_immature_v4_8.csv": events_all,
-        "09_rejection_audit_v4_8.csv": pd.DataFrame(
+        "01_run_summary_v4_9.csv": run_summary,
+        "02_n6_n7_behavior_w1_w8_v4_9.csv": behavior,
+        "03_first_hit_profit_vs_stop_v4_9.csv": first_hits,
+        "04_weekly_signal_calendar_v4_9.csv": calendar,
+        "05_feature_bucket_audit_v4_9.csv": factor_buckets,
+        "06_transparent_combination_audit_v4_9.csv": factor_combinations,
+        "07_winner_loser_feature_contrast_v4_9.csv": winner_loser_features,
+        "08_n6_n7_pair_summary_one_to_one_v4_9.csv": pair_summary,
+        "09_n6_n7_pair_details_one_to_one_v4_9.csv": pair_details,
+        "10_all_mature_events_with_features_v4_9.csv": mature,
+        "11_all_filtered_events_including_immature_v4_9.csv": events_all,
+        "12_rejection_audit_v4_9.csv": pd.DataFrame(
             [{"剔除原因": key, "次数": value} for key, value in sorted(rejects.items())]),
-        "10_api_errors_v4_8.csv": pd.DataFrame({"错误": API_ERRORS}),
-        "11_metadata_v4_8.csv": metadata,
+        "13_api_errors_v4_9.csv": pd.DataFrame({"错误": API_ERRORS}),
+        "14_metadata_v4_9.csv": metadata,
     }
     result_zip = make_zip(files)
     try:
@@ -1066,9 +1354,12 @@ def main() -> None:
     render_plain_table(behavior)
     st.subheader("止盈与-10%先后顺序")
     render_plain_table(first_hits)
-    st.subheader("N=6与N=7信号领先关系")
+    st.subheader("透明组合对照（不是最终评分）")
+    render_plain_table(factor_combinations)
+    st.caption("完整单因子分箱表及全部事件原始字段请下载ZIP查看。")
+    st.subheader("N=6与N=7信号一对一领先关系")
     render_plain_table(pair_summary)
-    render_download(result_zip, result_name, f"v48_current_{request_signature}")
+    render_download(result_zip, result_name, f"v49_current_{request_signature}")
 
 
 if __name__ == "__main__":
