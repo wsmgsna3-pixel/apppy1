@@ -1,15 +1,14 @@
 # -*- coding: utf-8 -*-
-"""周线SKDJ N=6/7 历史至少2次成功优先排名审计 V5.4。
+"""周线SKDJ N=6/7/9 买入提前量与W1-W12生命周期审计 V5.5。
 
-本版只研究K线从25下方向上穿过25，不要求此前低位金叉，也不要求K>D。
-唯一技术硬条件仍为信号前连续处于25下方1至5周，50亿元科技池保持不变。
-V5.1.1冻结100分继续作为基准，V5.2共振S/A/B/C作为旧方案对照；新方案把
-最近3个已完成金叉周期至少2次达到75线的股票放入优先层，其余股票放入普通层。
-不再区分达到2次和3次，同层先按原冻结100分排序，最近一次峰值仅用于破同分。
-板块共振和每周候选数量只用于题材/仓位置信度审计，不再改变个股名次。
-三套排序同场比较前3、前20%、随机基准、牛股依赖和周内排序相关性。
-正式信号窗口默认250个交易日用于快速开发；最终确认建议另跑500个交易日。
-开始前保留30周指标预热，信号后观察W1-W8。
+V5.4的信号、50亿元科技池、25线下连续1至5周硬条件和三套排序全部冻结，
+本版不再调分。新增默认参数N=9作为慢速对照，并把入场后的累计最大浮盈、
+最大不利波动和收盘净收益扩展到W1-W12。排名仍只使用W8成熟样本；W12只用于
+持仓生命周期审计，避免为了观察更久而改变V5.4的排名样本。
+
+另以同一股票、相邻信号轮次做N6/N7/N9一对一匹配，直接测量提前多少天、
+早买的价格差以及是否仍捕捉同一轮W12高点。目标不是强迫前段和后段收益相同，
+而是分别识别失败信号应多早退出、成功信号的利润通常在哪一周趋于成熟。
 """
 from __future__ import annotations
 
@@ -31,24 +30,28 @@ import pandas as pd
 import streamlit as st
 import tushare as ts
 
-TITLE = "周线SKDJ N=6/7 历史至少2次成功优先排名审计 V5.4"
-VERSION = "V5.4-WEEKLY-SKDJ-H2-PRIORITY-RANK-AUDIT"
-UI_PATCH = "V5.4-HISTORY-GE2-PRIORITY-AND-CONFIDENCE"
+TITLE = "周线SKDJ N=6/7/9 买入提前量与W1-W12生命周期审计 V5.5"
+VERSION = "V5.5-WEEKLY-SKDJ-N6-N7-N9-LIFECYCLE-AUDIT"
+UI_PATCH = "V5.5-N6-N7-N9-W12-MATCHED-LIFECYCLE"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # 沿用旧行情缓存目录，以便直接复用V4.7已经下载的更长历史数据。
 PRICE_CACHE_DIR = os.path.join(APP_DIR, "weekly_macd_validation_cache_v1_1")
-CHECKPOINT_DIR = os.path.join(APP_DIR, "weekly_skdj_v5_4_checkpoints")
-RESULT_DIR = os.path.join(APP_DIR, "weekly_skdj_v5_4_results")
-JOB_DIR = os.path.join(APP_DIR, "weekly_skdj_v5_4_jobs")
+CHECKPOINT_DIR = os.path.join(APP_DIR, "weekly_skdj_v5_5_checkpoints")
+RESULT_DIR = os.path.join(APP_DIR, "weekly_skdj_v5_5_results")
+JOB_DIR = os.path.join(APP_DIR, "weekly_skdj_v5_5_jobs")
 
-SKDJ_NS = (6, 7)
+SKDJ_NS = (6, 7, 9)
 SKDJ_M = 3
 SKDJ_BOTTOM = 25.0
 WARMUP_WEEKS = 30
-AUDIT_WEEKS = 8
+RANKING_WEEKS = 8
+AUDIT_WEEKS = 12
+LIFECYCLE_WEEKS = tuple(range(1, AUDIT_WEEKS + 1))
 UI_HEARTBEAT_SECONDS = 5.0
 FIRST_HIT_LEVELS = (10.0, 15.0, 20.0)
+FIRST_HIT_AUDIT_WEEKS = (RANKING_WEEKS, AUDIT_WEEKS)
+PAIR_MAX_CALENDAR_DAYS = 84
 MAX_BOTTOM_STREAK = 5
 RANDOM_DRAWS = 500
 RANDOM_SEED = 20260820
@@ -661,18 +664,33 @@ def market_snapshot(basic: pd.DataFrame, trade_date: str) -> dict[str, float]:
     }
 
 
-def first_hit_label(path: pd.DataFrame, entry: float, target_pct: float) -> str:
+def first_hit_detail(path: pd.DataFrame, entry: float, target_pct: float,
+                     entry_period: pd.Period) -> tuple[str, str, float]:
     upper, lower = entry * (1 + target_pct / 100.0), entry * 0.90
     for row in path.itertuples(index=False):
         hit_up = finite_num(getattr(row, "high", np.nan)) >= upper
         hit_down = finite_num(getattr(row, "low", np.nan)) <= lower
+        hit_date = normalize_date(getattr(row, "trade_date", ""))
+        hit_period = pd.Timestamp(hit_date).to_period("W-FRI") if hit_date else None
+        hit_week = (
+            float(hit_period.ordinal - entry_period.ordinal + 1)
+            if hit_period is not None else np.nan)
         if hit_up and hit_down:
-            return "同日同时触发_保守按-10%先"
+            return "同日同时触发_保守按-10%先", hit_date, hit_week
         if hit_down:
-            return "先到-10%"
+            return "先到-10%", hit_date, hit_week
         if hit_up:
-            return f"先到+{int(target_pct)}%"
-    return "均未触发"
+            return f"先到+{int(target_pct)}%", hit_date, hit_week
+    return "均未触发", "", np.nan
+
+
+def first_hit_label(path: pd.DataFrame, entry: float, target_pct: float) -> str:
+    """Backward-compatible label helper used by older audit functions."""
+    if path.empty:
+        return "均未触发"
+    first_date = normalize_date(path.iloc[0].get("trade_date", ""))
+    entry_period = pd.Timestamp(first_date).to_period("W-FRI")
+    return first_hit_detail(path, entry, target_pct, entry_period)[0]
 
 
 def entry_outcomes(daily: pd.DataFrame, signal_date: str, ts_code: str,
@@ -681,7 +699,7 @@ def entry_outcomes(daily: pd.DataFrame, signal_date: str, ts_code: str,
                    ) -> dict[str, Any]:
     out: dict[str, Any] = {
         "Tradable": False, "Date": "", "Raw_Open": np.nan,
-        "Reason": "",
+        "Reason": "", "Peak_Date_W12": "", "Peak_Week_W12": np.nan,
     }
     for week in range(1, AUDIT_WEEKS + 1):
         out.update({
@@ -689,6 +707,12 @@ def entry_outcomes(daily: pd.DataFrame, signal_date: str, ts_code: str,
             f"W{week}_MFE_Net_pct": np.nan, f"W{week}_MAE_Raw_pct": np.nan,
             f"W{week}_Close_Return_Net_pct": np.nan,
         })
+    for audit_week in FIRST_HIT_AUDIT_WEEKS:
+        for level in FIRST_HIT_LEVELS:
+            prefix = f"First_Hit_{int(level)}_vs_Minus10_W{audit_week}"
+            out[prefix] = ""
+            out[f"{prefix}_Date"] = ""
+            out[f"{prefix}_Week"] = np.nan
     if signal_date not in open_pos or open_pos[signal_date] + 1 >= len(open_dates):
         out["Reason"] = "未来市场交易日不足"
         return out
@@ -729,10 +753,23 @@ def entry_outcomes(daily: pd.DataFrame, signal_date: str, ts_code: str,
             f"W{week}_MAE_Raw_pct": (low / raw_entry - 1) * 100,
             f"W{week}_Close_Return_Net_pct": (close * sell_factor / net_entry - 1) * 100,
         })
-        if week == AUDIT_WEEKS:
+        if week in FIRST_HIT_AUDIT_WEEKS:
             for level in FIRST_HIT_LEVELS:
-                out[f"First_Hit_{int(level)}_vs_Minus10_W8"] = first_hit_label(
-                    path, raw_entry, level)
+                prefix = f"First_Hit_{int(level)}_vs_Minus10_W{week}"
+                label, hit_date, hit_week = first_hit_detail(
+                    path, raw_entry, level, entry_period)
+                out[prefix] = label
+                out[f"{prefix}_Date"] = hit_date
+                out[f"{prefix}_Week"] = hit_week
+        if week == AUDIT_WEEKS:
+            highs = pd.to_numeric(path["high"], errors="coerce")
+            if highs.notna().any():
+                peak_row = path.loc[highs.idxmax()]
+                peak_date = normalize_date(peak_row.get("trade_date", ""))
+                peak_period = pd.Timestamp(peak_date).to_period("W-FRI")
+                out["Peak_Date_W12"] = peak_date
+                out["Peak_Week_W12"] = float(
+                    peak_period.ordinal - entry_period.ordinal + 1)
     return out
 
 
@@ -832,12 +869,12 @@ def analyze_stock(stock: pd.Series, periods: list[dict[str, str]], daily: pd.Dat
     return rows, rejects
 
 
-def mature_events(events: pd.DataFrame) -> pd.DataFrame:
+def mature_events(events: pd.DataFrame, weeks: int = RANKING_WEEKS) -> pd.DataFrame:
     if events.empty:
         return events.copy()
     return events[
         true_mask(events, "Entry_Tradable")
-        & true_mask(events, f"Entry_Has_W{AUDIT_WEEKS}")
+        & true_mask(events, f"Entry_Has_W{int(weeks)}")
     ].copy()
 
 
@@ -1096,52 +1133,309 @@ def winner_loser_feature_audit(events: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def pair_signals(events: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    n6 = events[events["SKDJ_N"].eq(6)].copy()
-    n7 = events[events["SKDJ_N"].eq(7)].copy()
-    n7_groups = {str(code): group.copy() for code, group in n7.groupby("ts_code")}
+def lifecycle_cohort_specs() -> list[tuple[str, str]]:
+    return [
+        ("全部硬条件通过", ""),
+        ("原评分周内前3", "Top3"),
+        ("V5.4历史二层周内前20%", "H2_Top20Pct"),
+        ("V5.4历史二层周内前3", "H2_Top3"),
+    ]
+
+
+def select_lifecycle_cohort(frame: pd.DataFrame, flag: str) -> pd.DataFrame:
+    return frame if not flag else frame[true_mask(frame, flag)].copy()
+
+
+def lifecycle_horizon_audit(eligible_w12: pd.DataFrame,
+                            periods: list[dict[str, Any]]) -> pd.DataFrame:
+    """Trace cumulative returns without pretending every N has one fixed exit week."""
+    rows: list[dict[str, Any]] = []
+    for n in SKDJ_NS:
+        base_n = eligible_w12[eligible_w12["SKDJ_N"].eq(n)]
+        for period in periods:
+            period_base = select_period(base_n, period)
+            for cohort_name, flag in lifecycle_cohort_specs():
+                selected = select_lifecycle_cohort(period_base, flag)
+                previous_close = pd.Series(0.0, index=selected.index, dtype=float)
+                previous_mfe = pd.Series(0.0, index=selected.index, dtype=float)
+                for week in LIFECYCLE_WEEKS:
+                    mfe = numeric(selected, f"Entry_W{week}_MFE_Net_pct")
+                    mae = numeric(selected, f"Entry_W{week}_MAE_Raw_pct")
+                    close_ret = numeric(selected, f"Entry_W{week}_Close_Return_Net_pct")
+                    close_increment = close_ret - previous_close
+                    mfe_increment = mfe - previous_mfe
+                    weekly_equal = selected.assign(_value=close_ret).groupby(
+                        "Signal_Week")["_value"].mean()
+                    rows.append({
+                        "SKDJ_N": n, "时间分段": period["name"],
+                        "排名组": cohort_name, "观察周": week,
+                        "事件数": len(selected),
+                        "不同股票": selected["ts_code"].nunique() if not selected.empty else 0,
+                        "信号周": selected["Signal_Week"].nunique() if not selected.empty else 0,
+                        "累计最大浮盈均值%": mfe.mean(),
+                        "累计最大浮盈中位%": mfe.median(),
+                        "累计达到10%比例%": mfe.ge(10).mean() * 100,
+                        "累计达到15%比例%": mfe.ge(15).mean() * 100,
+                        "累计达到20%比例%": mfe.ge(20).mean() * 100,
+                        "累计最大不利波动中位%": mae.median(),
+                        "累计触及-10%比例%": mae.le(-10).mean() * 100,
+                        "周末收盘平均净收益%": close_ret.mean(),
+                        "周末收盘中位净收益%": close_ret.median(),
+                        "周末收盘胜率%": close_ret.gt(0).mean() * 100,
+                        "按信号周等权平均净收益%": weekly_equal.mean(),
+                        "相对前一周收盘增量均值百分点": close_increment.mean(),
+                        "相对前一周收盘增量中位百分点": close_increment.median(),
+                        "本周新增最大浮盈均值百分点": mfe_increment.mean(),
+                        "本周新增最大浮盈中位百分点": mfe_increment.median(),
+                    })
+                    previous_close = close_ret
+                    previous_mfe = mfe
+    return pd.DataFrame(rows)
+
+
+def _first_reach_week(values: pd.Series, target: float) -> float:
+    if not math.isfinite(target):
+        return np.nan
+    reached = values[numeric(pd.DataFrame({"v": values}), "v").ge(target)]
+    return float(reached.index.min()) if not reached.empty else np.nan
+
+
+def holding_window_summary(eligible_w12: pd.DataFrame,
+                           lifecycle: pd.DataFrame,
+                           periods: list[dict[str, Any]]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for n in SKDJ_NS:
+        base_n = eligible_w12[eligible_w12["SKDJ_N"].eq(n)]
+        for period in periods:
+            period_base = select_period(base_n, period)
+            for cohort_name, flag in lifecycle_cohort_specs():
+                selected = select_lifecycle_cohort(period_base, flag)
+                curve = lifecycle[
+                    lifecycle["SKDJ_N"].eq(n)
+                    & lifecycle["时间分段"].eq(period["name"])
+                    & lifecycle["排名组"].eq(cohort_name)
+                ].set_index("观察周")
+                mean_close = numeric(curve, "周末收盘平均净收益%")
+                median_close = numeric(curve, "周末收盘中位净收益%")
+                median_mfe = numeric(curve, "累计最大浮盈中位%")
+                w12_mfe = finite_num(median_mfe.get(AUDIT_WEEKS, np.nan))
+                maturity_target = w12_mfe * 0.90 if math.isfinite(w12_mfe) and w12_mfe > 0 else np.nan
+                hit_weeks: dict[int, float] = {}
+                for level in FIRST_HIT_LEVELS:
+                    prefix = f"Entry_First_Hit_{int(level)}_vs_Minus10_W12"
+                    labels = selected.get(
+                        prefix, pd.Series(index=selected.index, dtype=str)).astype(str)
+                    weeks = numeric(selected, f"{prefix}_Week")
+                    hit_weeks[int(level)] = weeks[labels.eq(
+                        f"先到+{int(level)}%")].median()
+                hit10 = selected.get(
+                    "Entry_First_Hit_10_vs_Minus10_W12",
+                    pd.Series(index=selected.index, dtype=str)).astype(str)
+                rows.append({
+                    "SKDJ_N": n, "时间分段": period["name"], "排名组": cohort_name,
+                    "事件数": len(selected),
+                    "平均收盘收益最高周": float(mean_close.idxmax()) if mean_close.notna().any() else np.nan,
+                    "中位收盘收益最高周": float(median_close.idxmax()) if median_close.notna().any() else np.nan,
+                    "最大浮盈中位达到W12的90%首周": _first_reach_week(
+                        median_mfe, maturity_target),
+                    "W12较W8平均收盘变化百分点": (
+                        numeric(selected, "Entry_W12_Close_Return_Net_pct")
+                        - numeric(selected, "Entry_W8_Close_Return_Net_pct")).mean(),
+                    "W12较W8中位收盘变化百分点": (
+                        numeric(selected, "Entry_W12_Close_Return_Net_pct")
+                        - numeric(selected, "Entry_W8_Close_Return_Net_pct")).median(),
+                    "W12较W8新增最大浮盈中位百分点": (
+                        numeric(selected, "Entry_W12_MFE_Net_pct")
+                        - numeric(selected, "Entry_W8_MFE_Net_pct")).median(),
+                    "W12最高价出现周中位": numeric(
+                        selected, "Entry_Peak_Week_W12").median(),
+                    "W12最高价出现周P25": numeric(
+                        selected, "Entry_Peak_Week_W12").quantile(0.25),
+                    "W12最高价出现周P75": numeric(
+                        selected, "Entry_Peak_Week_W12").quantile(0.75),
+                    "先到+10事件的触发周中位": hit_weeks[10],
+                    "先到+15事件的触发周中位": hit_weeks[15],
+                    "先到+20事件的触发周中位": hit_weeks[20],
+                    "W12先到+10比例%": hit10.eq("先到+10%").mean() * 100,
+                    "W12先到-10比例%_对比10": (
+                        hit10.eq("先到-10%")
+                        | hit10.str.startswith("同日同时触发")).mean() * 100,
+                })
+    return pd.DataFrame(rows)
+
+
+def early_failure_audit(eligible_w12: pd.DataFrame,
+                        periods: list[dict[str, Any]]) -> pd.DataFrame:
+    """Describe early divergence; this is an audit, not a fitted exit rule."""
+    rows: list[dict[str, Any]] = []
+    audit_periods = [p for p in periods if p["name"] in {
+        "全部区间", "前段观察", "后段冻结检验"}]
+    for n in SKDJ_NS:
+        base_n = eligible_w12[eligible_w12["SKDJ_N"].eq(n)]
+        for period in audit_periods:
+            base = select_period(base_n, period)
+            hit10 = base.get(
+                "Entry_First_Hit_10_vs_Minus10_W12",
+                pd.Series(index=base.index, dtype=str)).astype(str)
+            outcome_specs = [
+                ("W12最大浮盈≥20", numeric(base, "Entry_W12_MFE_Net_pct").ge(20)),
+                ("W12先到+10", hit10.eq("先到+10%")),
+                ("W12先到-10_含同日保守", hit10.eq("先到-10%") | hit10.str.startswith("同日同时触发")),
+                ("W12收盘亏损或持平", numeric(base, "Entry_W12_Close_Return_Net_pct").le(0)),
+            ]
+            for outcome_name, mask in outcome_specs:
+                selected = base[mask.fillna(False)]
+                row: dict[str, Any] = {
+                    "SKDJ_N": n, "时间分段": period["name"],
+                    "W12结果组": outcome_name, "事件数": len(selected),
+                    "不同股票": selected["ts_code"].nunique() if not selected.empty else 0,
+                }
+                for week in (1, 2, 3, 4):
+                    close_ret = numeric(selected, f"Entry_W{week}_Close_Return_Net_pct")
+                    mfe = numeric(selected, f"Entry_W{week}_MFE_Net_pct")
+                    mae = numeric(selected, f"Entry_W{week}_MAE_Raw_pct")
+                    row.update({
+                        f"W{week}收盘中位%": close_ret.median(),
+                        f"W{week}收盘≤0比例%": close_ret.le(0).mean() * 100,
+                        f"W{week}最大浮盈中位%": mfe.median(),
+                        f"W{week}最大浮盈<5比例%": mfe.lt(5).mean() * 100,
+                        f"W{week}最大不利波动中位%": mae.median(),
+                    })
+                rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def pair_parameter_signals(events: pd.DataFrame, fast_n: int, slow_n: int,
+                           max_days: int = PAIR_MAX_CALENDAR_DAYS) -> pd.DataFrame:
+    fast = events[events["SKDJ_N"].eq(fast_n)].reset_index(drop=True)
+    slow = events[events["SKDJ_N"].eq(slow_n)].reset_index(drop=True)
+    slow_groups = {str(code): group.reset_index(drop=True)
+                   for code, group in slow.groupby("ts_code")}
     details: list[dict[str, Any]] = []
-    for code, group6 in n6.groupby("ts_code"):
-        group7 = n7_groups.get(str(code))
-        if group7 is None or group7.empty:
+    for code, fast_group in fast.groupby("ts_code"):
+        slow_group = slow_groups.get(str(code))
+        if slow_group is None or slow_group.empty:
             continue
         candidates: list[tuple[int, int, int, int]] = []
-        for index6, row6 in group6.iterrows():
-            date6 = pd.to_datetime(str(row6["Signal_Date"]), format="%Y%m%d")
-            for index7, row7 in group7.iterrows():
-                date7 = pd.to_datetime(str(row7["Signal_Date"]), format="%Y%m%d")
-                gap = int((date7 - date6).days)
-                if abs(gap) <= 56:
-                    candidates.append((abs(gap), gap, int(index6), int(index7)))
-        # 全股票内按最近日期贪心一对一匹配，禁止同一条N=7信号被重复使用。
-        used6: set[int] = set()
-        used7: set[int] = set()
-        for _, gap, index6, index7 in sorted(
-                candidates, key=lambda item: (item[0], abs(item[1]), item[1])):
-            if index6 in used6 or index7 in used7:
+        fast_group = fast_group.reset_index(drop=True)
+        for fast_pos, fast_row in fast_group.iterrows():
+            fast_date = pd.to_datetime(str(fast_row["Signal_Date"]), format="%Y%m%d")
+            for slow_pos, slow_row in slow_group.iterrows():
+                slow_date = pd.to_datetime(str(slow_row["Signal_Date"]), format="%Y%m%d")
+                gap = int((slow_date - fast_date).days)
+                if abs(gap) <= int(max_days):
+                    candidates.append((abs(gap), gap, int(fast_pos), int(slow_pos)))
+        used_fast: set[int] = set()
+        used_slow: set[int] = set()
+        for _, gap, fast_pos, slow_pos in sorted(candidates):
+            if fast_pos in used_fast or slow_pos in used_slow:
                 continue
-            used6.add(index6)
-            used7.add(index7)
-            row6, row7 = n6.loc[index6], n7.loc[index7]
-            details.append({
-                "ts_code": str(code), "name": str(row6["name"]),
-                "N6_Signal_Date": str(row6["Signal_Date"]),
-                "N7_Signal_Date": str(row7["Signal_Date"]),
-                "N7_Minus_N6_Calendar_Days": gap,
-                "Exact_Same_Date": gap == 0,
-            })
-    detail = pd.DataFrame(details)
-    summary = pd.DataFrame([{
-        "N6事件": len(n6), "N7事件": len(n7),
-        "N6与N7同股票8周内匹配": len(detail),
-        "匹配中N6唯一信号": detail[["ts_code", "N6_Signal_Date"]].drop_duplicates().shape[0] if not detail.empty else 0,
-        "匹配中N7唯一信号": detail[["ts_code", "N7_Signal_Date"]].drop_duplicates().shape[0] if not detail.empty else 0,
-        "完全同日": int(true_mask(detail, "Exact_Same_Date").sum()) if not detail.empty else 0,
-        "N6更早比例%": numeric(detail, "N7_Minus_N6_Calendar_Days").gt(0).mean() * 100 if not detail.empty else np.nan,
-        "N7更早比例%": numeric(detail, "N7_Minus_N6_Calendar_Days").lt(0).mean() * 100 if not detail.empty else np.nan,
-        "N7减N6天数中位数": numeric(detail, "N7_Minus_N6_Calendar_Days").median() if not detail.empty else np.nan,
-    }])
-    return summary, detail
+            used_fast.add(fast_pos)
+            used_slow.add(slow_pos)
+            fast_row = fast_group.iloc[fast_pos]
+            slow_row = slow_group.iloc[slow_pos]
+            fast_price = finite_num(fast_row.get("Entry_Raw_Open"))
+            slow_price = finite_num(slow_row.get("Entry_Raw_Open"))
+            fast_peak = str(fast_row.get("Entry_Peak_Date_W12", ""))
+            slow_peak = str(slow_row.get("Entry_Peak_Date_W12", ""))
+            peak_gap = (
+                abs((pd.to_datetime(slow_peak) - pd.to_datetime(fast_peak)).days)
+                if normalize_date(fast_peak) and normalize_date(slow_peak) else np.nan)
+            detail = {
+                "参数对": f"N{fast_n}-N{slow_n}", "快参数": fast_n,
+                "慢参数": slow_n, "ts_code": str(code),
+                "name": str(fast_row.get("name", "")),
+                "快参数信号日": str(fast_row["Signal_Date"]),
+                "慢参数信号日": str(slow_row["Signal_Date"]),
+                "慢减快日历天": gap, "完全同日": gap == 0,
+                "快参数更早": gap > 0,
+                "快参数买入日": str(fast_row.get("Entry_Date", "")),
+                "慢参数买入日": str(slow_row.get("Entry_Date", "")),
+                "快参数买入开盘价": fast_price,
+                "慢参数买入开盘价": slow_price,
+                "慢参数相对快参数买价差%": (
+                    (slow_price / fast_price - 1) * 100
+                    if math.isfinite(fast_price) and fast_price > 0
+                    and math.isfinite(slow_price) else np.nan),
+                "快参数W12最大浮盈%": finite_num(
+                    fast_row.get("Entry_W12_MFE_Net_pct")),
+                "慢参数W12最大浮盈%": finite_num(
+                    slow_row.get("Entry_W12_MFE_Net_pct")),
+                "慢减快W12最大浮盈百分点": (
+                    finite_num(slow_row.get("Entry_W12_MFE_Net_pct"))
+                    - finite_num(fast_row.get("Entry_W12_MFE_Net_pct"))),
+                "快参数W12收盘净收益%": finite_num(
+                    fast_row.get("Entry_W12_Close_Return_Net_pct")),
+                "慢参数W12收盘净收益%": finite_num(
+                    slow_row.get("Entry_W12_Close_Return_Net_pct")),
+                "慢减快W12收盘百分点": (
+                    finite_num(slow_row.get("Entry_W12_Close_Return_Net_pct"))
+                    - finite_num(fast_row.get("Entry_W12_Close_Return_Net_pct"))),
+                "快参数W12最高价日期": fast_peak,
+                "慢参数W12最高价日期": slow_peak,
+                "两参数W12最高价日期相差天": peak_gap,
+                "两参数最高价日期在14天内": bool(
+                    math.isfinite(peak_gap) and peak_gap <= 14),
+            }
+            details.append(detail)
+    return pd.DataFrame(details)
+
+
+def parameter_pair_audit(events: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    detail_frames = [
+        pair_parameter_signals(events, 6, 7),
+        pair_parameter_signals(events, 6, 9),
+        pair_parameter_signals(events, 7, 9),
+    ]
+    detail = pd.concat(detail_frames, ignore_index=True) if detail_frames else pd.DataFrame()
+    summary_rows: list[dict[str, Any]] = []
+    for label in ("N6-N7", "N6-N9", "N7-N9"):
+        selected = detail[detail["参数对"].eq(label)] if not detail.empty else pd.DataFrame()
+        summary_rows.append({
+            "参数对": label, "匹配事件": len(selected),
+            "不同股票": selected["ts_code"].nunique() if not selected.empty else 0,
+            "完全同日比例%": true_mask(selected, "完全同日").mean() * 100 if not selected.empty else np.nan,
+            "快参数更早比例%": true_mask(selected, "快参数更早").mean() * 100 if not selected.empty else np.nan,
+            "慢减快日历天中位": numeric(selected, "慢减快日历天").median(),
+            "慢减快日历天P75": numeric(selected, "慢减快日历天").quantile(0.75),
+            "慢参数相对快参数买价差中位%": numeric(
+                selected, "慢参数相对快参数买价差%").median(),
+            "慢减快W12最大浮盈中位百分点": numeric(
+                selected, "慢减快W12最大浮盈百分点").median(),
+            "慢减快W12收盘中位百分点": numeric(
+                selected, "慢减快W12收盘百分点").median(),
+            "最高价日期在14天内比例%": true_mask(
+                selected, "两参数最高价日期在14天内").mean() * 100 if not selected.empty else np.nan,
+        })
+    summary = pd.DataFrame(summary_rows)
+    n69 = detail[detail["参数对"].eq("N6-N9")].copy()
+    n79 = detail[detail["参数对"].eq("N7-N9")].copy()
+    if n69.empty or n79.empty:
+        triple = pd.DataFrame()
+    else:
+        triple = n69.merge(
+            n79, on=["ts_code", "慢参数信号日"], suffixes=("_N6N9", "_N7N9"))
+        keep = [
+            "ts_code", "name_N6N9", "快参数信号日_N6N9",
+            "快参数信号日_N7N9", "慢参数信号日",
+            "慢减快日历天_N6N9", "慢减快日历天_N7N9",
+            "慢参数相对快参数买价差%_N6N9",
+            "慢参数相对快参数买价差%_N7N9",
+            "两参数最高价日期在14天内_N6N9",
+            "两参数最高价日期在14天内_N7N9",
+        ]
+        triple = triple[[column for column in keep if column in triple.columns]].copy()
+        triple = triple.rename(columns={
+            "name_N6N9": "name", "快参数信号日_N6N9": "N6信号日",
+            "快参数信号日_N7N9": "N7信号日", "慢参数信号日": "N9信号日",
+            "慢减快日历天_N6N9": "N9减N6日历天",
+            "慢减快日历天_N7N9": "N9减N7日历天",
+            "慢参数相对快参数买价差%_N6N9": "N9相对N6买价差%",
+            "慢参数相对快参数买价差%_N7N9": "N9相对N7买价差%",
+            "两参数最高价日期在14天内_N6N9": "N6与N9最高价日期14天内",
+            "两参数最高价日期在14天内_N7N9": "N7与N9最高价日期14天内",
+        })
+    return summary, detail, triple
 
 
 def frozen_score_definitions() -> pd.DataFrame:
@@ -2343,8 +2637,8 @@ def main() -> None:
     st.title(TITLE)
     streamlit_version = str(getattr(st, "__version__", "unknown"))
     st.caption(
-        f"{UI_PATCH}｜50亿科技池；1～5周硬条件；原评分、V5.2共振分层与"
-        f"V5.4历史≥2次优先同场比较。｜Streamlit {streamlit_version}")
+        f"{UI_PATCH}｜冻结V5.4选股与排序；新增N=9、W1～W12和同股同轮匹配。"
+        f"｜Streamlit {streamlit_version}")
     if streamlit_version.startswith("1.62"):
         st.error(
             "检测到Streamlit 1.62.x。该环境与本次约32秒断线重连日志一致；"
@@ -2352,9 +2646,10 @@ def main() -> None:
     with st.expander("本版口径", expanded=True):
         st.markdown(f"""
 - **信号**：上一完整周K＜25，本完整周K≥25；不要求低位金叉，不要求K>D。
+- **参数**：同一次运行分别计算N=6、N=7和默认N=9，M固定为3；三者使用完全相同的科技池、价格市值和交易成本。
 - **重复信号**：同一股票以后再次跌回25下方并重新上穿25，会再次计为新事件。
 - **买入**：信号完整周结束后的下一市场交易日开盘。
-- **数据长度**：默认正式窗口250个交易日（约52周）用于快速开发，最终确认建议另跑500个交易日；另加开始前{WARMUP_WEEKS}周预热和截止后W1-W8观察。
+- **数据长度**：默认正式窗口500个交易日；另加开始前{WARMUP_WEEKS}周预热和截止后W1-W12观察。
 - **过滤**：每个历史信号日分别检查当时科技行业归属；最低股价默认10元、最低流通市值默认50亿元，侧边栏可切换，避免使用今天状态回看历史。
 - **共同硬条件**：信号前连续处于25下方1～{MAX_BOTTOM_STREAK}周；超过5周不进入三套排名，但仍保留剔除计数。
 - **原评分基准**：SKDJ重置35分、量能20分、周K线结构20分、MA20趋势15分、同周价格/市值相对排名10分。
@@ -2365,51 +2660,54 @@ def main() -> None:
 - **候选宽度**：1～4只、5～20只、超过20只分别标记低/中/高仓位置信度；只审计，不剔除、不改变名次。
 - **相对行业强度**：4/8/12周相对强度继续只审计，不计分。
 - **周内比较**：三套排名分别比较全部候选、前20%、前5、前3、第4名以后及后20%。
-- **验收重点**：前3是主验收，前20%是辅助验收；同时与原100分和V5.2共振S/A/B/C比较。
+- **排名口径不变**：排名仍使用完整W8成熟样本；W12成熟样本仅分析持仓生命周期，避免因要求多4周未来数据而改写V5.4名次。
+- **生命周期**：逐周报告累计最大浮盈、最大不利波动、收盘收益和相对前一周的增量；不预设N越小就必须越早卖。
+- **失败与赢家**：分别观察W12先到-10%、先到+10%、最大浮盈≥20%和最终亏损事件在W1～W4何时开始分化。
+- **同股同轮**：在同一股票84个日历日内一对一匹配N6/N7/N9信号，比较领先天数、实际下一日开盘买价和W12高点日期。
 - **随机基准**：每个有候选的星期随机选择最多3只，重复{RANDOM_DRAWS}次，判断正式前3是否只是运气。
 - **压力测试**：分别剔除收益最高事件、贡献最高股票和表现最好信号周，检查成绩是否依赖少数牛股。
 - **防泄漏**：历史最低K和5周均量均只使用信号周以前的完整周；信号当周只使用本周已经收盘的数据。
 - **时间分段**：评分规则在代码中预先冻结；前段和后段只用于分别报告，不读取后段收益重新调权。
-- **买卖口径**：仍是下一交易日开盘买入和W1～W8观察；本版不运行三仓资金曲线，先验证排序本身。
+- **买卖口径**：下一交易日开盘买入，W1～W12仅做观察；本版不根据结果自动生成止盈止损参数。
 """)
     with st.sidebar:
         st.header("运行参数")
         backtest_days = st.number_input(
-            "回测交易日数", 100, 1000, 250, 50, key="v54_days")
-        st.caption("250日适合快速验证；准备定稿时建议再以500日复核跨阶段稳定性。")
+            "回测交易日数", 100, 1000, 500, 50, key="v55_days")
+        st.caption("本版默认500日，才能较可靠地比较N6/N7/N9的持仓生命周期。")
         # 沿用本页已经稳定加载的number_input，避免部分iOS/Safari会话在
         # 首次加载selectbox前端分块时出现“Importing a module script failed”。
         min_price = st.number_input(
             "最低股价（元）", min_value=10.0, max_value=20.0,
-            value=10.0, step=10.0, format="%.0f", key="v54_min_price")
+            value=10.0, step=10.0, format="%.0f", key="v55_min_price")
         min_mv = st.number_input(
             "最低流通市值（亿元）", min_value=50.0, max_value=100.0,
-            value=50.0, step=50.0, format="%.0f", key="v54_min_mv")
+            value=50.0, step=50.0, format="%.0f", key="v55_min_mv")
         st.caption(f"本次历史过滤：股价≥{min_price:.0f}元，流通市值≥{min_mv:.0f}亿元")
         signal_end_date = st.date_input(
-            "买入信号截止", date(2026, 6, 5), key="v54_signal_end")
+            "买入信号截止", date(2026, 6, 5), key="v55_signal_end")
         market_end_date = st.date_input(
-            "行情观察截止", date.today(), key="v54_market_end")
+            "行情观察截止", date.today(), key="v55_market_end")
         split_ratio_pct = st.number_input(
-            "前段观察占正式周比例(%)", 50, 80, 60, 5, key="v54_split")
+            "前段观察占正式周比例(%)", 50, 80, 60, 5, key="v55_split")
         pause = st.number_input(
-            "接口间隔(秒)", 0.0, 2.0, 0.12, 0.02, key="v54_pause")
-        use_cache = st.checkbox("复用行情缓存", True, key="v54_cache")
+            "接口间隔(秒)", 0.0, 2.0, 0.12, 0.02, key="v55_pause")
+        use_cache = st.checkbox("复用行情缓存", True, key="v55_cache")
         st.divider()
         commission_pct = st.number_input(
             "佣金率(%)", 0.0, 0.20, 0.025, 0.005,
-            format="%.3f", key="v54_commission")
+            format="%.3f", key="v55_commission")
         stamp_duty_pct = st.number_input(
             "卖出印花税率(%)", 0.0, 0.20, 0.05, 0.01,
-            format="%.3f", key="v54_stamp")
+            format="%.3f", key="v55_stamp")
         transfer_fee_pct = st.number_input(
             "过户费率(%)", 0.0, 0.05, 0.001, 0.001,
-            format="%.3f", key="v54_transfer")
-        if st.button("清除V5.4检查点和结果", key="v54_clear"):
+            format="%.3f", key="v55_transfer")
+        if st.button("清除V5.5检查点和结果", key="v55_clear"):
             shutil.rmtree(CHECKPOINT_DIR, ignore_errors=True)
             shutil.rmtree(RESULT_DIR, ignore_errors=True)
             shutil.rmtree(JOB_DIR, ignore_errors=True)
-            st.success("V5.4检查点和结果已清除；旧行情缓存保留")
+            st.success("V5.5检查点和结果已清除；旧行情缓存保留")
 
     request_payload = {
         "version": VERSION, "days": int(backtest_days),
@@ -2423,7 +2721,7 @@ def main() -> None:
     request_signature = stable_signature(request_payload)
     result_path = os.path.join(RESULT_DIR, f"{request_signature}.zip")
     result_name = (
-        f"weekly_skdj_h2_priority_rank_audit_v5_4_{int(backtest_days)}d_"
+        f"weekly_skdj_n6_n7_n9_lifecycle_v5_5_{int(backtest_days)}d_"
         f"p{int(min_price)}_mv{int(min_mv)}.zip")
     completed_available = False
     if os.path.exists(result_path):
@@ -2434,7 +2732,7 @@ def main() -> None:
             clear_job_active(request_signature)
             st.success("发现相同参数的已完成结果，可直接下载。")
             render_download(
-                saved_result, result_name, f"v54_saved_{request_signature}")
+                saved_result, result_name, f"v55_saved_{request_signature}")
         except Exception as exc:
             st.warning(f"旧结果读取失败：{exc}")
 
@@ -2443,14 +2741,14 @@ def main() -> None:
         token = secret_token
         st.caption("已从Streamlit Secrets读取TUSHARE_TOKEN。")
     else:
-        token = st.text_input("Tushare Token", type="password", key="v54_token")
+        token = st.text_input("Tushare Token", type="password", key="v55_token")
 
     job_active = is_job_active(request_signature)
     left, right = st.columns(2)
     with left:
-        start_clicked = st.button("开始/重新运行V5.4", type="primary", key="v54_run")
+        start_clicked = st.button("开始/重新运行V5.5", type="primary", key="v55_run")
     with right:
-        stop_clicked = st.button("停止自动续跑", disabled=not job_active, key="v54_stop")
+        stop_clicked = st.button("停止自动续跑", disabled=not job_active, key="v55_stop")
     if stop_clicked:
         clear_job_active(request_signature)
         st.success("已停止；逐股票检查点保留。")
@@ -2573,45 +2871,55 @@ def main() -> None:
         st.error("本区间没有生成通过历史时点过滤的K上穿25事件。")
         return
     events_all = events_all.sort_values(["Signal_Date", "SKDJ_N", "ts_code"]).reset_index(drop=True)
-    mature = mature_events(events_all)
-    if mature.empty:
+    mature_w8 = mature_events(events_all, RANKING_WEEKS)
+    mature_w12 = mature_events(events_all, AUDIT_WEEKS)
+    if mature_w8.empty:
         st.error("存在信号，但没有未来完整W8的成熟事件。")
         return
 
     calendar = signal_calendar(open_dates, signal_start, signal_end, events_all)
     split_end, periods = build_periods(calendar, float(split_ratio_pct) / 100.0)
-    scored_all, eligible = score_and_rank_events(mature, split_end)
+    scored_all, eligible = score_and_rank_events(mature_w8, split_end)
     if eligible.empty:
         st.error("存在成熟事件，但没有股票通过‘连续处于25下方不超过5周’硬条件。")
         return
     eligible = add_independent_candidate_features(eligible)
     eligible = add_challenger_rankings(eligible)
-    with st.spinner("比较原评分、V5.2共振分层与V5.4历史≥2次优先..."):
+    lifecycle_eligible = eligible[true_mask(eligible, "Entry_Has_W12")].copy()
+    if lifecycle_eligible.empty:
+        st.error("存在W8排名样本，但没有未来完整W12的生命周期样本；请延后行情观察截止。")
+        return
+    with st.spinner("复现V5.4排名，并审计N6/N7/N9的W1～W12生命周期..."):
         score_rules = frozen_score_definitions()
         challenger_rules = challenger_score_definitions()
         rank_cohorts = scheme_rank_cohort_audit(eligible, periods)
-        acceptance = scheme_acceptance_audit(rank_cohorts)
-        v54_vs_v52 = h2_vs_v52_acceptance_audit(rank_cohorts)
         rank_overlap = scheme_rank_overlap_audit(eligible, periods)
         random_benchmark = scheme_random_top3_benchmark(eligible, periods)
         concentration = scheme_concentration_stress(eligible, periods)
         ranked_calendar = weekly_rank_calendar(
             calendar, scored_all, eligible, split_end)
-        confidence_states = confidence_state_audit(eligible, periods)
         within_week_ic = within_week_rank_ic_audit(eligible, periods)
-        agreement = parameter_agreement(eligible, periods)
-        excellent_capture = scheme_excellent_capture_audit(eligible, periods)
+        lifecycle = lifecycle_horizon_audit(lifecycle_eligible, periods)
+        holding_summary = holding_window_summary(
+            lifecycle_eligible, lifecycle, periods)
+        early_failure = early_failure_audit(lifecycle_eligible, periods)
+        pair_summary, pair_detail, triple_detail = parameter_pair_audit(
+            lifecycle_eligible)
     summary_rows = []
     for n in SKDJ_NS:
         all_n = events_all[events_all["SKDJ_N"].eq(n)]
-        mature_n = mature[mature["SKDJ_N"].eq(n)]
+        mature_n = mature_w8[mature_w8["SKDJ_N"].eq(n)]
+        mature_w12_n = mature_w12[mature_w12["SKDJ_N"].eq(n)]
         eligible_n = eligible[eligible["SKDJ_N"].eq(n)]
+        lifecycle_n = lifecycle_eligible[lifecycle_eligible["SKDJ_N"].eq(n)]
         pass_by_date = eligible_n.groupby(eligible_n["Signal_Date"].astype(str)).size()
         pass_counts = calendar["Week_End"].astype(str).map(pass_by_date).fillna(0).astype(int)
         summary_rows.append({
             "SKDJ_N": n, "SKDJ_M": SKDJ_M,
             "全部通过过滤事件": len(all_n), "W8成熟事件": len(mature_n),
+            "W12成熟事件": len(mature_w12_n),
             "硬条件通过事件": len(eligible_n),
+            "硬条件通过且W12成熟事件": len(lifecycle_n),
             "硬条件剔除事件": len(mature_n) - len(eligible_n),
             "硬条件通过不同股票": eligible_n["ts_code"].nunique(),
             "硬条件通过有信号周": int(pass_counts.gt(0).sum()),
@@ -2656,7 +2964,7 @@ def main() -> None:
         rejected = group[~true_mask(group, "Hard_Pass")]
         for reason, count in rejected["Hard_Reject_Reason"].fillna("未知").value_counts().items():
             hard_rejections.append({
-                "层级": "V5.4三方案共同硬条件", "SKDJ_N": n,
+                "层级": "V5.5沿用V5.4共同硬条件", "SKDJ_N": n,
                 "剔除原因": reason, "次数": int(count)})
     historical_rejections = [{
         "层级": "历史时点基础过滤", "SKDJ_N": "全部",
@@ -2666,8 +2974,9 @@ def main() -> None:
     metadata = pd.DataFrame([
         ("信号", "上一完整周K<25，本完整周K>=25；不要求低位金叉，不要求K>D"),
         ("重复信号", "以后跌回25下方再上穿时重新计为新事件"),
-        ("参数", "同一次运行分别计算N=6、N=7；M固定为3"),
-        ("数据窗口", f"正式{int(backtest_days)}个交易日；开始前{WARMUP_WEEKS}周预热；截止后观察W1-W8"),
+        ("参数", "同一次运行分别计算N=6、N=7和默认N=9；M固定为3"),
+        ("数据窗口", f"正式{int(backtest_days)}个交易日；开始前{WARMUP_WEEKS}周预热；截止后观察W1-W12"),
+        ("双成熟样本", "V5.4排名继续使用完整W8样本；生命周期只使用完整W12子样本，不让延长观察期改变原排名"),
         ("历史价格市值过滤", f"信号日股价≥{float(min_price):g}元、流通市值≥{float(min_mv):g}亿元"),
         ("三方案共同硬条件", f"信号前连续处于25下方1～{MAX_BOTTOM_STREAK}周；超过5周不进入排名"),
         ("原评分基准", "V5.1.1冻结100分原样保留，既是基准也是各分层内部的主要排序依据"),
@@ -2676,7 +2985,7 @@ def main() -> None:
         ("V5.4历史二层", "最近3次已完成金叉至少2次达到75线进入优先层；2次和3次同级，其余进入普通层；板块共振不参与等级"),
         ("V5.4同层规则", "同一层内先按V5.1.1冻结100分降序；最近一次金叉峰值只用于原分相同时破同分"),
         ("当前K值", "突破当周K值不计分"),
-        ("时间分段", f"前段观察截止{split_end}；三套规则预先写死，后段不重新调权；不要求两个阶段绝对收益相同"),
+        ("时间分段", f"前段观察截止{split_end}；规则预先写死，后段不重新调权；不要求前后段绝对收益相同"),
         ("验收重点", "前3为主验收、前20%为辅助验收；V5.4同时对比原评分和V5.2共振分层，比较收益、胜率、回撤与随机百分位"),
         ("明显改善预设", "平均/中位收益至少提高2个百分点、胜率至少提高3个百分点、触及-10%至少下降3个百分点；每阶段4项中至少3项通过，且前后段均通过"),
         ("随机基准", f"每周随机选择最多3只，固定随机种子，重复{RANDOM_DRAWS}次"),
@@ -2686,43 +2995,39 @@ def main() -> None:
         ("候选宽度置信度", "同N同周1～4只标记低、5～20只标记中、超过20只标记高；只审计，不剔除、不改变名次"),
         ("此前金叉峰值", "只使用信号前已经完成死叉的最近1至3个K上穿D周期；记录各周期最高K及达到75的次数，未完成当前周期不参与"),
         ("周内IC", "每个至少5只候选且特征非恒定的信号周分别计算特征与W8收益Spearman，再报告周均值、中位和为正比例"),
-        ("防未来数据", "历史窗口均shift(1)排除信号周；买入及W1-W8结果不参与因子定义"),
+        ("防未来数据", "历史窗口均shift(1)排除信号周；买入及W1-W12结果不参与信号、硬条件或排名定义"),
         ("历史过滤", "每个信号日使用当时科技行业归属、股价和流通市值"),
         ("买入", "信号完整周结束后的下一市场交易日开盘"),
         ("成本", "买卖0.2%滑点、佣金、过户费；卖出另计印花税"),
-        ("优秀事件捕获", "分别以W8盈利、W8收益≥10/20%、W8最大浮盈≥20%和先到+10%定义优秀，报告进入扩池前3/前5/前20%的比例"),
-        ("回测长度建议", f"默认{int(backtest_days)}个交易日用于快速开发；准备定稿时建议另跑500个交易日复核，不自动强制"),
-        ("暂停功能", "本版不做三仓组合和卖点优化，只验证历史能力二层是否改善前3和前20%"),
+        ("生命周期", "逐周报告累计最大浮盈、最大不利波动、收盘净收益及相对前一周增量；不预设N越小必须越早卖"),
+        ("同股同轮匹配", f"同股票、信号相差不超过{PAIR_MAX_CALENDAR_DAYS}个日历日，按日期最近贪心一对一匹配；禁止一条慢参数信号重复配对"),
+        ("匹配买价", "各参数均以自身信号完整周后的下一市场交易日开盘价比较，不使用信号周收盘价替代"),
+        ("高点周", "在各自买入日起W12路径内寻找最高日线high，并换算为第1至12持有周；高点不是实际卖出价"),
+        ("先后顺序", "同一天同时触及止盈和-10%时保守计为-10%先；W8和W12分别独立计算"),
+        ("本版边界", "只识别赢家/失败者通常何时分化，不在本版根据回测结果自动拟合或执行卖点"),
         ("运行环境", f"Streamlit {streamlit_version}；运行稳定版要求requirements锁定1.61.0"),
     ], columns=["项目", "说明"])
-    top3_union = (
-        true_mask(eligible, "Top3")
-        | true_mask(eligible, "V52_Tier_Top3")
-        | true_mask(eligible, "H2_Top3"))
-    top3_detail = eligible[top3_union].copy()
     files = {
-        "01_run_summary_v5_4.csv": run_summary,
-        "02_original_frozen_score_rules_v5_4.csv": score_rules,
-        "03_v52_control_and_v54_h2_rules.csv": challenger_rules,
-        "04_three_scheme_rank_outcomes_v5_4.csv": rank_cohorts,
-        "05_acceptance_vs_original_v5_4.csv": acceptance,
-        "06_v54_vs_v52_acceptance.csv": v54_vs_v52,
-        "07_three_scheme_improvement_focus_v5_4.csv": rank_cohorts[
-            rank_cohorts["时间分段"].isin(["前段观察", "后段冻结检验"])
-            & rank_cohorts["排名组"].isin(["周内前20%", "周内前3"])].copy(),
-        "08_three_scheme_random_top3_v5_4.csv": random_benchmark,
-        "09_three_scheme_concentration_stress_v5_4.csv": concentration,
-        "10_three_scheme_rank_overlap_v5_4.csv": rank_overlap,
-        "11_weekly_rank_and_confidence_calendar_v5_4.csv": ranked_calendar,
-        "12_breadth_and_resonance_confidence_audit_v5_4.csv": confidence_states,
-        "13_within_week_rank_ic_audit_v5_4.csv": within_week_ic,
-        "14_three_scheme_excellent_capture_v5_4.csv": excellent_capture,
-        "15_n6_n7_original_parameter_agreement_v5_4.csv": agreement,
-        "16_union_top3_selection_detail_v5_4.csv": top3_detail,
-        "17_all_candidates_three_rankings_v5_4.csv": eligible,
-        "18_rejection_audit_v5_4.csv": rejection_audit,
-        "19_metadata_v5_4.csv": metadata,
-        "20_api_errors_v5_4.csv": pd.DataFrame({"错误": API_ERRORS}),
+        "01_run_summary_v5_5.csv": run_summary,
+        "02_w1_w12_lifecycle_curve_v5_5.csv": lifecycle,
+        "03_holding_window_summary_v5_5.csv": holding_summary,
+        "04_early_winner_failure_divergence_v5_5.csv": early_failure,
+        "05_n6_n7_n9_matched_pair_summary_v5_5.csv": pair_summary,
+        "06_n6_n7_n9_matched_pair_detail_v5_5.csv": pair_detail,
+        "07_n6_n7_n9_same_cycle_triples_v5_5.csv": triple_detail,
+        "08_v54_frozen_three_scheme_rank_outcomes_v5_5.csv": rank_cohorts,
+        "09_v54_three_scheme_random_top3_v5_5.csv": random_benchmark,
+        "10_v54_three_scheme_concentration_stress_v5_5.csv": concentration,
+        "11_v54_three_scheme_rank_overlap_v5_5.csv": rank_overlap,
+        "12_weekly_rank_calendar_v5_5.csv": ranked_calendar,
+        "13_within_week_rank_ic_v5_5.csv": within_week_ic,
+        "14_v54_original_score_rules_frozen.csv": score_rules,
+        "15_v54_challenger_rules_frozen.csv": challenger_rules,
+        "16_all_w8_ranking_candidates_v5_5.csv": eligible,
+        "17_all_w12_lifecycle_candidates_v5_5.csv": lifecycle_eligible,
+        "18_rejection_audit_v5_5.csv": rejection_audit,
+        "19_metadata_v5_5.csv": metadata,
+        "20_api_errors_v5_5.csv": pd.DataFrame({"错误": API_ERRORS}),
     }
     result_zip = make_zip(files)
     try:
@@ -2734,31 +3039,24 @@ def main() -> None:
         st.warning(f"结果未能持久保存，但当前页面仍可下载：{exc}")
 
     st.success(
-        f"完成：N=6硬条件通过{len(eligible[eligible['SKDJ_N'].eq(6)])}个，"
-        f"N=7硬条件通过{len(eligible[eligible['SKDJ_N'].eq(7)])}个；"
+        f"完成：N=6/7/9的W12生命周期样本分别为"
+        f"{len(lifecycle_eligible[lifecycle_eligible['SKDJ_N'].eq(6)])}/"
+        f"{len(lifecycle_eligible[lifecycle_eligible['SKDJ_N'].eq(7)])}/"
+        f"{len(lifecycle_eligible[lifecycle_eligible['SKDJ_N'].eq(9)])}个；"
         f"实际行情约{round((market_end_date - data_start_date).days / 7, 1)}周；"
         f"结果{'已保存' if persisted else '仅当前页面可下载'}。")
-    st.subheader("N=6 / N=7运行与共同候选覆盖摘要")
+    st.subheader("N=6 / N=7 / N=9运行与双成熟样本摘要")
     render_plain_table(run_summary)
-    st.subheader("三套排序：前段与后段的前3、前20%直接对照")
-    render_plain_table(rank_cohorts[
-        rank_cohorts["时间分段"].isin(["前段观察", "后段冻结检验"])
-        & rank_cohorts["排名组"].isin(["周内前20%", "周内前3"])])
-    st.subheader("预先设定的明显改善验收（前3主验收，前20%辅助）")
-    render_plain_table(acceptance)
-    st.subheader("V5.4历史≥2次优先是否超过V5.2共振分层")
-    render_plain_table(v54_vs_v52)
-    st.subheader("周内排序能力：特征究竟能否区分同周个股")
-    render_plain_table(within_week_ic[
-        within_week_ic["时间分段"].isin(["前段观察", "后段冻结检验"])])
-    st.subheader("三套前3与随机3只")
-    render_plain_table(random_benchmark[
-        random_benchmark["时间分段"].isin(["前段观察", "后段冻结检验"])])
-    st.subheader("挑战方案与原评分的入选重合率")
-    render_plain_table(rank_overlap[
-        rank_overlap["时间分段"].isin(["前段观察", "后段冻结检验"])])
-    st.caption("候选宽度/板块共振置信度、优秀事件捕获、压力测试及全部候选三套排名请下载ZIP查看。")
-    render_download(result_zip, result_name, f"v54_current_{request_signature}")
+    st.subheader("W1～W12生命周期摘要（全部区间）")
+    render_plain_table(holding_summary[
+        holding_summary["时间分段"].eq("全部区间")])
+    st.subheader("同股同轮：快参数相对慢参数究竟提前多少")
+    render_plain_table(pair_summary)
+    st.subheader("赢家与失败者在W1～W4的早期差异")
+    render_plain_table(early_failure[
+        early_failure["时间分段"].eq("全部区间")])
+    st.caption("完整逐周曲线、前后段、年度、匹配明细及冻结的V5.4排名复现均在ZIP中。")
+    render_download(result_zip, result_name, f"v55_current_{request_signature}")
 
 
 if __name__ == "__main__":
