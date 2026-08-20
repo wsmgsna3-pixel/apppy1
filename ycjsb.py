@@ -7,7 +7,6 @@
 """
 from __future__ import annotations
 
-import base64
 import glob
 import hashlib
 import html
@@ -29,7 +28,7 @@ import tushare as ts
 
 TITLE = "周线SKDJ N=6/7上穿25快速审计 V4.8"
 VERSION = "V4.8-WEEKLY-SKDJ-N6-N7-K-CROSS-25-NO-ML"
-UI_PATCH = "V4.8.1-NATIVE-DOWNLOAD-FIX"
+UI_PATCH = "V4.8.2-STATIC-DOWNLOAD-FIX"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # 沿用旧行情缓存目录，以便直接复用V4.7已经下载的更长历史数据。
@@ -262,26 +261,19 @@ def publish_static_result(payload: bytes, signature: str) -> str:
 def render_native_download(payload: bytes, filename: str, signature: str) -> None:
     """Avoid Streamlit's downloadable frontend module and transient endpoint."""
     safe_filename = html.escape(filename, quote=True)
-    # Safari与Streamlit连接中断时，data URL不再向服务器发起第二次请求。
-    if len(payload) <= 12 * 1024 * 1024:
-        encoded = base64.b64encode(payload).decode("ascii")
-        st.markdown(
-            "<a href='data:application/zip;base64," + encoded + "' download='"
-            + safe_filename + "' "
-            "style='display:inline-block;padding:0.72rem 1rem;background:#ff4b4b;"
-            "color:white;text-decoration:none;border-radius:0.5rem;font-weight:600'>"
-            "离线直接下载结果ZIP</a>", unsafe_allow_html=True)
     try:
         static_href = publish_static_result(payload, signature)
         st.markdown(
             "<a href='" + static_href + "' download='" + safe_filename + "' "
-            "style='display:inline-block;margin-top:0.65rem;padding:0.58rem 0.9rem;"
-            "border:1px solid #888;border-radius:0.5rem;text-decoration:none'>"
-            "备用静态下载</a>", unsafe_allow_html=True)
+            "style='display:inline-block;padding:0.72rem 1rem;background:#ff4b4b;"
+            "color:white;text-decoration:none;border-radius:0.5rem;font-weight:600'>"
+            "直接下载有效结果ZIP</a>", unsafe_allow_html=True)
     except Exception as exc:
         record_error(f"静态下载副本生成失败: {exc}")
+        st.error(f"静态下载副本生成失败：{exc}")
     st.caption(
-        f"结果大小：{len(payload) / 1024 / 1024:.2f} MB。以上链接不使用Streamlit下载组件。")
+        f"结果大小：{len(payload) / 1024 / 1024:.2f} MB。"
+        "此链接要求.streamlit/config.toml已启用enableStaticServing。")
 
 
 @st.cache_data(ttl=24 * 3600)
