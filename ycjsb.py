@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""科技股周线SKDJ N=6/7灵敏度与持续性审计 V4.7。
+"""科技股周线SKDJ N=6/7灵敏度与持续性审计 V4.7.1。
 
 本版恢复较早的可执行买点：周线K首次从25下方上穿25且K>D、K上升，
 下一市场交易日开盘买入。模型不再把下一周是否继续强分离当作最终目标，
@@ -8,10 +8,14 @@
 历史结果训练，再验证Top1/3/5、随机基准、稳健性和真实三仓占位组合。
 本版只改变SKDJ的N值，M固定为3；侧边栏打开为N=6、关闭为N=7，
 用相同股票池、买点、评分和退出规则比较爆发力与持续性。
+V4.7.1增加逐股票磁盘检查点和最终结果持久化，降低移动端WebSocket
+重连造成的重复运行损失；页面更新降频，不持久化Tushare Token。
 """
 from __future__ import annotations
 
+import hashlib
 import io
+import json
 import math
 import os
 import pickle
@@ -25,10 +29,13 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import tushare as ts
-TITLE = "科技股周线SKDJ N=6/7爆发力与持续性审计 V4.7"
-VERSION = "V4.7-WEEKLY-SKDJ-N6-N7-SENSITIVITY"
+TITLE = "科技股周线SKDJ N=6/7爆发力与持续性审计 V4.7.1"
+VERSION = "V4.7.1-WEEKLY-SKDJ-N6-N7-RESUMABLE"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(APP_DIR, "weekly_macd_validation_cache_v1_1")
+CHECKPOINT_DIR = os.path.join(APP_DIR, "weekly_skdj_v4_7_1_checkpoints")
+RESULT_DIR = os.path.join(APP_DIR, "weekly_skdj_v4_7_1_results")
+UI_UPDATE_EVERY = 10
 
 SKDJ_N = 6
 SKDJ_M = 3
@@ -158,10 +165,71 @@ def safe_get(func_name: str, retries: int = 3, required: bool = False, **kwargs)
 
 def atomic_pickle(payload: Any, path: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    temp = f"{path}.tmp"
+    temp = f"{path}.{os.getpid()}.{time.time_ns()}.tmp"
     with open(temp, "wb") as handle:
         pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
     os.replace(temp, path)
+
+
+def atomic_bytes(payload: bytes, path: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temp = f"{path}.{os.getpid()}.{time.time_ns()}.tmp"
+    with open(temp, "wb") as handle:
+        handle.write(payload)
+    os.replace(temp, path)
+
+
+def stable_signature(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:24]
+
+
+def result_cache_path(request_signature: str) -> str:
+    return os.path.join(RESULT_DIR, f"{request_signature}.zip")
+
+
+def stock_checkpoint_path(run_signature: str, ts_code: str) -> str:
+    safe_code = str(ts_code).replace(".", "_")
+    return os.path.join(CHECKPOINT_DIR, run_signature, f"{safe_code}.pkl")
+
+
+def load_stock_checkpoint(run_signature: str, ts_code: str) -> dict[str, Any] | None:
+    path = stock_checkpoint_path(run_signature, ts_code)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "rb") as handle:
+            payload = pickle.load(handle)
+        if (not isinstance(payload, dict)
+                or payload.get("run_signature") != run_signature
+                or payload.get("ts_code") != str(ts_code)):
+            return None
+        for key in ("cycle_rows", "model_rows", "event_rows", "rejects"):
+            if key not in payload:
+                return None
+        return payload
+    except Exception as exc:
+        record_error(f"分析检查点损坏 {ts_code}: {exc}")
+        return None
+
+
+def save_stock_checkpoint(run_signature: str, ts_code: str,
+                          cycle_rows: list[dict[str, Any]],
+                          model_rows: list[dict[str, Any]],
+                          event_rows: list[dict[str, Any]],
+                          rejects: dict[str, int]) -> None:
+    atomic_pickle({
+        "run_signature": run_signature, "ts_code": str(ts_code),
+        "cycle_rows": cycle_rows, "model_rows": model_rows,
+        "event_rows": event_rows, "rejects": rejects,
+    }, stock_checkpoint_path(run_signature, ts_code))
+
+
+def merge_counts(target: dict[str, int], source: dict[str, int]) -> None:
+    for key, value in source.items():
+        target[str(key)] = target.get(str(key), 0) + int(value)
 
 
 def csv_bytes(frame: pd.DataFrame) -> bytes:
@@ -1697,7 +1765,7 @@ def main() -> None:
     st.set_page_config(page_title=TITLE, layout="wide")
     st.title(TITLE)
     st.caption("严格单变量实验：除SKDJ的N=6/7外，股票池、买点、评分、退出和三仓规则全部沿用V4.6。")
-    with st.expander("V4.7验证框架", expanded=True):
+    with st.expander("V4.7.1验证框架", expanded=True):
         st.markdown(f"""
 - **唯一实验变量**：SKDJ的M固定为{SKDJ_M}；侧边栏开关打开使用N=6，关闭使用N=7。两次运行应保持其余参数完全一致。
 - **默认研究窗口**：以信号截止日向前精确取最近250个A股交易日，而不是粗略按自然日估算。
@@ -1711,6 +1779,7 @@ def main() -> None:
 - **真实三仓**：总资金30万元、三个独立10万元槽位；仓位未退出时不接收新信号，同一股票持仓期间不重复买入；按同周排名依次补空位。
 - **三仓边界**：交易级结果可以计算期末权益，但没有逐日组合净值，因此本版不伪造组合最大回撤。
 - **N值判断**：新增W1/W2/W3/W5/W8最大浮盈、收盘收益、10%/20%触达率和持续分离率，同时观察“爆发力”和“持续性”，不能只看最高价。
+- **断线恢复**：每完成一只股票立即写入本地检查点；相同参数重新运行时自动跳过已完成股票。最终ZIP也写入磁盘，不再只依赖WebSocket会话。
 """)
     with st.sidebar:
         st.header("运行参数")
@@ -1730,22 +1799,47 @@ def main() -> None:
         commission_pct = st.number_input("佣金率(%)", 0.0, 0.20, 0.025, 0.005, format="%.3f", key="v47_commission")
         stamp_duty_pct = st.number_input("卖出印花税率(%)", 0.0, 0.20, 0.05, 0.01, format="%.3f", key="v47_stamp")
         transfer_fee_pct = st.number_input("过户费率(%)", 0.0, 0.05, 0.001, 0.001, format="%.3f", key="v47_transfer")
-        if st.button("清除本程序行情缓存", key="v47_clear"):
+        if st.button("清除行情缓存、检查点和旧结果", key="v47_clear"):
             shutil.rmtree(CACHE_DIR, ignore_errors=True)
-            st.success("缓存已清除")
+            shutil.rmtree(CHECKPOINT_DIR, ignore_errors=True)
+            shutil.rmtree(RESULT_DIR, ignore_errors=True)
+            st.success("行情缓存、回测检查点和旧结果已清除")
+
+    request_payload = {
+        "version": VERSION, "skdj_n": int(skdj_n), "skdj_m": SKDJ_M,
+        "backtest_days": int(backtest_days),
+        "signal_end": signal_end_date.strftime("%Y%m%d"),
+        "market_end": market_end_date.strftime("%Y%m%d"),
+        "split_date": split_date_value.strftime("%Y%m%d"),
+        "commission_pct": float(commission_pct),
+        "stamp_duty_pct": float(stamp_duty_pct),
+        "transfer_fee_pct": float(transfer_fee_pct),
+    }
+    request_signature = stable_signature(request_payload)
+    persisted_result_path = result_cache_path(request_signature)
+    result_name = (
+        f"weekly_skdj_n{skdj_n}_{int(backtest_days)}d_"
+        "audit_v4_7_1_all_results.zip")
+    if os.path.exists(persisted_result_path):
+        try:
+            with open(persisted_result_path, "rb") as handle:
+                persisted_result = handle.read()
+            st.success("发现相同参数已经完成的回测结果，可直接下载；无需再次运行。")
+            st.download_button(
+                "下载已保存的结果ZIP", persisted_result, file_name=result_name,
+                mime="application/zip", type="primary",
+                key=f"v471_saved_download_{request_signature}", on_click="ignore")
+        except Exception as exc:
+            st.warning(f"旧结果文件无法读取，将允许重新运行：{exc}")
 
     token = st.text_input("Tushare Token", type="password", key="v47_token")
-    session_key = f"weekly_skdj_n{skdj_n}_{int(backtest_days)}d_v47_zip"
-    result_name = f"weekly_skdj_n{skdj_n}_{int(backtest_days)}d_audit_v4_7_all_results.zip"
     if not token:
-        st.info("请输入Tushare Token；本版没有增加新的Python依赖。")
+        st.info("请输入Tushare Token开始或续跑；Token不会写入磁盘。")
         return
     if not st.button(
-            f"开始V4.7审计（N={skdj_n}，{int(backtest_days)}个交易日）",
+            f"开始/续跑V4.7.1审计（N={skdj_n}，{int(backtest_days)}个交易日）",
             type="primary", key="v47_run"):
-        if session_key in st.session_state:
-            st.download_button("下载上一次结果ZIP", st.session_state[session_key],
-                               file_name=result_name, mime="application/zip", on_click="ignore")
+        st.caption("页面断线后，使用完全相同的参数重新点击“开始/续跑”，会从逐股票检查点继续。")
         return
     if market_end_date <= signal_end_date:
         st.error("行情观察截止日期必须晚于信号截止日期")
@@ -1790,6 +1884,10 @@ def main() -> None:
         "commission_pct": float(commission_pct), "stamp_duty_pct": float(stamp_duty_pct),
         "transfer_fee_pct": float(transfer_fee_pct), "rejects": rejects,
     }
+    run_signature = stable_signature({
+        "version": VERSION,
+        **{key: value for key, value in config.items() if key != "rejects"},
+    })
     try:
         with st.spinner("加载交易日历、申万历史科技池和训练期数据..."):
             open_dates = load_trade_calendar(model_start, market_end)
@@ -1813,26 +1911,53 @@ def main() -> None:
     cycle_rows: list[dict[str, Any]] = []
     model_rows: list[dict[str, Any]] = []
     event_rows: list[dict[str, Any]] = []
-    cache_hits = data_failures = 0
+    cache_hits = checkpoint_hits = data_failures = 0
     progress, status = st.progress(0.0), st.empty()
     for number, stock in stocks.iterrows():
         code = str(stock["ts_code"])
-        progress.progress((number + 1) / max(len(stocks), 1), text=f"{number + 1}/{len(stocks)} {code}")
-        status.caption(
-            f"底部周期 {len(cycle_rows)}；模型历史 {len(model_rows)}；目标事件 {len(event_rows)}；"
-            f"缓存 {cache_hits}；失败 {data_failures}")
-        daily, daily_basic, cache_hit = fetch_stock_history(
-            code, model_start, market_end, bool(use_cache), float(pause))
-        cache_hits += int(cache_hit)
-        if daily.empty:
-            data_failures += 1
-            continue
-        cycle_part, model_part, event_part = analyze_stock(
-            stock, period_index.get(code, []), daily, daily_basic, week_last_map,
-            open_dates, open_pos, market_weeks, config)
-        cycle_rows.extend(cycle_part)
-        model_rows.extend(model_part)
-        event_rows.extend(event_part)
+        checkpoint = load_stock_checkpoint(run_signature, code)
+        if checkpoint is not None:
+            cycle_rows.extend(checkpoint["cycle_rows"])
+            model_rows.extend(checkpoint["model_rows"])
+            event_rows.extend(checkpoint["event_rows"])
+            merge_counts(rejects, checkpoint["rejects"])
+            checkpoint_hits += 1
+        else:
+            daily, daily_basic, cache_hit = fetch_stock_history(
+                code, model_start, market_end, bool(use_cache), float(pause))
+            cache_hits += int(cache_hit)
+            if daily.empty:
+                data_failures += 1
+            else:
+                stock_config = dict(config)
+                stock_config["rejects"] = {}
+                try:
+                    cycle_part, model_part, event_part = analyze_stock(
+                        stock, period_index.get(code, []), daily, daily_basic,
+                        week_last_map, open_dates, open_pos, market_weeks,
+                        stock_config)
+                    cycle_rows.extend(cycle_part)
+                    model_rows.extend(model_part)
+                    event_rows.extend(event_part)
+                    merge_counts(rejects, stock_config["rejects"])
+                    try:
+                        save_stock_checkpoint(
+                            run_signature, code, cycle_part, model_part,
+                            event_part, stock_config["rejects"])
+                    except Exception as exc:
+                        record_error(f"分析检查点保存失败 {code}: {exc}")
+                except Exception as exc:
+                    data_failures += 1
+                    record_error(f"逐股票分析失败 {code}: {exc}")
+
+        processed = number + 1
+        if processed == 1 or processed % UI_UPDATE_EVERY == 0 or processed == len(stocks):
+            progress.progress(
+                processed / max(len(stocks), 1),
+                text=f"{processed}/{len(stocks)}，最近处理 {code}")
+            status.caption(
+                f"检查点恢复 {checkpoint_hits}；行情缓存 {cache_hits}；失败 {data_failures}；"
+                f"模型历史 {len(model_rows)}；目标事件 {len(event_rows)}")
     progress.empty()
     status.empty()
 
@@ -1881,7 +2006,8 @@ def main() -> None:
         "模型样本不足年度数": int(events["Model_Status"].ne(
             "年度样本外_直接收益Ridge+盈利Logistic").groupby(
                 events["Signal_Year"]).any().sum()),
-        "行情失败": data_failures, "缓存命中": cache_hits,
+        "行情失败": data_failures, "行情缓存命中": cache_hits,
+        "分析检查点恢复股票数": checkpoint_hits,
     }])
     metadata = pd.DataFrame([
         ("唯一实验变量", f"SKDJ N={int(skdj_n)}；M固定为{SKDJ_M}；另一轮只切换N，其他参数必须保持一致"),
@@ -1899,36 +2025,41 @@ def main() -> None:
         ("股票池", "申万历史科技行业；主板/创业板/科创板；低位金叉及上穿25日股价≥10元、流通市值≥100亿元"),
         ("N值评价", "比较W1/W2/W3的10%和20%触达率评估爆发力；比较W5/W8收盘收益、胜率和持续分离率评估持续性"),
         ("缓存说明", "行情缓存不含SKDJ计算结果，N=6和N=7可安全复用同一份原始日线缓存"),
+        ("断线恢复", "每只股票分析完成后立即保存检查点；相同参数重新运行时跳过已完成股票；Token不落盘"),
+        ("结果持久化", "最终ZIP写入本地结果目录；WebSocket会话丢失后，相同参数页面仍可重新发现并下载"),
         ("下载精简", "不再导出随机逐次明细、周度逐条明细、模型全历史、底部周期全集、完整股票池等大体积中间表"),
         ("严禁使用", "目标年度未来W1字段、未来收益、最高价及本年度训练结果均不进入当期评分"),
     ], columns=["项目", "说明"])
 
     files = {
-        "01_run_summary_v4_7.csv": run_summary,
-        "02_n6_n7_explosiveness_persistence_v4_7.csv": n_behavior,
-        "03_oos_model_summary_v4_7.csv": model_summary,
-        "04_oos_model_coefficients_v4_7.csv": coefficients,
-        "05_oos_direct_return_quality_v4_7.csv": direct_quality,
-        "06_top1_top3_top5_selection_quality_v4_7.csv": topk,
-        "07_same_week_rank_position_v4_7.csv": rank_positions,
-        "08_topk_vs_random_summary_v4_7.csv": random_summary,
-        "09_weekly_topk_lift_summary_v4_7.csv": weekly_lift,
-        "10_robustness_remove_winners_v4_7.csv": robustness,
-        "11_exit_policy_by_selection_v4_7.csv": exits,
-        "12_year_oos_stability_v4_7.csv": yearly,
-        "13_half_year_oos_stability_v4_7.csv": half_yearly,
-        "14_true_three_slot_portfolio_v4_7.csv": portfolio,
-        "15_true_three_slot_trades_v4_7.csv": portfolio_trades,
-        "16_three_slot_vs_random_rank_v4_7.csv": portfolio_random,
-        "17_weekly_signal_calendar_v4_7.csv": calendar,
-        "18_all_ranked_mature_events_v4_7.csv": events,
-        "19_rejection_audit_v4_7.csv": pd.DataFrame(
+        "01_run_summary_v4_7_1.csv": run_summary,
+        "02_n6_n7_explosiveness_persistence_v4_7_1.csv": n_behavior,
+        "03_oos_model_summary_v4_7_1.csv": model_summary,
+        "04_oos_model_coefficients_v4_7_1.csv": coefficients,
+        "05_oos_direct_return_quality_v4_7_1.csv": direct_quality,
+        "06_top1_top3_top5_selection_quality_v4_7_1.csv": topk,
+        "07_same_week_rank_position_v4_7_1.csv": rank_positions,
+        "08_topk_vs_random_summary_v4_7_1.csv": random_summary,
+        "09_weekly_topk_lift_summary_v4_7_1.csv": weekly_lift,
+        "10_robustness_remove_winners_v4_7_1.csv": robustness,
+        "11_exit_policy_by_selection_v4_7_1.csv": exits,
+        "12_year_oos_stability_v4_7_1.csv": yearly,
+        "13_half_year_oos_stability_v4_7_1.csv": half_yearly,
+        "14_true_three_slot_portfolio_v4_7_1.csv": portfolio,
+        "15_true_three_slot_trades_v4_7_1.csv": portfolio_trades,
+        "16_three_slot_vs_random_rank_v4_7_1.csv": portfolio_random,
+        "17_weekly_signal_calendar_v4_7_1.csv": calendar,
+        "18_all_ranked_mature_events_v4_7_1.csv": events,
+        "19_rejection_audit_v4_7_1.csv": pd.DataFrame(
             [{"剔除原因": key, "次数": value} for key, value in sorted(rejects.items())]),
-        "20_api_errors_v4_7.csv": pd.DataFrame({"错误": API_ERRORS}),
-        "21_metadata_v4_7.csv": metadata,
+        "20_api_errors_v4_7_1.csv": pd.DataFrame({"错误": API_ERRORS}),
+        "21_metadata_v4_7_1.csv": metadata,
     }
     result_zip = make_zip(files)
-    st.session_state[session_key] = result_zip
+    try:
+        atomic_bytes(result_zip, persisted_result_path)
+    except Exception as exc:
+        st.warning(f"最终结果未能写入磁盘，但本页仍可立即下载：{exc}")
     st.success(
         f"N={skdj_n}完成：实际回测起点{signal_start_date}，成熟候选{len(events)}个；"
         f"有信号周{int(counts.gt(0).sum())}，空窗{int(counts.eq(0).sum())}周。")
@@ -1949,8 +2080,9 @@ def main() -> None:
     st.dataframe(portfolio, use_container_width=True, hide_index=True)
     st.subheader("真实三仓与随机排名")
     st.dataframe(portfolio_random, use_container_width=True, hide_index=True)
-    st.download_button(f"下载N={skdj_n}的V4.7结果ZIP", result_zip, file_name=result_name,
-                       mime="application/zip", type="primary", key="v47_download", on_click="ignore")
+    st.download_button(
+        f"下载N={skdj_n}的V4.7.1结果ZIP", result_zip, file_name=result_name,
+        mime="application/zip", type="primary", key="v47_download", on_click="ignore")
     st.info(
         "先分别运行N=6与N=7并保持其余设置一致；对比02看爆发力和持续性，"
         "再看05–10的评分准确性与稳健性，最后看14–16的真实三仓结果。")
