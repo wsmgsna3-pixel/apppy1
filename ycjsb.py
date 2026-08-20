@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""科技股周线SKDJ N=6/7灵敏度与持续性审计 V4.7.1。
+"""科技股周线SKDJ N=6/7灵敏度与持续性审计 V4.7.2。
 
 本版恢复较早的可执行买点：周线K首次从25下方上穿25且K>D、K上升，
 下一市场交易日开盘买入。模型不再把下一周是否继续强分离当作最终目标，
@@ -8,8 +8,8 @@
 历史结果训练，再验证Top1/3/5、随机基准、稳健性和真实三仓占位组合。
 本版只改变SKDJ的N值，M固定为3；侧边栏打开为N=6、关闭为N=7，
 用相同股票池、买点、评分和退出规则比较爆发力与持续性。
-V4.7.1增加逐股票磁盘检查点和最终结果持久化，降低移动端WebSocket
-重连造成的重复运行损失；页面更新降频，不持久化Tushare Token。
+V4.7.2增加持久运行任务标记：首次点击后，即使Streamlit因WebSocket
+重连而重新执行脚本，也会自动从检查点续跑，无需反复点击按钮。
 """
 from __future__ import annotations
 
@@ -29,12 +29,14 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import tushare as ts
-TITLE = "科技股周线SKDJ N=6/7爆发力与持续性审计 V4.7.1"
-VERSION = "V4.7.1-WEEKLY-SKDJ-N6-N7-RESUMABLE"
+TITLE = "科技股周线SKDJ N=6/7爆发力与持续性审计 V4.7.2"
+VERSION = "V4.7.2-WEEKLY-SKDJ-N6-N7-AUTO-RESUME"
+ANALYSIS_SCHEMA_VERSION = "V4.7.1-WEEKLY-SKDJ-N6-N7-RESUMABLE"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(APP_DIR, "weekly_macd_validation_cache_v1_1")
 CHECKPOINT_DIR = os.path.join(APP_DIR, "weekly_skdj_v4_7_1_checkpoints")
 RESULT_DIR = os.path.join(APP_DIR, "weekly_skdj_v4_7_1_results")
+JOB_DIR = os.path.join(APP_DIR, "weekly_skdj_v4_7_1_jobs")
 UI_UPDATE_EVERY = 10
 
 SKDJ_N = 6
@@ -188,6 +190,39 @@ def stable_signature(payload: dict[str, Any]) -> str:
 
 def result_cache_path(request_signature: str) -> str:
     return os.path.join(RESULT_DIR, f"{request_signature}.zip")
+
+
+def active_job_path(request_signature: str) -> str:
+    return os.path.join(JOB_DIR, f"{request_signature}.active")
+
+
+def mark_job_active(request_signature: str) -> None:
+    payload = json.dumps({
+        "request_signature": request_signature,
+        "version": VERSION,
+        "started_or_resumed_at": pd.Timestamp.utcnow().isoformat(),
+    }, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    atomic_bytes(payload, active_job_path(request_signature))
+
+
+def clear_job_active(request_signature: str) -> None:
+    path = active_job_path(request_signature)
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError as exc:
+        record_error(f"运行任务标记清除失败: {exc}")
+
+
+def is_job_active(request_signature: str) -> bool:
+    return os.path.exists(active_job_path(request_signature))
+
+
+def configured_tushare_token() -> str:
+    try:
+        return str(st.secrets.get("TUSHARE_TOKEN", "")).strip()
+    except Exception:
+        return ""
 
 
 def stock_checkpoint_path(run_signature: str, ts_code: str) -> str:
@@ -1765,7 +1800,7 @@ def main() -> None:
     st.set_page_config(page_title=TITLE, layout="wide")
     st.title(TITLE)
     st.caption("严格单变量实验：除SKDJ的N=6/7外，股票池、买点、评分、退出和三仓规则全部沿用V4.6。")
-    with st.expander("V4.7.1验证框架", expanded=True):
+    with st.expander("V4.7.2验证框架", expanded=True):
         st.markdown(f"""
 - **唯一实验变量**：SKDJ的M固定为{SKDJ_M}；侧边栏开关打开使用N=6，关闭使用N=7。两次运行应保持其余参数完全一致。
 - **默认研究窗口**：以信号截止日向前精确取最近250个A股交易日，而不是粗略按自然日估算。
@@ -1779,7 +1814,8 @@ def main() -> None:
 - **真实三仓**：总资金30万元、三个独立10万元槽位；仓位未退出时不接收新信号，同一股票持仓期间不重复买入；按同周排名依次补空位。
 - **三仓边界**：交易级结果可以计算期末权益，但没有逐日组合净值，因此本版不伪造组合最大回撤。
 - **N值判断**：新增W1/W2/W3/W5/W8最大浮盈、收盘收益、10%/20%触达率和持续分离率，同时观察“爆发力”和“持续性”，不能只看最高价。
-- **断线恢复**：每完成一只股票立即写入本地检查点；相同参数重新运行时自动跳过已完成股票。最终ZIP也写入磁盘，不再只依赖WebSocket会话。
+- **自动续跑**：首次点击后写入“运行中”标记。WebSocket重连导致脚本重执行时，只要Token仍可用，程序会自动从逐股票检查点继续，不再要求重复点击。
+- **结果保存**：最终ZIP写入磁盘，不再只依赖WebSocket会话；Token不会写入磁盘。
 """)
     with st.sidebar:
         st.header("运行参数")
@@ -1803,6 +1839,7 @@ def main() -> None:
             shutil.rmtree(CACHE_DIR, ignore_errors=True)
             shutil.rmtree(CHECKPOINT_DIR, ignore_errors=True)
             shutil.rmtree(RESULT_DIR, ignore_errors=True)
+            shutil.rmtree(JOB_DIR, ignore_errors=True)
             st.success("行情缓存、回测检查点和旧结果已清除")
 
     request_payload = {
@@ -1819,31 +1856,68 @@ def main() -> None:
     persisted_result_path = result_cache_path(request_signature)
     result_name = (
         f"weekly_skdj_n{skdj_n}_{int(backtest_days)}d_"
-        "audit_v4_7_1_all_results.zip")
+        "audit_v4_7_2_all_results.zip")
+    completed_result_available = False
     if os.path.exists(persisted_result_path):
         try:
             with open(persisted_result_path, "rb") as handle:
                 persisted_result = handle.read()
+            completed_result_available = True
+            clear_job_active(request_signature)
             st.success("发现相同参数已经完成的回测结果，可直接下载；无需再次运行。")
             st.download_button(
                 "下载已保存的结果ZIP", persisted_result, file_name=result_name,
                 mime="application/zip", type="primary",
-                key=f"v471_saved_download_{request_signature}", on_click="ignore")
+                key=f"v472_saved_download_{request_signature}", on_click="ignore")
         except Exception as exc:
             st.warning(f"旧结果文件无法读取，将允许重新运行：{exc}")
 
-    token = st.text_input("Tushare Token", type="password", key="v47_token")
+    secret_token = configured_tushare_token()
+    if secret_token:
+        token = secret_token
+        st.caption("已从Streamlit Secrets读取TUSHARE_TOKEN，可在新会话中自动续跑。")
+    else:
+        token = st.text_input("Tushare Token", type="password", key="v47_token")
+
+    job_active = is_job_active(request_signature)
+    start_col, stop_col = st.columns(2)
+    with start_col:
+        start_clicked = st.button(
+            f"开始/重新运行V4.7.2（N={skdj_n}）",
+            type="primary", key="v47_run")
+    with stop_col:
+        stop_clicked = st.button(
+            "停止自动续跑", key="v472_stop", disabled=not job_active)
+
+    if stop_clicked:
+        clear_job_active(request_signature)
+        st.success("已停止自动续跑；已完成的逐股票检查点仍然保留。")
+        return
+
+    if start_clicked:
+        if market_end_date <= signal_end_date:
+            st.error("行情观察截止日期必须晚于信号截止日期")
+            return
+        try:
+            mark_job_active(request_signature)
+        except Exception as exc:
+            st.error(f"无法建立自动续跑任务标记：{exc}")
+            return
+        job_active = True
+
     if not token:
-        st.info("请输入Tushare Token开始或续跑；Token不会写入磁盘。")
+        if job_active:
+            st.warning("任务仍标记为运行中。重新输入Token后会立即自动续跑，无需再点击开始。")
+        else:
+            st.info("请输入Tushare Token；Token不会写入磁盘。")
         return
-    if not st.button(
-            f"开始/续跑V4.7.1审计（N={skdj_n}，{int(backtest_days)}个交易日）",
-            type="primary", key="v47_run"):
-        st.caption("页面断线后，使用完全相同的参数重新点击“开始/续跑”，会从逐股票检查点继续。")
+    if not job_active:
+        if completed_result_available:
+            st.caption("如需覆盖已有结果，请点击“开始/重新运行”。")
+        else:
+            st.caption("首次点击开始后，后续页面重连将自动续跑。")
         return
-    if market_end_date <= signal_end_date:
-        st.error("行情观察截止日期必须晚于信号截止日期")
-        return
+    st.info("自动续跑任务处于运行状态；页面重连时不需要再次点击开始。")
     if (market_end_date - signal_end_date).days < 70:
         st.warning("观察截止日距离信号截止日不足70天，末端事件可能没有完整W8；成熟样本会单独处理。")
 
@@ -1885,7 +1959,7 @@ def main() -> None:
         "transfer_fee_pct": float(transfer_fee_pct), "rejects": rejects,
     }
     run_signature = stable_signature({
-        "version": VERSION,
+        "version": ANALYSIS_SCHEMA_VERSION,
         **{key: value for key, value in config.items() if key != "rejects"},
     })
     try:
@@ -1912,8 +1986,12 @@ def main() -> None:
     model_rows: list[dict[str, Any]] = []
     event_rows: list[dict[str, Any]] = []
     cache_hits = checkpoint_hits = data_failures = 0
+    run_was_stopped = False
     progress, status = st.progress(0.0), st.empty()
     for number, stock in stocks.iterrows():
+        if not is_job_active(request_signature):
+            run_was_stopped = True
+            break
         code = str(stock["ts_code"])
         checkpoint = load_stock_checkpoint(run_signature, code)
         if checkpoint is not None:
@@ -1960,6 +2038,9 @@ def main() -> None:
                 f"模型历史 {len(model_rows)}；目标事件 {len(event_rows)}")
     progress.empty()
     status.empty()
+    if run_was_stopped:
+        st.warning("自动续跑任务已停止；当前检查点已保留。")
+        return
 
     cycles = pd.DataFrame(cycle_rows)
     model_history = pd.DataFrame(model_rows)
@@ -2025,44 +2106,49 @@ def main() -> None:
         ("股票池", "申万历史科技行业；主板/创业板/科创板；低位金叉及上穿25日股价≥10元、流通市值≥100亿元"),
         ("N值评价", "比较W1/W2/W3的10%和20%触达率评估爆发力；比较W5/W8收盘收益、胜率和持续分离率评估持续性"),
         ("缓存说明", "行情缓存不含SKDJ计算结果，N=6和N=7可安全复用同一份原始日线缓存"),
-        ("断线恢复", "每只股票分析完成后立即保存检查点；相同参数重新运行时跳过已完成股票；Token不落盘"),
-        ("结果持久化", "最终ZIP写入本地结果目录；WebSocket会话丢失后，相同参数页面仍可重新发现并下载"),
+        ("断线恢复", "首次点击后保存运行任务标记；脚本因WebSocket重连而重执行时自动续跑；每只股票完成后保存检查点"),
+        ("Token安全", "Token不写入任务标记或检查点；可选从Streamlit Secrets的TUSHARE_TOKEN安全读取"),
+        ("结果持久化", "最终ZIP写入本地结果目录；相同参数页面可重新发现并下载；成功保存后自动结束续跑任务"),
         ("下载精简", "不再导出随机逐次明细、周度逐条明细、模型全历史、底部周期全集、完整股票池等大体积中间表"),
         ("严禁使用", "目标年度未来W1字段、未来收益、最高价及本年度训练结果均不进入当期评分"),
     ], columns=["项目", "说明"])
 
     files = {
-        "01_run_summary_v4_7_1.csv": run_summary,
-        "02_n6_n7_explosiveness_persistence_v4_7_1.csv": n_behavior,
-        "03_oos_model_summary_v4_7_1.csv": model_summary,
-        "04_oos_model_coefficients_v4_7_1.csv": coefficients,
-        "05_oos_direct_return_quality_v4_7_1.csv": direct_quality,
-        "06_top1_top3_top5_selection_quality_v4_7_1.csv": topk,
-        "07_same_week_rank_position_v4_7_1.csv": rank_positions,
-        "08_topk_vs_random_summary_v4_7_1.csv": random_summary,
-        "09_weekly_topk_lift_summary_v4_7_1.csv": weekly_lift,
-        "10_robustness_remove_winners_v4_7_1.csv": robustness,
-        "11_exit_policy_by_selection_v4_7_1.csv": exits,
-        "12_year_oos_stability_v4_7_1.csv": yearly,
-        "13_half_year_oos_stability_v4_7_1.csv": half_yearly,
-        "14_true_three_slot_portfolio_v4_7_1.csv": portfolio,
-        "15_true_three_slot_trades_v4_7_1.csv": portfolio_trades,
-        "16_three_slot_vs_random_rank_v4_7_1.csv": portfolio_random,
-        "17_weekly_signal_calendar_v4_7_1.csv": calendar,
-        "18_all_ranked_mature_events_v4_7_1.csv": events,
-        "19_rejection_audit_v4_7_1.csv": pd.DataFrame(
+        "01_run_summary_v4_7_2.csv": run_summary,
+        "02_n6_n7_explosiveness_persistence_v4_7_2.csv": n_behavior,
+        "03_oos_model_summary_v4_7_2.csv": model_summary,
+        "04_oos_model_coefficients_v4_7_2.csv": coefficients,
+        "05_oos_direct_return_quality_v4_7_2.csv": direct_quality,
+        "06_top1_top3_top5_selection_quality_v4_7_2.csv": topk,
+        "07_same_week_rank_position_v4_7_2.csv": rank_positions,
+        "08_topk_vs_random_summary_v4_7_2.csv": random_summary,
+        "09_weekly_topk_lift_summary_v4_7_2.csv": weekly_lift,
+        "10_robustness_remove_winners_v4_7_2.csv": robustness,
+        "11_exit_policy_by_selection_v4_7_2.csv": exits,
+        "12_year_oos_stability_v4_7_2.csv": yearly,
+        "13_half_year_oos_stability_v4_7_2.csv": half_yearly,
+        "14_true_three_slot_portfolio_v4_7_2.csv": portfolio,
+        "15_true_three_slot_trades_v4_7_2.csv": portfolio_trades,
+        "16_three_slot_vs_random_rank_v4_7_2.csv": portfolio_random,
+        "17_weekly_signal_calendar_v4_7_2.csv": calendar,
+        "18_all_ranked_mature_events_v4_7_2.csv": events,
+        "19_rejection_audit_v4_7_2.csv": pd.DataFrame(
             [{"剔除原因": key, "次数": value} for key, value in sorted(rejects.items())]),
-        "20_api_errors_v4_7_1.csv": pd.DataFrame({"错误": API_ERRORS}),
-        "21_metadata_v4_7_1.csv": metadata,
+        "20_api_errors_v4_7_2.csv": pd.DataFrame({"错误": API_ERRORS}),
+        "21_metadata_v4_7_2.csv": metadata,
     }
     result_zip = make_zip(files)
+    result_persisted = False
     try:
         atomic_bytes(result_zip, persisted_result_path)
+        result_persisted = True
+        clear_job_active(request_signature)
     except Exception as exc:
         st.warning(f"最终结果未能写入磁盘，但本页仍可立即下载：{exc}")
     st.success(
         f"N={skdj_n}完成：实际回测起点{signal_start_date}，成熟候选{len(events)}个；"
-        f"有信号周{int(counts.gt(0).sum())}，空窗{int(counts.eq(0).sum())}周。")
+        f"有信号周{int(counts.gt(0).sum())}，空窗{int(counts.eq(0).sum())}周；"
+        f"结果{'已持久保存' if result_persisted else '仅在当前页面可下载'}。")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("成熟候选", len(events))
     c2.metric("有信号周", int(counts.gt(0).sum()))
@@ -2081,7 +2167,7 @@ def main() -> None:
     st.subheader("真实三仓与随机排名")
     st.dataframe(portfolio_random, use_container_width=True, hide_index=True)
     st.download_button(
-        f"下载N={skdj_n}的V4.7.1结果ZIP", result_zip, file_name=result_name,
+        f"下载N={skdj_n}的V4.7.2结果ZIP", result_zip, file_name=result_name,
         mime="application/zip", type="primary", key="v47_download", on_click="ignore")
     st.info(
         "先分别运行N=6与N=7并保持其余设置一致；对比02看爆发力和持续性，"
