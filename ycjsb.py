@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""周线SKDJ N=6/7 50亿扩池、冻结评分与独立特征审计 V5.1。
+"""周线SKDJ N=6/7 50亿扩池、冻结评分与独立特征审计 V5.1.1。
 
 本版只研究K线从25下方向上穿过25，不要求此前低位金叉，也不要求K>D。
 唯一技术硬条件仍为信号前连续处于25下方不超过5周；评分规则完全冻结。
@@ -28,16 +28,16 @@ import pandas as pd
 import streamlit as st
 import tushare as ts
 
-TITLE = "周线SKDJ N=6/7 50亿扩池与独立特征审计 V5.1"
-VERSION = "V5.1-WEEKLY-SKDJ-MV50-FROZEN-SCORE-FEATURE-AUDIT"
-UI_PATCH = "V5.1.0-MV50-LEGACY-RANK-RETENTION"
+TITLE = "周线SKDJ N=6/7 50亿扩池与独立特征审计 V5.1.1"
+VERSION = "V5.1.1-WEEKLY-SKDJ-MV50-FROZEN-SCORE-FEATURE-AUDIT"
+UI_PATCH = "V5.1.1-MV50-NUMBER-INPUT-FRONTEND-FALLBACK"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # 沿用旧行情缓存目录，以便直接复用V4.7已经下载的更长历史数据。
 PRICE_CACHE_DIR = os.path.join(APP_DIR, "weekly_macd_validation_cache_v1_1")
-CHECKPOINT_DIR = os.path.join(APP_DIR, "weekly_skdj_v5_1_checkpoints")
-RESULT_DIR = os.path.join(APP_DIR, "weekly_skdj_v5_1_results")
-JOB_DIR = os.path.join(APP_DIR, "weekly_skdj_v5_1_jobs")
+CHECKPOINT_DIR = os.path.join(APP_DIR, "weekly_skdj_v5_1_1_checkpoints")
+RESULT_DIR = os.path.join(APP_DIR, "weekly_skdj_v5_1_1_results")
+JOB_DIR = os.path.join(APP_DIR, "weekly_skdj_v5_1_1_jobs")
 
 SKDJ_NS = (6, 7)
 SKDJ_M = 3
@@ -1843,37 +1843,40 @@ def main() -> None:
     with st.sidebar:
         st.header("运行参数")
         backtest_days = st.number_input(
-            "回测交易日数", 100, 1000, 250, 50, key="v51_days")
+            "回测交易日数", 100, 1000, 250, 50, key="v511_days")
+        # 沿用本页已经稳定加载的number_input，避免部分iOS/Safari会话在
+        # 首次加载selectbox前端分块时出现“Importing a module script failed”。
+        min_price = st.number_input(
+            "最低股价（元）", min_value=10.0, max_value=20.0,
+            value=10.0, step=10.0, format="%.0f", key="v511_min_price")
+        min_mv = st.number_input(
+            "最低流通市值（亿元）", min_value=50.0, max_value=100.0,
+            value=50.0, step=50.0, format="%.0f", key="v511_min_mv")
+        st.caption(f"本次历史过滤：股价≥{min_price:.0f}元，流通市值≥{min_mv:.0f}亿元")
         signal_end_date = st.date_input(
-            "买入信号截止", date(2026, 6, 5), key="v51_signal_end")
+            "买入信号截止", date(2026, 6, 5), key="v511_signal_end")
         market_end_date = st.date_input(
-            "行情观察截止", date.today(), key="v51_market_end")
+            "行情观察截止", date.today(), key="v511_market_end")
         split_ratio_pct = st.number_input(
-            "前段观察占正式周比例(%)", 50, 80, 60, 5, key="v51_split")
+            "前段观察占正式周比例(%)", 50, 80, 60, 5, key="v511_split")
         pause = st.number_input(
-            "接口间隔(秒)", 0.0, 2.0, 0.12, 0.02, key="v51_pause")
-        use_cache = st.checkbox("复用行情缓存", True, key="v51_cache")
-        min_price = st.selectbox(
-            "最低股价（元）", options=[10.0, 20.0], index=0,
-            format_func=lambda value: f"{int(value)}元", key="v51_min_price")
-        min_mv = st.selectbox(
-            "最低流通市值（亿元）", options=[50.0, 100.0], index=0,
-            format_func=lambda value: f"{int(value)}亿元", key="v51_min_mv")
+            "接口间隔(秒)", 0.0, 2.0, 0.12, 0.02, key="v511_pause")
+        use_cache = st.checkbox("复用行情缓存", True, key="v511_cache")
         st.divider()
         commission_pct = st.number_input(
             "佣金率(%)", 0.0, 0.20, 0.025, 0.005,
-            format="%.3f", key="v51_commission")
+            format="%.3f", key="v511_commission")
         stamp_duty_pct = st.number_input(
             "卖出印花税率(%)", 0.0, 0.20, 0.05, 0.01,
-            format="%.3f", key="v51_stamp")
+            format="%.3f", key="v511_stamp")
         transfer_fee_pct = st.number_input(
             "过户费率(%)", 0.0, 0.05, 0.001, 0.001,
-            format="%.3f", key="v51_transfer")
-        if st.button("清除V5.1检查点和结果", key="v51_clear"):
+            format="%.3f", key="v511_transfer")
+        if st.button("清除V5.1.1检查点和结果", key="v511_clear"):
             shutil.rmtree(CHECKPOINT_DIR, ignore_errors=True)
             shutil.rmtree(RESULT_DIR, ignore_errors=True)
             shutil.rmtree(JOB_DIR, ignore_errors=True)
-            st.success("V5.1检查点和结果已清除；旧行情缓存保留")
+            st.success("V5.1.1检查点和结果已清除；旧行情缓存保留")
 
     request_payload = {
         "version": VERSION, "days": int(backtest_days),
@@ -1887,7 +1890,7 @@ def main() -> None:
     request_signature = stable_signature(request_payload)
     result_path = os.path.join(RESULT_DIR, f"{request_signature}.zip")
     result_name = (
-        f"weekly_skdj_marketcap_feature_audit_v5_1_{int(backtest_days)}d_"
+        f"weekly_skdj_marketcap_feature_audit_v5_1_1_{int(backtest_days)}d_"
         f"p{int(min_price)}_mv{int(min_mv)}.zip")
     completed_available = False
     if os.path.exists(result_path):
@@ -1898,7 +1901,7 @@ def main() -> None:
             clear_job_active(request_signature)
             st.success("发现相同参数的已完成结果，可直接下载。")
             render_download(
-                saved_result, result_name, f"v51_saved_{request_signature}")
+                saved_result, result_name, f"v511_saved_{request_signature}")
         except Exception as exc:
             st.warning(f"旧结果读取失败：{exc}")
 
@@ -1907,14 +1910,14 @@ def main() -> None:
         token = secret_token
         st.caption("已从Streamlit Secrets读取TUSHARE_TOKEN。")
     else:
-        token = st.text_input("Tushare Token", type="password", key="v51_token")
+        token = st.text_input("Tushare Token", type="password", key="v511_token")
 
     job_active = is_job_active(request_signature)
     left, right = st.columns(2)
     with left:
-        start_clicked = st.button("开始/重新运行V5.1", type="primary", key="v51_run")
+        start_clicked = st.button("开始/重新运行V5.1.1", type="primary", key="v511_run")
     with right:
-        stop_clicked = st.button("停止自动续跑", disabled=not job_active, key="v51_stop")
+        stop_clicked = st.button("停止自动续跑", disabled=not job_active, key="v511_stop")
     if stop_clicked:
         clear_job_active(request_signature)
         st.success("已停止；逐股票检查点保留。")
@@ -2113,7 +2116,7 @@ def main() -> None:
         rejected = group[~true_mask(group, "Hard_Pass")]
         for reason, count in rejected["Hard_Reject_Reason"].fillna("未知").value_counts().items():
             hard_rejections.append({
-                "层级": "V5.1评分前硬条件", "SKDJ_N": n,
+                "层级": "V5.1.1评分前硬条件", "SKDJ_N": n,
                 "剔除原因": reason, "次数": int(count)})
     historical_rejections = [{
         "层级": "历史时点基础过滤", "SKDJ_N": "全部",
@@ -2161,25 +2164,25 @@ def main() -> None:
     legacy_detail = legacy100[[
         column for column in legacy_detail_columns if column in legacy100.columns]].copy()
     files = {
-        "01_run_summary_v5_1.csv": run_summary,
-        "02_frozen_score_definitions_v5_1.csv": score_rules,
-        "03_expanded_rank_cohort_outcomes_v5_1.csv": rank_cohorts,
-        "04_random_top3_benchmark_v5_1.csv": random_benchmark,
-        "05_concentration_stress_v5_1.csv": concentration,
-        "06_weekly_rank_calendar_v5_1.csv": ranked_calendar,
-        "07_n6_n7_parameter_agreement_v5_1.csv": agreement,
-        "08_score_ablation_top3_v5_1.csv": ablation,
-        "09_expanded_top3_selection_detail_v5_1.csv": top3_detail,
-        "10_all_expanded_ranked_candidates_v5_1.csv": eligible,
-        "11_rejection_audit_v5_1.csv": rejection_audit,
-        "12_api_errors_v5_1.csv": pd.DataFrame({"错误": API_ERRORS}),
-        "13_metadata_v5_1.csv": metadata,
-        "14_market_cap_cohort_quality_v5_1.csv": market_cap_cohorts,
-        "15_legacy100_rank_retention_v5_1.csv": legacy_retention,
-        "16_legacy100_vs_expanded_rank_detail_v5_1.csv": legacy_detail,
-        "17_excellent_event_capture_v5_1.csv": excellent_capture,
-        "18_independent_feature_buckets_v5_1.csv": feature_buckets,
-        "19_independent_feature_correlations_v5_1.csv": feature_correlations,
+        "01_run_summary_v5_1_1.csv": run_summary,
+        "02_frozen_score_definitions_v5_1_1.csv": score_rules,
+        "03_expanded_rank_cohort_outcomes_v5_1_1.csv": rank_cohorts,
+        "04_random_top3_benchmark_v5_1_1.csv": random_benchmark,
+        "05_concentration_stress_v5_1_1.csv": concentration,
+        "06_weekly_rank_calendar_v5_1_1.csv": ranked_calendar,
+        "07_n6_n7_parameter_agreement_v5_1_1.csv": agreement,
+        "08_score_ablation_top3_v5_1_1.csv": ablation,
+        "09_expanded_top3_selection_detail_v5_1_1.csv": top3_detail,
+        "10_all_expanded_ranked_candidates_v5_1_1.csv": eligible,
+        "11_rejection_audit_v5_1_1.csv": rejection_audit,
+        "12_api_errors_v5_1_1.csv": pd.DataFrame({"错误": API_ERRORS}),
+        "13_metadata_v5_1_1.csv": metadata,
+        "14_market_cap_cohort_quality_v5_1_1.csv": market_cap_cohorts,
+        "15_legacy100_rank_retention_v5_1_1.csv": legacy_retention,
+        "16_legacy100_vs_expanded_rank_detail_v5_1_1.csv": legacy_detail,
+        "17_excellent_event_capture_v5_1_1.csv": excellent_capture,
+        "18_independent_feature_buckets_v5_1_1.csv": feature_buckets,
+        "19_independent_feature_correlations_v5_1_1.csv": feature_correlations,
     }
     result_zip = make_zip(files)
     try:
@@ -2213,7 +2216,7 @@ def main() -> None:
     render_plain_table(market_cap_cohorts[
         market_cap_cohorts["时间分段"].eq("全部区间")])
     st.caption("优秀事件捕获、独立特征分组、旧池逐事件新旧排名、压力测试及全部候选明细请下载ZIP查看。")
-    render_download(result_zip, result_name, f"v51_current_{request_signature}")
+    render_download(result_zip, result_name, f"v511_current_{request_signature}")
 
 
 if __name__ == "__main__":
