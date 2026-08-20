@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""周线SKDJ N=6/7 50亿扩池、冻结评分与独立特征审计 V5.1.1。
+"""周线SKDJ N=6/7 强权重评分与分层排名审计 V5.2。
 
 本版只研究K线从25下方向上穿过25，不要求此前低位金叉，也不要求K>D。
-唯一技术硬条件仍为信号前连续处于25下方不超过5周；评分规则完全冻结。
-最低流通市值默认降至50亿元，并在同一次运行中重建100亿元旧池排名，
-验证扩池后旧池优秀事件能否保留在前20%或前三名。新增的行业相对强度、
-板块共振和此前金叉峰值只做审计，绝不参与本版正式排名。
+唯一技术硬条件仍为信号前连续处于25下方1至5周，50亿元科技池保持不变。
+V5.1.1冻结100分继续作为基准；新增强权重评分让历史金叉能力占50分、
+板块共振占30分，旧100分压缩为20分。另设S/A/B/C分层排名，原评分只在
+同一层级内决定先后。三套排序同场比较前3、前20%、随机基准和牛股依赖。
 正式信号窗口默认250个交易日，开始前只保留30周指标预热，信号后观察W1-W8。
 """
 from __future__ import annotations
@@ -28,16 +28,16 @@ import pandas as pd
 import streamlit as st
 import tushare as ts
 
-TITLE = "周线SKDJ N=6/7 50亿扩池与独立特征审计 V5.1.1"
-VERSION = "V5.1.1-WEEKLY-SKDJ-MV50-FROZEN-SCORE-FEATURE-AUDIT"
-UI_PATCH = "V5.1.1-MV50-NUMBER-INPUT-FRONTEND-FALLBACK"
+TITLE = "周线SKDJ N=6/7 强权重评分与分层排名审计 V5.2"
+VERSION = "V5.2-WEEKLY-SKDJ-DOMINANT-WEIGHT-TIER-RANK-AUDIT"
+UI_PATCH = "V5.2-DOMINANT-WEIGHT-AND-SABC-TIER-RANK"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # 沿用旧行情缓存目录，以便直接复用V4.7已经下载的更长历史数据。
 PRICE_CACHE_DIR = os.path.join(APP_DIR, "weekly_macd_validation_cache_v1_1")
-CHECKPOINT_DIR = os.path.join(APP_DIR, "weekly_skdj_v5_1_1_checkpoints")
-RESULT_DIR = os.path.join(APP_DIR, "weekly_skdj_v5_1_1_results")
-JOB_DIR = os.path.join(APP_DIR, "weekly_skdj_v5_1_1_jobs")
+CHECKPOINT_DIR = os.path.join(APP_DIR, "weekly_skdj_v5_2_checkpoints")
+RESULT_DIR = os.path.join(APP_DIR, "weekly_skdj_v5_2_results")
+JOB_DIR = os.path.join(APP_DIR, "weekly_skdj_v5_2_jobs")
 
 SKDJ_NS = (6, 7)
 SKDJ_M = 3
@@ -1165,6 +1165,39 @@ def frozen_score_definitions() -> pd.DataFrame:
     ], columns=["层级", "字段", "条件", "分值"])
 
 
+def challenger_score_definitions() -> pd.DataFrame:
+    """V5.2 pre-registered challenger rules; no future return enters them."""
+    return pd.DataFrame([
+        ("共同硬条件", "25线下连续周数", "1～5周通过；≥6周或数据不足不排名", "不计分"),
+        ("强权重_历史能力", "最近3次已完成金叉达到75次数", "0/1/2/3次", "0/10/30/40"),
+        ("强权重_历史能力", "最近一次已完成金叉最高K", "<50 / 50～75 / ≥75", "0/5/10"),
+        ("强权重_历史能力", "历史能力模块封顶", "防止两个相关字段重复叠加过度", "最高50"),
+        ("强权重_板块共振", "同行业信号占当周候选比例", "40%～60%", "+30"),
+        ("强权重_板块共振", "同行业信号占当周候选比例", "其他区间", "+0"),
+        ("强权重_辅助", "V5.1.1冻结100分", "原总分×20%", "0～20"),
+        ("强权重_总分", "历史50＋共振30＋辅助20", "同周按总分降序", "0～100"),
+        ("分层排名", "S级", "达到75次数≥2 且 板块共振40%～60%", "最高优先级"),
+        ("分层排名", "A级", "非S级，且达到75次数≥2或最近金叉最高K≥75", "第二优先级"),
+        ("分层排名", "B级", "非S/A级，且达到75次数≥1或最近金叉最高K≥50", "第三优先级"),
+        ("分层排名", "C级", "其余硬条件通过事件", "第四优先级"),
+        ("分层同级", "V5.1.1冻结100分", "只在相同S/A/B/C等级内决定先后", "同级降序"),
+    ], columns=["层级", "字段", "条件", "分值或优先级"])
+
+
+def ranking_scheme_specs() -> list[dict[str, str]]:
+    return [
+        {"name": "原冻结100分", "rank": "Weekly_Rank", "rank_pct": "Weekly_Rank_Pct",
+         "top3": "Top3", "top5": "Top5", "top20": "Top20Pct",
+         "bottom20": "Bottom20Pct", "score": "Score_Total_100"},
+        {"name": "强权重100分", "rank": "Strong_Weekly_Rank", "rank_pct": "Strong_Weekly_Rank_Pct",
+         "top3": "Strong_Top3", "top5": "Strong_Top5", "top20": "Strong_Top20Pct",
+         "bottom20": "Strong_Bottom20Pct", "score": "Strong_Score_Total_100"},
+        {"name": "SABC分层排名", "rank": "Tier_Weekly_Rank", "rank_pct": "Tier_Weekly_Rank_Pct",
+         "top3": "Tier_Top3", "top5": "Tier_Top5", "top20": "Tier_Top20Pct",
+         "bottom20": "Tier_Bottom20Pct", "score": "Tier_Order"},
+    ]
+
+
 def score_and_rank_events(events: pd.DataFrame, split_end: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     work = events.copy()
     work["Signal_Date"] = work["Signal_Date"].astype(str)
@@ -1303,6 +1336,89 @@ def add_independent_candidate_features(eligible: pd.DataFrame) -> pd.DataFrame:
         na_position="last").reset_index(drop=True)
 
 
+def _assign_challenger_rank(
+        frame: pd.DataFrame, prefix: str, sort_columns: list[str],
+        ascending: list[bool]) -> pd.DataFrame:
+    """Assign one complete weekly ranking while preserving original row identity."""
+    work = frame.copy()
+    keys = ["SKDJ_N", "Signal_Week"]
+    ranked = work.sort_values(
+        ["SKDJ_N", "Signal_Week", *sort_columns, "ts_code"],
+        ascending=[True, True, *ascending, True])
+    rank_column = f"{prefix}_Weekly_Rank"
+    pct_column = f"{prefix}_Weekly_Rank_Pct"
+    ranked[rank_column] = ranked.groupby(keys).cumcount() + 1
+    rank_map = ranked[rank_column]
+    work.loc[rank_map.index, rank_column] = rank_map
+    candidate_count = numeric(work, "Candidates_This_Week").replace(0, np.nan)
+    work[pct_column] = numeric(work, rank_column) / candidate_count
+    top20_count = np.ceil(candidate_count * 0.20).clip(lower=1)
+    work[f"{prefix}_Top3"] = numeric(work, rank_column).le(3)
+    work[f"{prefix}_Top5"] = numeric(work, rank_column).le(5)
+    work[f"{prefix}_Top20Pct"] = numeric(work, rank_column).le(top20_count)
+    work[f"{prefix}_Bottom20Pct"] = numeric(work, rank_column).gt(
+        candidate_count - top20_count)
+    return work
+
+
+def add_challenger_rankings(eligible: pd.DataFrame) -> pd.DataFrame:
+    """Add dominant-weight and lexicographic S/A/B/C rankings.
+
+    Every input uses information known by the signal-week close.  V5.1.1's
+    frozen score remains untouched and is compressed to a 20-point tiebreaking
+    block only in the strong-weight challenger.
+    """
+    if eligible.empty:
+        return eligible.copy()
+    work = eligible.copy()
+    reached75 = numeric(
+        work, "Signal_Prior_GC_Reached75_Count_Last3").fillna(0).clip(0, 3)
+    latest_peak = numeric(work, "Signal_Prior_GC1_Peak_K")
+    resonance = numeric(work, "Industry_Resonance_Pct")
+    resonance_40_60 = resonance.between(40.0, 60.0, inclusive="both")
+
+    reached_score = np.select(
+        [reached75.ge(3), reached75.eq(2), reached75.eq(1)],
+        [40.0, 30.0, 10.0], default=0.0)
+    peak_score = np.select(
+        [latest_peak.ge(75.0), latest_peak.ge(50.0)],
+        [10.0, 5.0], default=0.0)
+    work["Strong_Score_Reached75_40"] = reached_score
+    work["Strong_Score_LatestPeak_10"] = peak_score
+    work["Strong_Score_History_50"] = (
+        work["Strong_Score_Reached75_40"]
+        + work["Strong_Score_LatestPeak_10"]).clip(upper=50.0)
+    work["Strong_Score_Resonance_30"] = resonance_40_60.astype(float) * 30.0
+    work["Strong_Score_Auxiliary_20"] = (
+        numeric(work, "Score_Total_100").fillna(0).clip(0, 100) * 0.20)
+    work["Strong_Score_Total_100"] = (
+        work["Strong_Score_History_50"]
+        + work["Strong_Score_Resonance_30"]
+        + work["Strong_Score_Auxiliary_20"]).clip(0, 100)
+
+    tier_s = reached75.ge(2) & resonance_40_60
+    tier_a = ~tier_s & (reached75.ge(2) | latest_peak.ge(75.0))
+    tier_b = ~tier_s & ~tier_a & (reached75.ge(1) | latest_peak.ge(50.0))
+    work["Tier_Level"] = np.select(
+        [tier_s, tier_a, tier_b], ["S", "A", "B"], default="C")
+    work["Tier_Order"] = work["Tier_Level"].map(
+        {"S": 1.0, "A": 2.0, "B": 3.0, "C": 4.0}).astype(float)
+
+    work = _assign_challenger_rank(
+        work, "Strong",
+        ["Strong_Score_Total_100", "Strong_Score_History_50",
+         "Strong_Score_Resonance_30", "Score_Total_100"],
+        [False, False, False, False])
+    work = _assign_challenger_rank(
+        work, "Tier",
+        ["Tier_Order", "Score_Total_100", "Strong_Score_History_50",
+         "Strong_Score_Resonance_30"],
+        [True, False, False, False])
+    return work.sort_values(
+        ["Signal_Date", "SKDJ_N", "Weekly_Rank", "ts_code"],
+        na_position="last").reset_index(drop=True)
+
+
 def build_periods(calendar: pd.DataFrame, split_ratio: float
                   ) -> tuple[str, list[dict[str, Any]]]:
     week_ends = calendar["Week_End"].astype(str).sort_values().drop_duplicates().tolist()
@@ -1376,6 +1492,119 @@ def cohort_metric_row(n: int, period_name: str, cohort_name: str,
     }
 
 
+def scheme_rank_cohort_audit(eligible: pd.DataFrame,
+                             periods: list[dict[str, Any]]) -> pd.DataFrame:
+    """Compare all three rankings on identical candidates and periods."""
+    rows: list[dict[str, Any]] = []
+    for spec in ranking_scheme_specs():
+        for n in SKDJ_NS:
+            base_n = eligible[eligible["SKDJ_N"].eq(n)]
+            for period in periods:
+                base = select_period(base_n, period)
+                groups = [
+                    ("全部硬条件通过", base),
+                    ("周内前20%", base[true_mask(base, spec["top20"])]),
+                    ("周内前5", base[true_mask(base, spec["top5"])]),
+                    ("周内前3", base[true_mask(base, spec["top3"])]),
+                    ("周内第4名以后", base[numeric(base, spec["rank"]).gt(3)]),
+                    ("周内后20%", base[true_mask(base, spec["bottom20"])]),
+                ]
+                for label, selected in groups:
+                    row = cohort_metric_row(
+                        n, str(period["name"]), label, selected,
+                        int(period["total_weeks"]))
+                    row["排序方案"] = spec["name"]
+                    row["方案排序值均值"] = numeric(selected, spec["score"]).mean()
+                    row["S级占比%"] = (
+                        selected.get("Tier_Level", pd.Series(
+                            index=selected.index, dtype=str)).astype(str).eq("S").mean() * 100
+                        if len(selected) else np.nan)
+                    rows.append(row)
+    result = pd.DataFrame(rows)
+    if result.empty:
+        return result
+    compare_metrics = [
+        "W8收盘平均净收益%", "W8收盘中位净收益%", "W8每周等权平均净收益%",
+        "W8收盘胜率%", "W8最大浮盈中位%", "W8最大回撤中位%",
+        "W8触及-10%比例%", "先到+10比例%", "先到+20比例%",
+    ]
+    keys = ["SKDJ_N", "时间分段", "排名组"]
+    baseline = result[result["排序方案"].eq("原冻结100分")][keys + compare_metrics].copy()
+    baseline = baseline.rename(columns={metric: f"_baseline_{metric}" for metric in compare_metrics})
+    result = result.merge(baseline, on=keys, how="left")
+    for metric in compare_metrics:
+        result[f"相对原评分_{metric}"] = (
+            numeric(result, metric) - numeric(result, f"_baseline_{metric}"))
+    return result.drop(columns=[f"_baseline_{metric}" for metric in compare_metrics])
+
+
+def scheme_rank_overlap_audit(eligible: pd.DataFrame,
+                              periods: list[dict[str, Any]]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for n in SKDJ_NS:
+        base_n = eligible[eligible["SKDJ_N"].eq(n)]
+        for period in periods:
+            base = select_period(base_n, period)
+            baseline_top3 = base[true_mask(base, "Top3")]
+            baseline_top20 = base[true_mask(base, "Top20Pct")]
+            for spec in ranking_scheme_specs()[1:]:
+                challenger_top3 = base[true_mask(base, spec["top3"])]
+                challenger_top20 = base[true_mask(base, spec["top20"])]
+                rows.append({
+                    "SKDJ_N": n, "时间分段": period["name"], "挑战方案": spec["name"],
+                    "原评分前3事件": len(baseline_top3), "挑战方案前3事件": len(challenger_top3),
+                    "前3重合事件": int(baseline_top3.index.isin(challenger_top3.index).sum()),
+                    "前3重合率%": (
+                        baseline_top3.index.isin(challenger_top3.index).mean() * 100
+                        if len(baseline_top3) else np.nan),
+                    "原评分前20%事件": len(baseline_top20),
+                    "挑战方案前20%事件": len(challenger_top20),
+                    "前20%重合事件": int(baseline_top20.index.isin(challenger_top20.index).sum()),
+                    "前20%重合率%": (
+                        baseline_top20.index.isin(challenger_top20.index).mean() * 100
+                        if len(baseline_top20) else np.nan),
+                })
+    return pd.DataFrame(rows)
+
+
+def scheme_acceptance_audit(rank_outcomes: pd.DataFrame) -> pd.DataFrame:
+    """Pre-declared material-improvement check; equality across years is not required."""
+    rows: list[dict[str, Any]] = []
+    focus = rank_outcomes[
+        rank_outcomes["排序方案"].isin(["强权重100分", "SABC分层排名"])
+        & rank_outcomes["时间分段"].isin(["前段观察", "后段冻结检验"])
+        & rank_outcomes["排名组"].isin(["周内前20%", "周内前3"])].copy()
+    for _, row in focus.iterrows():
+        mean_delta = finite_num(row.get("相对原评分_W8收盘平均净收益%"))
+        median_delta = finite_num(row.get("相对原评分_W8收盘中位净收益%"))
+        win_delta = finite_num(row.get("相对原评分_W8收盘胜率%"))
+        stop_delta = finite_num(row.get("相对原评分_W8触及-10%比例%"))
+        checks = {
+            "平均收益至少提高2个百分点": bool(mean_delta >= 2.0),
+            "中位收益至少提高2个百分点": bool(median_delta >= 2.0),
+            "胜率至少提高3个百分点": bool(win_delta >= 3.0),
+            "触及负10比例至少下降3个百分点": bool(stop_delta <= -3.0),
+        }
+        rows.append({
+            "SKDJ_N": row["SKDJ_N"], "排序方案": row["排序方案"],
+            "排名组": row["排名组"], "时间分段": row["时间分段"],
+            "平均收益变化百分点": mean_delta,
+            "中位收益变化百分点": median_delta,
+            "胜率变化百分点": win_delta,
+            "触及负10比例变化百分点": stop_delta,
+            **checks,
+            "明显改善项数_共4项": sum(checks.values()),
+            "本阶段至少3项明显改善": sum(checks.values()) >= 3,
+        })
+    result = pd.DataFrame(rows)
+    if not result.empty:
+        keys = ["SKDJ_N", "排序方案", "排名组"]
+        both = result.groupby(keys)["本阶段至少3项明显改善"].transform("all")
+        count = result.groupby(keys)["时间分段"].transform("nunique")
+        result["前后段均通过"] = both & count.eq(2)
+    return result
+
+
 def rank_cohort_audit(eligible: pd.DataFrame,
                       periods: list[dict[str, Any]]) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
@@ -1418,10 +1647,23 @@ def weekly_rank_calendar(calendar: pd.DataFrame, all_events: pd.DataFrame,
         pass_counts = group.groupby("Week_End").size()
         top3_counts = group[true_mask(group, "Top3")].groupby("Week_End").size()
         top5_counts = group[true_mask(group, "Top5")].groupby("Week_End").size()
+        strong_top3_counts = group[true_mask(
+            group, "Strong_Top3")].groupby("Week_End").size()
+        tier_top3_counts = group[true_mask(
+            group, "Tier_Top3")].groupby("Week_End").size()
+        tier_s_counts = group[group.get(
+            "Tier_Level", pd.Series(index=group.index, dtype=str))
+            .astype(str).eq("S")].groupby("Week_End").size()
         result[f"N{n}_全部原始事件"] = result["Week_End"].map(raw_counts).fillna(0).astype(int)
         result[f"N{n}_硬条件通过"] = result["Week_End"].map(pass_counts).fillna(0).astype(int)
         result[f"N{n}_前3"] = result["Week_End"].map(top3_counts).fillna(0).astype(int)
         result[f"N{n}_前5"] = result["Week_End"].map(top5_counts).fillna(0).astype(int)
+        result[f"N{n}_强权重前3"] = result["Week_End"].map(
+            strong_top3_counts).fillna(0).astype(int)
+        result[f"N{n}_分层前3"] = result["Week_End"].map(
+            tier_top3_counts).fillna(0).astype(int)
+        result[f"N{n}_S级事件"] = result["Week_End"].map(
+            tier_s_counts).fillna(0).astype(int)
         score_stats = group.groupby("Week_End")["Score_Total_100"].agg(["max", "median", "min"])
         for stat, cn in (("max", "最高分"), ("median", "中位分"), ("min", "最低分")):
             result[f"N{n}_{cn}"] = result["Week_End"].map(score_stats[stat])
@@ -1485,6 +1727,55 @@ def random_top3_benchmark(eligible: pd.DataFrame,
     return pd.DataFrame(rows)
 
 
+def scheme_random_top3_benchmark(eligible: pd.DataFrame,
+                                 periods: list[dict[str, Any]]) -> pd.DataFrame:
+    """Use the same random draws for every scheme in one N/period comparison."""
+    rows: list[dict[str, Any]] = []
+    lower_is_better = {"W8触及-10%比例%"}
+    for n in SKDJ_NS:
+        base_n = eligible[eligible["SKDJ_N"].eq(n)]
+        for period_number, period in enumerate(periods):
+            base = select_period(base_n, period)
+            if base.empty:
+                continue
+            weekly_indices = [
+                group.index.to_numpy() for _, group in base.groupby("Signal_Week")]
+            rng = np.random.default_rng(RANDOM_SEED + n * 1000 + period_number)
+            sample_metrics = random_metric_values(base.iloc[0:0])
+            draws: dict[str, list[float]] = {key: [] for key in sample_metrics}
+            for _ in range(RANDOM_DRAWS):
+                picked = np.concatenate([
+                    rng.choice(indices, size=min(3, len(indices)), replace=False)
+                    for indices in weekly_indices
+                ])
+                values = random_metric_values(base.loc[picked])
+                for key, value in values.items():
+                    draws[key].append(value)
+            distributions = {
+                key: pd.Series(values, dtype=float).dropna()
+                for key, values in draws.items()}
+            for spec in ranking_scheme_specs():
+                selected = base[true_mask(base, spec["top3"])]
+                actual = random_metric_values(selected)
+                for metric, actual_value in actual.items():
+                    distribution = distributions[metric]
+                    percentile = (
+                        distribution.ge(actual_value).mean() * 100
+                        if metric in lower_is_better
+                        else distribution.le(actual_value).mean() * 100)
+                    rows.append({
+                        "SKDJ_N": n, "时间分段": period["name"],
+                        "排序方案": spec["name"], "指标": metric,
+                        "方案前3": actual_value,
+                        "随机3只P05": distribution.quantile(0.05),
+                        "随机3只中位": distribution.median(),
+                        "随机3只P95": distribution.quantile(0.95),
+                        "方案前3优于随机百分位%": percentile,
+                        "随机次数": RANDOM_DRAWS,
+                    })
+    return pd.DataFrame(rows)
+
+
 def concentration_stress(eligible: pd.DataFrame,
                          periods: list[dict[str, Any]]) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
@@ -1521,6 +1812,54 @@ def concentration_stress(eligible: pd.DataFrame,
                     int(period["total_weeks"]))
                 row["剔除对象"] = removed
                 rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def scheme_concentration_stress(eligible: pd.DataFrame,
+                                periods: list[dict[str, Any]]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    selected_periods = [
+        period for period in periods
+        if period["name"] in {"全部区间", "后段冻结检验"}
+        or str(period["name"]).startswith("年度")]
+    for spec in ranking_scheme_specs():
+        for n in SKDJ_NS:
+            base_n = eligible[eligible["SKDJ_N"].eq(n)]
+            for period in selected_periods:
+                top3 = select_period(base_n, period)
+                top3 = top3[true_mask(top3, spec["top3"])].copy()
+                if top3.empty:
+                    continue
+                scenarios: list[tuple[str, str, pd.DataFrame]] = [("原始", "", top3)]
+                for count in (1, 3, 5):
+                    best_events = top3.nlargest(
+                        min(count, len(top3)), "Entry_W8_Close_Return_Net_pct")
+                    scenarios.append((
+                        f"剔除收益最高{count}个事件",
+                        ",".join(best_events["ts_code"].astype(str)
+                                 + "@" + best_events["Signal_Date"].astype(str)),
+                        top3.drop(index=best_events.index)))
+                    stock_contribution = top3.groupby(
+                        "ts_code")["Entry_W8_Close_Return_Net_pct"].sum()
+                    best_stocks = stock_contribution.nlargest(
+                        min(count, len(stock_contribution))).index.astype(str)
+                    scenarios.append((
+                        f"剔除贡献最高{count}只股票", ",".join(best_stocks),
+                        top3[~top3["ts_code"].astype(str).isin(best_stocks)]))
+                    week_contribution = top3.groupby(
+                        "Signal_Week")["Entry_W8_Close_Return_Net_pct"].mean()
+                    best_weeks = week_contribution.nlargest(
+                        min(count, len(week_contribution))).index.astype(str)
+                    scenarios.append((
+                        f"剔除表现最好{count}个信号周", ",".join(best_weeks),
+                        top3[~top3["Signal_Week"].astype(str).isin(best_weeks)]))
+                for scenario, removed, selected in scenarios:
+                    row = cohort_metric_row(
+                        n, str(period["name"]), scenario, selected,
+                        int(period["total_weeks"]))
+                    row["排序方案"] = spec["name"]
+                    row["剔除对象"] = removed
+                    rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -1747,6 +2086,60 @@ def excellent_event_capture_audit(eligible: pd.DataFrame,
     return pd.DataFrame(rows)
 
 
+def scheme_excellent_capture_audit(eligible: pd.DataFrame,
+                                   periods: list[dict[str, Any]]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    definitions = [
+        ("W8收盘净收益>0", lambda frame: numeric(
+            frame, "Entry_W8_Close_Return_Net_pct").gt(0)),
+        ("W8收盘净收益≥10%", lambda frame: numeric(
+            frame, "Entry_W8_Close_Return_Net_pct").ge(10)),
+        ("W8收盘净收益≥20%", lambda frame: numeric(
+            frame, "Entry_W8_Close_Return_Net_pct").ge(20)),
+        ("W8最大浮盈≥20%", lambda frame: numeric(
+            frame, "Entry_W8_MFE_Net_pct").ge(20)),
+        ("先到+10%而非-10%", lambda frame: frame.get(
+            "Entry_First_Hit_10_vs_Minus10_W8",
+            pd.Series(index=frame.index, dtype=str)).astype(str).eq("先到+10%")),
+    ]
+    for spec in ranking_scheme_specs():
+        for n in SKDJ_NS:
+            base_n = eligible[eligible["SKDJ_N"].eq(n)]
+            for period in periods:
+                period_base = select_period(base_n, period)
+                period_size = numeric(period_base, "Circ_MV_Billion")
+                size_groups = [
+                    ("全部50亿以上", period_base),
+                    ("新增50～100亿", period_base[
+                        period_size.ge(50) & period_size.lt(100)]),
+                    ("原100亿以上", period_base[period_size.ge(100)]),
+                ]
+                for size_label, base in size_groups:
+                    for definition, mask_builder in definitions:
+                        excellent = base[mask_builder(base)]
+                        count = len(excellent)
+                        rows.append({
+                            "排序方案": spec["name"], "SKDJ_N": n,
+                            "时间分段": period["name"], "市值组": size_label,
+                            "优秀定义": definition, "优秀事件数": count,
+                            "进入前3": int(true_mask(excellent, spec["top3"]).sum()),
+                            "进入前3比例%": (
+                                true_mask(excellent, spec["top3"]).mean() * 100
+                                if count else np.nan),
+                            "进入前5": int(true_mask(excellent, spec["top5"]).sum()),
+                            "进入前5比例%": (
+                                true_mask(excellent, spec["top5"]).mean() * 100
+                                if count else np.nan),
+                            "进入前20%": int(true_mask(excellent, spec["top20"]).sum()),
+                            "进入前20%比例%": (
+                                true_mask(excellent, spec["top20"]).mean() * 100
+                                if count else np.nan),
+                            "优秀事件方案排名中位": numeric(
+                                excellent, spec["rank"]).median(),
+                        })
+    return pd.DataFrame(rows)
+
+
 def independent_feature_audit(eligible: pd.DataFrame,
                               periods: list[dict[str, Any]]) -> tuple[pd.DataFrame, pd.DataFrame]:
     bucket_rows: list[dict[str, Any]] = []
@@ -1816,8 +2209,8 @@ def main() -> None:
     st.title(TITLE)
     streamlit_version = str(getattr(st, "__version__", "unknown"))
     st.caption(
-        f"{UI_PATCH}｜默认最低流通市值50亿；冻结原100分；新增独立特征只审计；"
-        f"同场重建100亿旧池排名。｜Streamlit {streamlit_version}")
+        f"{UI_PATCH}｜50亿科技池；1～5周硬条件；原评分、强权重与S/A/B/C分层"
+        f"三方案同场比较。｜Streamlit {streamlit_version}")
     if streamlit_version.startswith("1.62"):
         st.error(
             "检测到Streamlit 1.62.x。该环境与本次约32秒断线重连日志一致；"
@@ -1829,11 +2222,13 @@ def main() -> None:
 - **买入**：信号完整周结束后的下一市场交易日开盘。
 - **数据长度**：默认正式窗口250个交易日（约52周）＋开始前{WARMUP_WEEKS}周预热＋截止后W1-W8观察；通常约90～100周，而不是120周或290周。
 - **过滤**：每个历史信号日分别检查当时科技行业归属；最低股价默认10元、最低流通市值默认50亿元，侧边栏可切换，避免使用今天状态回看历史。
-- **唯一新增硬条件**：信号前连续处于25下方1～{MAX_BOTTOM_STREAK}周；超过5周不进入评分排名，但仍保留剔除计数。
-- **冻结评分**：SKDJ重置35分、量能20分、周K线结构20分、MA20趋势15分、同周价格/市值相对排名10分；突破当周K值不计分。
+- **共同硬条件**：信号前连续处于25下方1～{MAX_BOTTOM_STREAK}周；超过5周不进入三套排名，但仍保留剔除计数。
+- **原评分基准**：SKDJ重置35分、量能20分、周K线结构20分、MA20趋势15分、同周价格/市值相对排名10分。
+- **强权重评分**：历史金叉能力50分、板块共振30分、原100分压缩为20分；强特征真正主导排名。
+- **分层排名**：先按S/A/B/C等级排序，再由原100分在同一等级内决定先后；不因分层减少候选。
 - **100亿旧池对照**：在同一批行情中对≥100亿元事件单独重算旧池价格市值分和周内排名，再与50亿扩池排名逐事件比较。
-- **新增独立特征**：候选池内同行业4/8/12周相对强度、行业信号数与共振占比、此前已完成K/D金叉周期最高K；本版全部只审计，不进入100分。
-- **周内比较**：同一次运行分别计算N=6和N=7，比较全部候选、前20%、前5、前3、第4名以后及后20%。
+- **相对行业强度**：4/8/12周相对强度继续只审计；板块共振和历史金叉能力进入两套挑战排名。
+- **周内比较**：三套排名分别比较全部候选、前20%、前5、前3、第4名以后及后20%。
 - **随机基准**：每个有候选的星期随机选择最多3只，重复{RANDOM_DRAWS}次，判断正式前3是否只是运气。
 - **压力测试**：分别剔除收益最高事件、贡献最高股票和表现最好信号周，检查成绩是否依赖少数牛股。
 - **防泄漏**：历史最低K和5周均量均只使用信号周以前的完整周；信号当周只使用本周已经收盘的数据。
@@ -1843,40 +2238,40 @@ def main() -> None:
     with st.sidebar:
         st.header("运行参数")
         backtest_days = st.number_input(
-            "回测交易日数", 100, 1000, 250, 50, key="v511_days")
+            "回测交易日数", 100, 1000, 250, 50, key="v52_days")
         # 沿用本页已经稳定加载的number_input，避免部分iOS/Safari会话在
         # 首次加载selectbox前端分块时出现“Importing a module script failed”。
         min_price = st.number_input(
             "最低股价（元）", min_value=10.0, max_value=20.0,
-            value=10.0, step=10.0, format="%.0f", key="v511_min_price")
+            value=10.0, step=10.0, format="%.0f", key="v52_min_price")
         min_mv = st.number_input(
             "最低流通市值（亿元）", min_value=50.0, max_value=100.0,
-            value=50.0, step=50.0, format="%.0f", key="v511_min_mv")
+            value=50.0, step=50.0, format="%.0f", key="v52_min_mv")
         st.caption(f"本次历史过滤：股价≥{min_price:.0f}元，流通市值≥{min_mv:.0f}亿元")
         signal_end_date = st.date_input(
-            "买入信号截止", date(2026, 6, 5), key="v511_signal_end")
+            "买入信号截止", date(2026, 6, 5), key="v52_signal_end")
         market_end_date = st.date_input(
-            "行情观察截止", date.today(), key="v511_market_end")
+            "行情观察截止", date.today(), key="v52_market_end")
         split_ratio_pct = st.number_input(
-            "前段观察占正式周比例(%)", 50, 80, 60, 5, key="v511_split")
+            "前段观察占正式周比例(%)", 50, 80, 60, 5, key="v52_split")
         pause = st.number_input(
-            "接口间隔(秒)", 0.0, 2.0, 0.12, 0.02, key="v511_pause")
-        use_cache = st.checkbox("复用行情缓存", True, key="v511_cache")
+            "接口间隔(秒)", 0.0, 2.0, 0.12, 0.02, key="v52_pause")
+        use_cache = st.checkbox("复用行情缓存", True, key="v52_cache")
         st.divider()
         commission_pct = st.number_input(
             "佣金率(%)", 0.0, 0.20, 0.025, 0.005,
-            format="%.3f", key="v511_commission")
+            format="%.3f", key="v52_commission")
         stamp_duty_pct = st.number_input(
             "卖出印花税率(%)", 0.0, 0.20, 0.05, 0.01,
-            format="%.3f", key="v511_stamp")
+            format="%.3f", key="v52_stamp")
         transfer_fee_pct = st.number_input(
             "过户费率(%)", 0.0, 0.05, 0.001, 0.001,
-            format="%.3f", key="v511_transfer")
-        if st.button("清除V5.1.1检查点和结果", key="v511_clear"):
+            format="%.3f", key="v52_transfer")
+        if st.button("清除V5.2检查点和结果", key="v52_clear"):
             shutil.rmtree(CHECKPOINT_DIR, ignore_errors=True)
             shutil.rmtree(RESULT_DIR, ignore_errors=True)
             shutil.rmtree(JOB_DIR, ignore_errors=True)
-            st.success("V5.1.1检查点和结果已清除；旧行情缓存保留")
+            st.success("V5.2检查点和结果已清除；旧行情缓存保留")
 
     request_payload = {
         "version": VERSION, "days": int(backtest_days),
@@ -1890,7 +2285,7 @@ def main() -> None:
     request_signature = stable_signature(request_payload)
     result_path = os.path.join(RESULT_DIR, f"{request_signature}.zip")
     result_name = (
-        f"weekly_skdj_marketcap_feature_audit_v5_1_1_{int(backtest_days)}d_"
+        f"weekly_skdj_dominant_tier_rank_audit_v5_2_{int(backtest_days)}d_"
         f"p{int(min_price)}_mv{int(min_mv)}.zip")
     completed_available = False
     if os.path.exists(result_path):
@@ -1901,7 +2296,7 @@ def main() -> None:
             clear_job_active(request_signature)
             st.success("发现相同参数的已完成结果，可直接下载。")
             render_download(
-                saved_result, result_name, f"v511_saved_{request_signature}")
+                saved_result, result_name, f"v52_saved_{request_signature}")
         except Exception as exc:
             st.warning(f"旧结果读取失败：{exc}")
 
@@ -1910,14 +2305,14 @@ def main() -> None:
         token = secret_token
         st.caption("已从Streamlit Secrets读取TUSHARE_TOKEN。")
     else:
-        token = st.text_input("Tushare Token", type="password", key="v511_token")
+        token = st.text_input("Tushare Token", type="password", key="v52_token")
 
     job_active = is_job_active(request_signature)
     left, right = st.columns(2)
     with left:
-        start_clicked = st.button("开始/重新运行V5.1.1", type="primary", key="v511_run")
+        start_clicked = st.button("开始/重新运行V5.2", type="primary", key="v52_run")
     with right:
-        stop_clicked = st.button("停止自动续跑", disabled=not job_active, key="v511_stop")
+        stop_clicked = st.button("停止自动续跑", disabled=not job_active, key="v52_stop")
     if stop_clicked:
         clear_job_active(request_signature)
         st.success("已停止；逐股票检查点保留。")
@@ -2052,19 +2447,23 @@ def main() -> None:
         st.error("存在成熟事件，但没有股票通过‘连续处于25下方不超过5周’硬条件。")
         return
     eligible = add_independent_candidate_features(eligible)
+    eligible = add_challenger_rankings(eligible)
     eligible, legacy100 = add_legacy_100b_ranks(eligible)
-    with st.spinner("计算扩池排名、100亿旧池保留率、优秀事件捕获和独立特征审计..."):
+    with st.spinner("比较原评分、强权重评分与S/A/B/C分层排名..."):
         score_rules = frozen_score_definitions()
-        rank_cohorts = rank_cohort_audit(eligible, periods)
-        random_benchmark = random_top3_benchmark(eligible, periods)
-        concentration = concentration_stress(eligible, periods)
+        challenger_rules = challenger_score_definitions()
+        rank_cohorts = scheme_rank_cohort_audit(eligible, periods)
+        acceptance = scheme_acceptance_audit(rank_cohorts)
+        rank_overlap = scheme_rank_overlap_audit(eligible, periods)
+        random_benchmark = scheme_random_top3_benchmark(eligible, periods)
+        concentration = scheme_concentration_stress(eligible, periods)
         ranked_calendar = weekly_rank_calendar(
             calendar, scored_all, eligible, split_end)
         agreement = parameter_agreement(eligible, periods)
         ablation = score_ablation_top3(eligible, periods)
         market_cap_cohorts = market_cap_cohort_audit(eligible, periods)
         legacy_retention = legacy_rank_retention_audit(legacy100, periods)
-        excellent_capture = excellent_event_capture_audit(eligible, periods)
+        excellent_capture = scheme_excellent_capture_audit(eligible, periods)
         feature_buckets, feature_correlations = independent_feature_audit(
             eligible, periods)
     summary_rows = []
@@ -2092,7 +2491,10 @@ def main() -> None:
                 eligible_n, "Circ_MV_Billion").between(50, 100, inclusive="left").sum()),
             "原100亿以上事件": int(numeric(
                 eligible_n, "Circ_MV_Billion").ge(100).sum()),
-            "正式前3事件": int(true_mask(eligible_n, "Top3").sum()),
+            "原评分前3事件": int(true_mask(eligible_n, "Top3").sum()),
+            "强权重前3事件": int(true_mask(eligible_n, "Strong_Top3").sum()),
+            "分层排名前3事件": int(true_mask(eligible_n, "Tier_Top3").sum()),
+            "S级事件": int(eligible_n["Tier_Level"].astype(str).eq("S").sum()),
         })
     run_summary = pd.DataFrame(summary_rows)
     run_summary.insert(0, "程序版本", VERSION)
@@ -2116,7 +2518,7 @@ def main() -> None:
         rejected = group[~true_mask(group, "Hard_Pass")]
         for reason, count in rejected["Hard_Reject_Reason"].fillna("未知").value_counts().items():
             hard_rejections.append({
-                "层级": "V5.1.1评分前硬条件", "SKDJ_N": n,
+                "层级": "V5.2三方案共同硬条件", "SKDJ_N": n,
                 "剔除原因": reason, "次数": int(count)})
     historical_rejections = [{
         "层级": "历史时点基础过滤", "SKDJ_N": "全部",
@@ -2129,29 +2531,38 @@ def main() -> None:
         ("参数", "同一次运行分别计算N=6、N=7；M固定为3"),
         ("数据窗口", f"正式{int(backtest_days)}个交易日；开始前{WARMUP_WEEKS}周预热；截止后观察W1-W8"),
         ("历史价格市值过滤", f"信号日股价≥{float(min_price):g}元、流通市值≥{float(min_mv):g}亿元"),
-        ("唯一新增硬条件", f"信号前连续处于25下方1～{MAX_BOTTOM_STREAK}周；超过5周不进入排名"),
-        ("评分定位", "冻结100分透明规则；不使用未来收益调分，不使用机器学习"),
-        ("评分结构", "SKDJ重置35、量能20、周K线结构20、MA20趋势15、同周价格市值百分位10"),
+        ("三方案共同硬条件", f"信号前连续处于25下方1～{MAX_BOTTOM_STREAK}周；超过5周不进入排名"),
+        ("原评分基准", "V5.1.1冻结100分原样保留，只作为基准和两套挑战方案的辅助排序"),
+        ("原评分结构", "SKDJ重置35、量能20、周K线结构20、MA20趋势15、同周价格市值百分位10"),
+        ("强权重评分", "历史金叉能力50分、板块共振40%～60%得30分、原冻结100分乘20%得20分"),
+        ("历史能力50分", "最近3次已完成金叉达到75为0/1/2/3次时得0/10/30/40分；最近一次峰值50～75/≥75再得5/10分，模块封顶50"),
+        ("分层排名", "S级=达到75次数≥2且共振40%～60%；A级=次数≥2或最近峰值≥75；B级=次数≥1或最近峰值≥50；其余C级"),
+        ("分层同级规则", "先比较S/A/B/C等级；相同等级内按V5.1.1冻结100分降序"),
         ("当前K值", "突破当周K值不计分"),
-        ("时间分段", f"前段观察截止{split_end}；后段只报告冻结评分表现，不重新调权"),
-        ("排名", "N=6和N=7各自在每个信号周内部排名；总分降序"),
+        ("时间分段", f"前段观察截止{split_end}；三套规则预先写死，后段不重新调权；不要求两个阶段绝对收益相同"),
+        ("验收重点", "原评分、强权重、分层排名在相同事件上比较前3和前20%的收益、胜率、回撤、优秀事件捕获与随机百分位"),
+        ("明显改善预设", "平均/中位收益至少提高2个百分点、胜率至少提高3个百分点、触及-10%至少下降3个百分点；每阶段4项中至少3项通过，且前后段均通过"),
         ("随机基准", f"每周随机选择最多3只，固定随机种子，重复{RANDOM_DRAWS}次"),
         ("集中度压力", "事后剔除最佳事件、贡献最高股票和最佳信号周，仅用于检查牛股依赖，不属于交易规则"),
         ("评分消融", "完整100分为正式排序；另外报告去掉价格市值、仅结构75分和五项等权，仅用于诊断分项贡献"),
         ("100亿旧池对照", "从同次50亿扩池事件中抽取≥100亿股票，重新计算旧池价格市值分、总分和周排名；不读取旧结果文件"),
         ("行业相对强度", "个股4/8/12周收益减去同N、同周、同申万一级行业且通过硬条件候选的收益中位数；同行业仅1只时留空"),
-        ("板块共振", "同N同周同申万一级行业候选数、占当周候选比例及行业候选数周内百分位；只审计不计分"),
+        ("板块共振", "同N同周同申万一级行业候选数占当周候选比例；40%～60%进入强权重30分并用于S级判定"),
         ("此前金叉峰值", "只使用信号前已经完成死叉的最近1至3个K上穿D周期；记录各周期最高K及达到75的次数，未完成当前周期不参与"),
-        ("独立特征定位", "行业相对强度、板块共振和此前金叉峰值均不改变冻结100分、前3或前20%"),
+        ("独立特征定位", "行业相对强度继续只审计；板块共振和此前金叉峰值主导两套挑战排名；原冻结排名保持不变作对照"),
         ("防未来数据", "历史窗口均shift(1)排除信号周；买入及W1-W8结果不参与因子定义"),
         ("历史过滤", "每个信号日使用当时科技行业归属、股价和流通市值"),
         ("买入", "信号完整周结束后的下一市场交易日开盘"),
         ("成本", "买卖0.2%滑点、佣金、过户费；卖出另计印花税"),
         ("优秀事件捕获", "分别以W8盈利、W8收益≥10/20%、W8最大浮盈≥20%和先到+10%定义优秀，报告进入扩池前3/前5/前20%的比例"),
-        ("暂停功能", "本版不做三仓组合和卖点优化，先验证50亿扩池后的评分排序本身"),
+        ("暂停功能", "本版不做三仓组合和卖点优化，只验证强特征掌权后是否改善前3和前20%"),
         ("运行环境", f"Streamlit {streamlit_version}；运行稳定版要求requirements锁定1.61.0"),
     ], columns=["项目", "说明"])
-    top3_detail = eligible[true_mask(eligible, "Top3")].copy()
+    top3_union = (
+        true_mask(eligible, "Top3")
+        | true_mask(eligible, "Strong_Top3")
+        | true_mask(eligible, "Tier_Top3"))
+    top3_detail = eligible[top3_union].copy()
     legacy_detail_columns = [
         "ts_code", "name", "SKDJ_N", "Signal_Date", "Signal_Week",
         "Circ_MV_Billion", "Score_Total_100", "Weekly_Rank", "Candidates_This_Week",
@@ -2164,25 +2575,31 @@ def main() -> None:
     legacy_detail = legacy100[[
         column for column in legacy_detail_columns if column in legacy100.columns]].copy()
     files = {
-        "01_run_summary_v5_1_1.csv": run_summary,
-        "02_frozen_score_definitions_v5_1_1.csv": score_rules,
-        "03_expanded_rank_cohort_outcomes_v5_1_1.csv": rank_cohorts,
-        "04_random_top3_benchmark_v5_1_1.csv": random_benchmark,
-        "05_concentration_stress_v5_1_1.csv": concentration,
-        "06_weekly_rank_calendar_v5_1_1.csv": ranked_calendar,
-        "07_n6_n7_parameter_agreement_v5_1_1.csv": agreement,
-        "08_score_ablation_top3_v5_1_1.csv": ablation,
-        "09_expanded_top3_selection_detail_v5_1_1.csv": top3_detail,
-        "10_all_expanded_ranked_candidates_v5_1_1.csv": eligible,
-        "11_rejection_audit_v5_1_1.csv": rejection_audit,
-        "12_api_errors_v5_1_1.csv": pd.DataFrame({"错误": API_ERRORS}),
-        "13_metadata_v5_1_1.csv": metadata,
-        "14_market_cap_cohort_quality_v5_1_1.csv": market_cap_cohorts,
-        "15_legacy100_rank_retention_v5_1_1.csv": legacy_retention,
-        "16_legacy100_vs_expanded_rank_detail_v5_1_1.csv": legacy_detail,
-        "17_excellent_event_capture_v5_1_1.csv": excellent_capture,
-        "18_independent_feature_buckets_v5_1_1.csv": feature_buckets,
-        "19_independent_feature_correlations_v5_1_1.csv": feature_correlations,
+        "01_run_summary_v5_2.csv": run_summary,
+        "02_original_frozen_score_rules_v5_2.csv": score_rules,
+        "03_challenger_score_and_tier_rules_v5_2.csv": challenger_rules,
+        "04_three_scheme_rank_outcomes_v5_2.csv": rank_cohorts,
+        "05_predeclared_acceptance_audit_v5_2.csv": acceptance,
+        "06_three_scheme_improvement_focus_v5_2.csv": rank_cohorts[
+            rank_cohorts["时间分段"].isin(["前段观察", "后段冻结检验"])
+            & rank_cohorts["排名组"].isin(["周内前20%", "周内前3"])].copy(),
+        "07_three_scheme_random_top3_v5_2.csv": random_benchmark,
+        "08_three_scheme_concentration_stress_v5_2.csv": concentration,
+        "09_three_scheme_rank_overlap_v5_2.csv": rank_overlap,
+        "10_weekly_rank_calendar_v5_2.csv": ranked_calendar,
+        "11_n6_n7_original_parameter_agreement_v5_2.csv": agreement,
+        "12_original_score_ablation_v5_2.csv": ablation,
+        "13_union_top3_selection_detail_v5_2.csv": top3_detail,
+        "14_all_candidates_three_rankings_v5_2.csv": eligible,
+        "15_rejection_audit_v5_2.csv": rejection_audit,
+        "16_api_errors_v5_2.csv": pd.DataFrame({"错误": API_ERRORS}),
+        "17_metadata_v5_2.csv": metadata,
+        "18_market_cap_cohort_original_rank_v5_2.csv": market_cap_cohorts,
+        "19_legacy100_rank_retention_v5_2.csv": legacy_retention,
+        "20_legacy100_vs_expanded_rank_detail_v5_2.csv": legacy_detail,
+        "21_three_scheme_excellent_capture_v5_2.csv": excellent_capture,
+        "22_independent_feature_buckets_v5_2.csv": feature_buckets,
+        "23_independent_feature_correlations_v5_2.csv": feature_correlations,
     }
     result_zip = make_zip(files)
     try:
@@ -2198,25 +2615,22 @@ def main() -> None:
         f"N=7硬条件通过{len(eligible[eligible['SKDJ_N'].eq(7)])}个；"
         f"实际行情约{round((market_end_date - data_start_date).days / 7, 1)}周；"
         f"结果{'已保存' if persisted else '仅当前页面可下载'}。")
-    st.subheader("N=6 / N=7扩池运行与覆盖摘要")
+    st.subheader("N=6 / N=7运行与共同候选覆盖摘要")
     render_plain_table(run_summary)
-    st.subheader("全部区间周内排名对照")
-    render_plain_table(rank_cohorts[rank_cohorts["时间分段"].eq("全部区间")])
-    st.subheader("正式前3与随机3只")
+    st.subheader("三套排序：前段与后段的前3、前20%直接对照")
+    render_plain_table(rank_cohorts[
+        rank_cohorts["时间分段"].isin(["前段观察", "后段冻结检验"])
+        & rank_cohorts["排名组"].isin(["周内前20%", "周内前3"])])
+    st.subheader("预先设定的明显改善验收")
+    render_plain_table(acceptance)
+    st.subheader("三套前3与随机3只")
     render_plain_table(random_benchmark[
-        random_benchmark["时间分段"].isin(["全部区间", "后段冻结检验"])])
-    st.subheader("N=6与N=7评分和前3重合")
-    render_plain_table(agreement)
-    st.subheader("评分分项消融（全部区间）")
-    render_plain_table(ablation[ablation["时间分段"].eq("全部区间")])
-    st.subheader("100亿旧池优秀排名在50亿扩池中的保留率")
-    render_plain_table(legacy_retention[
-        legacy_retention["时间分段"].isin(["全部区间", "后段冻结检验"])])
-    st.subheader("市值组质量（全部区间）")
-    render_plain_table(market_cap_cohorts[
-        market_cap_cohorts["时间分段"].eq("全部区间")])
-    st.caption("优秀事件捕获、独立特征分组、旧池逐事件新旧排名、压力测试及全部候选明细请下载ZIP查看。")
-    render_download(result_zip, result_name, f"v511_current_{request_signature}")
+        random_benchmark["时间分段"].isin(["前段观察", "后段冻结检验"])])
+    st.subheader("挑战方案与原评分的入选重合率")
+    render_plain_table(rank_overlap[
+        rank_overlap["时间分段"].isin(["前段观察", "后段冻结检验"])])
+    st.caption("优秀事件捕获、三方案压力测试、S/A/B/C等级及全部候选三套排名请下载ZIP查看。")
+    render_download(result_zip, result_name, f"v52_current_{request_signature}")
 
 
 if __name__ == "__main__":
