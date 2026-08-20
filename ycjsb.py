@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
-"""科技股周线SKDJ上穿25直接收益排序与三仓审计 V4.6。
+"""科技股周线SKDJ N=6/7灵敏度与持续性审计 V4.7。
 
 本版恢复较早的可执行买点：周线K首次从25下方上穿25且K>D、K上升，
 下一市场交易日开盘买入。模型不再把下一周是否继续强分离当作最终目标，
 而是直接预测买入后固定W5净收益（训练标签缩尾至-15%～+20%），并辅以
 同周收益百分位和W5盈利概率。每个目标年度只使用此前三年已经完整发生的
 历史结果训练，再验证Top1/3/5、随机基准、稳健性和真实三仓占位组合。
+本版只改变SKDJ的N值，M固定为3；侧边栏打开为N=6、关闭为N=7，
+用相同股票池、买点、评分和退出规则比较爆发力与持续性。
 """
 from __future__ import annotations
 
@@ -23,12 +25,12 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import tushare as ts
-TITLE = "科技股周线SKDJ直接收益排序与真实三仓审计 V4.6"
-VERSION = "V4.6-WEEKLY-SKDJ-DIRECT-RETURN-RANK"
+TITLE = "科技股周线SKDJ N=6/7爆发力与持续性审计 V4.7"
+VERSION = "V4.7-WEEKLY-SKDJ-N6-N7-SENSITIVITY"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(APP_DIR, "weekly_macd_validation_cache_v1_1")
 
-SKDJ_N = 9
+SKDJ_N = 6
 SKDJ_M = 3
 SKDJ_BOTTOM = 25.0
 INDICATOR_WARMUP_WEEKS = 40
@@ -115,6 +117,15 @@ def validate_dates(signal_start: date, signal_end: date, market_end: date) -> st
     if market_end <= signal_end:
         return "行情观察截止日期必须晚于信号截止日期"
     return ""
+
+
+def trailing_signal_start(open_dates: list[str], signal_end: str,
+                          trading_days: int) -> str:
+    eligible = [day for day in open_dates if day <= signal_end]
+    if len(eligible) < int(trading_days):
+        raise ValueError(
+            f"交易日历只有{len(eligible)}个可用交易日，不足设定的{int(trading_days)}日")
+    return eligible[-int(trading_days)]
 
 
 def safe_get(func_name: str, retries: int = 3, required: bool = False, **kwargs) -> pd.DataFrame:
@@ -343,7 +354,8 @@ def aggregate_weekly(daily: pd.DataFrame) -> pd.DataFrame:
     }).dropna(subset=["close"]).reset_index().rename(columns={"dt": "week_label"})
 
 
-def build_complete_weekly(daily: pd.DataFrame, week_last_map: dict[pd.Timestamp, str]) -> pd.DataFrame:
+def build_complete_weekly(daily: pd.DataFrame, week_last_map: dict[pd.Timestamp, str],
+                          skdj_n: int) -> pd.DataFrame:
     if daily.empty:
         return pd.DataFrame()
     weekly = aggregate_weekly(daily)
@@ -352,7 +364,7 @@ def build_complete_weekly(daily: pd.DataFrame, week_last_map: dict[pd.Timestamp,
         weekly["calendar_week_last"].notna()
         & weekly["trade_date"].astype(str).eq(weekly["calendar_week_last"].astype(str))
     ].copy().reset_index(drop=True)
-    return add_skdj(weekly) if not weekly.empty else weekly
+    return add_skdj(weekly, n=int(skdj_n), m=SKDJ_M) if not weekly.empty else weekly
 
 
 def add_daily_features(daily: pd.DataFrame) -> pd.DataFrame:
@@ -799,7 +811,7 @@ def analyze_stock(stock: pd.Series, periods: list[dict[str, str]], daily_raw: pd
                   open_dates: list[str], open_pos: dict[str, int],
                   market_weeks: list[tuple[pd.Period, str]], config: dict[str, Any]
                   ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    weekly = build_complete_weekly(daily_raw, week_last_map)
+    weekly = build_complete_weekly(daily_raw, week_last_map, int(config["skdj_n"]))
     if len(weekly) < INDICATOR_WARMUP_WEEKS:
         config["rejects"]["周线不足"] = config["rejects"].get("周线不足", 0) + 1
         return [], [], []
@@ -889,6 +901,7 @@ def analyze_stock(stock: pd.Series, periods: list[dict[str, str]], daily_raw: pd
             if anchor_snapshot["Raw_Close"] > 0 else np.nan)
         row: dict[str, Any] = {
             "ts_code": code, "name": str(stock["name"]), "Sample_Board": board,
+            "SKDJ_N": int(config["skdj_n"]), "SKDJ_M": SKDJ_M,
             "SW_L1": trigger_membership["l1"] if trigger_membership else "",
             "SW_L2": trigger_membership["l2"] if trigger_membership else "",
             "SW_L3": trigger_membership["l3"] if trigger_membership else "",
@@ -1375,6 +1388,38 @@ def direct_prediction_quality_audit(events: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def n_parameter_behavior_audit(events: pd.DataFrame, skdj_n: int) -> pd.DataFrame:
+    """Separate early explosiveness from later persistence for N=6/7 comparison."""
+    rows: list[dict[str, Any]] = []
+    selections = [("全部候选", events),
+                  ("同周Top1", events[true_mask(events, "Selected_Top1")])]
+    for selection_name, selected in selections:
+        row: dict[str, Any] = {
+            "SKDJ_N": int(skdj_n), "SKDJ_M": SKDJ_M,
+            "选择组": selection_name, "事件数": len(selected),
+            "不同股票": selected["ts_code"].nunique(),
+            "信号周": selected["Signal_Date"].nunique(),
+            "未来W1持续分离率%": true_mask(
+                selected, "Future_W1_Strong_Separation").mean() * 100,
+        }
+        for week in (1, 2, 3, 5, 8):
+            mfe = numeric(selected, f"Entry_W{week}_Cum_MFE_Net_pct")
+            mae = numeric(selected, f"Entry_W{week}_Cum_MAE_Raw_pct")
+            close_return = numeric(selected, f"Entry_W{week}_Close_Return_Net_pct")
+            row.update({
+                f"W{week}最大浮盈均值%": mfe.mean(),
+                f"W{week}最大浮盈中位%": mfe.median(),
+                f"W{week}达到10%比例%": mfe.ge(10).mean() * 100,
+                f"W{week}达到20%比例%": mfe.ge(20).mean() * 100,
+                f"W{week}收盘平均净收益%": close_return.mean(),
+                f"W{week}收盘中位净收益%": close_return.median(),
+                f"W{week}收盘胜率%": close_return.gt(0).mean() * 100,
+                f"W{week}未触及-10%比例%": mae.gt(-10).mean() * 100,
+            })
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def score_decile_audit(events: pd.DataFrame) -> pd.DataFrame:
     work = events.copy()
     ranks = numeric(work, "OOS_Direct_Return_Score").rank(method="first")
@@ -1651,9 +1696,11 @@ def main() -> None:
     global pro, API_ERRORS
     st.set_page_config(page_title=TITLE, layout="wide")
     st.title(TITLE)
-    st.caption("上穿25后立即执行；按历史真实W5收益逐年样本外训练；直接收益排序后再进行真实三仓占位。")
-    with st.expander("V4.6验证框架", expanded=True):
+    st.caption("严格单变量实验：除SKDJ的N=6/7外，股票池、买点、评分、退出和三仓规则全部沿用V4.6。")
+    with st.expander("V4.7验证框架", expanded=True):
         st.markdown(f"""
+- **唯一实验变量**：SKDJ的M固定为{SKDJ_M}；侧边栏开关打开使用N=6，关闭使用N=7。两次运行应保持其余参数完全一致。
+- **默认研究窗口**：以信号截止日向前精确取最近250个A股交易日，而不是粗略按自然日估算。
 - **可执行买点**：周线低位金叉进入观察；K首次从25下方上穿25、K>D且K上升，该完整周结束后的下一市场交易日开盘买入。
 - **主训练目标**：直接预测固定W5净收益，训练标签限制在{RETURN_TARGET_FLOOR:.0f}%～+{RETURN_TARGET_CAP:.0f}%，降低少数牛股对模型的支配。
 - **辅助目标**：同时预测同周W5收益百分位、W5盈利概率以及未来W1持续分离概率；未来字段只属于过去训练样本，绝不作为当期已知事实。
@@ -1663,37 +1710,45 @@ def main() -> None:
 - **稳健性审计**：报告中位数、截尾/缩尾、去掉前1/3/5/10赢家、每股仅首次信号、排除2025年。
 - **真实三仓**：总资金30万元、三个独立10万元槽位；仓位未退出时不接收新信号，同一股票持仓期间不重复买入；按同周排名依次补空位。
 - **三仓边界**：交易级结果可以计算期末权益，但没有逐日组合净值，因此本版不伪造组合最大回撤。
+- **N值判断**：新增W1/W2/W3/W5/W8最大浮盈、收盘收益、10%/20%触达率和持续分离率，同时观察“爆发力”和“持续性”，不能只看最高价。
 """)
     with st.sidebar:
         st.header("运行参数")
-        signal_start_date = st.date_input("买入信号开始", date(2023, 6, 5), key="v46_start")
-        signal_end_date = st.date_input("买入信号截止", date(2026, 6, 5), key="v46_end")
-        market_end_date = st.date_input("行情观察截止", date.today(), key="v46_market_end")
-        split_date_value = st.date_input("近期行情分界", date(2025, 6, 1), key="v46_split")
-        pause = st.number_input("接口间隔(秒)", 0.0, 2.0, 0.12, 0.02, key="v46_pause")
-        use_cache = st.checkbox("复用逐股票缓存", True, key="v46_cache")
+        use_n6 = st.toggle(
+            "SKDJ参数（打开N=6，关闭N=7）", value=True, key="v47_n_toggle")
+        skdj_n = 6 if use_n6 else 7
+        st.success(f"当前参数：N={skdj_n}，M={SKDJ_M}")
+        backtest_days = st.number_input(
+            "回测交易日数", min_value=100, max_value=1000, value=250,
+            step=50, key="v47_backtest_days")
+        signal_end_date = st.date_input("买入信号截止", date(2026, 6, 5), key="v47_end")
+        market_end_date = st.date_input("行情观察截止", date.today(), key="v47_market_end")
+        split_date_value = st.date_input("近期行情分界", date(2025, 6, 1), key="v47_split")
+        pause = st.number_input("接口间隔(秒)", 0.0, 2.0, 0.12, 0.02, key="v47_pause")
+        use_cache = st.checkbox("复用逐股票缓存", True, key="v47_cache")
         st.divider()
-        commission_pct = st.number_input("佣金率(%)", 0.0, 0.20, 0.025, 0.005, format="%.3f", key="v46_commission")
-        stamp_duty_pct = st.number_input("卖出印花税率(%)", 0.0, 0.20, 0.05, 0.01, format="%.3f", key="v46_stamp")
-        transfer_fee_pct = st.number_input("过户费率(%)", 0.0, 0.05, 0.001, 0.001, format="%.3f", key="v46_transfer")
-        if st.button("清除本程序行情缓存", key="v46_clear"):
+        commission_pct = st.number_input("佣金率(%)", 0.0, 0.20, 0.025, 0.005, format="%.3f", key="v47_commission")
+        stamp_duty_pct = st.number_input("卖出印花税率(%)", 0.0, 0.20, 0.05, 0.01, format="%.3f", key="v47_stamp")
+        transfer_fee_pct = st.number_input("过户费率(%)", 0.0, 0.05, 0.001, 0.001, format="%.3f", key="v47_transfer")
+        if st.button("清除本程序行情缓存", key="v47_clear"):
             shutil.rmtree(CACHE_DIR, ignore_errors=True)
             st.success("缓存已清除")
 
-    token = st.text_input("Tushare Token", type="password", key="v46_token")
-    session_key = "weekly_skdj_direct_return_rank_v46_zip"
-    result_name = "weekly_skdj_direct_return_rank_v4_6_all_results.zip"
+    token = st.text_input("Tushare Token", type="password", key="v47_token")
+    session_key = f"weekly_skdj_n{skdj_n}_{int(backtest_days)}d_v47_zip"
+    result_name = f"weekly_skdj_n{skdj_n}_{int(backtest_days)}d_audit_v4_7_all_results.zip"
     if not token:
         st.info("请输入Tushare Token；本版没有增加新的Python依赖。")
         return
-    if not st.button("开始V4.6直接收益排序审计", type="primary", key="v46_run"):
+    if not st.button(
+            f"开始V4.7审计（N={skdj_n}，{int(backtest_days)}个交易日）",
+            type="primary", key="v47_run"):
         if session_key in st.session_state:
             st.download_button("下载上一次结果ZIP", st.session_state[session_key],
                                file_name=result_name, mime="application/zip", on_click="ignore")
         return
-    error = validate_dates(signal_start_date, signal_end_date, market_end_date)
-    if error:
-        st.error(error)
+    if market_end_date <= signal_end_date:
+        st.error("行情观察截止日期必须晚于信号截止日期")
         return
     if (market_end_date - signal_end_date).days < 70:
         st.warning("观察截止日距离信号截止日不足70天，末端事件可能没有完整W8；成熟样本会单独处理。")
@@ -1701,17 +1756,35 @@ def main() -> None:
     API_ERRORS = []
     ts.set_token(token)
     pro = ts.pro_api()
-    signal_start = signal_start_date.strftime("%Y%m%d")
     signal_end = signal_end_date.strftime("%Y%m%d")
     market_end = market_end_date.strftime("%Y%m%d")
-    # Keep the same history window/cache key as V4.4. The 40-week indicator warm-up
-    # naturally shortens the first target year's usable training history.
-    model_start_date = signal_start_date - timedelta(days=MODEL_LOOKBACK_YEARS * 365)
+    try:
+        probe_start_date = signal_end_date - timedelta(
+            days=int(backtest_days) * 2 + 120)
+        probe_dates = load_trade_calendar(probe_start_date.strftime("%Y%m%d"), signal_end)
+        signal_start = trailing_signal_start(
+            probe_dates, signal_end, int(backtest_days))
+        signal_start_date = pd.Timestamp(signal_start).date()
+    except Exception as exc:
+        st.error(f"无法按{int(backtest_days)}个交易日确定回测起点：{exc}")
+        return
+    error = validate_dates(signal_start_date, signal_end_date, market_end_date)
+    if error:
+        st.error(error)
+        return
+
+    # 训练期覆盖目标起始年度之前的三个完整年度；再额外留足周线指标预热。
+    first_target_year = int(signal_start[:4])
+    training_calendar_start = date(
+        first_target_year - MODEL_LOOKBACK_YEARS, 1, 1)
+    model_start_date = training_calendar_start - timedelta(
+        weeks=INDICATOR_WARMUP_WEEKS + 8)
     model_start = model_start_date.strftime("%Y%m%d")
     rejects: dict[str, int] = {}
     config = {
         "signal_start": signal_start, "signal_end": signal_end, "market_end": market_end,
         "model_start": model_start, "split_date": split_date_value.strftime("%Y%m%d"),
+        "skdj_n": int(skdj_n), "backtest_days": int(backtest_days),
         "min_price": 10.0, "min_mv": 100.0,
         "buy_slippage_pct": 0.20, "sell_slippage_pct": 0.20,
         "commission_pct": float(commission_pct), "stamp_duty_pct": float(stamp_duty_pct),
@@ -1735,8 +1808,6 @@ def main() -> None:
     stocks = stocks[~stocks["list_date"].gt(signal_end) & ~stocks["delist_date"].lt(model_start)].copy()
     stocks["Sample_Board"] = stocks.apply(sample_board, axis=1)
     stocks = stocks.sort_values("ts_code").reset_index(drop=True)
-    population = stocks.groupby("Sample_Board").size().reindex(
-        BOARDS, fill_value=0).rename("股票数").reset_index()
     open_pos = {day: position for position, day in enumerate(open_dates)}
 
     cycle_rows: list[dict[str, Any]] = []
@@ -1781,14 +1852,12 @@ def main() -> None:
         st.error("有上穿25事件，但没有未来完整W8的成熟样本；请延后行情观察截止日。")
         return
 
-    classification = classification_audit(events_all)
+    n_behavior = n_parameter_behavior_audit(events, skdj_n)
     direct_quality = direct_prediction_quality_audit(events)
-    label_value = future_label_value_audit(events)
     topk = topk_selection_audit(events)
-    deciles = score_decile_audit(events)
     rank_positions = rank_position_audit(events)
-    random_summary, random_trials = random_topk_audit(events, events_all)
-    weekly_lift, weekly_lift_details = weekly_lift_audit(events)
+    random_summary, _random_trials = random_topk_audit(events, events_all)
+    weekly_lift, _weekly_lift_details = weekly_lift_audit(events)
     robustness = robustness_audit(events)
     exits = exit_policy_audit(events)
     yearly = period_selection_audit(events, "Signal_Year")
@@ -1798,7 +1867,9 @@ def main() -> None:
     counts = calendar["All_Candidates"]
 
     run_summary = pd.DataFrame([{
-        "程序": TITLE, "版本": VERSION, "买入信号开始": signal_start,
+        "程序": TITLE, "版本": VERSION, "SKDJ_N": int(skdj_n),
+        "SKDJ_M": SKDJ_M, "目标回测交易日数": int(backtest_days),
+        "买入信号开始": signal_start,
         "买入信号截止": signal_end, "观察截止": market_end,
         "模型历史开始": model_start, "底部周期": len(cycles),
         "历史模型事件": len(model_history), "全部买入信号": len(events_all),
@@ -1813,6 +1884,8 @@ def main() -> None:
         "行情失败": data_failures, "缓存命中": cache_hits,
     }])
     metadata = pd.DataFrame([
+        ("唯一实验变量", f"SKDJ N={int(skdj_n)}；M固定为{SKDJ_M}；另一轮只切换N，其他参数必须保持一致"),
+        ("回测窗口", f"信号截止日前最近{int(backtest_days)}个A股交易日；实际起点{signal_start}"),
         ("买点", "低位金叉观察后，K首次从25下方上穿25且K>D、K上升；下一市场交易日开盘买"),
         ("主训练目标", f"固定W5净收益缩尾至{RETURN_TARGET_FLOOR:.0f}%～+{RETURN_TARGET_CAP:.0f}%；直接预测可交易结果"),
         ("辅助训练目标", "同周W5收益百分位、W5盈利概率、未来W1持续分离概率"),
@@ -1824,52 +1897,48 @@ def main() -> None:
         ("组合限制", "只输出交易级复利期末权益；没有逐日组合净值，不报告最大回撤"),
         ("成本", "买卖均计0.2%滑点、佣金和过户费，卖出另计印花税"),
         ("股票池", "申万历史科技行业；主板/创业板/科创板；低位金叉及上穿25日股价≥10元、流通市值≥100亿元"),
+        ("N值评价", "比较W1/W2/W3的10%和20%触达率评估爆发力；比较W5/W8收盘收益、胜率和持续分离率评估持续性"),
+        ("缓存说明", "行情缓存不含SKDJ计算结果，N=6和N=7可安全复用同一份原始日线缓存"),
+        ("下载精简", "不再导出随机逐次明细、周度逐条明细、模型全历史、底部周期全集、完整股票池等大体积中间表"),
         ("严禁使用", "目标年度未来W1字段、未来收益、最高价及本年度训练结果均不进入当期评分"),
     ], columns=["项目", "说明"])
 
     files = {
-        "01_run_summary_v4_6.csv": run_summary,
-        "02_oos_model_summary_v4_6.csv": model_summary,
-        "03_oos_model_coefficients_v4_6.csv": coefficients,
-        "04_oos_direct_return_quality_v4_6.csv": direct_quality,
-        "05_oos_w1_auxiliary_quality_v4_6.csv": classification,
-        "06_future_w1_label_value_v4_6.csv": label_value,
-        "07_top1_top3_top5_selection_quality_v4_6.csv": topk,
-        "08_direct_score_decile_monotonicity_v4_6.csv": deciles,
-        "09_same_week_rank_position_v4_6.csv": rank_positions,
-        "10_topk_vs_random_summary_v4_6.csv": random_summary,
-        "11_topk_random_trials_v4_6.csv": random_trials,
-        "12_weekly_topk_lift_summary_v4_6.csv": weekly_lift,
-        "13_weekly_topk_lift_details_v4_6.csv": weekly_lift_details,
-        "14_robustness_remove_winners_v4_6.csv": robustness,
-        "15_exit_policy_by_selection_v4_6.csv": exits,
-        "16_year_oos_stability_v4_6.csv": yearly,
-        "17_half_year_oos_stability_v4_6.csv": half_yearly,
-        "18_true_three_slot_portfolio_v4_6.csv": portfolio,
-        "19_true_three_slot_trades_v4_6.csv": portfolio_trades,
-        "20_three_slot_vs_random_rank_v4_6.csv": portfolio_random,
-        "21_weekly_signal_calendar_v4_6.csv": calendar,
-        "22_all_ranked_signal_events_v4_6.csv": events_all,
-        "23_all_ranked_mature_events_v4_6.csv": events,
-        "24_all_model_history_events_v4_6.csv": model_history,
-        "25_all_bottom_cycles_v4_6.csv": cycles,
-        "26_full_tech_universe_v4_6.csv": stocks,
-        "27_board_population_v4_6.csv": population,
-        "28_rejection_audit_v4_6.csv": pd.DataFrame(
+        "01_run_summary_v4_7.csv": run_summary,
+        "02_n6_n7_explosiveness_persistence_v4_7.csv": n_behavior,
+        "03_oos_model_summary_v4_7.csv": model_summary,
+        "04_oos_model_coefficients_v4_7.csv": coefficients,
+        "05_oos_direct_return_quality_v4_7.csv": direct_quality,
+        "06_top1_top3_top5_selection_quality_v4_7.csv": topk,
+        "07_same_week_rank_position_v4_7.csv": rank_positions,
+        "08_topk_vs_random_summary_v4_7.csv": random_summary,
+        "09_weekly_topk_lift_summary_v4_7.csv": weekly_lift,
+        "10_robustness_remove_winners_v4_7.csv": robustness,
+        "11_exit_policy_by_selection_v4_7.csv": exits,
+        "12_year_oos_stability_v4_7.csv": yearly,
+        "13_half_year_oos_stability_v4_7.csv": half_yearly,
+        "14_true_three_slot_portfolio_v4_7.csv": portfolio,
+        "15_true_three_slot_trades_v4_7.csv": portfolio_trades,
+        "16_three_slot_vs_random_rank_v4_7.csv": portfolio_random,
+        "17_weekly_signal_calendar_v4_7.csv": calendar,
+        "18_all_ranked_mature_events_v4_7.csv": events,
+        "19_rejection_audit_v4_7.csv": pd.DataFrame(
             [{"剔除原因": key, "次数": value} for key, value in sorted(rejects.items())]),
-        "29_api_errors_v4_6.csv": pd.DataFrame({"错误": API_ERRORS}),
-        "30_metadata_v4_6.csv": metadata,
+        "20_api_errors_v4_7.csv": pd.DataFrame({"错误": API_ERRORS}),
+        "21_metadata_v4_7.csv": metadata,
     }
     result_zip = make_zip(files)
     st.session_state[session_key] = result_zip
     st.success(
-        f"完成：成熟候选{len(events)}个；有信号周{int(counts.gt(0).sum())}，"
-        f"空窗{int(counts.eq(0).sum())}周；已完成样本外TopK和真实三仓审计。")
+        f"N={skdj_n}完成：实际回测起点{signal_start_date}，成熟候选{len(events)}个；"
+        f"有信号周{int(counts.gt(0).sum())}，空窗{int(counts.eq(0).sum())}周。")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("成熟候选", len(events))
     c2.metric("有信号周", int(counts.gt(0).sum()))
     c3.metric("空窗周", int(counts.eq(0).sum()))
     c4.metric("单周最多", int(counts.max()))
+    st.subheader(f"N={skdj_n}爆发力与持续性")
+    st.dataframe(n_behavior, use_container_width=True, hide_index=True)
     st.subheader("样本外直接收益预测质量")
     st.dataframe(direct_quality, use_container_width=True, hide_index=True)
     st.subheader("Top1 / Top3 / Top5准确性")
@@ -1880,9 +1949,11 @@ def main() -> None:
     st.dataframe(portfolio, use_container_width=True, hide_index=True)
     st.subheader("真实三仓与随机排名")
     st.dataframe(portfolio_random, use_container_width=True, hide_index=True)
-    st.download_button("下载V4.6全部结果ZIP", result_zip, file_name=result_name,
-                       mime="application/zip", type="primary", key="v46_download", on_click="ignore")
-    st.info("先看04判断直接收益预测；07–14判断TopK、随机基准和牛股依赖；最后看18–20判断真实三仓是否稳定优于随机。")
+    st.download_button(f"下载N={skdj_n}的V4.7结果ZIP", result_zip, file_name=result_name,
+                       mime="application/zip", type="primary", key="v47_download", on_click="ignore")
+    st.info(
+        "先分别运行N=6与N=7并保持其余设置一致；对比02看爆发力和持续性，"
+        "再看05–10的评分准确性与稳健性，最后看14–16的真实三仓结果。")
 
 
 if __name__ == "__main__":
