@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
-"""周线SKDJ N=6/7 历史能力分层与信号置信度审计 V5.3。
+"""周线SKDJ N=6/7 历史至少2次成功优先排名审计 V5.4。
 
 本版只研究K线从25下方向上穿过25，不要求此前低位金叉，也不要求K>D。
 唯一技术硬条件仍为信号前连续处于25下方1至5周，50亿元科技池保持不变。
-V5.1.1冻结100分继续作为基准，V5.2共振S/A/B/C作为旧方案对照；新方案只按
-最近3个已完成金叉周期达到75线的次数划分S/A/B/C，同层内由原冻结评分排序。
+V5.1.1冻结100分继续作为基准，V5.2共振S/A/B/C作为旧方案对照；新方案把
+最近3个已完成金叉周期至少2次达到75线的股票放入优先层，其余股票放入普通层。
+不再区分达到2次和3次，同层先按原冻结100分排序，最近一次峰值仅用于破同分。
 板块共振和每周候选数量只用于题材/仓位置信度审计，不再改变个股名次。
 三套排序同场比较前3、前20%、随机基准、牛股依赖和周内排序相关性。
-正式信号窗口默认250个交易日，开始前只保留30周指标预热，信号后观察W1-W8。
+正式信号窗口默认250个交易日用于快速开发；最终确认建议另跑500个交易日。
+开始前保留30周指标预热，信号后观察W1-W8。
 """
 from __future__ import annotations
 
@@ -29,16 +31,16 @@ import pandas as pd
 import streamlit as st
 import tushare as ts
 
-TITLE = "周线SKDJ N=6/7 历史能力分层与信号置信度审计 V5.3"
-VERSION = "V5.3-WEEKLY-SKDJ-HISTORY-TIER-CONFIDENCE-AUDIT"
-UI_PATCH = "V5.3-HISTORY-SABC-AND-SIGNAL-CONFIDENCE"
+TITLE = "周线SKDJ N=6/7 历史至少2次成功优先排名审计 V5.4"
+VERSION = "V5.4-WEEKLY-SKDJ-H2-PRIORITY-RANK-AUDIT"
+UI_PATCH = "V5.4-HISTORY-GE2-PRIORITY-AND-CONFIDENCE"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # 沿用旧行情缓存目录，以便直接复用V4.7已经下载的更长历史数据。
 PRICE_CACHE_DIR = os.path.join(APP_DIR, "weekly_macd_validation_cache_v1_1")
-CHECKPOINT_DIR = os.path.join(APP_DIR, "weekly_skdj_v5_3_checkpoints")
-RESULT_DIR = os.path.join(APP_DIR, "weekly_skdj_v5_3_results")
-JOB_DIR = os.path.join(APP_DIR, "weekly_skdj_v5_3_jobs")
+CHECKPOINT_DIR = os.path.join(APP_DIR, "weekly_skdj_v5_4_checkpoints")
+RESULT_DIR = os.path.join(APP_DIR, "weekly_skdj_v5_4_results")
+JOB_DIR = os.path.join(APP_DIR, "weekly_skdj_v5_4_jobs")
 
 SKDJ_NS = (6, 7)
 SKDJ_M = 3
@@ -1167,17 +1169,15 @@ def frozen_score_definitions() -> pd.DataFrame:
 
 
 def challenger_score_definitions() -> pd.DataFrame:
-    """V5.2 control and V5.3 pre-registered rules; no future return enters them."""
+    """V5.2 control and V5.4 pre-registered rules; no future return enters them."""
     return pd.DataFrame([
         ("共同硬条件", "25线下连续周数", "1～5周通过；≥6周或数据不足不排名", "不计分"),
         ("V5.2旧方案对照", "S级", "达到75次数≥2且板块共振40%～60%", "最高优先级"),
         ("V5.2旧方案对照", "A/B/C级", "沿用V5.2共振S/A/B/C定义", "依次降低"),
-        ("V5.3纯历史分层", "S级", "最近3次已完成金叉有3次达到75", "最高优先级"),
-        ("V5.3纯历史分层", "A级", "最近3次已完成金叉有2次达到75", "第二优先级"),
-        ("V5.3纯历史分层", "B级", "最近3次已完成金叉有1次达到75", "第三优先级"),
-        ("V5.3纯历史分层", "C级", "最近3次已完成金叉均未达到75或无有效记录", "第四优先级"),
-        ("V5.3同层排序", "V5.1.1冻结100分", "同层先按原冻结总分降序", "主要顺序"),
-        ("V5.3同层破同分", "最近一次已完成金叉最高K", "仅在原冻结总分相同时降序", "破同分"),
+        ("V5.4历史二层", "优先层", "最近3次已完成金叉至少2次达到75；2次和3次不再区分", "最高优先级"),
+        ("V5.4历史二层", "普通层", "达到75次数少于2次或无有效记录", "第二优先级"),
+        ("V5.4同层排序", "V5.1.1冻结100分", "同层先按原冻结总分降序", "主要顺序"),
+        ("V5.4同层破同分", "最近一次已完成金叉最高K", "仅在原冻结总分相同时降序", "破同分"),
         ("板块共振", "同行业信号占当周候选比例", "只分档审计，不参与个股名次", "不计分"),
         ("每周候选数量", "1～4 / 5～20 / >20", "低/中/高仓位置信度，只审计不剔除", "不计分"),
     ], columns=["层级", "字段", "条件", "分值或优先级"])
@@ -1193,11 +1193,11 @@ def ranking_scheme_specs() -> list[dict[str, str]]:
          "top5": "V52_Tier_Top5", "top20": "V52_Tier_Top20Pct",
          "bottom20": "V52_Tier_Bottom20Pct", "score": "V52_Tier_Order",
          "tier": "V52_Tier_Level"},
-        {"name": "V5.3纯历史SABC", "rank": "History_Weekly_Rank",
-         "rank_pct": "History_Weekly_Rank_Pct", "top3": "History_Top3",
-         "top5": "History_Top5", "top20": "History_Top20Pct",
-         "bottom20": "History_Bottom20Pct", "score": "History_Tier_Order",
-         "tier": "History_Tier_Level"},
+        {"name": "V5.4历史≥2次优先", "rank": "H2_Weekly_Rank",
+         "rank_pct": "H2_Weekly_Rank_Pct", "top3": "H2_Top3",
+         "top5": "H2_Top5", "top20": "H2_Top20Pct",
+         "bottom20": "H2_Bottom20Pct", "score": "H2_Tier_Order",
+         "tier": "H2_Tier_Level"},
     ]
 
 
@@ -1365,11 +1365,11 @@ def _assign_challenger_rank(
 
 
 def add_challenger_rankings(eligible: pd.DataFrame) -> pd.DataFrame:
-    """Add the V5.2 control and V5.3 history-only tier ranking.
+    """Add the V5.2 control and V5.4 history-at-least-two tier ranking.
 
     Every input is known by the signal-week close.  Industry resonance and
     weekly candidate breadth receive labels for state/confidence audits but do
-    not enter the V5.3 stock order.
+    not enter the V5.4 stock order.
     """
     if eligible.empty:
         return eligible.copy()
@@ -1403,16 +1403,15 @@ def add_challenger_rankings(eligible: pd.DataFrame) -> pd.DataFrame:
          "V52_History_Tie", "V52_Resonance_Tie"],
         [True, False, False, False])
 
-    # V5.3: the number of successful historical cycles owns the tier; the
-    # frozen score owns the order inside each tier.  Resonance is absent.
-    work["History_Tier_Level"] = np.select(
-        [reached75.ge(3), reached75.eq(2), reached75.eq(1)],
-        ["S", "A", "B"], default="C")
-    work["History_Tier_Order"] = work["History_Tier_Level"].map(
-        {"S": 1.0, "A": 2.0, "B": 3.0, "C": 4.0}).astype(float)
+    # V5.4: reached 75 at least twice is one preferred tier.  Two and three
+    # successes are deliberately equal; the frozen score owns the order inside
+    # both tiers.  The latest completed-cycle peak can only break a frozen-score tie.
+    work["H2_Tier_Level"] = np.where(reached75.ge(2), "S", "C")
+    work["H2_Tier_Order"] = work["H2_Tier_Level"].map(
+        {"S": 1.0, "C": 2.0}).astype(float)
     work = _assign_challenger_rank(
-        work, "History",
-        ["History_Tier_Order", "Score_Total_100", "Signal_Prior_GC1_Peak_K"],
+        work, "H2",
+        ["H2_Tier_Order", "Score_Total_100", "Signal_Prior_GC1_Peak_K"],
         [True, False, False])
 
     candidate_count = numeric(work, "Candidates_This_Week")
@@ -1627,11 +1626,11 @@ def scheme_acceptance_audit(rank_outcomes: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
-def history_vs_v52_acceptance_audit(rank_outcomes: pd.DataFrame) -> pd.DataFrame:
-    """Apply the same frozen thresholds to V5.3 versus the V5.2 tier control."""
+def h2_vs_v52_acceptance_audit(rank_outcomes: pd.DataFrame) -> pd.DataFrame:
+    """Apply the same frozen thresholds to V5.4 versus the V5.2 tier control."""
     rows: list[dict[str, Any]] = []
     focus = rank_outcomes[
-        rank_outcomes["排序方案"].eq("V5.3纯历史SABC")
+        rank_outcomes["排序方案"].eq("V5.4历史≥2次优先")
         & rank_outcomes["时间分段"].isin(["前段观察", "后段冻结检验"])
         & rank_outcomes["排名组"].isin(["周内前20%", "周内前3"])].copy()
     for _, row in focus.iterrows():
@@ -1709,10 +1708,10 @@ def weekly_rank_calendar(calendar: pd.DataFrame, all_events: pd.DataFrame,
         top5_counts = group[true_mask(group, "Top5")].groupby("Week_End").size()
         v52_top3_counts = group[true_mask(
             group, "V52_Tier_Top3")].groupby("Week_End").size()
-        history_top3_counts = group[true_mask(
-            group, "History_Top3")].groupby("Week_End").size()
-        history_s_counts = group[group.get(
-            "History_Tier_Level", pd.Series(index=group.index, dtype=str))
+        h2_top3_counts = group[true_mask(
+            group, "H2_Top3")].groupby("Week_End").size()
+        h2_s_counts = group[group.get(
+            "H2_Tier_Level", pd.Series(index=group.index, dtype=str))
             .astype(str).eq("S")].groupby("Week_End").size()
         result[f"N{n}_全部原始事件"] = result["Week_End"].map(raw_counts).fillna(0).astype(int)
         result[f"N{n}_硬条件通过"] = result["Week_End"].map(pass_counts).fillna(0).astype(int)
@@ -1720,10 +1719,10 @@ def weekly_rank_calendar(calendar: pd.DataFrame, all_events: pd.DataFrame,
         result[f"N{n}_前5"] = result["Week_End"].map(top5_counts).fillna(0).astype(int)
         result[f"N{n}_V5.2分层前3"] = result["Week_End"].map(
             v52_top3_counts).fillna(0).astype(int)
-        result[f"N{n}_V5.3历史分层前3"] = result["Week_End"].map(
-            history_top3_counts).fillna(0).astype(int)
-        result[f"N{n}_V5.3历史S级事件"] = result["Week_End"].map(
-            history_s_counts).fillna(0).astype(int)
+        result[f"N{n}_V5.4历史二层前3"] = result["Week_End"].map(
+            h2_top3_counts).fillna(0).astype(int)
+        result[f"N{n}_V5.4历史优先层事件"] = result["Week_End"].map(
+            h2_s_counts).fillna(0).astype(int)
         score_stats = group.groupby("Week_End")["Score_Total_100"].agg(["max", "median", "min"])
         for stat, cn in (("max", "最高分"), ("median", "中位分"), ("min", "最低分")):
             result[f"N{n}_{cn}"] = result["Week_End"].map(score_stats[stat])
@@ -2345,7 +2344,7 @@ def main() -> None:
     streamlit_version = str(getattr(st, "__version__", "unknown"))
     st.caption(
         f"{UI_PATCH}｜50亿科技池；1～5周硬条件；原评分、V5.2共振分层与"
-        f"V5.3纯历史分层同场比较。｜Streamlit {streamlit_version}")
+        f"V5.4历史≥2次优先同场比较。｜Streamlit {streamlit_version}")
     if streamlit_version.startswith("1.62"):
         st.error(
             "检测到Streamlit 1.62.x。该环境与本次约32秒断线重连日志一致；"
@@ -2355,16 +2354,18 @@ def main() -> None:
 - **信号**：上一完整周K＜25，本完整周K≥25；不要求低位金叉，不要求K>D。
 - **重复信号**：同一股票以后再次跌回25下方并重新上穿25，会再次计为新事件。
 - **买入**：信号完整周结束后的下一市场交易日开盘。
-- **数据长度**：默认正式窗口250个交易日（约52周）＋开始前{WARMUP_WEEKS}周预热＋截止后W1-W8观察；通常约90～100周，而不是120周或290周。
+- **数据长度**：默认正式窗口250个交易日（约52周）用于快速开发，最终确认建议另跑500个交易日；另加开始前{WARMUP_WEEKS}周预热和截止后W1-W8观察。
 - **过滤**：每个历史信号日分别检查当时科技行业归属；最低股价默认10元、最低流通市值默认50亿元，侧边栏可切换，避免使用今天状态回看历史。
 - **共同硬条件**：信号前连续处于25下方1～{MAX_BOTTOM_STREAK}周；超过5周不进入三套排名，但仍保留剔除计数。
 - **原评分基准**：SKDJ重置35分、量能20分、周K线结构20分、MA20趋势15分、同周价格/市值相对排名10分。
 - **V5.2对照**：保留上一版共振S/A/B/C结果，作为新方案必须超过的直接对照。
-- **V5.3纯历史分层**：最近3次已完成金叉达到75线3/2/1/0次，依次为S/A/B/C；同层按原100分降序。
+- **V5.4历史二层**：最近3次已完成金叉至少2次达到75线进入优先层；2次和3次不再区分，其余进入普通层。
+- **V5.4同层顺序**：先按原100分降序；最近一次已完成金叉峰值仅在原分相同时破同分。
 - **板块共振**：退出个股排名，只报告不同共振区间的表现和周内排序相关性。
 - **候选宽度**：1～4只、5～20只、超过20只分别标记低/中/高仓位置信度；只审计，不剔除、不改变名次。
 - **相对行业强度**：4/8/12周相对强度继续只审计，不计分。
 - **周内比较**：三套排名分别比较全部候选、前20%、前5、前3、第4名以后及后20%。
+- **验收重点**：前3是主验收，前20%是辅助验收；同时与原100分和V5.2共振S/A/B/C比较。
 - **随机基准**：每个有候选的星期随机选择最多3只，重复{RANDOM_DRAWS}次，判断正式前3是否只是运气。
 - **压力测试**：分别剔除收益最高事件、贡献最高股票和表现最好信号周，检查成绩是否依赖少数牛股。
 - **防泄漏**：历史最低K和5周均量均只使用信号周以前的完整周；信号当周只使用本周已经收盘的数据。
@@ -2374,40 +2375,41 @@ def main() -> None:
     with st.sidebar:
         st.header("运行参数")
         backtest_days = st.number_input(
-            "回测交易日数", 100, 1000, 250, 50, key="v53_days")
+            "回测交易日数", 100, 1000, 250, 50, key="v54_days")
+        st.caption("250日适合快速验证；准备定稿时建议再以500日复核跨阶段稳定性。")
         # 沿用本页已经稳定加载的number_input，避免部分iOS/Safari会话在
         # 首次加载selectbox前端分块时出现“Importing a module script failed”。
         min_price = st.number_input(
             "最低股价（元）", min_value=10.0, max_value=20.0,
-            value=10.0, step=10.0, format="%.0f", key="v53_min_price")
+            value=10.0, step=10.0, format="%.0f", key="v54_min_price")
         min_mv = st.number_input(
             "最低流通市值（亿元）", min_value=50.0, max_value=100.0,
-            value=50.0, step=50.0, format="%.0f", key="v53_min_mv")
+            value=50.0, step=50.0, format="%.0f", key="v54_min_mv")
         st.caption(f"本次历史过滤：股价≥{min_price:.0f}元，流通市值≥{min_mv:.0f}亿元")
         signal_end_date = st.date_input(
-            "买入信号截止", date(2026, 6, 5), key="v53_signal_end")
+            "买入信号截止", date(2026, 6, 5), key="v54_signal_end")
         market_end_date = st.date_input(
-            "行情观察截止", date.today(), key="v53_market_end")
+            "行情观察截止", date.today(), key="v54_market_end")
         split_ratio_pct = st.number_input(
-            "前段观察占正式周比例(%)", 50, 80, 60, 5, key="v53_split")
+            "前段观察占正式周比例(%)", 50, 80, 60, 5, key="v54_split")
         pause = st.number_input(
-            "接口间隔(秒)", 0.0, 2.0, 0.12, 0.02, key="v53_pause")
-        use_cache = st.checkbox("复用行情缓存", True, key="v53_cache")
+            "接口间隔(秒)", 0.0, 2.0, 0.12, 0.02, key="v54_pause")
+        use_cache = st.checkbox("复用行情缓存", True, key="v54_cache")
         st.divider()
         commission_pct = st.number_input(
             "佣金率(%)", 0.0, 0.20, 0.025, 0.005,
-            format="%.3f", key="v53_commission")
+            format="%.3f", key="v54_commission")
         stamp_duty_pct = st.number_input(
             "卖出印花税率(%)", 0.0, 0.20, 0.05, 0.01,
-            format="%.3f", key="v53_stamp")
+            format="%.3f", key="v54_stamp")
         transfer_fee_pct = st.number_input(
             "过户费率(%)", 0.0, 0.05, 0.001, 0.001,
-            format="%.3f", key="v53_transfer")
-        if st.button("清除V5.3检查点和结果", key="v53_clear"):
+            format="%.3f", key="v54_transfer")
+        if st.button("清除V5.4检查点和结果", key="v54_clear"):
             shutil.rmtree(CHECKPOINT_DIR, ignore_errors=True)
             shutil.rmtree(RESULT_DIR, ignore_errors=True)
             shutil.rmtree(JOB_DIR, ignore_errors=True)
-            st.success("V5.3检查点和结果已清除；旧行情缓存保留")
+            st.success("V5.4检查点和结果已清除；旧行情缓存保留")
 
     request_payload = {
         "version": VERSION, "days": int(backtest_days),
@@ -2421,7 +2423,7 @@ def main() -> None:
     request_signature = stable_signature(request_payload)
     result_path = os.path.join(RESULT_DIR, f"{request_signature}.zip")
     result_name = (
-        f"weekly_skdj_history_tier_confidence_audit_v5_3_{int(backtest_days)}d_"
+        f"weekly_skdj_h2_priority_rank_audit_v5_4_{int(backtest_days)}d_"
         f"p{int(min_price)}_mv{int(min_mv)}.zip")
     completed_available = False
     if os.path.exists(result_path):
@@ -2432,7 +2434,7 @@ def main() -> None:
             clear_job_active(request_signature)
             st.success("发现相同参数的已完成结果，可直接下载。")
             render_download(
-                saved_result, result_name, f"v53_saved_{request_signature}")
+                saved_result, result_name, f"v54_saved_{request_signature}")
         except Exception as exc:
             st.warning(f"旧结果读取失败：{exc}")
 
@@ -2441,14 +2443,14 @@ def main() -> None:
         token = secret_token
         st.caption("已从Streamlit Secrets读取TUSHARE_TOKEN。")
     else:
-        token = st.text_input("Tushare Token", type="password", key="v53_token")
+        token = st.text_input("Tushare Token", type="password", key="v54_token")
 
     job_active = is_job_active(request_signature)
     left, right = st.columns(2)
     with left:
-        start_clicked = st.button("开始/重新运行V5.3", type="primary", key="v53_run")
+        start_clicked = st.button("开始/重新运行V5.4", type="primary", key="v54_run")
     with right:
-        stop_clicked = st.button("停止自动续跑", disabled=not job_active, key="v53_stop")
+        stop_clicked = st.button("停止自动续跑", disabled=not job_active, key="v54_stop")
     if stop_clicked:
         clear_job_active(request_signature)
         st.success("已停止；逐股票检查点保留。")
@@ -2584,12 +2586,12 @@ def main() -> None:
         return
     eligible = add_independent_candidate_features(eligible)
     eligible = add_challenger_rankings(eligible)
-    with st.spinner("比较原评分、V5.2共振分层与V5.3纯历史分层..."):
+    with st.spinner("比较原评分、V5.2共振分层与V5.4历史≥2次优先..."):
         score_rules = frozen_score_definitions()
         challenger_rules = challenger_score_definitions()
         rank_cohorts = scheme_rank_cohort_audit(eligible, periods)
         acceptance = scheme_acceptance_audit(rank_cohorts)
-        v53_vs_v52 = history_vs_v52_acceptance_audit(rank_cohorts)
+        v54_vs_v52 = h2_vs_v52_acceptance_audit(rank_cohorts)
         rank_overlap = scheme_rank_overlap_audit(eligible, periods)
         random_benchmark = scheme_random_top3_benchmark(eligible, periods)
         concentration = scheme_concentration_stress(eligible, periods)
@@ -2627,10 +2629,10 @@ def main() -> None:
             "原评分前3事件": int(true_mask(eligible_n, "Top3").sum()),
             "V5.2共振分层前3事件": int(true_mask(
                 eligible_n, "V52_Tier_Top3").sum()),
-            "V5.3历史分层前3事件": int(true_mask(
-                eligible_n, "History_Top3").sum()),
-            "V5.3历史S级事件": int(
-                eligible_n["History_Tier_Level"].astype(str).eq("S").sum()),
+            "V5.4历史二层前3事件": int(true_mask(
+                eligible_n, "H2_Top3").sum()),
+            "V5.4历史优先层事件": int(
+                eligible_n["H2_Tier_Level"].astype(str).eq("S").sum()),
         })
     run_summary = pd.DataFrame(summary_rows)
     run_summary.insert(0, "程序版本", VERSION)
@@ -2654,7 +2656,7 @@ def main() -> None:
         rejected = group[~true_mask(group, "Hard_Pass")]
         for reason, count in rejected["Hard_Reject_Reason"].fillna("未知").value_counts().items():
             hard_rejections.append({
-                "层级": "V5.3三方案共同硬条件", "SKDJ_N": n,
+                "层级": "V5.4三方案共同硬条件", "SKDJ_N": n,
                 "剔除原因": reason, "次数": int(count)})
     historical_rejections = [{
         "层级": "历史时点基础过滤", "SKDJ_N": "全部",
@@ -2671,11 +2673,11 @@ def main() -> None:
         ("原评分基准", "V5.1.1冻结100分原样保留，既是基准也是各分层内部的主要排序依据"),
         ("原评分结构", "SKDJ重置35、量能20、周K线结构20、MA20趋势15、同周价格市值百分位10"),
         ("V5.2对照", "保留上一版共振S/A/B/C定义和同层原评分排序；已删除V5.2强权重线性100分"),
-        ("V5.3纯历史分层", "最近3次已完成金叉达到75线3/2/1/0次依次划为S/A/B/C；板块共振不参与等级"),
-        ("V5.3同层规则", "同一历史等级内先按V5.1.1冻结100分降序；最近一次金叉峰值只用于原分相同时破同分"),
+        ("V5.4历史二层", "最近3次已完成金叉至少2次达到75线进入优先层；2次和3次同级，其余进入普通层；板块共振不参与等级"),
+        ("V5.4同层规则", "同一层内先按V5.1.1冻结100分降序；最近一次金叉峰值只用于原分相同时破同分"),
         ("当前K值", "突破当周K值不计分"),
         ("时间分段", f"前段观察截止{split_end}；三套规则预先写死，后段不重新调权；不要求两个阶段绝对收益相同"),
-        ("验收重点", "V5.3纯历史分层同时对比原评分和V5.2共振分层；比较前3、前20%的收益、胜率、回撤与随机百分位"),
+        ("验收重点", "前3为主验收、前20%为辅助验收；V5.4同时对比原评分和V5.2共振分层，比较收益、胜率、回撤与随机百分位"),
         ("明显改善预设", "平均/中位收益至少提高2个百分点、胜率至少提高3个百分点、触及-10%至少下降3个百分点；每阶段4项中至少3项通过，且前后段均通过"),
         ("随机基准", f"每周随机选择最多3只，固定随机种子，重复{RANDOM_DRAWS}次"),
         ("集中度压力", "事后剔除最佳事件、贡献最高股票和最佳信号周，仅用于检查牛股依赖，不属于交易规则"),
@@ -2689,37 +2691,38 @@ def main() -> None:
         ("买入", "信号完整周结束后的下一市场交易日开盘"),
         ("成本", "买卖0.2%滑点、佣金、过户费；卖出另计印花税"),
         ("优秀事件捕获", "分别以W8盈利、W8收益≥10/20%、W8最大浮盈≥20%和先到+10%定义优秀，报告进入扩池前3/前5/前20%的比例"),
-        ("暂停功能", "本版不做三仓组合和卖点优化，只验证历史能力分层是否改善前3和前20%"),
+        ("回测长度建议", f"默认{int(backtest_days)}个交易日用于快速开发；准备定稿时建议另跑500个交易日复核，不自动强制"),
+        ("暂停功能", "本版不做三仓组合和卖点优化，只验证历史能力二层是否改善前3和前20%"),
         ("运行环境", f"Streamlit {streamlit_version}；运行稳定版要求requirements锁定1.61.0"),
     ], columns=["项目", "说明"])
     top3_union = (
         true_mask(eligible, "Top3")
         | true_mask(eligible, "V52_Tier_Top3")
-        | true_mask(eligible, "History_Top3"))
+        | true_mask(eligible, "H2_Top3"))
     top3_detail = eligible[top3_union].copy()
     files = {
-        "01_run_summary_v5_3.csv": run_summary,
-        "02_original_frozen_score_rules_v5_3.csv": score_rules,
-        "03_v52_control_and_v53_history_tier_rules.csv": challenger_rules,
-        "04_three_scheme_rank_outcomes_v5_3.csv": rank_cohorts,
-        "05_acceptance_vs_original_v5_3.csv": acceptance,
-        "06_v53_vs_v52_acceptance.csv": v53_vs_v52,
-        "07_three_scheme_improvement_focus_v5_3.csv": rank_cohorts[
+        "01_run_summary_v5_4.csv": run_summary,
+        "02_original_frozen_score_rules_v5_4.csv": score_rules,
+        "03_v52_control_and_v54_h2_rules.csv": challenger_rules,
+        "04_three_scheme_rank_outcomes_v5_4.csv": rank_cohorts,
+        "05_acceptance_vs_original_v5_4.csv": acceptance,
+        "06_v54_vs_v52_acceptance.csv": v54_vs_v52,
+        "07_three_scheme_improvement_focus_v5_4.csv": rank_cohorts[
             rank_cohorts["时间分段"].isin(["前段观察", "后段冻结检验"])
             & rank_cohorts["排名组"].isin(["周内前20%", "周内前3"])].copy(),
-        "08_three_scheme_random_top3_v5_3.csv": random_benchmark,
-        "09_three_scheme_concentration_stress_v5_3.csv": concentration,
-        "10_three_scheme_rank_overlap_v5_3.csv": rank_overlap,
-        "11_weekly_rank_and_confidence_calendar_v5_3.csv": ranked_calendar,
-        "12_breadth_and_resonance_confidence_audit_v5_3.csv": confidence_states,
-        "13_within_week_rank_ic_audit_v5_3.csv": within_week_ic,
-        "14_three_scheme_excellent_capture_v5_3.csv": excellent_capture,
-        "15_n6_n7_original_parameter_agreement_v5_3.csv": agreement,
-        "16_union_top3_selection_detail_v5_3.csv": top3_detail,
-        "17_all_candidates_three_rankings_v5_3.csv": eligible,
-        "18_rejection_audit_v5_3.csv": rejection_audit,
-        "19_metadata_v5_3.csv": metadata,
-        "20_api_errors_v5_3.csv": pd.DataFrame({"错误": API_ERRORS}),
+        "08_three_scheme_random_top3_v5_4.csv": random_benchmark,
+        "09_three_scheme_concentration_stress_v5_4.csv": concentration,
+        "10_three_scheme_rank_overlap_v5_4.csv": rank_overlap,
+        "11_weekly_rank_and_confidence_calendar_v5_4.csv": ranked_calendar,
+        "12_breadth_and_resonance_confidence_audit_v5_4.csv": confidence_states,
+        "13_within_week_rank_ic_audit_v5_4.csv": within_week_ic,
+        "14_three_scheme_excellent_capture_v5_4.csv": excellent_capture,
+        "15_n6_n7_original_parameter_agreement_v5_4.csv": agreement,
+        "16_union_top3_selection_detail_v5_4.csv": top3_detail,
+        "17_all_candidates_three_rankings_v5_4.csv": eligible,
+        "18_rejection_audit_v5_4.csv": rejection_audit,
+        "19_metadata_v5_4.csv": metadata,
+        "20_api_errors_v5_4.csv": pd.DataFrame({"错误": API_ERRORS}),
     }
     result_zip = make_zip(files)
     try:
@@ -2741,10 +2744,10 @@ def main() -> None:
     render_plain_table(rank_cohorts[
         rank_cohorts["时间分段"].isin(["前段观察", "后段冻结检验"])
         & rank_cohorts["排名组"].isin(["周内前20%", "周内前3"])])
-    st.subheader("预先设定的明显改善验收")
+    st.subheader("预先设定的明显改善验收（前3主验收，前20%辅助）")
     render_plain_table(acceptance)
-    st.subheader("V5.3纯历史分层是否超过V5.2共振分层")
-    render_plain_table(v53_vs_v52)
+    st.subheader("V5.4历史≥2次优先是否超过V5.2共振分层")
+    render_plain_table(v54_vs_v52)
     st.subheader("周内排序能力：特征究竟能否区分同周个股")
     render_plain_table(within_week_ic[
         within_week_ic["时间分段"].isin(["前段观察", "后段冻结检验"])])
@@ -2755,7 +2758,7 @@ def main() -> None:
     render_plain_table(rank_overlap[
         rank_overlap["时间分段"].isin(["前段观察", "后段冻结检验"])])
     st.caption("候选宽度/板块共振置信度、优秀事件捕获、压力测试及全部候选三套排名请下载ZIP查看。")
-    render_download(result_zip, result_name, f"v53_current_{request_signature}")
+    render_download(result_zip, result_name, f"v54_current_{request_signature}")
 
 
 if __name__ == "__main__":
