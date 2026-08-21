@@ -1,11 +1,15 @@
 # -*- coding: utf-8 -*-
-"""周线SKDJ重复爆发股性与负面剔除审计 V5.9。
+"""周线SKDJ周内爆发力Learning-to-Rank与实盘观察 V6.0。
 
-本版完整冻结V5.8候选池、硬条件和九套排名，不把新发现直接写入评分。新增两组
-信号时点审计：一是只使用信号前52个完整周，识别互不重叠、已经回撤确认的
-30%/50%/100%上涨波段，并单列尚未结束的当前上涨段；二是检验“当周只有1只”
-以及“行业拥挤但量能/动能衰减”等负面特征能否高比例清除F级、低比例误杀A/S。
-判卷仍以S级、A/S、前三至少两只A/S和W8最大浮盈为主；本版不改变实盘名次。
+历史研究与实盘观察使用两条互不污染的时间线：历史买入信号默认截止
+2026-06-05，只有已经走完W8且次周可成交的事件才能训练和判卷；实盘观察则把
+行情延伸到最近可用交易日，只显示最近完整交易周的候选，不进入历史收益、标签、
+随机基准或时间外验收。
+
+本版保留宽候选池和V5.7双因子H2作为对照，不采用V5.9的52周股性硬剔除。新的
+主排名使用NumPy成对逻辑回归：只比较同一周中爆发等级不同的股票，按
+F/B/A/S=0/1/2/3学习相对次序，并以每个预测周以前已经完整揭晓W8结果的事件滚动
+训练。这样直接优化周内前三名，同时不增加XGBoost/LightGBM部署依赖。
 """
 from __future__ import annotations
 
@@ -27,17 +31,17 @@ import pandas as pd
 import streamlit as st
 import tushare as ts
 
-TITLE = "周线SKDJ重复爆发股性与负面剔除审计 V5.9"
-VERSION = "V5.9-WEEKLY-SKDJ-SWING-RECURRENCE-NEGATIVE-AUDIT"
-UI_PATCH = "V5.9-52W-REPEATED-SWING-NEGATIVE-AUDIT"
+TITLE = "周线SKDJ周内爆发力排名与本周候选 V6.0"
+VERSION = "V6.0-WEEKLY-SKDJ-PAIRWISE-LTR-LIVE"
+UI_PATCH = "V6.0-PAIRWISE-LTR-HISTORY-LIVE-SEPARATION"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # 沿用旧行情缓存目录，以便直接复用V4.7已经下载的更长历史数据。
 PRICE_CACHE_DIR = os.path.join(APP_DIR, "weekly_macd_validation_cache_v1_1")
 # 200周预热会改变历史周期字段，不能复用30周预热的逐股票检查点。
-CHECKPOINT_DIR = os.path.join(APP_DIR, "weekly_skdj_v5_9_checkpoints")
-RESULT_DIR = os.path.join(APP_DIR, "weekly_skdj_v5_9_results")
-JOB_DIR = os.path.join(APP_DIR, "weekly_skdj_v5_9_jobs")
+CHECKPOINT_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_0_checkpoints")
+RESULT_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_0_results")
+JOB_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_0_jobs")
 
 SKDJ_NS = (6, 7, 9)
 SKDJ_M = 3
@@ -64,6 +68,35 @@ SWING_LEVELS = (30.0, 50.0, 100.0)
 NEGATIVE_ABOVE_MA20_PCT = 70.0
 NEGATIVE_VOLUME_EXPAND_PCT = 35.0
 NEGATIVE_K_RISING_PCT = 60.0
+
+# Pairwise LTR uses only signal-time fields.  All source columns are transformed
+# into within-N/within-week percentile ranks before fitting, so different market
+# regimes and units are comparable.  Feature count is intentionally small
+# because the effective independent sample is the number of signal weeks.
+LTR_FEATURES = (
+    "Signal_K_Change_1W",
+    "Signal_KD_Spread",
+    "Signal_Prior_Below25_Streak",
+    "Signal_Volume_Ratio_5W",
+    "Signal_Week_Return_pct",
+    "Signal_Return_4W_pct",
+    "Signal_Return_12W_pct",
+    "Signal_Relative_Industry_12W_pct",
+    "Breadth_MA20_Rising_Pct",
+    "Industry_Resonance_Pct",
+    "Signal_MA20_Slope_4W_pct",
+    "Signal_K_Thrust_per_AbsWeekReturn",
+    "Swing52_Close_to_High_pct",
+    "Signal_VCP_Range_4W_vs_12W",
+    "Signal_Prior_GC_Reached75_Count_Last3",
+)
+LTR_MIN_TRAIN_WEEKS = 20
+LTR_MIN_TRAIN_ROWS = 160
+LTR_MAX_PAIRS_PER_WEEK = 80
+LTR_C = 0.35
+LTR_NEWTON_MAX_ITER = 100
+LTR_NEWTON_TOL = 1e-8
+LTR_PRIMARY_N = 6
 
 CORE_TECH_L1 = {"电子", "计算机", "通信", "国防军工"}
 EXTENDED_TECH_L1 = {"机械设备", "电力设备", "医药生物", "汽车", "基础化工", "有色金属", "建筑材料"}
@@ -571,6 +604,7 @@ def swing_character_features(weekly: pd.DataFrame, signal_date: str) -> dict[str
         f"{prefix}Ongoing_Drawdown_From_Peak_pct": np.nan,
         f"{prefix}Range_pct": np.nan,
         f"{prefix}Current_Position_pct": np.nan,
+        f"{prefix}Close_to_High_pct": np.nan,
         f"{prefix}Higher_High_Ratio_pct": np.nan,
         f"{prefix}Higher_Low_Ratio_pct": np.nan,
         f"{prefix}Structure_State": "数据不足",
@@ -671,6 +705,9 @@ def swing_character_features(weekly: pd.DataFrame, signal_date: str) -> dict[str
     out[f"{prefix}Current_Position_pct"] = (
         (latest_close - year_low) / (year_high - year_low) * 100.0
         if year_high > year_low and math.isfinite(latest_close) else np.nan)
+    out[f"{prefix}Close_to_High_pct"] = (
+        (latest_close / year_high - 1.0) * 100.0
+        if year_high > 0 and math.isfinite(latest_close) else np.nan)
 
     peaks = [finite_num(leg["peak"]) for leg in completed]
     troughs = [finite_num(leg["trough"]) for leg in completed]
@@ -811,6 +848,13 @@ def add_skdj(weekly: pd.DataFrame, n: int) -> pd.DataFrame:
     work["Return_4W_pct"] = work["close"].pct_change(4, fill_method=None) * 100.0
     work["Return_8W_pct"] = work["close"].pct_change(8, fill_method=None) * 100.0
     work["Return_12W_pct"] = work["close"].pct_change(12, fill_method=None) * 100.0
+    weekly_range_pct = (
+        (work["high"] - work["low"])
+        / work["close"].shift(1).replace(0, np.nan) * 100.0)
+    prior4_range = weekly_range_pct.shift(1).rolling(4, min_periods=4).mean()
+    prior12_range = weekly_range_pct.shift(1).rolling(12, min_periods=8).mean()
+    work["VCP_Range_4W_vs_12W"] = (
+        prior4_range / prior12_range.replace(0, np.nan))
     price_range = (work["high"] - work["low"]).replace(0, np.nan)
     work["Signal_Close_Location_pct"] = (
         (work["close"] - work["low"]) / price_range * 100.0)
@@ -1245,6 +1289,7 @@ def analyze_stock(stock: pd.Series, periods: list[dict[str, str]], daily: pd.Dat
     rejects: dict[str, int] = {}
     breadth: dict[str, dict[str, float]] = {}
     weekly_base = aggregate_complete_weekly(daily, week_last_map)
+    event_signal_end = str(config.get("event_signal_end", config["signal_end"]))
     crosses: list[tuple[int, pd.Series]] = []
     indicators: dict[int, pd.DataFrame] = {}
     for n in SKDJ_NS:
@@ -1252,7 +1297,7 @@ def analyze_stock(stock: pd.Series, periods: list[dict[str, str]], daily: pd.Dat
         indicators[n] = indicator
         breadth_weeks = indicator[
             indicator["trade_date"].astype(str).between(
-                config["signal_start"], config["signal_end"])]
+                config["signal_start"], event_signal_end)]
         for _, week_signal in breadth_weeks.iterrows():
             week_date = str(week_signal["trade_date"])
             membership = membership_on_date(periods, week_date)
@@ -1267,7 +1312,7 @@ def analyze_stock(stock: pd.Series, periods: list[dict[str, str]], daily: pd.Dat
         selected = indicator[
             indicator["K_Cross_25"]
             & indicator["trade_date"].astype(str).between(
-                config["signal_start"], config["signal_end"])
+                config["signal_start"], event_signal_end)
         ]
         crosses.extend((n, row) for _, row in selected.iterrows())
     if not crosses:
@@ -1332,6 +1377,8 @@ def analyze_stock(stock: pd.Series, periods: list[dict[str, str]], daily: pd.Dat
             "Signal_Return_4W_pct": finite_num(signal.get("Return_4W_pct")),
             "Signal_Return_8W_pct": finite_num(signal.get("Return_8W_pct")),
             "Signal_Return_12W_pct": finite_num(signal.get("Return_12W_pct")),
+            "Signal_VCP_Range_4W_vs_12W": finite_num(
+                signal.get("VCP_Range_4W_vs_12W")),
             "Signal_Close_Location_pct": finite_num(
                 signal.get("Signal_Close_Location_pct")),
             "Signal_Upper_Shadow_pct": finite_num(
@@ -4508,13 +4555,421 @@ def slim_discovery_candidates(eligible: pd.DataFrame) -> pd.DataFrame:
     return eligible[columns].copy()
 
 
+def ltr_definitions() -> pd.DataFrame:
+    rows = [
+        ("候选池", "保持宽池", "科技股、股价/市值过滤、K上穿25、25线下1～5周；不增加52周股性硬过滤"),
+        ("分组", "Signal_Week", "只比较同一个N、同一个信号周内的候选股票"),
+        ("标签", "F/B/A/S=0/1/2/3", "W8内分别未先到+10、先到+10、先到+20、先到+30；全部与-10%比较"),
+        ("等级收益", "0/1/3/7", "成对训练按等级收益差加权，S对F的比较权重最高"),
+        ("模型", "成对逻辑回归", "高等级减低等级作为正样本，反向差值作为负样本；L2正则，不新增部署依赖"),
+        ("特征尺度", "周内百分位", "每项特征先转换为同N同周百分位；缺失值中性填充0.5"),
+        ("防泄漏", "W8_End_Date < 当前预测日", "滚动预测时，只使用在当前周以前已经完整揭晓W8结果的事件"),
+        ("最小训练", f"{LTR_MIN_TRAIN_WEEKS}周/{LTR_MIN_TRAIN_ROWS}行", "不足时不伪造LTR历史名次；实盘使用截止日前全部成熟历史"),
+        ("周权重", "每周总权重相等", "每周最多抽取固定数量的有效等级对，避免信号扎堆周支配模型"),
+        ("验收", "Top3爆发力", "与精确随机Top3、原100分和V5.7双因子H2在完全相同OOS周比较"),
+        ("实盘观察", "最近完整交易周", "只显示状态和模型排名；不生成W8标签、不计入历史成绩"),
+    ]
+    return pd.DataFrame(rows, columns=["环节", "规则", "说明"])
+
+
+def add_ltr_week_percentiles(frame: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """Transform signal-time features to comparable within-week percentiles."""
+    work = frame.copy()
+    keys = ["SKDJ_N", "Signal_Week"]
+    columns: list[str] = []
+    for source in LTR_FEATURES:
+        target = f"LTRP_{source}"
+        values = numeric(work, source)
+        work[target] = (
+            work.assign(_ltr_value=values).groupby(keys)["_ltr_value"]
+            .rank(method="average", pct=True, ascending=True))
+        columns.append(target)
+    return work, columns
+
+
+def _ltr_seed(text_value: str) -> int:
+    payload = f"{RANDOM_SEED}|{text_value}".encode("utf-8")
+    return int(hashlib.sha256(payload).hexdigest()[:8], 16)
+
+
+def _fit_weighted_pairwise_logit(
+        matrix: np.ndarray, labels: np.ndarray,
+        sample_weights: np.ndarray) -> np.ndarray:
+    """Solve a no-intercept L2 logistic model with deterministic Newton steps.
+
+    Keeping this tiny solver in app.py avoids adding a new deployment package.
+    Pair observations are symmetric (+difference and -difference), so an
+    intercept is neither needed nor desirable for a relative ranking model.
+    """
+    x = np.asarray(matrix, dtype=float)
+    y = np.asarray(labels, dtype=float)
+    weights = np.asarray(sample_weights, dtype=float)
+    if x.ndim != 2 or len(x) != len(y) or len(y) != len(weights):
+        raise ValueError("成对LTR训练矩阵尺寸不一致")
+    coefficients = np.zeros(x.shape[1], dtype=float)
+    ridge = 1.0 / max(float(LTR_C), 1e-9)
+    identity = np.eye(x.shape[1], dtype=float)
+    for _ in range(LTR_NEWTON_MAX_ITER):
+        logits = np.clip(x @ coefficients, -35.0, 35.0)
+        probabilities = 1.0 / (1.0 + np.exp(-logits))
+        gradient = x.T @ (weights * (probabilities - y)) + ridge * coefficients
+        curvature = weights * probabilities * (1.0 - probabilities)
+        hessian = x.T @ (x * curvature[:, None]) + ridge * identity
+        try:
+            step = np.linalg.solve(hessian, gradient)
+        except np.linalg.LinAlgError:
+            step = np.linalg.pinv(hessian) @ gradient
+        coefficients -= step
+        if float(np.max(np.abs(step))) < LTR_NEWTON_TOL:
+            break
+    if not np.isfinite(coefficients).all():
+        raise RuntimeError("成对LTR求解产生非有限系数")
+    return coefficients
+
+
+def fit_pairwise_ltr(
+        train: pd.DataFrame, feature_columns: list[str]
+        ) -> dict[str, Any] | None:
+    """Fit a deterministic RankNet-style linear pairwise ranker.
+
+    Pairs are constructed only within a signal week.  Every week has total
+    sample weight one, while F/B/A/S gain differences 0/1/3/7 emphasize
+    comparisons involving the desired explosive classes.
+    """
+    if train.empty:
+        return None
+    work = train.copy()
+    grade = numeric(work, "Explosion_Grade_W8")
+    work = work[grade.notna()].copy()
+    work["_grade"] = numeric(work, "Explosion_Grade_W8")
+    if (len(work) < LTR_MIN_TRAIN_ROWS
+            or work["Signal_Week"].nunique() < LTR_MIN_TRAIN_WEEKS
+            or work["_grade"].nunique() < 2):
+        return None
+
+    x_rows: list[np.ndarray] = []
+    y_rows: list[int] = []
+    weight_rows: list[float] = []
+    pair_count = 0
+    gain_map = {0: 0.0, 1: 1.0, 2: 3.0, 3: 7.0}
+    for week, group in work.groupby("Signal_Week", sort=True):
+        group = group.reset_index(drop=True)
+        matrix = group[feature_columns].apply(
+            pd.to_numeric, errors="coerce").fillna(0.5).to_numpy(dtype=float)
+        labels = pd.to_numeric(group["_grade"], errors="coerce").to_numpy(dtype=float)
+        possible: list[tuple[int, int]] = []
+        for left in range(len(group)):
+            for right in range(left + 1, len(group)):
+                if not math.isfinite(labels[left]) or not math.isfinite(labels[right]):
+                    continue
+                if labels[left] == labels[right]:
+                    continue
+                high, low = ((left, right) if labels[left] > labels[right]
+                             else (right, left))
+                possible.append((high, low))
+        if not possible:
+            continue
+        if len(possible) > LTR_MAX_PAIRS_PER_WEEK:
+            rng = np.random.default_rng(_ltr_seed(str(week)))
+            chosen = rng.choice(
+                len(possible), size=LTR_MAX_PAIRS_PER_WEEK, replace=False)
+            pairs = [possible[int(position)] for position in sorted(chosen.tolist())]
+        else:
+            pairs = possible
+        raw_weights = np.array([
+            gain_map[int(labels[high])] - gain_map[int(labels[low])]
+            for high, low in pairs], dtype=float)
+        raw_weights = raw_weights / max(float(raw_weights.sum()), 1.0)
+        for (high, low), pair_weight in zip(pairs, raw_weights):
+            difference = matrix[high] - matrix[low]
+            x_rows.extend([difference, -difference])
+            y_rows.extend([1, 0])
+            # Positive and reverse observations together contribute one week.
+            weight_rows.extend([float(pair_weight) * 0.5,
+                                float(pair_weight) * 0.5])
+        pair_count += len(pairs)
+    if pair_count == 0 or len(set(y_rows)) < 2:
+        return None
+    coefficients = _fit_weighted_pairwise_logit(
+        np.asarray(x_rows, dtype=float), np.asarray(y_rows, dtype=int),
+        np.asarray(weight_rows, dtype=float))
+    return {
+        "coefficients": coefficients,
+        "feature_columns": list(feature_columns),
+        "train_rows": int(len(work)),
+        "train_weeks": int(work["Signal_Week"].nunique()),
+        "pair_count": int(pair_count),
+        "train_start": str(work["Signal_Date"].astype(str).min()),
+        "train_end": str(work["Signal_Date"].astype(str).max()),
+    }
+
+
+def predict_pairwise_ltr(
+        frame: pd.DataFrame, bundle: dict[str, Any] | None
+        ) -> pd.Series:
+    if frame.empty or bundle is None:
+        return pd.Series(np.nan, index=frame.index, dtype=float)
+    columns = list(bundle["feature_columns"])
+    matrix = frame[columns].apply(
+        pd.to_numeric, errors="coerce").fillna(0.5).to_numpy(dtype=float)
+    coefficients = np.asarray(bundle["coefficients"], dtype=float)
+    return pd.Series(matrix @ coefficients, index=frame.index, dtype=float)
+
+
+def _assign_ltr_flags(work: pd.DataFrame, prefix: str) -> pd.DataFrame:
+    keys = ["SKDJ_N", "Signal_Week"]
+    score_column = f"{prefix}_Score"
+    rank_column = f"{prefix}_Weekly_Rank"
+    valid = numeric(work, score_column).notna()
+    ranked = work[valid].sort_values(
+        ["SKDJ_N", "Signal_Week", score_column, "V57_DualH2_Weekly_Rank",
+         "Score_Total_100", "ts_code"],
+        ascending=[True, True, False, True, False, True]).copy()
+    ranked[rank_column] = ranked.groupby(keys).cumcount() + 1
+    work.loc[ranked.index, rank_column] = ranked[rank_column]
+    candidate_count = numeric(work, "Candidates_This_Week").replace(0, np.nan)
+    top20_count = np.ceil(candidate_count * 0.20).clip(lower=1)
+    work[f"{prefix}_Top3"] = numeric(work, rank_column).le(3)
+    work[f"{prefix}_Top20Pct"] = numeric(work, rank_column).le(top20_count)
+    return work
+
+
+def add_walk_forward_ltr(eligible: pd.DataFrame) -> pd.DataFrame:
+    """Generate strictly walk-forward OOS ranks for N=6 historical events."""
+    work, feature_columns = add_ltr_week_percentiles(eligible)
+    work["LTR_OOS_Score"] = np.nan
+    work["LTR_OOS_Weekly_Rank"] = np.nan
+    work["LTR_OOS_Top3"] = False
+    work["LTR_OOS_Top20Pct"] = False
+    work["LTR_OOS_Available"] = False
+    work["LTR_OOS_Train_Rows"] = 0
+    work["LTR_OOS_Train_Weeks"] = 0
+    primary = work[work["SKDJ_N"].eq(LTR_PRIMARY_N)].copy()
+    for week, group in primary.groupby("Signal_Week", sort=True):
+        prediction_date = str(group["Signal_Date"].astype(str).max())
+        revealed = (
+            primary.get("Entry_W8_End_Date", pd.Series(
+                "", index=primary.index, dtype=str)).astype(str)
+            .lt(prediction_date))
+        train = primary[
+            revealed & numeric(primary, "Explosion_Grade_W8").notna()].copy()
+        bundle = fit_pairwise_ltr(train, feature_columns)
+        if bundle is None:
+            continue
+        work.loc[group.index, "LTR_OOS_Score"] = predict_pairwise_ltr(
+            work.loc[group.index], bundle)
+        work.loc[group.index, "LTR_OOS_Available"] = True
+        work.loc[group.index, "LTR_OOS_Train_Rows"] = bundle["train_rows"]
+        work.loc[group.index, "LTR_OOS_Train_Weeks"] = bundle["train_weeks"]
+    work = _assign_ltr_flags(work, "LTR_OOS")
+    return work.sort_values(
+        ["Signal_Date", "SKDJ_N", "LTR_OOS_Weekly_Rank", "ts_code"],
+        na_position="last").reset_index(drop=True)
+
+
+def fit_full_history_ltr(eligible: pd.DataFrame) -> tuple[dict[str, Any] | None, pd.DataFrame]:
+    prepared, feature_columns = add_ltr_week_percentiles(eligible)
+    primary = prepared[
+        prepared["SKDJ_N"].eq(LTR_PRIMARY_N)
+        & numeric(prepared, "Explosion_Grade_W8").notna()].copy()
+    return fit_pairwise_ltr(primary, feature_columns), prepared
+
+
+def score_live_candidates(
+        live: pd.DataFrame, history: pd.DataFrame,
+        bundle: dict[str, Any] | None
+        ) -> pd.DataFrame:
+    if live.empty:
+        return live.copy()
+    work, feature_columns = add_ltr_week_percentiles(live)
+    # A full-history model uses the same fixed feature list as live candidates.
+    if bundle is not None and feature_columns != list(bundle["feature_columns"]):
+        raise RuntimeError("实盘LTR特征列与历史训练不一致")
+    work["LTR_Live_Score"] = np.nan
+    primary = work["SKDJ_N"].eq(LTR_PRIMARY_N)
+    work.loc[primary, "LTR_Live_Score"] = predict_pairwise_ltr(
+        work.loc[primary], bundle)
+    work["LTR_Live_Weekly_Rank"] = np.nan
+    work["LTR_Live_Top3"] = False
+    work["LTR_Live_Top20Pct"] = False
+    work = _assign_ltr_flags(work, "LTR_Live")
+    resonance_keys = ["Signal_Week", "ts_code"]
+    confirmations = (work.groupby(resonance_keys)["SKDJ_N"]
+                     .agg(lambda values: "/".join(
+                         str(int(value)) for value in sorted(set(values))))
+                     .rename("参数共振N").reset_index())
+    counts = (work.groupby(resonance_keys)["SKDJ_N"].nunique()
+              .rename("参数共振数量").reset_index())
+    work = work.merge(confirmations, on=resonance_keys, how="left")
+    work = work.merge(counts, on=resonance_keys, how="left")
+    work["历史训练事件"] = int(bundle["train_rows"]) if bundle else 0
+    work["历史训练周"] = int(bundle["train_weeks"]) if bundle else 0
+    return work.sort_values(
+        ["SKDJ_N", "LTR_Live_Weekly_Rank", "V57_DualH2_Weekly_Rank",
+         "ts_code"], na_position="last").reset_index(drop=True)
+
+
+def _top3_metrics(pool: pd.DataFrame, selected: pd.DataFrame) -> dict[str, Any]:
+    signal_weeks = int(pool["Signal_Week"].nunique())
+    classes = selected.get(
+        "Explosion_Class_W8", pd.Series(index=selected.index, dtype=str)).astype(str)
+    as_flag = classes.isin(["A", "S"])
+    weekly_as = selected.assign(_as=as_flag.astype(int)).groupby(
+        "Signal_Week")["_as"].sum()
+    return {
+        "事件数": int(len(selected)),
+        "覆盖信号周": int(selected["Signal_Week"].nunique()),
+        "S级比例%": classes.eq("S").mean() * 100 if len(selected) else np.nan,
+        "A或S比例%": as_flag.mean() * 100 if len(selected) else np.nan,
+        "B级以上比例%": classes.isin(["B", "A", "S"]).mean() * 100 if len(selected) else np.nan,
+        "W8最大浮盈均值%": numeric(selected, "Entry_W8_MFE_Net_pct").mean(),
+        "每周至少2只A或S比例%": (
+            weekly_as.ge(2).sum() / signal_weeks * 100 if signal_weeks else np.nan),
+    }
+
+
+def _exact_random_top3_metrics(pool: pd.DataFrame) -> dict[str, Any]:
+    selected_count = 0
+    expected_s = expected_as = expected_b = expected_mfe = 0.0
+    expected_two_as_weeks = 0.0
+    signal_weeks = int(pool["Signal_Week"].nunique())
+    for _, group in pool.groupby("Signal_Week"):
+        n = len(group)
+        k = min(3, n)
+        if n <= 0:
+            continue
+        selected_count += k
+        classes = group["Explosion_Class_W8"].astype(str)
+        expected_s += k * classes.eq("S").mean()
+        expected_as += k * classes.isin(["A", "S"]).mean()
+        expected_b += k * classes.isin(["B", "A", "S"]).mean()
+        expected_mfe += k * numeric(group, "Entry_W8_MFE_Net_pct").mean()
+        successes = int(classes.isin(["A", "S"]).sum())
+        denominator = math.comb(n, k)
+        probability = 0.0
+        for count in range(2, k + 1):
+            if count <= successes and k - count <= n - successes:
+                probability += (
+                    math.comb(successes, count)
+                    * math.comb(n - successes, k - count) / denominator)
+        expected_two_as_weeks += probability
+    denominator = max(selected_count, 1)
+    return {
+        "事件数": selected_count,
+        "覆盖信号周": signal_weeks,
+        "S级比例%": expected_s / denominator * 100,
+        "A或S比例%": expected_as / denominator * 100,
+        "B级以上比例%": expected_b / denominator * 100,
+        "W8最大浮盈均值%": expected_mfe / denominator,
+        "每周至少2只A或S比例%": (
+            expected_two_as_weeks / signal_weeks * 100 if signal_weeks else np.nan),
+    }
+
+
+def ltr_oos_comparison(eligible: pd.DataFrame) -> pd.DataFrame:
+    primary = eligible[
+        eligible["SKDJ_N"].eq(LTR_PRIMARY_N)
+        & true_mask(eligible, "LTR_OOS_Available")].copy()
+    if primary.empty:
+        return pd.DataFrame()
+    rows: list[dict[str, Any]] = []
+    period_masks = [
+        ("全部OOS", pd.Series(True, index=primary.index)),
+        ("前段OOS", primary["Validation_Period"].astype(str).eq("前段观察")),
+        ("后段OOS", primary["Validation_Period"].astype(str).eq("后段冻结检验")),
+    ]
+    for period_name, mask in period_masks:
+        pool = primary[mask].copy()
+        if pool.empty:
+            continue
+        schemes = [
+            ("精确随机Top3期望", None),
+            ("原冻结100分Top3", "Top3"),
+            ("V5.7双因子H2 Top3", "V57_DualH2_Top3"),
+            ("V6.0成对LTR Top3", "LTR_OOS_Top3"),
+            ("V6.0成对LTR前20%", "LTR_OOS_Top20Pct"),
+        ]
+        for scheme, flag in schemes:
+            metrics = (_exact_random_top3_metrics(pool) if flag is None
+                       else _top3_metrics(pool, pool[true_mask(pool, flag)]))
+            rows.append({"时间分段": period_name, "方案": scheme, **metrics})
+    return pd.DataFrame(rows)
+
+
+def ltr_weekly_detail(eligible: pd.DataFrame) -> pd.DataFrame:
+    primary = eligible[
+        eligible["SKDJ_N"].eq(LTR_PRIMARY_N)
+        & true_mask(eligible, "LTR_OOS_Available")].copy()
+    rows = []
+    for week, group in primary.groupby("Signal_Week", sort=True):
+        selected = group[true_mask(group, "LTR_OOS_Top3")].sort_values(
+            "LTR_OOS_Weekly_Rank")
+        classes = selected["Explosion_Class_W8"].astype(str)
+        rows.append({
+            "Signal_Week": week,
+            "Signal_Date": str(group["Signal_Date"].astype(str).max()),
+            "候选数": len(group),
+            "训练事件": int(numeric(group, "LTR_OOS_Train_Rows").max()),
+            "训练周": int(numeric(group, "LTR_OOS_Train_Weeks").max()),
+            "前三股票": "、".join(selected["name"].astype(str).tolist()),
+            "前三爆发等级": "/".join(classes.tolist()),
+            "前三A或S数量": int(classes.isin(["A", "S"]).sum()),
+            "前三S数量": int(classes.eq("S").sum()),
+            "前三W8最大浮盈均值%": numeric(
+                selected, "Entry_W8_MFE_Net_pct").mean(),
+        })
+    return pd.DataFrame(rows)
+
+
+def ltr_feature_coefficients(bundle: dict[str, Any] | None) -> pd.DataFrame:
+    if bundle is None:
+        return pd.DataFrame(columns=["特征", "周内百分位系数", "模型方向"])
+    coefficients = np.asarray(bundle["coefficients"], dtype=float)
+    rows = []
+    for source, transformed, coefficient in zip(
+            LTR_FEATURES, bundle["feature_columns"], coefficients):
+        rows.append({
+            "特征": source, "模型字段": transformed,
+            "周内百分位系数": float(coefficient),
+            "模型方向": "数值较高有利" if coefficient > 0 else "数值较低有利",
+            "绝对影响": abs(float(coefficient)),
+            "历史训练事件": int(bundle["train_rows"]),
+            "历史训练周": int(bundle["train_weeks"]),
+            "训练成对样本": int(bundle["pair_count"]),
+        })
+    return pd.DataFrame(rows).sort_values("绝对影响", ascending=False).reset_index(drop=True)
+
+
+def slim_ltr_candidates(eligible: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "ts_code", "name", "SKDJ_N", "Signal_Date", "Signal_Week",
+        "SW_L1", "SW_L2", "Raw_Close", "Circ_MV_Billion",
+        "Signal_K", "Signal_D", "Signal_KD_Spread",
+        "Signal_Prior_Below25_Streak", "Signal_Volume_Ratio_5W",
+        "Signal_Week_Return_pct", "Signal_Return_4W_pct",
+        "Signal_Return_12W_pct", "Signal_Relative_Industry_12W_pct",
+        "Breadth_MA20_Rising_Pct", "Industry_Resonance_Pct",
+        "Signal_MA20_Slope_4W_pct", "Signal_K_Thrust_per_AbsWeekReturn",
+        "Swing52_Close_to_High_pct", "Signal_VCP_Range_4W_vs_12W",
+        "Signal_Prior_GC_Reached75_Count_Last3",
+        "Score_Total_100", "Weekly_Rank", "V57_DualH2_Weekly_Rank",
+        "LTR_OOS_Score", "LTR_OOS_Weekly_Rank", "LTR_OOS_Top3",
+        "LTR_OOS_Top20Pct", "LTR_OOS_Available",
+        "LTR_OOS_Train_Rows", "LTR_OOS_Train_Weeks",
+        "Explosion_Class_W8", "Explosion_Grade_W8",
+        "Entry_W8_MFE_Net_pct", "Entry_W8_MAE_Raw_pct",
+        "Entry_W8_Close_Return_Net_pct", "Validation_Period",
+    ]
+    return eligible[[column for column in columns if column in eligible.columns]].copy()
+
+
 def main() -> None:
     global pro, API_ERRORS
     st.set_page_config(page_title=TITLE, layout="wide")
     st.title(TITLE)
     streamlit_version = str(getattr(st, "__version__", "unknown"))
     st.caption(
-        f"{UI_PATCH}｜冻结V5.8候选池和九套排名；新增52周股性与负面剔除审计。"
+        f"{UI_PATCH}｜历史W8判卷与最近完整周候选分离；N=6为主模型。"
         f"｜Streamlit {streamlit_version}")
     if streamlit_version.startswith("1.62"):
         st.error(
@@ -4526,72 +4981,61 @@ def main() -> None:
 - **参数**：同一次运行分别计算N=6、N=7和默认N=9，M固定为3；三者使用完全相同的科技池、价格市值和交易成本。
 - **重复信号**：同一股票以后再次跌回25下方并重新上穿25，会再次计为新事件。
 - **买入**：信号完整周结束后的下一市场交易日开盘。
-- **数据长度**：默认正式窗口500个交易日；开始前预热扩展为{WARMUP_WEEKS}周，截止后观察W1-W12。
-- **预热用途**：200周只用于形成指标和读取已完成历史金叉，不增加正式信号；因此候选买点窗口仍是500个交易日。
+- **历史时间线**：默认回测500个交易日，买入信号严格截止2026-06-05；只有次周可成交且已经走完W8的事件参与训练、排名验收和收益统计。
+- **实盘时间线**：行情读取到侧边栏“实盘观察截止”；只显示最近一个已经完整结束的市场周候选，未成熟事件绝不进入历史成绩。
+- **预热用途**：开始前{WARMUP_WEEKS}周只用于形成指标、历史金叉和52周状态，不增加正式历史信号。
 - **过滤**：每个历史信号日分别检查当时科技行业归属；最低股价默认10元、最低流通市值默认50亿元，侧边栏可切换，避免使用今天状态回看历史。
-- **共同硬条件**：信号前连续处于25下方1～{MAX_BOTTOM_STREAK}周；超过5周不进入九套排名，但仍保留剔除计数。
-- **原评分基准**：SKDJ重置35分、量能20分、周K线结构20分、MA20趋势15分、同周价格/市值相对排名10分。
-- **V5.2/V5.4对照**：三套旧排名完整保留，新增特征不改变任何股票名次。
-- **V5.4历史二层**：最近3次已完成金叉至少2次达到75线进入优先层；2次和3次不再区分，其余进入普通层。
-- **V5.4同层顺序**：先按原100分降序；最近一次已完成金叉峰值仅在原分相同时破同分。
-- **V5.6.1确认的特征一**：K动能相对股价扩张效率越低越好，表示K上穿25伴随更真实的股价响应。
-- **V5.6.1确认的特征二**：所属行业MA20上升比例越高越好，表示个股处在更健康的行业中期趋势中。
-- **单因子排名**：分别测试K效率低优先、行业MA20广度高优先；原100分只破同值。
-- **双因子分层**：同周两个特征都进入优秀20%为P1、一个进入为P2、均未进入为P3、数据不足为PX。
-- **双因子对照**：一套按P1/P2/P3直接排序；另一套在特征层内让V5.4历史H2优先。
-- **历史完整度**：分别标记有效历史周期0/1/2/3次；只有3次完整历史才能判定“至少2次达到75”。
-- **V5.8完整H2**：完整3次且至少2次达到75为S层；完整但不足2次为C层；历史不足为PX层，事件不删除。
-- **V5.8双因子完整H2**：保持P1/P2/P3/PX顺序，在同一特征层内使用完整历史H2，而不是把历史不足当失败。
-- **52周股性**：只看信号周以前52个完整周；上涨段只有在此后回撤15%时才确认结束，当前未结束段单列。
-- **重复爆发**：分别统计互不重叠的30%、50%、100%波段；检验多次爆发、一次异动、持续趋势和低活跃的差异。
-- **结构强候选**：反复爆发且高低点共同抬高，或持续趋势，并要求行业相对12周强度为正；只分组、不改名次。
-- **负面审计**：核验当周仅1只、行业拥挤但量能/K衰减、52周低活跃能否高比例清除F级且少误杀A/S。
+- **唯一共同硬条件**：信号前连续处于25下方1～{MAX_BOTTOM_STREAK}周；不再把52周活跃度、当周候选数量或板块状态升级为硬过滤。
 - **爆发等级**：S级=先到+30%，A级=先到+20%但未到S，B级=先到+10%但未到A/S，其余为F；全部与-10%比较且同日冲突按-10%先。
-- **主目标**：爆发等级、W8最大浮盈、+20先于-10、+30先于-10；S优先、A其次、B只在无S/A时补位。
-- **辅助目标**：W8期末收益、+10和较小回撤仅供风险解释，不参与特征入选判定，也不要求W1～W12平滑一致。
-- **三仓审计**：同时统计前三名至少两只A/S和至少两只B级以上；A/S是主目标，B只作没有S/A时的补位。
-- **预设验收**：九套旧排名原样保留；新增股性和负面规则只报告收益分层、F捕获率、A/S误杀率和新增空窗周。
-- **防泄漏**：全部特征只使用信号周收盘时已经知道的数据；买入后结果只用于判卷。
-- **时间分段**：评分规则在代码中预先冻结；前段和后段只用于分别报告，不读取后段收益重新调权。
-- **本版边界**：不调权、不修改候选硬条件、不把新审计直接变成剔除规则、不研究止损止盈。
+- **LTR排序**：每个信号周是一个独立组，只比较同周股票；F/B/A/S按0/1/2/3并用0/1/3/7收益差训练成对逻辑模型。
+- **时间外预测**：预测某一历史周时，训练集只允许包含W8结束日早于该周信号日的事件；至少{LTR_MIN_TRAIN_WEEKS}个成熟历史周才出LTR名次。
+- **主验收**：同一批OOS周比较LTR、精确随机Top3、原100分和V5.7双因子H2；看S、A/S、B以上、W8最大浮盈和每周至少两只A/S。
+- **防过拟合**：只使用15项预先声明的信号时点技术特征、L2正则、每周等权和固定成对抽样；不因结果不佳增加硬条件。
+- **实盘排名**：N=6使用截至历史信号截止日的全部成熟W8样本训练；N=7/9只显示参数共振与旧排名，不混成独立训练样本。
+- **本版边界**：不研究止损止盈、不要求W1～W12平滑、不把实盘候选的未来走势写回本次历史模型。
 """)
     with st.sidebar:
         st.header("运行参数")
         backtest_days = st.number_input(
-            "回测交易日数", 100, 1000, 500, 50, key="v59_days")
-        st.caption("默认500日；首次运行需读取额外200周历史，数据量会大于V5.7。")
+            "回测交易日数", 100, 1000, 500, 50, key="v60_days")
+        st.caption("默认500日；只决定2026-06-05以前的历史信号起点。")
         # 沿用本页已经稳定加载的number_input，避免部分iOS/Safari会话在
         # 首次加载selectbox前端分块时出现“Importing a module script failed”。
         min_price = st.number_input(
             "最低股价（元）", min_value=10.0, max_value=20.0,
-            value=10.0, step=10.0, format="%.0f", key="v59_min_price")
+            value=10.0, step=10.0, format="%.0f", key="v60_min_price")
         min_mv = st.number_input(
             "最低流通市值（亿元）", min_value=50.0, max_value=100.0,
-            value=50.0, step=50.0, format="%.0f", key="v59_min_mv")
+            value=50.0, step=50.0, format="%.0f", key="v60_min_mv")
         st.caption(f"本次历史过滤：股价≥{min_price:.0f}元，流通市值≥{min_mv:.0f}亿元")
         signal_end_date = st.date_input(
-            "买入信号截止", date(2026, 6, 5), key="v59_signal_end")
+            "历史买入信号截止（W8判卷）", date(2026, 6, 5),
+            key="v60_signal_end")
         market_end_date = st.date_input(
-            "行情观察截止", date.today(), key="v59_market_end")
+            "实盘候选观察截止（默认今天）", date.today(),
+            key="v60_market_end")
+        st.caption(
+            "历史成绩只接收信号日≤历史截止且W8成熟的事件；"
+            "观察截止仅用于寻找最近完整周候选。")
         split_ratio_pct = st.number_input(
-            "前段观察占正式周比例(%)", 50, 80, 60, 5, key="v59_split")
+            "前段观察占正式周比例(%)", 50, 80, 60, 5, key="v60_split")
         pause = st.number_input(
-            "接口间隔(秒)", 0.0, 2.0, 0.12, 0.02, key="v59_pause")
-        use_cache = st.checkbox("复用行情缓存", True, key="v59_cache")
+            "接口间隔(秒)", 0.0, 2.0, 0.12, 0.02, key="v60_pause")
+        use_cache = st.checkbox("复用行情缓存", True, key="v60_cache")
         st.divider()
         commission_pct = st.number_input(
             "佣金率(%)", 0.0, 0.20, 0.025, 0.005,
-            format="%.3f", key="v59_commission")
+            format="%.3f", key="v60_commission")
         stamp_duty_pct = st.number_input(
             "卖出印花税率(%)", 0.0, 0.20, 0.05, 0.01,
-            format="%.3f", key="v59_stamp")
+            format="%.3f", key="v60_stamp")
         transfer_fee_pct = st.number_input(
             "过户费率(%)", 0.0, 0.05, 0.001, 0.001,
-            format="%.3f", key="v59_transfer")
-        if st.button("清除V5.9结果和运行状态", key="v59_clear"):
+            format="%.3f", key="v60_transfer")
+        if st.button("清除V6.0结果和运行状态", key="v60_clear"):
             shutil.rmtree(RESULT_DIR, ignore_errors=True)
             shutil.rmtree(JOB_DIR, ignore_errors=True)
-            st.success("V5.9结果和检查点已清除；通用行情缓存保留")
+            st.success("V6.0结果和检查点已清除；通用行情缓存保留")
 
     request_payload = {
         "version": VERSION, "days": int(backtest_days),
@@ -4605,7 +5049,7 @@ def main() -> None:
     request_signature = stable_signature(request_payload)
     result_path = os.path.join(RESULT_DIR, f"{request_signature}.zip")
     result_name = (
-        f"weekly_skdj_swing_recurrence_negative_audit_v5_9_{int(backtest_days)}d_"
+        f"weekly_skdj_pairwise_ltr_live_v6_0_{int(backtest_days)}d_"
         f"p{int(min_price)}_mv{int(min_mv)}.zip")
     completed_available = False
     if os.path.exists(result_path):
@@ -4616,7 +5060,7 @@ def main() -> None:
             clear_job_active(request_signature)
             st.success("发现相同参数的已完成结果，可直接下载。")
             render_download(
-                saved_result, result_name, f"v59_saved_{request_signature}")
+                saved_result, result_name, f"v60_saved_{request_signature}")
         except Exception as exc:
             st.warning(f"旧结果读取失败：{exc}")
 
@@ -4625,14 +5069,14 @@ def main() -> None:
         token = secret_token
         st.caption("已从Streamlit Secrets读取TUSHARE_TOKEN。")
     else:
-        token = st.text_input("Tushare Token", type="password", key="v59_token")
+        token = st.text_input("Tushare Token", type="password", key="v60_token")
 
     job_active = is_job_active(request_signature)
     left, right = st.columns(2)
     with left:
-        start_clicked = st.button("开始/重新运行V5.9", type="primary", key="v59_run")
+        start_clicked = st.button("开始/重新运行V6.0", type="primary", key="v60_run")
     with right:
-        stop_clicked = st.button("停止自动续跑", disabled=not job_active, key="v59_stop")
+        stop_clicked = st.button("停止自动续跑", disabled=not job_active, key="v60_stop")
     if stop_clicked:
         clear_job_active(request_signature)
         st.success("已停止；逐股票检查点保留。")
@@ -4667,6 +5111,9 @@ def main() -> None:
     data_start = data_start_date.strftime("%Y%m%d")
     config = {
         "signal_start": signal_start, "signal_end": signal_end,
+        # event_signal_end extends event generation for the live observation
+        # lane.  Historical training is filtered back to signal_end below.
+        "event_signal_end": market_end,
         "data_start": data_start, "market_end": market_end,
         "min_price": float(min_price), "min_mv": float(min_mv),
         "buy_slippage_pct": 0.20, "sell_slippage_pct": 0.20,
@@ -4674,7 +5121,8 @@ def main() -> None:
         "stamp_duty_pct": float(stamp_duty_pct),
         "transfer_fee_pct": float(transfer_fee_pct),
     }
-    # 逐股票事件新增52周波段字段，必须使用V5.9独立检查点。
+    # Live event generation changes the event range, so V6.0 uses its own
+    # checkpoints while retaining the common price cache.
     run_signature = stable_signature({"version": VERSION, **config})
 
     try:
@@ -4690,14 +5138,23 @@ def main() -> None:
         st.error(f"基础数据加载失败：{exc}")
         return
 
+    open_date_set = set(open_dates)
+    completed_week_ends = sorted({
+        str(value) for value in week_last_map.values()
+        if str(value) <= market_end and str(value) in open_date_set
+    })
+    if not completed_week_ends:
+        st.error("实盘观察截止以前没有可识别的完整市场周")
+        return
+    live_week_end = completed_week_ends[-1]
     period_index = build_period_index(memberships)
     active_codes = {
         code for code, periods in period_index.items()
-        if periods_overlap(periods, signal_start, signal_end)
+        if periods_overlap(periods, signal_start, market_end)
     }
     stocks = stock_basic[stock_basic["ts_code"].isin(active_codes)].copy()
     stocks = stocks[
-        ~stocks["list_date"].gt(signal_end)
+        ~stocks["list_date"].gt(market_end)
         & ~stocks["delist_date"].lt(data_start)
     ].sort_values("ts_code").reset_index(drop=True)
     open_pos = {day: position for position, day in enumerate(open_dates)}
@@ -4761,69 +5218,128 @@ def main() -> None:
         return
     events_all = events_all.sort_values(["Signal_Date", "SKDJ_N", "ts_code"]).reset_index(drop=True)
     breadth_frame = build_industry_breadth_frame(breadth_totals)
-    mature_w8 = mature_events(events_all, RANKING_WEEKS)
-    mature_w12 = mature_events(events_all, AUDIT_WEEKS)
+    # Strict separation: post-cutoff events may be shown, but only events at or
+    # before the historical cutoff can mature into labels or enter training.
+    history_events = events_all[
+        events_all["Signal_Date"].astype(str).le(signal_end)].copy()
+    observation_events = events_all[
+        events_all["Signal_Date"].astype(str).gt(signal_end)
+        & events_all["Signal_Date"].astype(str).le(live_week_end)].copy()
+    if (history_events["Signal_Date"].astype(str).gt(signal_end).any()
+            or observation_events["Signal_Date"].astype(str).le(signal_end).any()):
+        raise RuntimeError("历史训练与实盘观察时间线分离失败")
+    mature_w8 = mature_events(history_events, RANKING_WEEKS)
+    mature_w12 = mature_events(history_events, AUDIT_WEEKS)
     if mature_w8.empty:
         st.error("存在信号，但没有未来完整W8的成熟事件。")
         return
+    if mature_w8["Signal_Date"].astype(str).gt(signal_end).any():
+        raise RuntimeError("W8历史样本混入了历史截止日以后的候选")
 
-    calendar = signal_calendar(open_dates, signal_start, signal_end, events_all)
+    calendar = signal_calendar(open_dates, signal_start, signal_end, history_events)
     split_end, periods = build_periods(calendar, float(split_ratio_pct) / 100.0)
     scored_all, eligible = score_and_rank_events(mature_w8, split_end)
     if eligible.empty:
         st.error("存在成熟事件，但没有股票通过‘连续处于25下方不超过5周’硬条件。")
         return
+    if eligible["Signal_Date"].astype(str).gt(signal_end).any():
+        raise RuntimeError("LTR历史候选混入了实盘观察事件")
     eligible = add_independent_candidate_features(eligible)
     eligible = add_industry_breadth_features(eligible, breadth_frame)
     eligible = add_challenger_rankings(eligible)
     eligible = add_v57_explosion_rankings(eligible)
     eligible = add_explosion_labels(eligible)
-    eligible = add_v59_audit_labels(eligible)
+    eligible = add_walk_forward_ltr(eligible)
+    live_model, _ = fit_full_history_ltr(eligible)
+
+    # Score every post-cutoff observation week with the frozen full-history
+    # model, then display the exact latest completed market week.  No row here
+    # is passed to add_explosion_labels or any historical metric function.
+    live_scored_all = pd.DataFrame()
+    live_ranked_all = pd.DataFrame()
+    if not observation_events.empty:
+        live_scored_all, live_ranked_all = score_and_rank_events(
+            observation_events, split_end)
+        if not live_ranked_all.empty:
+            live_ranked_all = add_independent_candidate_features(live_ranked_all)
+            live_ranked_all = add_industry_breadth_features(
+                live_ranked_all, breadth_frame)
+            live_ranked_all = add_challenger_rankings(live_ranked_all)
+            live_ranked_all = add_v57_explosion_rankings(live_ranked_all)
+            live_ranked_all = score_live_candidates(
+                live_ranked_all, eligible, live_model)
+    live_candidates = live_ranked_all[
+        live_ranked_all.get(
+            "Signal_Date", pd.Series(index=live_ranked_all.index, dtype=str)
+        ).astype(str).eq(live_week_end)].copy()
+    recent_candidate_week = ""
+    recent_reference_candidates = pd.DataFrame()
+    if not live_ranked_all.empty:
+        recent_candidate_week = str(
+            live_ranked_all["Signal_Date"].astype(str).max())
+        recent_reference_candidates = live_ranked_all[
+            live_ranked_all["Signal_Date"].astype(str).eq(
+                recent_candidate_week)].copy()
+
     feature_status = st.empty()
-    with st.spinner("冻结V5.8候选池和九套排名，并执行V5.9股性/负面审计..."):
-        feature_status.caption("1/11 复现V5.8共同候选池与九套排名...")
+    with st.spinner("执行V6.0周内LTR时间外验证并生成最近完整周候选..."):
+        feature_status.caption("1/6 复现宽候选池、原100分和V5.7对照排名...")
         score_rules = frozen_score_definitions()
-        challenger_rules = challenger_score_definitions()
         v57_rules = v57_ranking_definitions()
-        v58_rules = v58_history_definitions()
-        v59_swing_rules = v59_swing_definitions()
-        v59_negative_rules = v59_negative_definitions()
+        ltr_rules = ltr_definitions()
         explosion_definitions = explosion_class_definitions()
-        feature_status.caption("2/11 复核九套冻结排名的分组表现...")
-        rank_cohorts = scheme_rank_cohort_audit(eligible, periods)
-        feature_status.caption("3/11 汇总历史有效周期0/1/2/3次...")
-        history_completeness = v58_history_completeness_audit(eligible, periods)
-        feature_status.caption("4/11 汇总P1/P2/P3/PX特征层...")
-        feature_tiers = v57_feature_tier_audit(eligible, periods)
-        feature_status.caption("5/11 检验九套排名的三仓表现...")
-        top3_explosion = top3_explosion_portfolio_audit(eligible, periods)
-        feature_status.caption("6/11 复核V5.7冻结验收...")
-        acceptance = v57_rank_acceptance_audit(top3_explosion)
-        feature_status.caption("7/11 比较完整度修正与冻结父方案...")
-        history_acceptance = v58_history_rank_acceptance_audit(top3_explosion)
+        feature_status.caption("2/6 生成严格滚动的N=6成对LTR时间外名次...")
+        ltr_comparison = ltr_oos_comparison(eligible)
+        ltr_week_detail = ltr_weekly_detail(eligible)
+        feature_status.caption("3/6 训练截至历史截止日的实盘模型...")
+        ltr_coefficients = ltr_feature_coefficients(live_model)
+        feature_status.caption("4/6 汇总历史爆发等级和基准排名...")
         explosion_classes = explosion_class_audit(eligible, periods)
-        feature_status.caption("8/11 审计52周重复爆发股性...")
-        swing_outcomes = v59_swing_outcome_audit(eligible, periods)
-        feature_status.caption("9/11 审计负面规则的F捕获与A/S误杀...")
-        negative_filters = v59_negative_filter_audit(eligible, periods)
-        feature_status.caption("10/11 检查剔除后冻结前三名是否真正改善...")
-        negative_top3 = v59_negative_frozen_top3_audit(eligible, periods)
-        feature_status.caption("11/11 生成周历和精简候选明细...")
+        feature_status.caption("5/6 生成历史周历和精简LTR候选明细...")
         ranked_calendar = weekly_rank_calendar(
             calendar, scored_all, eligible, split_end)
-        slim_candidates = slim_discovery_candidates(eligible)
+        slim_candidates = slim_ltr_candidates(eligible)
+        feature_status.caption("6/6 整理最近完整周实盘观察表...")
+        live_columns = [
+            "ts_code", "name", "SKDJ_N", "Signal_Date", "Signal_Week",
+            "SW_L1", "SW_L2", "Raw_Close", "Circ_MV_Billion",
+            "Signal_K", "Signal_D", "Signal_KD_Spread",
+            "Signal_Prior_Below25_Streak", "Signal_Volume_Ratio_5W",
+            "Signal_Week_Return_pct", "Signal_Return_4W_pct",
+            "Signal_Return_12W_pct", "Signal_Relative_Industry_12W_pct",
+            "Breadth_MA20_Rising_Pct", "Industry_Resonance_Pct",
+            "Swing52_Close_to_High_pct", "Signal_VCP_Range_4W_vs_12W",
+            "Signal_Prior_GC_Reached75_Count_Last3",
+            "Score_Total_100", "Weekly_Rank", "V57_DualH2_Weekly_Rank",
+            "LTR_Live_Score", "LTR_Live_Weekly_Rank", "LTR_Live_Top3",
+            "LTR_Live_Top20Pct", "参数共振N", "参数共振数量",
+            "历史训练事件", "历史训练周",
+        ]
+        live_candidates_export = live_candidates[[
+            column for column in live_columns if column in live_candidates.columns
+        ]].copy()
     feature_status.empty()
     summary_rows = []
     for n in SKDJ_NS:
-        all_n = events_all[events_all["SKDJ_N"].eq(n)]
+        all_n = history_events[history_events["SKDJ_N"].eq(n)]
         mature_n = mature_w8[mature_w8["SKDJ_N"].eq(n)]
         mature_w12_n = mature_w12[mature_w12["SKDJ_N"].eq(n)]
         eligible_n = eligible[eligible["SKDJ_N"].eq(n)]
+        observation_n = live_ranked_all[
+            live_ranked_all.get(
+                "SKDJ_N", pd.Series(index=live_ranked_all.index, dtype=float)
+            ).eq(n)].copy()
+        live_n = live_candidates[
+            live_candidates.get(
+                "SKDJ_N", pd.Series(index=live_candidates.index, dtype=float)
+            ).eq(n)].copy()
         pass_by_date = eligible_n.groupby(eligible_n["Signal_Date"].astype(str)).size()
         pass_counts = calendar["Week_End"].astype(str).map(pass_by_date).fillna(0).astype(int)
+        oos_available = true_mask(eligible_n, "LTR_OOS_Available")
+        oos_dates = eligible_n.loc[oos_available, "Signal_Date"].astype(str)
         summary_rows.append({
             "SKDJ_N": n, "SKDJ_M": SKDJ_M,
-            "全部通过过滤事件": len(all_n), "W8成熟事件": len(mature_n),
+            "历史基础过滤事件": len(all_n), "W8成熟事件": len(mature_n),
             "W12成熟事件": len(mature_w12_n),
             "硬条件通过事件": len(eligible_n),
             "硬条件剔除事件": len(mature_n) - len(eligible_n),
@@ -4842,71 +5358,14 @@ def main() -> None:
             "原100亿以上事件": int(numeric(
                 eligible_n, "Circ_MV_Billion").ge(100).sum()),
             "原评分前3事件": int(true_mask(eligible_n, "Top3").sum()),
-            "V5.2共振分层前3事件": int(true_mask(
-                eligible_n, "V52_Tier_Top3").sum()),
-            "V5.4历史二层前3事件": int(true_mask(
-                eligible_n, "H2_Top3").sum()),
-            "V5.4历史优先层事件": int(
-                eligible_n["H2_Tier_Level"].astype(str).eq("S").sum()),
-            "历史完整3次事件": int(numeric(
-                eligible_n, "H2_History_Valid_Count").ge(3).sum()),
-            "历史部分2次事件": int(numeric(
-                eligible_n, "H2_History_Valid_Count").eq(2).sum()),
-            "历史部分1次事件": int(numeric(
-                eligible_n, "H2_History_Valid_Count").eq(1).sum()),
-            "历史无有效周期事件": int(numeric(
-                eligible_n, "H2_History_Valid_Count").eq(0).sum()),
-            "V5.8完整H2优先层事件": int(
-                eligible_n["H2C_Tier_Level"].astype(str).eq("S").sum()),
-            "V5.8完整H2前3事件": int(true_mask(
-                eligible_n, "H2C_Top3").sum()),
-            "V5.7双优P1事件": int(
-                eligible_n["V57_Factor_Tier"].astype(str).eq("P1").sum()),
-            "V5.7单优P2事件": int(
-                eligible_n["V57_Factor_Tier"].astype(str).eq("P2").sum()),
-            "V5.7无优P3事件": int(
-                eligible_n["V57_Factor_Tier"].astype(str).eq("P3").sum()),
-            "V5.7数据不足PX事件": int(
-                eligible_n["V57_Factor_Tier"].astype(str).eq("PX").sum()),
-            "V5.7_K效率前3事件": int(true_mask(
-                eligible_n, "V57_K_Top3").sum()),
-            "V5.7_行业广度前3事件": int(true_mask(
-                eligible_n, "V57_Breadth_Top3").sum()),
-            "V5.7_双因子前3事件": int(true_mask(
-                eligible_n, "V57_Dual_Top3").sum()),
             "V5.7_双因子H2前3事件": int(true_mask(
                 eligible_n, "V57_DualH2_Top3").sum()),
-            "V5.8_双因子完整H2前3事件": int(true_mask(
-                eligible_n, "V58_DualH2C_Top3").sum()),
-            "52周结构强活跃候选事件": int(
-                eligible_n["V59_Stock_Character"].astype(str).eq(
-                    "结构强活跃候选").sum()),
-            "52周反复波动结构未确认事件": int(
-                eligible_n["V59_Stock_Character"].astype(str).eq(
-                    "反复波动但结构未确认").sum()),
-            "52周持续趋势事件": int(
-                eligible_n["Swing52_Activity_Class"].astype(str).eq(
-                    "持续趋势型").sum()),
-            "52周仅一次大波段事件": int(
-                eligible_n["Swing52_Activity_Class"].astype(str).eq(
-                    "一次爆发型").sum()),
-            "52周低活跃事件": int(
-                eligible_n["Swing52_Activity_Class"].astype(str).eq(
-                    "低活跃型").sum()),
-            "52周至少2次30%波段事件": int(numeric(
-                eligible_n, "Swing52_Count_30_Including_Ongoing").ge(2).sum()),
-            "52周至少2次50%波段事件": int(numeric(
-                eligible_n, "Swing52_Count_50_Including_Ongoing").ge(2).sum()),
-            "52周至少1次100%波段事件": int(numeric(
-                eligible_n, "Swing52_Count_100_Including_Ongoing").ge(1).sum()),
-            "负面_当周仅1只事件": int(true_mask(
-                eligible_n, "V59_Negative_OnlyOneCandidate").sum()),
-            "负面_行业拥挤量能不扩张事件": int(true_mask(
-                eligible_n, "V59_Negative_CrowdedVolumeFade").sum()),
-            "负面_行业拥挤K动能衰减事件": int(true_mask(
-                eligible_n, "V59_Negative_CrowdedKFade").sum()),
-            "负面_52周低活跃事件": int(true_mask(
-                eligible_n, "V59_Negative_LowActivity").sum()),
+            "LTR可严格OOS事件": int(oos_available.sum()),
+            "LTR可严格OOS信号周": int(
+                eligible_n.loc[oos_available, "Signal_Week"].nunique()),
+            "LTR严格OOS开始": oos_dates.min() if not oos_dates.empty else "",
+            "LTR严格OOS前3事件": int(true_mask(
+                eligible_n, "LTR_OOS_Top3").sum()),
             "爆发S级事件": int(eligible_n[
                 "Explosion_Class_W8"].astype(str).eq("S").sum()),
             "爆发A级事件": int(eligible_n[
@@ -4915,17 +5374,16 @@ def main() -> None:
                 "Explosion_Class_W8"].astype(str).eq("B").sum()),
             "爆发F级事件": int(eligible_n[
                 "Explosion_Class_W8"].astype(str).eq("F").sum()),
-            "有至少1次成熟历史同类信号": int(numeric(
-                eligible_n, "Hist_SameSignal_Valid_Count_Last3").ge(1).sum()),
-            "信号周日线路径有效": int(numeric(
-                eligible_n, "SignalWeek_Trading_Days").ge(2).sum()),
-            "全行业广度匹配有效": int(numeric(
-                eligible_n, "Breadth_Constituent_Count").ge(2).sum()),
+            "历史截止后观察事件": len(observation_n),
+            "最近完整周候选": len(live_n),
+            "最近完整周LTR前3": int(true_mask(live_n, "LTR_Live_Top3").sum()),
         })
     run_summary = pd.DataFrame(summary_rows)
     run_summary.insert(0, "程序版本", VERSION)
     run_summary["正式信号开始"] = signal_start
     run_summary["正式信号截止"] = signal_end
+    run_summary["最近完整市场周"] = live_week_end
+    run_summary["最近有候选观察周"] = recent_candidate_week
     run_summary["实际行情开始"] = data_start
     run_summary["行情观察截止"] = market_end
     run_summary["前段观察截止"] = split_end
@@ -4943,7 +5401,7 @@ def main() -> None:
         rejected = group[~true_mask(group, "Hard_Pass")]
         for reason, count in rejected["Hard_Reject_Reason"].fillna("未知").value_counts().items():
             hard_rejections.append({
-                "层级": "V5.9沿用V5.8共同硬条件", "SKDJ_N": n,
+                "层级": "V6.0唯一共同硬条件", "SKDJ_N": n,
                 "剔除原因": reason, "次数": int(count)})
     historical_rejections = [{
         "层级": "历史时点基础过滤", "SKDJ_N": "全部",
@@ -4954,76 +5412,62 @@ def main() -> None:
         ("信号", "上一完整周K<25，本完整周K>=25；不要求低位金叉，不要求K>D"),
         ("重复信号", "以后跌回25下方再上穿时重新计为新事件"),
         ("参数", "同一次运行分别计算N=6、N=7和默认N=9；M固定为3"),
-        ("数据窗口", f"正式{int(backtest_days)}个交易日；开始前{WARMUP_WEEKS}周预热；截止后观察W1-W12"),
-        ("成熟样本", "旧排名和爆发力主审计使用完整W8样本；W12只作补充生命周期观察，不要求与W8表现一致"),
+        ("历史数据窗口", f"正式{int(backtest_days)}个交易日；历史信号{signal_start}至{signal_end}；开始前{WARMUP_WEEKS}周预热"),
+        ("历史成熟样本", "只有Signal_Date不晚于历史截止、次周可成交且Entry_Has_W8=True的事件才能训练和判卷"),
+        ("实盘观察窗口", f"行情读取至{market_end}；最近完整市场周为{live_week_end}；该时间线不进入历史标签和收益"),
         ("历史价格市值过滤", f"信号日股价≥{float(min_price):g}元、流通市值≥{float(min_mv):g}亿元"),
-        ("九方案共同硬条件", f"信号前连续处于25下方1～{MAX_BOTTOM_STREAK}周；超过5周不进入排名"),
-        ("事件检查点", "V5.9逐股票事件新增信号前52周波段字段，使用独立检查点；覆盖足够长区间的通用行情缓存仍可复用"),
-        ("原评分基准", "V5.1.1冻结100分原样保留；新单因子排序仅用它破同值，新双因子排序仅在更高优先规则都相同时使用"),
+        ("唯一共同硬条件", f"信号前连续处于25下方1～{MAX_BOTTOM_STREAK}周；不增加52周股性或候选数量硬过滤"),
+        ("原评分基准", "V5.1.1冻结100分仅作失效基准，不作为V6.0主模型"),
         ("原评分结构", "SKDJ重置35、量能20、周K线结构20、MA20趋势15、同周价格市值百分位10"),
-        ("V5.2对照", "保留上一版共振S/A/B/C定义和同层原评分排序；已删除V5.2强权重线性100分"),
-        ("V5.4历史二层", "最近3次已完成金叉至少2次达到75线进入优先层；2次和3次同级，其余进入普通层；板块共振不参与等级"),
-        ("V5.4同层规则", "同一层内先按V5.1.1冻结100分降序；最近一次金叉峰值只用于原分相同时破同分"),
-        ("历史有效周期", "只统计当前信号以前已经出现死叉、完整结束的K/D金叉周期；分别标记0/1/2/3次"),
-        ("V5.8完整历史H2", "只有有效周期=3且其中至少2次达到75才进入S层；完整但不足2次为C层；历史不足为PX层"),
-        ("V5.8双因子完整H2", "保持V5.7的P1/P2/P3/PX顺序；同一特征层内依次按完整历史H2、两因子百分位和、原100分排序"),
-        ("V5.9股性窗口", "只读取信号周以前52个完整周；信号周和买入后数据均不参与股性识别"),
-        ("V5.9独立波段", "低点至高点后出现至少15%回撤才确认完成；上涨段互不重叠，尚未确认结束的当前段单列"),
-        ("V5.9重复爆发", "分别统计30%、50%、100%已完成波段及含当前段次数；反复爆发、持续趋势、一次爆发、低活跃分开判卷"),
-        ("V5.9结构强候选", "反复爆发且高低点共同抬高，或持续趋势；同时要求行业相对12周强度为正且年内位置不低于40%；只审计不排名"),
-        ("V5.9负面规则", "当周仅1只、行业拥挤但量能不扩张、行业拥挤但K动能衰减、二者同时、52周低活跃分别核验"),
-        ("V5.9负面验收", "同时报告F捕获率、A/S误杀率、保留后爆发力和新增空窗周；不因单一总体均值好看就升级为硬条件"),
-        ("V5.7确认特征一", "K动能相对股价扩张效率越低越好；只在同参数同信号周内部比较，优秀20%为有利状态"),
-        ("V5.7确认特征二", "所属行业MA20上升比例越高越好；只在同参数同信号周内部比较，优秀20%为有利状态"),
-        ("V5.7单因子排名", "分别按K效率由低到高、行业MA20广度由高到低；冻结100分只破同值，不做温和加分"),
-        ("V5.7双因子层", "P1=两项均进入同周优秀20%，P2=一项，P3=均未进入，PX=任一数据缺失；优先级P1>P2>P3>PX"),
-        ("V5.7双因子排序", "方案一层内按两因子周内百分位和排序；方案二层内先让V5.4历史H2优先，再按百分位和；最后才用原100分"),
-        ("当前K值", "突破当周K值不计分"),
+        ("V5.7对照", "双因子H2完整保留为当前最好人工基准，与随机和V6.0在相同OOS周比较"),
+        ("爆发等级", "S=先到+30；A=先到+20但未到S；B=先到+10但未到A/S；F=其余；全部在W8内与-10比较"),
+        ("LTR分组", "同一个SKDJ_N和Signal_Week构成一个查询组；只学习组内相对次序"),
+        ("LTR标签收益", "F/B/A/S标签为0/1/2/3，成对权重使用0/1/3/7的等级收益差，S优先于稳定小涨"),
+        ("LTR特征", "15项信号时点技术特征先转换为同N同周百分位；缺失按中性0.5；不使用买入后数据"),
+        ("LTR模型", f"NumPy成对逻辑回归，L2正则C={LTR_C:g}；每周最多{LTR_MAX_PAIRS_PER_WEEK}个等级不同股票对且每周总权重相同"),
+        ("LTR最小训练", f"至少{LTR_MIN_TRAIN_WEEKS}个已成熟信号周且{LTR_MIN_TRAIN_ROWS}个事件；不足时历史OOS名次留空而非伪造"),
+        ("LTR防泄漏", "预测某历史周时，训练事件必须满足Entry_W8_End_Date严格早于当前Signal_Date"),
+        ("LTR实盘模型", "只用历史截止日以前全部W8成熟N=6事件训练；N=7和N=9只作参数共振观察"),
+        ("VCP", "信号前4周平均周振幅/前12周平均周振幅作为收缩特征；只参与LTR，不作硬条件"),
+        ("52周位置", "使用信号前52周最近收盘距离52周最高价，不用全年总波幅作硬过滤"),
         ("时间分段", f"前段观察截止{split_end}；规则预先写死，后段不重新调权；不要求前后段绝对收益相同"),
-        ("全行业广度", "按历史申万一级归属累计全部可识别科技成分股；行业MA20上升比例只用信号当时可知数据"),
         ("策略目标", "科技股高爆发优先；允许约三分之一失败，目标是三仓中尽量有两只达到A/S，而不是挑低波动小涨股票"),
-        ("爆发等级", "S=W8先到+30%；A=先到+20%但未到S；B=先到+10%但未到A/S；F=其余完整路径；均与-10%比较"),
-        ("主评价目标", "S级比例、A/S比例、前三至少两只A/S周比例、W8最大浮盈；四项共同判卷，不用期末小幅稳定盈利替代爆发力"),
-        ("辅助评价目标", "W8期末收益、+10、较小不利波动和W12结果只作解释，不参与入选判定；不要求W1至W12平滑或前后段收益相同"),
-        ("候选宽度", "全部宽度、1至5、6至15、16至25、超过25只分别报告；不改变候选和排名"),
-        ("V5.7预设验收", "四套V5.7排名继续统一与V5.4比较，不因延长历史后出现的新结果改变门槛"),
-        ("V5.8完整度验收", "完整H2与V5.4比较；双因子完整H2与V5.7双因子H2比较；总体至少改善3项且前后段各至少改善2项才支持"),
-        ("三仓验收", "同时报告前三名个股A/S比例、每周至少两只A/S比例，以及候选池本来存在至少两只A/S时的命中率；不以单一平均胜率代替组合检验"),
-        ("防未来数据", "买入后结果只用于判卷；全部特征在信号周收盘时已经可知"),
-        ("历史过滤", "每个信号日使用当时科技行业归属、股价和流通市值"),
+        ("主评价目标", "S比例、A/S比例、B以上比例、W8最大浮盈、每周前三至少两只A/S；不把期末平滑收益作为主目标"),
+        ("随机基准", "按每周候选数精确计算随机抽取最多3只的事件比例和超几何两只A/S概率，不依赖抽样运气"),
         ("买入", "信号完整周结束后的下一市场交易日开盘"),
         ("成本", "买卖0.2%滑点、佣金、过户费；卖出另计印花税"),
         ("先后顺序", "同一天同时触及止盈和-10%时保守计为-10%先；W8和W12分别独立计算"),
-        ("本版边界", "不加入基本面、不修改候选硬条件、不调旧排名权重；52周股性和负面特征仅审计，不研究止损止盈"),
+        ("本版边界", "不加入基本面、不增加新硬过滤、不研究止损止盈；实盘观察行不写入历史模型"),
         ("运行环境", f"Streamlit {streamlit_version}；运行稳定版要求requirements锁定1.61.0"),
     ], columns=["项目", "说明"])
-    score_rules_export = pd.concat([
-        score_rules.assign(规则组="V5.1.1冻结100分"),
-        challenger_rules.assign(规则组="V5.2/V5.4冻结分层"),
-    ], ignore_index=True, sort=False)
+    model_status = pd.DataFrame([{
+        "历史信号开始": signal_start,
+        "历史信号截止": signal_end,
+        "行情观察截止": market_end,
+        "最近完整市场周": live_week_end,
+        "最近完整周候选": len(live_candidates),
+        "最近有候选观察周": recent_candidate_week,
+        "N6训练事件": int(live_model["train_rows"]) if live_model else 0,
+        "N6训练周": int(live_model["train_weeks"]) if live_model else 0,
+        "N6训练成对样本": int(live_model["pair_count"]) if live_model else 0,
+        "实盘模型可用": bool(live_model is not None),
+    }])
     files = {
-        "01_run_summary_v5_9.csv": run_summary,
-        "02_swing52_definitions_v5_9.csv": v59_swing_rules,
-        "03_swing52_outcomes_v5_9.csv": swing_outcomes,
-        "04_negative_rule_definitions_v5_9.csv": v59_negative_rules,
-        "05_negative_filter_f_capture_as_miskill_v5_9.csv": negative_filters,
-        "06_negative_filter_after_frozen_top3_v5_9.csv": negative_top3,
-        "07_history_completeness_outcomes_v5_9.csv": history_completeness,
-        "08_history_complete_rank_acceptance_v5_9.csv": history_acceptance,
-        "09_history_completeness_definitions_v5_9.csv": v58_rules,
-        "10_v57_predeclared_acceptance_recheck_v5_9.csv": acceptance,
-        "11_v57_rank_definitions_frozen_v5_9.csv": v57_rules,
-        "12_v57_feature_tier_outcomes_v5_9.csv": feature_tiers,
-        "13_all_nine_rank_top3_two_winner_audit_v5_9.csv": top3_explosion,
-        "14_all_nine_rank_cohort_outcomes_v5_9.csv": rank_cohorts,
-        "15_explosion_class_definitions_v5_9.csv": explosion_definitions,
-        "16_explosion_class_outcomes_v5_9.csv": explosion_classes,
-        "17_weekly_candidate_calendar_v5_9.csv": ranked_calendar,
-        "18_slim_w8_candidates_with_swing_negative_v5_9.csv": slim_candidates,
-        "19_frozen_old_rules_v5_9.csv": score_rules_export,
-        "20_rejection_audit_v5_9.csv": rejection_audit,
-        "21_metadata_v5_9.csv": metadata,
-        "22_api_errors_v5_9.csv": pd.DataFrame({"错误": API_ERRORS}),
+        "01_run_summary_v6_0.csv": run_summary,
+        "02_ltr_definitions_v6_0.csv": ltr_rules,
+        "03_ltr_oos_top3_comparison_v6_0.csv": ltr_comparison,
+        "04_ltr_oos_weekly_detail_v6_0.csv": ltr_week_detail,
+        "05_ltr_full_history_coefficients_v6_0.csv": ltr_coefficients,
+        "06_live_latest_complete_week_candidates_v6_0.csv": live_candidates_export,
+        "07_live_model_status_v6_0.csv": model_status,
+        "08_historical_explosion_class_outcomes_v6_0.csv": explosion_classes,
+        "09_historical_candidate_calendar_v6_0.csv": ranked_calendar,
+        "10_historical_w8_ltr_candidates_v6_0.csv": slim_candidates,
+        "11_legacy_score_definitions_v6_0.csv": score_rules,
+        "12_v57_baseline_definitions_v6_0.csv": v57_rules,
+        "13_rejection_audit_v6_0.csv": rejection_audit,
+        "14_metadata_v6_0.csv": metadata,
+        "15_api_errors_v6_0.csv": pd.DataFrame({"错误": API_ERRORS}),
     }
     result_zip = make_zip(files)
     try:
@@ -5035,51 +5479,42 @@ def main() -> None:
         st.warning(f"结果未能持久保存，但当前页面仍可下载：{exc}")
 
     st.success(
-        f"完成：N=6/7/9的W8候选分别为"
+        f"完成：历史N=6/7/9的W8宽池候选分别为"
         f"{len(eligible[eligible['SKDJ_N'].eq(6)])}/"
         f"{len(eligible[eligible['SKDJ_N'].eq(7)])}/"
         f"{len(eligible[eligible['SKDJ_N'].eq(9)])}个；"
-        f"实际行情约{round((market_end_date - data_start_date).days / 7, 1)}周；"
+        f"最近完整市场周{live_week_end}共有{len(live_candidates)}个跨参数候选；"
         f"结果{'已保存' if persisted else '仅当前页面可下载'}。")
+    st.subheader(f"最近完整市场周候选：{live_week_end}")
+    st.caption(
+        f"历史训练截止{signal_end}；行情观察截止{market_end}。下表仅供实盘观察，"
+        "没有W8标签，也没有进入本次历史成绩。N=6的LTR名次是主排序。")
+    primary_live = live_candidates_export[
+        live_candidates_export.get(
+            "SKDJ_N", pd.Series(index=live_candidates_export.index, dtype=float)
+        ).eq(LTR_PRIMARY_N)].copy()
+    if not primary_live.empty:
+        render_plain_table(primary_live.sort_values("LTR_Live_Weekly_Rank"), 100)
+    elif not live_candidates_export.empty:
+        st.warning("最近完整周没有N=6候选；以下仅为N=7/9参数观察，不是主模型买入名单。")
+        render_plain_table(live_candidates_export, 100)
+    else:
+        st.warning("最近完整周没有股票通过当前宽池与1～5周硬条件，本周观察名单为空。")
+        if (recent_candidate_week and recent_candidate_week != live_week_end
+                and not recent_reference_candidates.empty):
+            st.caption(f"为便于查看形态，下面另列最近一次有候选的观察周：{recent_candidate_week}；它不是本周信号。")
+            reference_export = recent_reference_candidates[[
+                column for column in live_columns
+                if column in recent_reference_candidates.columns]].copy()
+            render_plain_table(reference_export, 100)
+    st.subheader("N=6严格时间外：LTR与随机/旧排名同周比较")
+    render_plain_table(ltr_comparison, 30)
+    st.subheader("N=6全历史实盘模型特征方向")
+    render_plain_table(ltr_coefficients, 30)
     st.subheader("N=6 / N=7 / N=9运行摘要")
     render_plain_table(run_summary)
-    st.subheader("N=6信号前52周股性与爆发结果")
-    render_plain_table(swing_outcomes[
-        swing_outcomes["SKDJ_N"].eq(6)
-        & swing_outcomes["时间分段"].isin(
-            ["全部区间", "前段观察", "后段冻结检验"])], 80)
-    st.subheader("N=6负面规则：F捕获与A/S误杀")
-    render_plain_table(negative_filters[
-        negative_filters["SKDJ_N"].eq(6)
-        & negative_filters["候选范围"].eq("V5.7双因子前20%")
-        & negative_filters["时间分段"].isin(
-            ["全部区间", "前段观察", "后段冻结检验"])], 60)
-    st.subheader("N=6负面剔除后仍沿用冻结前三名")
-    render_plain_table(negative_top3[
-        negative_top3["SKDJ_N"].eq(6)
-        & negative_top3["时间分段"].isin(
-            ["全部区间", "前段观察", "后段冻结检验"])], 30)
-    st.subheader("N=6历史完整度分布与表现")
-    render_plain_table(history_completeness[
-        history_completeness["SKDJ_N"].eq(6)
-        & history_completeness["时间分段"].isin(
-            ["全部区间", "前段观察", "后段冻结检验"])], 30)
-    st.subheader("N=6两套历史完整度修正验收")
-    render_plain_table(history_acceptance, 20)
-    st.subheader("N=6四套V5.7排名的冻结验收复核")
-    render_plain_table(acceptance, 20)
-    st.subheader("N=6双因子P1/P2/P3分层表现")
-    render_plain_table(feature_tiers[
-        feature_tiers["SKDJ_N"].eq(6)
-        & feature_tiers["时间分段"].isin(
-            ["全部区间", "前段观察", "后段冻结检验"])], 30)
-    st.subheader("N=6九套排名的三仓爆发力")
-    render_plain_table(top3_explosion[
-        top3_explosion["SKDJ_N"].eq(6)
-        & top3_explosion["时间分段"].isin(
-            ["全部区间", "前段观察", "后段冻结检验"])], 30)
-    st.caption("结果ZIP含22个审计文件；V5.8九套名次完全冻结，V5.9新增52周重复爆发和负面剔除审计。")
-    render_download(result_zip, result_name, f"v59_current_{request_signature}")
+    st.caption("结果ZIP含15个文件；最近周候选与历史W8训练/验收在代码中严格分流。")
+    render_download(result_zip, result_name, f"v60_current_{request_signature}")
 
 
 if __name__ == "__main__":
