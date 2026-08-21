@@ -1,18 +1,15 @@
 # -*- coding: utf-8 -*-
-"""周线SKDJ爆发力主导排名验证 V5.7。
+"""周线SKDJ历史完整度与爆发力排名审计 V5.8。
 
-V5.5的N=6/7/9信号、50亿元科技池、25线下连续1至5周硬条件、冻结100分、
-V5.2和V5.4历史二层排序全部保持不变。本版不把新发现直接写成分数，而是检验
-四类此前没有被充分表达的信息：历史同类信号的真实价格反应、信号周内部日线
-路径、全行业周状态广度，以及方向性量价效率。
+V5.7已经证明双因子能较稳定地识别优秀前20%，但前三名排序仍然分段不稳。
+复核发现，V5.4历史H2需要最近3次已完成K/D金叉周期，而旧版正式窗口前只预热
+30周，早期事件可能把“历史不足”误当成“历史失败”。
 
-所有历史反应必须在当前信号日以前已经完整走完W8；所有日线路径仅使用信号周
-收盘以前的数据；行业广度来自当时全部可识别科技成分股，而不是只统计本周候选。
-V5.6.1已发现两个前后段方向一致的特征：行业MA20上升比例越高越好，以及
-K动能相对股价扩张效率越低越好。本版不再重复31项特征发现，而是预先冻结
-四套新排名，与原100分、V5.2和V5.4在完全相同候选池上比较。核心验收只看
-S级、A/S比例、每周前三名至少两只A/S及W8最大浮盈；B级只作补位，期末收益
-和低回撤仅作辅助观察。
+本版冻结V5.7候选池、N=6/7/9、K上穿25、25线下1至5周硬条件、三套旧排名
+和四套V5.7排名，不增加新指标、不调权。唯一基础变更是把预热扩展到200周，
+并明确导出历史有效周期0/1/2/3次。另增加两套透明对照：完整历史H2，以及
+双因子层内完整历史H2；有效周期不足3次者进入PX层，不再按失败次数为0处理。
+判卷继续以S级、A/S、前三至少两只A/S和W8最大浮盈为主。
 """
 from __future__ import annotations
 
@@ -34,23 +31,22 @@ import pandas as pd
 import streamlit as st
 import tushare as ts
 
-TITLE = "周线SKDJ爆发力主导排名验证 V5.7"
-VERSION = "V5.7-WEEKLY-SKDJ-EXPLOSION-DOMINANT-RANK-VALIDATION"
-EVENT_CACHE_VERSION = "V5.6.1-WEEKLY-SKDJ-EXPLOSION-PRIORITY-FEATURE-AUDIT"
-UI_PATCH = "V5.7-TWO-FACTOR-DOMINANT-RANK"
+TITLE = "周线SKDJ历史完整度与爆发力排名审计 V5.8"
+VERSION = "V5.8-WEEKLY-SKDJ-HISTORY-COMPLETENESS-AUDIT"
+UI_PATCH = "V5.8-200W-HISTORY-COMPLETE-H2"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # 沿用旧行情缓存目录，以便直接复用V4.7已经下载的更长历史数据。
 PRICE_CACHE_DIR = os.path.join(APP_DIR, "weekly_macd_validation_cache_v1_1")
-# 事件字段与V5.6.1完全相同，保留同一检查点目录和签名以直接复用已完成股票。
-CHECKPOINT_DIR = os.path.join(APP_DIR, "weekly_skdj_v5_6_1_checkpoints")
-RESULT_DIR = os.path.join(APP_DIR, "weekly_skdj_v5_7_results")
-JOB_DIR = os.path.join(APP_DIR, "weekly_skdj_v5_7_jobs")
+# 200周预热会改变历史周期字段，不能复用30周预热的逐股票检查点。
+CHECKPOINT_DIR = os.path.join(APP_DIR, "weekly_skdj_v5_8_checkpoints")
+RESULT_DIR = os.path.join(APP_DIR, "weekly_skdj_v5_8_results")
+JOB_DIR = os.path.join(APP_DIR, "weekly_skdj_v5_8_jobs")
 
 SKDJ_NS = (6, 7, 9)
 SKDJ_M = 3
 SKDJ_BOTTOM = 25.0
-WARMUP_WEEKS = 30
+WARMUP_WEEKS = 200
 RANKING_WEEKS = 8
 AUDIT_WEEKS = 12
 LIFECYCLE_WEEKS = tuple(range(1, AUDIT_WEEKS + 1))
@@ -1847,8 +1843,26 @@ def v57_ranking_scheme_specs() -> list[dict[str, str]]:
     ]
 
 
+def v58_ranking_scheme_specs() -> list[dict[str, str]]:
+    """History-completeness controls added after the V5.7 result was frozen."""
+    return [
+        {"name": "V5.8完整历史H2优先", "rank": "H2C_Weekly_Rank",
+         "rank_pct": "H2C_Weekly_Rank_Pct", "top3": "H2C_Top3",
+         "top5": "H2C_Top5", "top20": "H2C_Top20Pct",
+         "bottom20": "H2C_Bottom20Pct", "score": "H2C_Tier_Order",
+         "tier": "H2C_Tier_Level"},
+        {"name": "V5.8双因子层内完整H2", "rank": "V58_DualH2C_Weekly_Rank",
+         "rank_pct": "V58_DualH2C_Weekly_Rank_Pct",
+         "top3": "V58_DualH2C_Top3", "top5": "V58_DualH2C_Top5",
+         "top20": "V58_DualH2C_Top20Pct",
+         "bottom20": "V58_DualH2C_Bottom20Pct",
+         "score": "V57_Factor_Tier_Order", "tier": "V57_Factor_Tier"},
+    ]
+
+
 def all_ranking_scheme_specs() -> list[dict[str, str]]:
-    return ranking_scheme_specs() + v57_ranking_scheme_specs()
+    return (ranking_scheme_specs() + v57_ranking_scheme_specs()
+            + v58_ranking_scheme_specs())
 
 
 def v57_ranking_definitions() -> pd.DataFrame:
@@ -1864,6 +1878,20 @@ def v57_ranking_definitions() -> pd.DataFrame:
         ("双因子层内H2", "层内排序", "先P1/P2/P3/PX；同层先V5.4历史H2，再按两因子百分位和，最后原100分"),
         ("判卷", "主目标", "S级、A/S比例、前三至少两只A/S周、W8最大浮盈；B级和回撤只辅助"),
     ], columns=["方案", "层级", "预先冻结规则"])
+
+
+def v58_history_definitions() -> pd.DataFrame:
+    return pd.DataFrame([
+        ("历史窗口", "200周", "正式信号开始前读取200个日历周，仅用于形成指标和历史周期，不增加正式信号"),
+        ("历史完整", "完整3次", "当前信号以前至少存在3个已经死叉结束的K/D金叉周期"),
+        ("历史不足", "部分2次", "只找到2个已完成周期；单独标记，不按第三次失败处理"),
+        ("历史不足", "部分1次", "只找到1个已完成周期；单独标记，不按其余两次失败处理"),
+        ("历史不足", "无有效周期", "没有已完成周期；单独标记，不等同于三次均未到75"),
+        ("完整H2优先层", "S", "历史完整3次，且其中至少2次最高K达到75"),
+        ("完整H2普通层", "C", "历史完整3次，但达到75不足2次"),
+        ("完整H2数据不足层", "PX", "有效历史周期不足3次；排在完整S/C之后，但不删除事件"),
+        ("冻结对照", "V5.4/V5.7", "七套旧排名完全保留；新增两套排名只检验历史完整度处理方式"),
+    ], columns=["审计项目", "状态", "定义"])
 
 
 def score_and_rank_events(events: pd.DataFrame, split_end: str) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -2059,6 +2087,14 @@ def add_challenger_rankings(eligible: pd.DataFrame) -> pd.DataFrame:
     work = eligible.copy()
     reached75 = numeric(
         work, "Signal_Prior_GC_Reached75_Count_Last3").fillna(0).clip(0, 3)
+    valid_count = numeric(
+        work, "Signal_Prior_GC_Valid_Count_Last3").fillna(0).clip(0, 3)
+    history_complete = valid_count.ge(3)
+    work["H2_History_Valid_Count"] = valid_count.astype(float)
+    work["H2_History_Complete"] = history_complete
+    work["H2_History_State"] = np.select(
+        [valid_count.ge(3), valid_count.eq(2), valid_count.eq(1)],
+        ["完整3次", "部分2次", "部分1次"], default="无有效周期")
     latest_peak = numeric(work, "Signal_Prior_GC1_Peak_K")
     resonance = numeric(work, "Industry_Resonance_Pct")
     resonance_40_60 = resonance.between(40.0, 60.0, inclusive="both")
@@ -2095,6 +2131,19 @@ def add_challenger_rankings(eligible: pd.DataFrame) -> pd.DataFrame:
     work = _assign_challenger_rank(
         work, "H2",
         ["H2_Tier_Order", "Score_Total_100", "Signal_Prior_GC1_Peak_K"],
+        [True, False, False])
+
+    # V5.8 completeness correction: incomplete history is neither success nor
+    # failure.  It remains tradable and auditable, but is ranked behind stocks
+    # with three completed historical cycles.
+    h2c_s = history_complete & reached75.ge(2)
+    work["H2C_Tier_Level"] = np.select(
+        [h2c_s, history_complete], ["S", "C"], default="PX")
+    work["H2C_Tier_Order"] = work["H2C_Tier_Level"].map(
+        {"S": 1.0, "C": 2.0, "PX": 3.0}).astype(float)
+    work = _assign_challenger_rank(
+        work, "H2C",
+        ["H2C_Tier_Order", "Score_Total_100", "Signal_Prior_GC1_Peak_K"],
         [True, False, False])
 
     candidate_count = numeric(work, "Candidates_This_Week")
@@ -2165,8 +2214,13 @@ def add_v57_explosion_rankings(eligible: pd.DataFrame) -> pd.DataFrame:
         ["V57_Factor_Tier_Order", "H2_Tier_Order",
          "V57_TwoFactor_Rank_Sum", "Score_Total_100"],
         [True, True, True, False])
+    work = _assign_challenger_rank(
+        work, "V58_DualH2C",
+        ["V57_Factor_Tier_Order", "H2C_Tier_Order",
+         "V57_TwoFactor_Rank_Sum", "Score_Total_100"],
+        [True, True, True, False])
     return work.sort_values(
-        ["Signal_Date", "SKDJ_N", "V57_DualH2_Weekly_Rank", "ts_code"],
+        ["Signal_Date", "SKDJ_N", "V58_DualH2C_Weekly_Rank", "ts_code"],
         na_position="last").reset_index(drop=True)
 
 
@@ -2453,6 +2507,10 @@ def weekly_rank_calendar(calendar: pd.DataFrame, all_events: pd.DataFrame,
         h2_s_counts = group[group.get(
             "H2_Tier_Level", pd.Series(index=group.index, dtype=str))
             .astype(str).eq("S")].groupby("Week_End").size()
+        h2c_top3_counts = group[true_mask(
+            group, "H2C_Top3")].groupby("Week_End").size()
+        h2_complete_counts = group[true_mask(
+            group, "H2_History_Complete")].groupby("Week_End").size()
         result[f"N{n}_全部原始事件"] = result["Week_End"].map(raw_counts).fillna(0).astype(int)
         result[f"N{n}_硬条件通过"] = result["Week_End"].map(pass_counts).fillna(0).astype(int)
         result[f"N{n}_前3"] = result["Week_End"].map(top3_counts).fillna(0).astype(int)
@@ -2463,12 +2521,16 @@ def weekly_rank_calendar(calendar: pd.DataFrame, all_events: pd.DataFrame,
             h2_top3_counts).fillna(0).astype(int)
         result[f"N{n}_V5.4历史优先层事件"] = result["Week_End"].map(
             h2_s_counts).fillna(0).astype(int)
+        result[f"N{n}_历史完整3次事件"] = result["Week_End"].map(
+            h2_complete_counts).fillna(0).astype(int)
+        result[f"N{n}_V5.8完整H2前3"] = result["Week_End"].map(
+            h2c_top3_counts).fillna(0).astype(int)
         p1_counts = group[group.get(
             "V57_Factor_Tier", pd.Series(index=group.index, dtype=str))
             .astype(str).eq("P1")].groupby("Week_End").size()
         result[f"N{n}_V5.7双优P1事件"] = result["Week_End"].map(
             p1_counts).fillna(0).astype(int)
-        for spec in v57_ranking_scheme_specs():
+        for spec in v57_ranking_scheme_specs() + v58_ranking_scheme_specs():
             counts = group[true_mask(group, spec["top3"])].groupby("Week_End").size()
             result[f"N{n}_{spec['name']}前3"] = result["Week_End"].map(
                 counts).fillna(0).astype(int)
@@ -3811,6 +3873,112 @@ def v57_feature_tier_audit(
     return pd.DataFrame(rows)
 
 
+def v58_history_completeness_audit(
+        eligible: pd.DataFrame, periods: list[dict[str, Any]]) -> pd.DataFrame:
+    """Separate insufficient history from three-cycle completed history."""
+    rows: list[dict[str, Any]] = []
+    ordered_states = ("完整3次", "部分2次", "部分1次", "无有效周期")
+    for n in SKDJ_NS:
+        base_n = eligible[eligible["SKDJ_N"].eq(n)]
+        for period in periods:
+            base = select_period(base_n, period)
+            for state in ordered_states:
+                selected = base[base.get(
+                    "H2_History_State",
+                    pd.Series(index=base.index, dtype=str)).astype(str).eq(state)]
+                classes = selected.get(
+                    "Explosion_Class_W8",
+                    pd.Series(index=selected.index, dtype=str)).astype(str)
+                rows.append({
+                    "SKDJ_N": n, "时间分段": period["name"],
+                    "历史完整度": state, "事件数": len(selected),
+                    "占本段候选%": len(selected) / len(base) * 100
+                    if len(base) else np.nan,
+                    "不同股票": selected["ts_code"].nunique()
+                    if len(selected) else 0,
+                    "覆盖信号周": selected["Signal_Week"].nunique()
+                    if len(selected) else 0,
+                    "达到75次数均值": numeric(
+                        selected, "Signal_Prior_GC_Reached75_Count_Last3").mean(),
+                    "旧V5.4优先层比例%": selected.get(
+                        "H2_Tier_Level",
+                        pd.Series(index=selected.index, dtype=str)
+                    ).astype(str).eq("S").mean() * 100 if len(selected) else np.nan,
+                    "S级比例%": classes.eq("S").mean() * 100
+                    if len(classes) else np.nan,
+                    "A或S比例%": classes.isin(["A", "S"]).mean() * 100
+                    if len(classes) else np.nan,
+                    "B及以上比例%": classes.isin(["B", "A", "S"]).mean() * 100
+                    if len(classes) else np.nan,
+                    "W8最大浮盈均值%": numeric(
+                        selected, "Entry_W8_MFE_Net_pct").mean(),
+                    "W8最大浮盈中位%": numeric(
+                        selected, "Entry_W8_MFE_Net_pct").median(),
+                    "W8期末净收益均值%_辅助": numeric(
+                        selected, "Entry_W8_Close_Return_Net_pct").mean(),
+                    "W8最大回撤均值%_风险": numeric(
+                        selected, "Entry_W8_MAE_Raw_pct").mean(),
+                })
+    return pd.DataFrame(rows)
+
+
+def v58_history_rank_acceptance_audit(
+        top3_audit: pd.DataFrame) -> pd.DataFrame:
+    """Compare each completeness correction only with its frozen parent."""
+    comparisons = (
+        ("V5.8完整历史H2优先", "V5.4历史≥2次优先"),
+        ("V5.8双因子层内完整H2", "V5.7-双因子层内H2优先"),
+    )
+    periods = ("全部区间", "前段观察", "后段冻结检验")
+    metrics = (
+        ("前3_S级比例%", "S级"),
+        ("前3_A或S比例%", "A或S"),
+        ("前3至少2只A或S占全部信号周%", "至少2只A或S周"),
+        ("前3_W8最大浮盈均值%", "最大浮盈"),
+    )
+
+    def one(scheme: str, period: str) -> pd.Series | None:
+        selected = top3_audit[
+            top3_audit["排序方案"].eq(scheme)
+            & top3_audit["SKDJ_N"].eq(6)
+            & top3_audit["时间分段"].eq(period)]
+        return selected.iloc[0] if len(selected) else None
+
+    rows: list[dict[str, Any]] = []
+    for scheme, baseline_name in comparisons:
+        row: dict[str, Any] = {"排序方案": scheme, "冻结基准": baseline_name}
+        improvements: dict[str, int] = {}
+        for period in periods:
+            current, baseline = one(scheme, period), one(baseline_name, period)
+            key = {"全部区间": "全部", "前段观察": "前段",
+                   "后段冻结检验": "后段"}[period]
+            deltas: list[float] = []
+            for metric, short in metrics:
+                delta = (
+                    finite_num(current.get(metric)) - finite_num(baseline.get(metric))
+                    if current is not None and baseline is not None else np.nan)
+                row[f"{key}_{short}差"] = delta
+                if math.isfinite(delta):
+                    deltas.append(delta)
+            improvements[key] = sum(value > 0 for value in deltas)
+            row[f"{key}_四项改善数"] = improvements[key]
+            row[f"{key}_B及以上差"] = (
+                finite_num(current.get("前3_B及以上比例%"))
+                - finite_num(baseline.get("前3_B及以上比例%"))
+                if current is not None and baseline is not None else np.nan)
+        if (improvements.get("全部", 0) >= 3
+                and improvements.get("前段", 0) >= 2
+                and improvements.get("后段", 0) >= 2):
+            verdict = "支持：历史完整度修正前后段均改善"
+        elif improvements.get("全部", 0) >= 3:
+            verdict = "观察：总体改善但分段不一致"
+        else:
+            verdict = "不支持：完整度修正未改善主要目标"
+        row["历史完整度修正结论"] = verdict
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def v57_rank_acceptance_audit(top3_audit: pd.DataFrame) -> pd.DataFrame:
     """Apply predeclared acceptance rules versus V5.4, focused on N=6."""
     rows: list[dict[str, Any]] = []
@@ -3889,10 +4057,14 @@ def slim_discovery_candidates(eligible: pd.DataFrame) -> pd.DataFrame:
         "Top3", "Top20Pct", "V52_Tier_Level", "V52_Tier_Weekly_Rank",
         "V52_Tier_Top3", "V52_Tier_Top20Pct",
         "H2_Tier_Level", "H2_Weekly_Rank", "H2_Top3", "H2_Top20Pct",
+        "H2_History_Valid_Count", "H2_History_State", "H2_History_Complete",
+        "H2C_Tier_Level", "H2C_Weekly_Rank", "H2C_Top3", "H2C_Top20Pct",
         "V57_K_Weekly_Rank", "V57_K_Top3", "V57_K_Top20Pct",
         "V57_Breadth_Weekly_Rank", "V57_Breadth_Top3", "V57_Breadth_Top20Pct",
         "V57_Dual_Weekly_Rank", "V57_Dual_Top3", "V57_Dual_Top20Pct",
         "V57_DualH2_Weekly_Rank", "V57_DualH2_Top3", "V57_DualH2_Top20Pct",
+        "V58_DualH2C_Weekly_Rank", "V58_DualH2C_Top3",
+        "V58_DualH2C_Top20Pct",
         "Validation_Period",
     ]
     feature_columns = [
@@ -3902,6 +4074,7 @@ def slim_discovery_candidates(eligible: pd.DataFrame) -> pd.DataFrame:
         "V57_Favorable_Count", "V57_Feature_Data_Valid",
         "V57_Factor_Tier", "V57_Factor_Tier_Order",
         "V57_TwoFactor_Rank_Sum",
+        "Signal_Prior_GC_Valid_Count_Last3",
         "Signal_Prior_GC_Reached75_Count_Last3", "Signal_Prior_GC1_Peak_K",
     ]
     outcomes = [
@@ -3926,7 +4099,7 @@ def main() -> None:
     st.title(TITLE)
     streamlit_version = str(getattr(st, "__version__", "unknown"))
     st.caption(
-        f"{UI_PATCH}｜冻结候选池与三套旧排名；新增四套爆发力排名。"
+        f"{UI_PATCH}｜冻结V5.7七套排名；新增两套历史完整度对照。"
         f"｜Streamlit {streamlit_version}")
     if streamlit_version.startswith("1.62"):
         st.error(
@@ -3938,9 +4111,10 @@ def main() -> None:
 - **参数**：同一次运行分别计算N=6、N=7和默认N=9，M固定为3；三者使用完全相同的科技池、价格市值和交易成本。
 - **重复信号**：同一股票以后再次跌回25下方并重新上穿25，会再次计为新事件。
 - **买入**：信号完整周结束后的下一市场交易日开盘。
-- **数据长度**：默认正式窗口500个交易日；另加开始前{WARMUP_WEEKS}周预热和截止后W1-W12观察。
+- **数据长度**：默认正式窗口500个交易日；开始前预热扩展为{WARMUP_WEEKS}周，截止后观察W1-W12。
+- **预热用途**：200周只用于形成指标和读取已完成历史金叉，不增加正式信号；因此候选买点窗口仍是500个交易日。
 - **过滤**：每个历史信号日分别检查当时科技行业归属；最低股价默认10元、最低流通市值默认50亿元，侧边栏可切换，避免使用今天状态回看历史。
-- **共同硬条件**：信号前连续处于25下方1～{MAX_BOTTOM_STREAK}周；超过5周不进入七套排名，但仍保留剔除计数。
+- **共同硬条件**：信号前连续处于25下方1～{MAX_BOTTOM_STREAK}周；超过5周不进入九套排名，但仍保留剔除计数。
 - **原评分基准**：SKDJ重置35分、量能20分、周K线结构20分、MA20趋势15分、同周价格/市值相对排名10分。
 - **V5.2/V5.4对照**：三套旧排名完整保留，新增特征不改变任何股票名次。
 - **V5.4历史二层**：最近3次已完成金叉至少2次达到75线进入优先层；2次和3次不再区分，其余进入普通层。
@@ -3950,52 +4124,55 @@ def main() -> None:
 - **单因子排名**：分别测试K效率低优先、行业MA20广度高优先；原100分只破同值。
 - **双因子分层**：同周两个特征都进入优秀20%为P1、一个进入为P2、均未进入为P3、数据不足为PX。
 - **双因子对照**：一套按P1/P2/P3直接排序；另一套在特征层内让V5.4历史H2优先。
+- **历史完整度**：分别标记有效历史周期0/1/2/3次；只有3次完整历史才能判定“至少2次达到75”。
+- **V5.8完整H2**：完整3次且至少2次达到75为S层；完整但不足2次为C层；历史不足为PX层，事件不删除。
+- **V5.8双因子完整H2**：保持P1/P2/P3/PX顺序，在同一特征层内使用完整历史H2，而不是把历史不足当失败。
 - **爆发等级**：S级=先到+30%，A级=先到+20%但未到S，B级=先到+10%但未到A/S，其余为F；全部与-10%比较且同日冲突按-10%先。
 - **主目标**：爆发等级、W8最大浮盈、+20先于-10、+30先于-10；S优先、A其次、B只在无S/A时补位。
 - **辅助目标**：W8期末收益、+10和较小回撤仅供风险解释，不参与特征入选判定，也不要求W1～W12平滑一致。
 - **三仓审计**：同时统计前三名至少两只A/S和至少两只B级以上；A/S是主目标，B只作没有S/A时的补位。
-- **预设验收**：四套新排名统一与V5.4比较；总体、前段、后段分别判卷，规则运行前写死，不根据结果改门槛。
+- **预设验收**：四套V5.7排名继续与V5.4比较；两套V5.8完整度排名只与各自冻结父方案比较。
 - **防泄漏**：全部特征只使用信号周收盘时已经知道的数据；买入后结果只用于判卷。
 - **时间分段**：评分规则在代码中预先冻结；前段和后段只用于分别报告，不读取后段收益重新调权。
-- **本版边界**：不加入基本面、不修改候选硬条件、不重新寻找31项特征、不研究止损止盈。
+- **本版边界**：不加入新指标、不调权、不修改候选硬条件、不重新寻找31项特征、不研究止损止盈。
 """)
     with st.sidebar:
         st.header("运行参数")
         backtest_days = st.number_input(
-            "回测交易日数", 100, 1000, 500, 50, key="v57_days")
-        st.caption("默认500日；真正独立的样本是有多个候选的信号周，不是事件总数。")
+            "回测交易日数", 100, 1000, 500, 50, key="v58_days")
+        st.caption("默认500日；首次运行需读取额外200周历史，数据量会大于V5.7。")
         # 沿用本页已经稳定加载的number_input，避免部分iOS/Safari会话在
         # 首次加载selectbox前端分块时出现“Importing a module script failed”。
         min_price = st.number_input(
             "最低股价（元）", min_value=10.0, max_value=20.0,
-            value=10.0, step=10.0, format="%.0f", key="v57_min_price")
+            value=10.0, step=10.0, format="%.0f", key="v58_min_price")
         min_mv = st.number_input(
             "最低流通市值（亿元）", min_value=50.0, max_value=100.0,
-            value=50.0, step=50.0, format="%.0f", key="v57_min_mv")
+            value=50.0, step=50.0, format="%.0f", key="v58_min_mv")
         st.caption(f"本次历史过滤：股价≥{min_price:.0f}元，流通市值≥{min_mv:.0f}亿元")
         signal_end_date = st.date_input(
-            "买入信号截止", date(2026, 6, 5), key="v57_signal_end")
+            "买入信号截止", date(2026, 6, 5), key="v58_signal_end")
         market_end_date = st.date_input(
-            "行情观察截止", date.today(), key="v57_market_end")
+            "行情观察截止", date.today(), key="v58_market_end")
         split_ratio_pct = st.number_input(
-            "前段观察占正式周比例(%)", 50, 80, 60, 5, key="v57_split")
+            "前段观察占正式周比例(%)", 50, 80, 60, 5, key="v58_split")
         pause = st.number_input(
-            "接口间隔(秒)", 0.0, 2.0, 0.12, 0.02, key="v57_pause")
-        use_cache = st.checkbox("复用行情缓存", True, key="v57_cache")
+            "接口间隔(秒)", 0.0, 2.0, 0.12, 0.02, key="v58_pause")
+        use_cache = st.checkbox("复用行情缓存", True, key="v58_cache")
         st.divider()
         commission_pct = st.number_input(
             "佣金率(%)", 0.0, 0.20, 0.025, 0.005,
-            format="%.3f", key="v57_commission")
+            format="%.3f", key="v58_commission")
         stamp_duty_pct = st.number_input(
             "卖出印花税率(%)", 0.0, 0.20, 0.05, 0.01,
-            format="%.3f", key="v57_stamp")
+            format="%.3f", key="v58_stamp")
         transfer_fee_pct = st.number_input(
             "过户费率(%)", 0.0, 0.05, 0.001, 0.001,
-            format="%.3f", key="v57_transfer")
-        if st.button("清除V5.7结果和运行状态", key="v57_clear"):
+            format="%.3f", key="v58_transfer")
+        if st.button("清除V5.8结果和运行状态", key="v58_clear"):
             shutil.rmtree(RESULT_DIR, ignore_errors=True)
             shutil.rmtree(JOB_DIR, ignore_errors=True)
-            st.success("V5.7结果已清除；V5.6.1逐股票检查点和旧行情缓存均保留")
+            st.success("V5.8结果和检查点已清除；通用行情缓存保留")
 
     request_payload = {
         "version": VERSION, "days": int(backtest_days),
@@ -4009,7 +4186,7 @@ def main() -> None:
     request_signature = stable_signature(request_payload)
     result_path = os.path.join(RESULT_DIR, f"{request_signature}.zip")
     result_name = (
-        f"weekly_skdj_explosion_rank_validation_v5_7_{int(backtest_days)}d_"
+        f"weekly_skdj_history_completeness_audit_v5_8_{int(backtest_days)}d_"
         f"p{int(min_price)}_mv{int(min_mv)}.zip")
     completed_available = False
     if os.path.exists(result_path):
@@ -4020,7 +4197,7 @@ def main() -> None:
             clear_job_active(request_signature)
             st.success("发现相同参数的已完成结果，可直接下载。")
             render_download(
-                saved_result, result_name, f"v57_saved_{request_signature}")
+                saved_result, result_name, f"v58_saved_{request_signature}")
         except Exception as exc:
             st.warning(f"旧结果读取失败：{exc}")
 
@@ -4029,14 +4206,14 @@ def main() -> None:
         token = secret_token
         st.caption("已从Streamlit Secrets读取TUSHARE_TOKEN。")
     else:
-        token = st.text_input("Tushare Token", type="password", key="v57_token")
+        token = st.text_input("Tushare Token", type="password", key="v58_token")
 
     job_active = is_job_active(request_signature)
     left, right = st.columns(2)
     with left:
-        start_clicked = st.button("开始/重新运行V5.7", type="primary", key="v57_run")
+        start_clicked = st.button("开始/重新运行V5.8", type="primary", key="v58_run")
     with right:
-        stop_clicked = st.button("停止自动续跑", disabled=not job_active, key="v57_stop")
+        stop_clicked = st.button("停止自动续跑", disabled=not job_active, key="v58_stop")
     if stop_clicked:
         clear_job_active(request_signature)
         st.success("已停止；逐股票检查点保留。")
@@ -4078,9 +4255,8 @@ def main() -> None:
         "stamp_duty_pct": float(stamp_duty_pct),
         "transfer_fee_pct": float(transfer_fee_pct),
     }
-    # 候选事件字段和计算口径与V5.6.1完全相同，故有意复用旧签名与逐股票检查点。
-    # request_signature仍包含V5.7版本号，最终结果不会与旧版混在一起。
-    run_signature = stable_signature({"version": EVENT_CACHE_VERSION, **config})
+    # 200周预热会改变历史周期完整度，必须使用V5.8独立检查点。
+    run_signature = stable_signature({"version": VERSION, **config})
 
     try:
         with st.spinner("加载交易日历和历史科技池..."):
@@ -4184,22 +4360,27 @@ def main() -> None:
     eligible = add_v57_explosion_rankings(eligible)
     eligible = add_explosion_labels(eligible)
     feature_status = st.empty()
-    with st.spinner("冻结七套排名，并执行V5.7爆发力验收..."):
-        feature_status.caption("1/6 复现共同候选池与三套旧排名...")
+    with st.spinner("冻结V5.7七套排名，并执行历史完整度审计..."):
+        feature_status.caption("1/8 复现共同候选池与V5.7七套排名...")
         score_rules = frozen_score_definitions()
         challenger_rules = challenger_score_definitions()
         v57_rules = v57_ranking_definitions()
+        v58_rules = v58_history_definitions()
         explosion_definitions = explosion_class_definitions()
-        feature_status.caption("2/6 生成四套预先冻结的新排名...")
+        feature_status.caption("2/8 生成两套历史完整度修正排名...")
         rank_cohorts = scheme_rank_cohort_audit(eligible, periods)
-        feature_status.caption("3/6 汇总P1/P2/P3/PX特征层...")
+        feature_status.caption("3/8 汇总历史有效周期0/1/2/3次...")
+        history_completeness = v58_history_completeness_audit(eligible, periods)
+        feature_status.caption("4/8 汇总P1/P2/P3/PX特征层...")
         feature_tiers = v57_feature_tier_audit(eligible, periods)
-        feature_status.caption("4/6 检验三仓至少两只A/S与B级补位...")
+        feature_status.caption("5/8 检验九套排名的三仓表现...")
         top3_explosion = top3_explosion_portfolio_audit(eligible, periods)
-        feature_status.caption("5/6 按预设门槛与V5.4比较...")
+        feature_status.caption("6/8 复核V5.7冻结验收...")
         acceptance = v57_rank_acceptance_audit(top3_explosion)
+        feature_status.caption("7/8 比较完整度修正与冻结父方案...")
+        history_acceptance = v58_history_rank_acceptance_audit(top3_explosion)
         explosion_classes = explosion_class_audit(eligible, periods)
-        feature_status.caption("6/6 生成周历和精简候选明细...")
+        feature_status.caption("8/8 生成周历和精简候选明细...")
         ranked_calendar = weekly_rank_calendar(
             calendar, scored_all, eligible, split_end)
         slim_candidates = slim_discovery_candidates(eligible)
@@ -4239,6 +4420,18 @@ def main() -> None:
                 eligible_n, "H2_Top3").sum()),
             "V5.4历史优先层事件": int(
                 eligible_n["H2_Tier_Level"].astype(str).eq("S").sum()),
+            "历史完整3次事件": int(numeric(
+                eligible_n, "H2_History_Valid_Count").ge(3).sum()),
+            "历史部分2次事件": int(numeric(
+                eligible_n, "H2_History_Valid_Count").eq(2).sum()),
+            "历史部分1次事件": int(numeric(
+                eligible_n, "H2_History_Valid_Count").eq(1).sum()),
+            "历史无有效周期事件": int(numeric(
+                eligible_n, "H2_History_Valid_Count").eq(0).sum()),
+            "V5.8完整H2优先层事件": int(
+                eligible_n["H2C_Tier_Level"].astype(str).eq("S").sum()),
+            "V5.8完整H2前3事件": int(true_mask(
+                eligible_n, "H2C_Top3").sum()),
             "V5.7双优P1事件": int(
                 eligible_n["V57_Factor_Tier"].astype(str).eq("P1").sum()),
             "V5.7单优P2事件": int(
@@ -4255,6 +4448,8 @@ def main() -> None:
                 eligible_n, "V57_Dual_Top3").sum()),
             "V5.7_双因子H2前3事件": int(true_mask(
                 eligible_n, "V57_DualH2_Top3").sum()),
+            "V5.8_双因子完整H2前3事件": int(true_mask(
+                eligible_n, "V58_DualH2C_Top3").sum()),
             "爆发S级事件": int(eligible_n[
                 "Explosion_Class_W8"].astype(str).eq("S").sum()),
             "爆发A级事件": int(eligible_n[
@@ -4291,7 +4486,7 @@ def main() -> None:
         rejected = group[~true_mask(group, "Hard_Pass")]
         for reason, count in rejected["Hard_Reject_Reason"].fillna("未知").value_counts().items():
             hard_rejections.append({
-                "层级": "V5.7冻结共同硬条件", "SKDJ_N": n,
+                "层级": "V5.8冻结共同硬条件", "SKDJ_N": n,
                 "剔除原因": reason, "次数": int(count)})
     historical_rejections = [{
         "层级": "历史时点基础过滤", "SKDJ_N": "全部",
@@ -4305,13 +4500,16 @@ def main() -> None:
         ("数据窗口", f"正式{int(backtest_days)}个交易日；开始前{WARMUP_WEEKS}周预热；截止后观察W1-W12"),
         ("成熟样本", "旧排名和爆发力主审计使用完整W8样本；W12只作补充生命周期观察，不要求与W8表现一致"),
         ("历史价格市值过滤", f"信号日股价≥{float(min_price):g}元、流通市值≥{float(min_mv):g}亿元"),
-        ("七方案共同硬条件", f"信号前连续处于25下方1～{MAX_BOTTOM_STREAK}周；超过5周不进入排名"),
-        ("事件检查点", "候选事件字段与V5.6.1完全相同，故复用V5.6.1逐股票检查点；结果ZIP和运行状态仍与V5.7隔离"),
+        ("九方案共同硬条件", f"信号前连续处于25下方1～{MAX_BOTTOM_STREAK}周；超过5周不进入排名"),
+        ("事件检查点", "200周预热改变历史周期完整度，V5.8使用独立逐股票检查点；覆盖足够长区间的通用行情缓存仍可复用"),
         ("原评分基准", "V5.1.1冻结100分原样保留；新单因子排序仅用它破同值，新双因子排序仅在更高优先规则都相同时使用"),
         ("原评分结构", "SKDJ重置35、量能20、周K线结构20、MA20趋势15、同周价格市值百分位10"),
         ("V5.2对照", "保留上一版共振S/A/B/C定义和同层原评分排序；已删除V5.2强权重线性100分"),
         ("V5.4历史二层", "最近3次已完成金叉至少2次达到75线进入优先层；2次和3次同级，其余进入普通层；板块共振不参与等级"),
         ("V5.4同层规则", "同一层内先按V5.1.1冻结100分降序；最近一次金叉峰值只用于原分相同时破同分"),
+        ("历史有效周期", "只统计当前信号以前已经出现死叉、完整结束的K/D金叉周期；分别标记0/1/2/3次"),
+        ("V5.8完整历史H2", "只有有效周期=3且其中至少2次达到75才进入S层；完整但不足2次为C层；历史不足为PX层"),
+        ("V5.8双因子完整H2", "保持V5.7的P1/P2/P3/PX顺序；同一特征层内依次按完整历史H2、两因子百分位和、原100分排序"),
         ("V5.7确认特征一", "K动能相对股价扩张效率越低越好；只在同参数同信号周内部比较，优秀20%为有利状态"),
         ("V5.7确认特征二", "所属行业MA20上升比例越高越好；只在同参数同信号周内部比较，优秀20%为有利状态"),
         ("V5.7单因子排名", "分别按K效率由低到高、行业MA20广度由高到低；冻结100分只破同值，不做温和加分"),
@@ -4325,14 +4523,15 @@ def main() -> None:
         ("主评价目标", "S级比例、A/S比例、前三至少两只A/S周比例、W8最大浮盈；四项共同判卷，不用期末小幅稳定盈利替代爆发力"),
         ("辅助评价目标", "W8期末收益、+10、较小不利波动和W12结果只作解释，不参与入选判定；不要求W1至W12平滑或前后段收益相同"),
         ("候选宽度", "全部宽度、1至5、6至15、16至25、超过25只分别报告；不改变候选和排名"),
-        ("预设验收", "四套新排名统一与V5.4比较；总体四项至少改善3项且双A/S周提高至少3个百分点，前后段各至少改善2项，并限制分段退化"),
+        ("V5.7预设验收", "四套V5.7排名继续统一与V5.4比较，不因延长历史后出现的新结果改变门槛"),
+        ("V5.8完整度验收", "完整H2与V5.4比较；双因子完整H2与V5.7双因子H2比较；总体至少改善3项且前后段各至少改善2项才支持"),
         ("三仓验收", "同时报告前三名个股A/S比例、每周至少两只A/S比例，以及候选池本来存在至少两只A/S时的命中率；不以单一平均胜率代替组合检验"),
         ("防未来数据", "买入后结果只用于判卷；全部特征在信号周收盘时已经可知"),
         ("历史过滤", "每个信号日使用当时科技行业归属、股价和流通市值"),
         ("买入", "信号完整周结束后的下一市场交易日开盘"),
         ("成本", "买卖0.2%滑点、佣金、过户费；卖出另计印花税"),
         ("先后顺序", "同一天同时触及止盈和-10%时保守计为-10%先；W8和W12分别独立计算"),
-        ("本版边界", "不加入基本面、不修改硬条件、不重新搜索31项特征、不改变三套旧排名、不研究止损止盈"),
+        ("本版边界", "不加入基本面或新指标、不修改硬条件、不重新搜索31项特征、不调旧排名权重、不研究止损止盈"),
         ("运行环境", f"Streamlit {streamlit_version}；运行稳定版要求requirements锁定1.61.0"),
     ], columns=["项目", "说明"])
     score_rules_export = pd.concat([
@@ -4340,20 +4539,23 @@ def main() -> None:
         challenger_rules.assign(规则组="V5.2/V5.4冻结分层"),
     ], ignore_index=True, sort=False)
     files = {
-        "01_run_summary_v5_7.csv": run_summary,
-        "02_v57_predeclared_acceptance_v5_7.csv": acceptance,
-        "03_v57_rank_definitions_v5_7.csv": v57_rules,
-        "04_v57_feature_tier_outcomes_v5_7.csv": feature_tiers,
-        "05_all_rank_top3_two_winner_audit_v5_7.csv": top3_explosion,
-        "06_all_rank_cohort_outcomes_v5_7.csv": rank_cohorts,
-        "07_explosion_class_definitions_v5_7.csv": explosion_definitions,
-        "08_explosion_class_outcomes_v5_7.csv": explosion_classes,
-        "09_weekly_candidate_calendar_v5_7.csv": ranked_calendar,
-        "10_slim_w8_candidates_with_v57_ranks.csv": slim_candidates,
-        "11_frozen_old_rules_v5_7.csv": score_rules_export,
-        "12_rejection_audit_v5_7.csv": rejection_audit,
-        "13_metadata_v5_7.csv": metadata,
-        "14_api_errors_v5_7.csv": pd.DataFrame({"错误": API_ERRORS}),
+        "01_run_summary_v5_8.csv": run_summary,
+        "02_history_completeness_outcomes_v5_8.csv": history_completeness,
+        "03_history_complete_rank_acceptance_v5_8.csv": history_acceptance,
+        "04_history_completeness_definitions_v5_8.csv": v58_rules,
+        "05_v57_predeclared_acceptance_recheck_v5_8.csv": acceptance,
+        "06_v57_rank_definitions_frozen_v5_8.csv": v57_rules,
+        "07_v57_feature_tier_outcomes_v5_8.csv": feature_tiers,
+        "08_all_nine_rank_top3_two_winner_audit_v5_8.csv": top3_explosion,
+        "09_all_nine_rank_cohort_outcomes_v5_8.csv": rank_cohorts,
+        "10_explosion_class_definitions_v5_8.csv": explosion_definitions,
+        "11_explosion_class_outcomes_v5_8.csv": explosion_classes,
+        "12_weekly_candidate_calendar_v5_8.csv": ranked_calendar,
+        "13_slim_w8_candidates_with_history_completeness_v5_8.csv": slim_candidates,
+        "14_frozen_old_rules_v5_8.csv": score_rules_export,
+        "15_rejection_audit_v5_8.csv": rejection_audit,
+        "16_metadata_v5_8.csv": metadata,
+        "17_api_errors_v5_8.csv": pd.DataFrame({"错误": API_ERRORS}),
     }
     result_zip = make_zip(files)
     try:
@@ -4373,20 +4575,27 @@ def main() -> None:
         f"结果{'已保存' if persisted else '仅当前页面可下载'}。")
     st.subheader("N=6 / N=7 / N=9运行摘要")
     render_plain_table(run_summary)
-    st.subheader("N=6四套新排名的预设验收")
+    st.subheader("N=6历史完整度分布与表现")
+    render_plain_table(history_completeness[
+        history_completeness["SKDJ_N"].eq(6)
+        & history_completeness["时间分段"].isin(
+            ["全部区间", "前段观察", "后段冻结检验"])], 30)
+    st.subheader("N=6两套历史完整度修正验收")
+    render_plain_table(history_acceptance, 20)
+    st.subheader("N=6四套V5.7排名的冻结验收复核")
     render_plain_table(acceptance, 20)
     st.subheader("N=6双因子P1/P2/P3分层表现")
     render_plain_table(feature_tiers[
         feature_tiers["SKDJ_N"].eq(6)
         & feature_tiers["时间分段"].isin(
             ["全部区间", "前段观察", "后段冻结检验"])], 30)
-    st.subheader("N=6七套排名的三仓爆发力")
+    st.subheader("N=6九套排名的三仓爆发力")
     render_plain_table(top3_explosion[
         top3_explosion["SKDJ_N"].eq(6)
         & top3_explosion["时间分段"].isin(
             ["全部区间", "前段观察", "后段冻结检验"])], 30)
-    st.caption("ZIP仅保留14个判卷文件；不再重复导出31项发现审计、巨大行业面板和W12逐条明细。")
-    render_download(result_zip, result_name, f"v57_current_{request_signature}")
+    st.caption("结果ZIP保留17个审计文件；核心新增是历史完整度分组和两套修正排名，不重复31项特征发现。")
+    render_download(result_zip, result_name, f"v58_current_{request_signature}")
 
 
 if __name__ == "__main__":
