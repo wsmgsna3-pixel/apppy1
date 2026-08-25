@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""周线SKDJ提前买入、状态确认与选择性重入审计 V6.4。
+"""周线SKDJ提前试仓、状态确认与仓位升级审计 V6.5。
 
 本版根据V6.1结果，把周线N=6 SKDJ K位于15～25定义为观察池，并独立扫描
 日线MACD红柱周期内股价自红柱起点首次上涨3%、5%、8%和10%的四个强度确认
@@ -10,11 +10,10 @@
 共同样本，分别模拟第2、3、4、5日买入。该组使用了未来“能持续到第5日”的
 信息，只用于公平比较等待代价，绝不作为实盘规则或实时候选。
 
-V6.4沿用3%提前买点，但不再把任何一次周线K上穿25都视为同等确认。程序在
-确认日按日线MACD状态和本轮累计涨幅分为高质量确认、普通确认与已涨超30%的
-早仓利润保护组；14日超时退出后，只允许后来出现“红柱扩张且已涨10～30%”
-的高质量确认重新买入。同时比较普通确认立即退出、红柱剩余10/20/30%退出，
-并统计选择性重入究竟填补了多少原本没有3%新信号的星期。
+V6.5沿用V6.4完全相同的事件引擎，把3%提前买点改为试仓，并验证完整的仓位
+生命周期：14日内高质量确认才补足仓位，普通确认只保留试仓，已涨超30%只
+保护早仓而不追买，14日未确认退出，迟到的高质量确认允许满仓重入。程序同时
+比较1/3试仓、1/2试仓与100%直接买入，避免把单纯降低仓位误判成选股改善。
 """
 from __future__ import annotations
 
@@ -123,14 +122,19 @@ COHORT_RED_AGES = (2, 3, 4, 5)
 STRENGTH_MIN_REMAINING_PCT = 75.0
 STRENGTH_MAX_PRIOR_RALLY_PCT = 30.0
 
-# V6.4 state-aware lifecycle audit.  Internal v63 helper names are retained to
+# V6.5 staged-position lifecycle audit.  Internal v63/v64 helper names are
+# retained to
 # minimize regression risk; the final ``main`` is the only entry point.
-V63_TITLE = "周线SKDJ提前买入、状态确认与选择性重入审计 V6.4"
-V63_VERSION = "V6.4-SKDJ-STATE-CONFIRMATION-SELECTIVE-REENTRY"
-V63_UI_PATCH = "V6.4-3PCT-ENTRY-STATE-CONFIRM-SELECTIVE-REENTRY-MACD-EXIT"
+# The stock-level event rows are byte-compatible with V6.4, so its checkpoint
+# signature and directory are deliberately reused.  Results/jobs use new V6.5
+# directories and cannot collide with a completed V6.4 result.
+V63_TITLE = "周线SKDJ提前试仓、状态确认与仓位升级审计 V6.5"
+V63_VERSION = "V6.5-SKDJ-STAGED-POSITION-CONFIRMATION-LIFECYCLE"
+V63_UI_PATCH = "V6.5-TRIAL-POSITION-HIGH-CONFIRM-UPGRADE-LATE-HIGH-REENTRY"
+V65_EVENT_ENGINE_VERSION = "V6.4-SKDJ-STATE-CONFIRMATION-SELECTIVE-REENTRY"
 V63_CHECKPOINT_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_4_checkpoints")
-V63_RESULT_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_4_results")
-V63_JOB_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_4_jobs")
+V63_RESULT_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_5_results")
+V63_JOB_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_5_jobs")
 V63_CONFIRM_DEADLINES = (7, 14)
 V63_REENTRY_WINDOW_DAYS = 42
 V63_STRENGTH_THRESHOLD = 3.0
@@ -143,6 +147,7 @@ V64_CROSS_ORDINARY = "普通确认_不加仓"
 V64_CROSS_OVERHEATED = "已涨超过30_早仓保护_禁止新追"
 V64_CROSS_NONE = "42日内未确认"
 V64_POST_CROSS_REMAINING = (10.0, 20.0, 30.0)
+V65_TRIAL_WEIGHTS = (1.0 / 3.0, 1.0 / 2.0)
 
 CORE_TECH_L1 = {"电子", "计算机", "通信", "国防军工"}
 EXTENDED_TECH_L1 = {"机械设备", "电力设备", "医药生物", "汽车", "基础化工", "有色金属", "建筑材料"}
@@ -7779,7 +7784,7 @@ def analyze_stock_v63(
         code, config["data_start"], config["market_end"], daily,
         cached_basic, storage_path, use_cache, api_pause)
     if basic.empty:
-        rejects["存在V6.4信号但daily_basic缺失"] = estimated
+        rejects["存在V6.5信号但daily_basic缺失"] = estimated
         return [], rejects, {}
     cross_dates = weekly_crosses["trade_date"].astype(str).sort_values().tolist()
     outcome_cache: dict[str, dict[str, Any]] = {}
@@ -8110,8 +8115,12 @@ def v63_reentry_summary(early: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     for deadline in V63_CONFIRM_DEADLINES:
         prefix = f"Confirm{int(deadline)}_"
-        has_reentry = early[f"{prefix}Reentry_Signal_Date"].astype(str).str.len().gt(0)
-        mature = true_mask(early, f"{prefix}Reentry_Has_40D")
+        has_reentry = early[f"{prefix}Reentry_Signal_Date"].map(
+            normalize_date).str.len().gt(0)
+        # V6.4 did not export a Confirm*_Reentry_Has_40D field.  A finite
+        # 40-day close return is the authoritative maturity flag.
+        mature = numeric(
+            early, f"{prefix}Reentry_Close_Return_Net_pct").notna()
         classes = early[f"{prefix}Reentry_Class_40D"].astype(str)
         combined = numeric(early, f"{prefix}Combined_Return_Net_pct")
         rows.append({
@@ -8243,6 +8252,209 @@ def v64_add_state_lifecycle_columns(early: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
+def v65_add_staged_position_columns(early: pd.DataFrame) -> pd.DataFrame:
+    """Build capital-level trial/add/reentry paths from observable states.
+
+    The first leg uses only ``trial_weight`` of starting capital.  An on-time
+    high-quality confirmation adds the unused capital at the next tradable
+    open and measures that added leg over its own 40-market-day window.  A
+    14-day timeout closes only the trial leg; if a late high-quality
+    confirmation arrives, the then-current whole account is re-entered.  This
+    keeps parallel adds additive and sequential reentries compounded.
+    """
+    result = early.copy()
+    confirm14 = true_mask(result, "Confirm14_Confirmed")
+    state = result["Future_Cross_State"].fillna(V64_CROSS_NONE).astype(str)
+    high = state.eq(V64_CROSS_HIGH)
+    ordinary = state.eq(V64_CROSS_ORDINARY)
+    overheated = state.eq(V64_CROSS_OVERHEATED)
+    no_cross = state.eq(V64_CROSS_NONE)
+    on_time_high = confirm14 & high
+    late_high = ~confirm14 & high
+
+    action = pd.Series("", index=result.index, dtype=object)
+    action.loc[confirm14 & high] = "14日内高质量确认_试仓升级"
+    action.loc[confirm14 & ordinary] = "14日内普通确认_只保留试仓"
+    action.loc[confirm14 & overheated] = "14日内已涨超30_保护试仓不追买"
+    action.loc[~confirm14 & late_high] = "14日退出_迟到高质量确认可重入"
+    action.loc[~confirm14 & ordinary] = "14日退出_迟到普通确认不重入"
+    action.loc[~confirm14 & overheated] = "14日退出_迟到且已涨超30不追买"
+    action.loc[~confirm14 & no_cross] = "14日退出_42日仍未确认"
+    action.loc[action.eq("")] = "其他_仅保留试仓"
+    result["V65_Lifecycle_Action"] = action
+
+    base_return = numeric(result, "Entry_Close_Return_Net_pct")
+    gate_return = numeric(result, "Confirm14_Strategy_Return_Net_pct")
+    gate_hold = numeric(result, "Confirm14_Strategy_Hold_Market_Days")
+    add_return = numeric(result, "CrossEntry_Close_Return_Net_pct")
+    late_reentry_return = numeric(
+        result, "Selective_Reentry14_Close_Return_Net_pct")
+
+    result["Lifecycle_V65_FullUpfront_Return_Net_pct"] = base_return
+    result["Lifecycle_V65_FullUpfront_Capital_Exposure_Days"] = 40.0
+    result["Lifecycle_V65_FullUpfront_Peak_Capital_Weight"] = 1.0
+    result["Lifecycle_V65_FullUpfront_Round_Trips"] = 1.0
+    result["Lifecycle_V65_FullUpfront_High_Upgrade_Used"] = False
+    result["Lifecycle_V65_FullUpfront_Late_High_Reentry_Used"] = False
+
+    def add_variant(key: str, trial_weight: float,
+                    allow_late_high_reentry: bool) -> None:
+        returns = pd.Series(np.nan, index=result.index, dtype=float)
+        exposure = pd.Series(np.nan, index=result.index, dtype=float)
+        peak_weight = pd.Series(np.nan, index=result.index, dtype=float)
+        round_trips = pd.Series(np.nan, index=result.index, dtype=float)
+
+        confirmed_base = confirm14 & base_return.notna()
+        timeout_base = ~confirm14 & gate_return.notna()
+        returns.loc[confirmed_base] = (
+            float(trial_weight) * base_return.loc[confirmed_base])
+        returns.loc[timeout_base] = (
+            float(trial_weight) * gate_return.loc[timeout_base])
+        exposure.loc[confirmed_base] = float(trial_weight) * 40.0
+        exposure.loc[timeout_base] = (
+            float(trial_weight) * gate_hold.loc[timeout_base])
+        initial_valid = confirmed_base | timeout_base
+        peak_weight.loc[initial_valid] = float(trial_weight)
+        round_trips.loc[initial_valid] = 1.0
+
+        upgrade_used = (
+            on_time_high & base_return.notna() & add_return.notna())
+        returns.loc[upgrade_used] = (
+            float(trial_weight) * base_return.loc[upgrade_used]
+            + (1.0 - float(trial_weight)) * add_return.loc[upgrade_used])
+        exposure.loc[upgrade_used] = 40.0
+        peak_weight.loc[upgrade_used] = 1.0
+        round_trips.loc[upgrade_used] = 2.0
+
+        reentry_used = pd.Series(False, index=result.index, dtype=bool)
+        if allow_late_high_reentry:
+            reentry_used = (
+                late_high & gate_return.notna() & late_reentry_return.notna())
+            pre_reentry_multiplier = (
+                1.0 + float(trial_weight)
+                * gate_return.loc[reentry_used] / 100.0)
+            returns.loc[reentry_used] = (
+                pre_reentry_multiplier
+                * (1.0 + late_reentry_return.loc[reentry_used] / 100.0)
+                - 1.0) * 100.0
+            exposure.loc[reentry_used] = (
+                float(trial_weight) * gate_hold.loc[reentry_used] + 40.0)
+            peak_weight.loc[reentry_used] = 1.0
+            round_trips.loc[reentry_used] = 2.0
+
+        prefix = f"Lifecycle_V65_{key}_"
+        result[f"{prefix}Return_Net_pct"] = returns
+        result[f"{prefix}Capital_Exposure_Days"] = exposure
+        result[f"{prefix}Peak_Capital_Weight"] = peak_weight
+        result[f"{prefix}Round_Trips"] = round_trips
+        result[f"{prefix}High_Upgrade_Used"] = upgrade_used
+        result[f"{prefix}Late_High_Reentry_Used"] = reentry_used
+
+    for weight in V65_TRIAL_WEIGHTS:
+        number = int(round(weight * 100.0))
+        add_variant(f"Trial{number}UpgradeNoReentry", weight, False)
+        add_variant(f"Trial{number}UpgradeLateHigh", weight, True)
+    return result
+
+
+V65_STAGED_SCHEMES = (
+    ("100%提前买入固定40日", "FullUpfront"),
+    ("1/3试仓_高质量补满_不重入", "Trial33UpgradeNoReentry"),
+    ("1/3试仓_高质量补满_迟到高质量满仓重入",
+     "Trial33UpgradeLateHigh"),
+    ("1/2试仓_高质量补满_不重入", "Trial50UpgradeNoReentry"),
+    ("1/2试仓_高质量补满_迟到高质量满仓重入",
+     "Trial50UpgradeLateHigh"),
+)
+
+
+def v65_staged_position_summary(early: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for label, key in V65_STAGED_SCHEMES:
+        prefix = f"Lifecycle_V65_{key}_"
+        returns = numeric(early, f"{prefix}Return_Net_pct").dropna()
+        if returns.empty:
+            continue
+        source = early.loc[returns.index]
+        exposure = numeric(source, f"{prefix}Capital_Exposure_Days")
+        peak = numeric(source, f"{prefix}Peak_Capital_Weight")
+        trips = numeric(source, f"{prefix}Round_Trips")
+        upgrades = true_mask(source, f"{prefix}High_Upgrade_Used")
+        reentries = true_mask(source, f"{prefix}Late_High_Reentry_Used")
+        mean_exposure = exposure.mean()
+        equivalent_40d_return = (
+            returns.mean() * 40.0 / mean_exposure
+            if math.isfinite(mean_exposure) and mean_exposure > 0 else np.nan)
+        rows.append({
+            "资金生命周期方案": label,
+            "有结果事件": len(returns),
+            "实际收益均值%": returns.mean(),
+            "实际收益中位%": returns.median(),
+            "实际盈利比例%": returns.gt(0).mean() * 100.0,
+            "实际达到10%比例%": returns.ge(10).mean() * 100.0,
+            "实际达到20%比例%": returns.ge(20).mean() * 100.0,
+            "实际达到30%比例%": returns.ge(30).mean() * 100.0,
+            "实际亏损10%以上比例%": returns.le(-10).mean() * 100.0,
+            "收益第10分位%": returns.quantile(0.10),
+            "最差10%平均收益%": returns[returns.le(
+                returns.quantile(0.10))].mean(),
+            "收益标准差%": returns.std(ddof=0),
+            "平均峰值资金占用%": peak.mean() * 100.0,
+            "平均资本暴露日": mean_exposure,
+            "粗略40日等效资本收益%": equivalent_40d_return,
+            "高质量确认补仓事件": int(upgrades.sum()),
+            "迟到高质量满仓重入事件": int(reentries.sum()),
+            "平均完整交易腿数": trips.mean(),
+        })
+    return pd.DataFrame(rows)
+
+
+def v65_action_outcome_summary(early: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for action, group in early.groupby("V65_Lifecycle_Action", dropna=False):
+        classes = group["Explosion_Class_40D"].astype(str)
+        early_return = numeric(group, "Entry_Close_Return_Net_pct")
+        row: dict[str, Any] = {
+            "生命周期动作": action,
+            "事件数": len(group),
+            "不同股票": group["ts_code"].nunique(),
+            "信号周": group["Signal_Week"].nunique(),
+            "原早仓S级比例%": classes.eq("S").mean() * 100.0,
+            "原早仓A或S比例%": classes.isin(["S", "A"]).mean() * 100.0,
+            "原早仓B级以上比例%": classes.isin(
+                ["S", "A", "B"]).mean() * 100.0,
+            "原早仓F级比例%": classes.eq("F").mean() * 100.0,
+            "原早仓40日收益均值%": early_return.mean(),
+            "原早仓40日收益中位%": early_return.median(),
+            "原早仓最大浮盈中位%": numeric(
+                group, "Entry_MFE_Net_pct").median(),
+            "原早仓最大回撤均值%": numeric(
+                group, "Entry_MAE_Raw_pct").mean(),
+        }
+        for label, key in V65_STAGED_SCHEMES[1:]:
+            values = numeric(
+                group, f"Lifecycle_V65_{key}_Return_Net_pct")
+            short = "33%含重入" if key == "Trial33UpgradeLateHigh" else (
+                "33%不重入" if key == "Trial33UpgradeNoReentry" else (
+                    "50%含重入" if key == "Trial50UpgradeLateHigh"
+                    else "50%不重入"))
+            row[f"{short}收益均值%"] = values.mean()
+            row[f"{short}收益中位%"] = values.median()
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def v65_staged_year_summary(early: pd.DataFrame) -> pd.DataFrame:
+    parts: list[pd.DataFrame] = []
+    years = early["Signal_Date"].astype(str).str[:4]
+    for year, group in early.groupby(years):
+        part = v65_staged_position_summary(group)
+        if not part.empty:
+            part.insert(0, "信号年度", year)
+            parts.append(part)
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+
+
 def v64_realized_strategy_summary(early: pd.DataFrame) -> pd.DataFrame:
     labels = (
         ("提前买入固定40日", "Baseline40"),
@@ -8322,17 +8534,19 @@ def v64_cross_entry_summary(early: pd.DataFrame) -> pd.DataFrame:
 def v64_selective_reentry_summary(early: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     schemes = (
-        ("任意后来上穿25都重入", true_mask(
-            early, "Confirm14_Reentry_Has_40D"), "Confirm14_Reentry_"),
+        ("任意后来上穿25都重入", numeric(
+            early, "Confirm14_Reentry_Close_Return_Net_pct").notna(),
+         "Confirm14_Reentry_", "Confirm14_Combined_Return_Net_pct"),
         ("只在高质量确认时重入", true_mask(
             early, "Selective_Reentry14_Has_40D"),
-         "Selective_Reentry14_"),
+         "Selective_Reentry14_",
+         "Selective_Reentry14_Combined_Return_Net_pct"),
     )
-    for label, mask, prefix in schemes:
+    for label, mask, prefix, combined_column in schemes:
         group = early[mask].copy()
         classes = group[f"{prefix}Class_40D"].astype(str)
-        combined = numeric(group, f"{prefix}Combined_Return_Net_pct")
-        signal_dates = group[f"{prefix}Signal_Date"].astype(str)
+        combined = numeric(group, combined_column)
+        signal_dates = group[f"{prefix}Signal_Date"].map(normalize_date)
         rows.append({
             "重入方案": label, "成熟重入事件": len(group),
             "不同股票": group["ts_code"].nunique(),
@@ -8376,7 +8590,7 @@ def v64_reentry_week_coverage(
             reentry_events = 0
             reentry_weeks: set[str] = set()
         else:
-            dates = early[column].astype(str)
+            dates = early[column].map(normalize_date)
             dates = dates[
                 dates.str.len().eq(8) & dates.between(start_date, end_date)]
             reentry_events = len(dates)
@@ -8411,13 +8625,13 @@ def v64_live_lifecycle_status(
             on_time = delay <= V64_PRIMARY_CONFIRM_DAYS or to_bool(
                 row.get("Confirm14_Confirmed"))
             if on_time and state == V64_CROSS_HIGH:
-                statuses.loc[index] = "14日内高质量确认_继续持有或加仓"
+                statuses.loc[index] = "14日内高质量确认_试仓升级满仓"
             elif on_time and state == V64_CROSS_OVERHEATED:
-                statuses.loc[index] = "14日内已涨超30_早仓保护_禁止追买"
+                statuses.loc[index] = "14日内已涨超30_保护试仓_禁止追买"
             elif on_time:
-                statuses.loc[index] = "14日内普通确认_不加仓"
+                statuses.loc[index] = "14日内普通确认_只保留试仓"
             elif state == V64_CROSS_HIGH:
-                statuses.loc[index] = "14日退出后高质量确认_允许选择性重入"
+                statuses.loc[index] = "14日退出后高质量确认_允许满仓重入"
             else:
                 statuses.loc[index] = "14日退出后非高质量确认_禁止重入"
             continue
@@ -8520,7 +8734,7 @@ def v63_clear_job_active(signature: str) -> None:
         if os.path.exists(path):
             os.remove(path)
     except OSError as exc:
-        record_error(f"V6.4任务标记清除失败: {exc}")
+        record_error(f"V6.5任务标记清除失败: {exc}")
 
 
 def v63_is_job_active(signature: str) -> bool:
@@ -8547,7 +8761,7 @@ def v63_load_checkpoint(signature: str, ts_code: str) -> dict[str, Any] | None:
             return None
         return payload
     except Exception as exc:
-        record_error(f"V6.4检查点损坏 {ts_code}: {exc}")
+        record_error(f"V6.5检查点损坏 {ts_code}: {exc}")
         return None
 
 
@@ -8566,14 +8780,15 @@ def main() -> None:
     st.title(V63_TITLE)
     streamlit_version = str(getattr(st, "__version__", "unknown"))
     st.caption(f"{V63_UI_PATCH}｜Streamlit {streamlit_version}")
-    with st.expander("V6.4验证口径", expanded=True):
+    with st.expander("V6.5验证口径", expanded=True):
         st.markdown(f"""
-- **唯一提前买点**：最近完整周N=6、M=3的SKDJ K位于{EARLY_WEEKLY_K_MIN:g}～{EARLY_WEEKLY_K_MAX:g}；日线MACD红柱扩张或剩余强度≥{STRENGTH_MIN_REMAINING_PCT:g}%；本轮股价首次达到+{V63_STRENGTH_THRESHOLD:g}%后，下一市场交易日开盘买入。
-- **主确认期限**：提前买入后观察{V64_PRIMARY_CONFIRM_DAYS}自然日。未上穿25则在期限后的下一只可交易开盘退出；7日结果只保留为速度对照。
-- **确认状态**：上穿25当天，红柱扩张且本轮累计上涨10～30%为高质量确认；累计上涨超过30%属于已有早仓的利润保护组，禁止把它解释为新的追高买点；其余为普通确认。
-- **普通确认退出审计**：分别测试确认后立即退出，以及从确认日开始等待日线MACD红柱翻绿或剩余强度≤10/20/30%再退出。确认前出现过的日线变化不能触发退出。
-- **选择性重入**：14日超时退出后，原信号起{V63_REENTRY_WINDOW_DAYS}自然日内只有后来出现高质量确认才允许重入；“任何上穿25都重入”仅作为失败对照。
-- **空窗检验**：分别统计任意重入和高质量重入真正填补了多少原3%信号空窗周，不把重入伪装成新的候选股票。
+- **唯一提前买点**：最近完整周N=6、M=3的SKDJ K位于{EARLY_WEEKLY_K_MIN:g}～{EARLY_WEEKLY_K_MAX:g}；日线MACD红柱扩张或剩余强度≥{STRENGTH_MIN_REMAINING_PCT:g}%；本轮股价首次达到+{V63_STRENGTH_THRESHOLD:g}%后，下一市场交易日开盘试仓。
+- **试仓对照**：同时测试初始投入1/3和1/2；100%直接买入固定40日只作为基准，不把降低仓位造成的低回撤误判为选股改善。
+- **14日内高质量确认**：周线K上穿25当天，日线红柱扩张且本轮累计上涨10～30%，下一开盘用剩余资金补足至满仓；早仓和补仓腿分别观察40个市场日。
+- **14日内普通确认**：只保留原试仓至40日，不补仓；不再使用已经证明损害爆发收益的“普通确认立即退出”。
+- **已涨超过30%**：只保护已有试仓，不补仓、不把周线确认解释为新追买点。
+- **14日未确认**：期限后的下一只可交易开盘退出试仓。若原信号起{V63_REENTRY_WINDOW_DAYS}自然日内迟到出现高质量确认，使用当时全部可用资金重入；迟到普通确认不重入。
+- **资金计算**：同一时间的试仓与补仓按资本权重相加；退出后重入属于先后两段交易，按账户净值复合；全部计入交易成本。
 - **判卷**：S/A/B仍为40日内先到+30/+20/+10且先于-10，其余为F；所有退出与重入均按当时可见数据和下一可交易开盘执行并计入成本。
 - **缓存**：交易日历和股票基础资料72小时，行业成员7天，逐股票行情与检查点不主动过期；应用重启或重新部署仍可能清空实例内存和临时磁盘。
 """)
@@ -8581,35 +8796,35 @@ def main() -> None:
     with st.sidebar:
         st.header("运行参数")
         backtest_days = st.number_input(
-            "回测交易日数", 100, 1000, 500, 50, key="v64_days")
+            "回测交易日数", 100, 1000, 500, 50, key="v65_days")
         min_price = st.number_input(
             "最低股价（元）", 10.0, 20.0, 10.0, 10.0,
-            format="%.0f", key="v64_min_price")
+            format="%.0f", key="v65_min_price")
         min_mv = st.number_input(
             "最低流通市值（亿元）", 50.0, 100.0, 50.0, 50.0,
-            format="%.0f", key="v64_min_mv")
+            format="%.0f", key="v65_min_mv")
         signal_end_date = st.date_input(
             "历史买入信号截止（40日判卷）", date(2026, 6, 5),
-            key="v64_signal_end")
+            key="v65_signal_end")
         market_end_date = st.date_input(
             "最新信号观察截止（默认今天）", date.today(),
-            key="v64_market_end")
+            key="v65_market_end")
         pause = st.number_input(
-            "接口间隔(秒)", 0.0, 2.0, 0.12, 0.02, key="v64_pause")
+            "接口间隔(秒)", 0.0, 2.0, 0.12, 0.02, key="v65_pause")
         use_cache = st.checkbox(
-            "复用行情和72小时基础缓存", True, key="v64_cache")
-        st.caption("逐股票行情和检查点不设TTL；同参数页面重连会自动续跑。")
+            "复用行情和72小时基础缓存", True, key="v65_cache")
+        st.caption("逐股票行情不设TTL；本版兼容并复用V6.4逐股票检查点。")
         st.divider()
         commission_pct = st.number_input(
             "佣金率(%)", 0.0, 0.20, 0.025, 0.005,
-            format="%.3f", key="v64_commission")
+            format="%.3f", key="v65_commission")
         stamp_duty_pct = st.number_input(
             "卖出印花税率(%)", 0.0, 0.20, 0.05, 0.01,
-            format="%.3f", key="v64_stamp")
+            format="%.3f", key="v65_stamp")
         transfer_fee_pct = st.number_input(
             "过户费率(%)", 0.0, 0.05, 0.001, 0.001,
-            format="%.3f", key="v64_transfer")
-        if st.button("清除V6.4结果和运行状态", key="v64_clear"):
+            format="%.3f", key="v65_transfer")
+        if st.button("清除V6.5结果和运行状态", key="v65_clear"):
             shutil.rmtree(V63_RESULT_DIR, ignore_errors=True)
             shutil.rmtree(V63_JOB_DIR, ignore_errors=True)
             st.success("结果和运行状态已清除；逐股票检查点与行情缓存保留。")
@@ -8628,13 +8843,17 @@ def main() -> None:
         "cross_states": [V64_CROSS_HIGH, V64_CROSS_ORDINARY,
                          V64_CROSS_OVERHEATED],
         "post_cross_remaining": list(V64_POST_CROSS_REMAINING),
+        "trial_weights": list(V65_TRIAL_WEIGHTS),
+        "upgrade_rule": "14d_high_confirm_add_to_full",
+        "ordinary_rule": "keep_trial_only",
+        "timeout_rule": "exit_trial_late_high_full_reentry",
         "score_weights": [V63_SCORE_K_WEIGHT, V63_SCORE_AGE_WEIGHT,
                           V63_SCORE_KD_WEIGHT],
     }
     request_signature = stable_signature(request_payload)
     result_path = os.path.join(V63_RESULT_DIR, f"{request_signature}.zip")
     result_name = (
-        f"weekly_skdj_state_confirmation_reentry_audit_v6_4_"
+        f"weekly_skdj_staged_position_lifecycle_audit_v6_5_"
         f"{int(backtest_days)}d_p{int(min_price)}_mv{int(min_mv)}.zip")
     completed_available = False
     if os.path.exists(result_path):
@@ -8645,7 +8864,7 @@ def main() -> None:
             v63_clear_job_active(request_signature)
             st.success("发现相同参数的已完成结果，可直接下载。")
             render_download(
-                saved_result, result_name, f"v64_saved_{request_signature}")
+                saved_result, result_name, f"v65_saved_{request_signature}")
         except Exception as exc:
             st.warning(f"已保存结果读取失败：{exc}")
 
@@ -8654,15 +8873,15 @@ def main() -> None:
         token = secret_token
         st.caption("已从Streamlit Secrets读取TUSHARE_TOKEN。")
     else:
-        token = st.text_input("Tushare Token", type="password", key="v64_token")
+        token = st.text_input("Tushare Token", type="password", key="v65_token")
     job_active = v63_is_job_active(request_signature)
     left, right = st.columns(2)
     with left:
         start_clicked = st.button(
-            "开始/重新运行V6.4", type="primary", key="v64_run")
+            "开始/重新运行V6.5", type="primary", key="v65_run")
     with right:
         stop_clicked = st.button(
-            "停止自动续跑", disabled=not job_active, key="v64_stop")
+            "停止自动续跑", disabled=not job_active, key="v65_stop")
     if stop_clicked:
         v63_clear_job_active(request_signature)
         st.success("已停止；逐股票检查点保留。")
@@ -8723,7 +8942,10 @@ def main() -> None:
         "stamp_duty_pct": float(stamp_duty_pct),
         "transfer_fee_pct": float(transfer_fee_pct),
     }
-    run_signature = stable_signature({"version": V63_VERSION, **config})
+    # Reuse V6.4 stock-level checkpoints: event generation is unchanged and
+    # V6.5 only adds deterministic post-processing of those rows.
+    run_signature = stable_signature({
+        "version": V65_EVENT_ENGINE_VERSION, **config})
     period_index = build_period_index(memberships)
     active_codes = {
         code for code, code_periods in period_index.items()
@@ -8768,7 +8990,7 @@ def main() -> None:
                         run_signature, code, rows, stock_rejects)
                 except Exception as exc:
                     failures += 1
-                    record_error(f"V6.4逐股票分析失败 {code}: {exc}")
+                    record_error(f"V6.5逐股票分析失败 {code}: {exc}")
         processed = number + 1
         now = time.monotonic()
         if (processed == 1 or now - last_update >= UI_HEARTBEAT_SECONDS
@@ -8788,7 +9010,7 @@ def main() -> None:
 
     events_all = pd.DataFrame(event_rows)
     if events_all.empty:
-        st.error("本区间没有生成V6.4事件。")
+        st.error("本区间没有生成V6.5事件。")
         return
     events_all = v63_attach_breadth_and_rank(events_all, open_dates)
     events_all = events_all.sort_values(
@@ -8823,10 +9045,11 @@ def main() -> None:
         "Weekly_Momentum_Tier"] = "风险组_已涨超过30"
 
     early = v64_add_state_lifecycle_columns(early)
+    early = v65_add_staged_position_columns(early)
 
     overall = timing_outcome_summary(
         mature[mature["Event_Type"].isin(["STRENGTH_3", "WEEKLY_CROSS25"])],
-        ["Event_Type", "Strategy_Label"], "V6.4基础买点")
+        ["Event_Type", "Strategy_Label"], "V6.5基础买点")
     score_audit = timing_outcome_summary(
         early, ["Timing_Score_221"], "2-2-1结构分档")
     three_factor_audit = timing_outcome_summary(
@@ -8843,6 +9066,9 @@ def main() -> None:
     gate_summary = v63_gate_summary(early)
     reentry_summary = v63_reentry_summary(early)
     realized_strategy = v64_realized_strategy_summary(early)
+    staged_position = v65_staged_position_summary(early)
+    staged_action = v65_action_outcome_summary(early)
+    staged_year = v65_staged_year_summary(early)
     cross_state_outcomes = timing_outcome_summary(
         early, ["Cross_Delay_Group", "Future_Cross_State"],
         "提前买入后按确认速度和确认日状态分组")
@@ -8908,9 +9134,13 @@ def main() -> None:
         "高优先级周线事件": len(high_priority_weekly),
         "提前事件后来高质量确认": int(
             early["Future_Cross_State"].eq(V64_CROSS_HIGH).sum()),
+        "14日内高质量补仓资格": int(early[
+            "V65_Lifecycle_Action"].eq("14日内高质量确认_试仓升级").sum()),
+        "迟到高质量满仓重入资格": int(early[
+            "V65_Lifecycle_Action"].eq("14日退出_迟到高质量确认可重入").sum()),
         "14日超时": int((~true_mask(early, "Confirm14_Confirmed")).sum()),
-        "任意金叉成熟重入": int(true_mask(
-            early, "Confirm14_Reentry_Has_40D").sum()),
+        "任意金叉成熟重入": int(numeric(
+            early, "Confirm14_Reentry_Close_Return_Net_pct").notna().sum()),
         "高质量确认成熟重入": int(true_mask(
             early, "Selective_Reentry14_Has_40D").sum()),
         "3%提前信号周": early["Signal_Week"].nunique(),
@@ -8921,24 +9151,25 @@ def main() -> None:
         "行情缓存命中": price_cache_hits, "失败股票": failures,
     }])
     definitions = pd.DataFrame([
-        ("提前买点", "周线K15至25；日线MACD质量合格；本轮首次上涨3%；次日开盘"),
+        ("提前试仓", "周线K15至25；日线MACD质量合格；本轮首次上涨3%；次日开盘"),
+        ("试仓比例", "同时验证1/3和1/2；100%直接买入只作基准"),
         ("主确认期限", "14自然日内上穿25视为按时确认；7日只作速度对照"),
-        ("高质量确认", "上穿日红柱扩张且本轮累计上涨10至30%"),
-        ("普通确认", "不满足高质量且累计上涨未超过30%；不自动加仓"),
-        ("已涨超过30", "已有早仓测试持有或保护；确认后禁止作为新买点追入"),
-        ("普通确认退出", "从确认日开始测试立即退出或MACD剩余10/20/30%退出"),
-        ("选择性重入", "14日退出后只在42日窗口内出现高质量确认才重新买入"),
-        ("失败对照", "14日退出后任何上穿25都重入"),
-        ("空窗统计", "重入与原3%新信号分开，统计实际填补空窗周"),
+        ("高质量确认", "上穿日红柱扩张且本轮累计上涨10至30%；下一开盘补足满仓"),
+        ("普通确认", "不满足高质量且累计上涨未超过30%；只保留试仓至40日"),
+        ("已涨超过30", "只保护已有试仓；不补仓、不追买"),
+        ("未确认退出", "14日仍未上穿25，下一可交易开盘退出试仓"),
+        ("迟到高质量重入", "42日窗口内迟到出现高质量确认，使用全部可用资金重入"),
+        ("迟到普通确认", "不重入"),
+        ("资本核算", "并行试仓与补仓按权重相加；退出后重入按净值复合"),
         ("历史与实时", "历史只到默认20260605并要求40日成熟；以后只展示观察名单"),
-        ("缓存", "交易日历与股票基础资料72小时；行业7天；行情和检查点不设TTL"),
+        ("缓存", "基础缓存72小时；行情不设TTL；逐股票事件复用V6.4检查点"),
     ], columns=["项目", "定义"])
     cache_policy = pd.DataFrame([
         ("交易日历", "Streamlit内存", "72小时", "实例重启可能提前消失"),
         ("股票基础资料", "Streamlit内存", "72小时", "实例重启可能提前消失"),
         ("申万科技行业成员", "Streamlit内存", "7天", "实例重启可能提前消失"),
         ("逐股票日线与daily_basic", "应用临时磁盘", "不自动过期", "重新部署可能清空"),
-        ("V6.4逐股票检查点", "应用临时磁盘", "不自动过期", "参数变化使用新签名"),
+        ("V6.4兼容逐股票检查点", "应用临时磁盘", "不自动过期", "V6.5直接复用相同事件"),
     ], columns=["对象", "位置", "设定时长", "实际边界"])
     rejection_audit = pd.DataFrame([
         {"剔除原因": key, "次数": value} for key, value in sorted(rejects.items())])
@@ -8951,6 +9182,10 @@ def main() -> None:
         "确认期限自然日": "/".join(str(v) for v in V63_CONFIRM_DEADLINES),
         "延迟重入窗口自然日": V63_REENTRY_WINDOW_DAYS,
         "高质量确认": "红柱扩张且累计上涨10至30%",
+        "试仓比例": "/".join(f"{value:.4f}" for value in V65_TRIAL_WEIGHTS),
+        "高质量补仓": "补足至100%",
+        "普通确认": "只保留试仓",
+        "迟到高质量确认": "满仓重入",
         "普通确认退出阈值": "/".join(
             str(int(v)) for v in V64_POST_CROSS_REMAINING),
         "选择性重入": "只允许高质量确认",
@@ -8979,6 +9214,7 @@ def main() -> None:
         "Lead_Calendar_Days_to_Weekly_Cross", "Entry_Date", "Entry_Raw_Open",
         "Future_Cross_State", "Future_Cross_Daily_MACD_State",
         "Future_Cross_Rally_From_Red_Start_pct", "Cross_Delay_Group",
+        "V65_Lifecycle_Action",
         "CrossEntry_Date", "CrossEntry_Tradable", "CrossEntry_Has_40D",
         "CrossEntry_Class_40D", "CrossEntry_MFE_Net_pct",
         "CrossEntry_MAE_Raw_pct", "CrossEntry_Close_Return_Net_pct",
@@ -9051,30 +9287,33 @@ def main() -> None:
     live_watch_export = live_watch[[
         column for column in live_columns if column in live_watch.columns]].copy()
     files = {
-        "01_run_summary_v6_4.csv": run_summary,
-        "02_experiment_definitions_v6_4.csv": definitions,
-        "03_strength3_vs_weekly_outcomes_v6_4.csv": overall,
-        "04_confirmation_exit_7d_14d_v6_4.csv": gate_summary,
-        "05_early_outcomes_by_cross_state_v6_4.csv": cross_state_outcomes,
-        "06_fresh_cross_entry_by_state_v6_4.csv": cross_entry_outcomes,
-        "07_cross_state_by_year_v6_4.csv": cross_state_year,
-        "08_realized_lifecycle_strategy_v6_4.csv": realized_strategy,
-        "09_any_vs_selective_reentry_v6_4.csv": selective_reentry,
-        "10_reentry_week_coverage_v6_4.csv": reentry_week_coverage,
-        "11_confirmation_status_original_grade_v6_4.csv": gate_status_audit,
-        "12_weekly_momentum_priority_v6_4.csv": weekly_momentum,
-        "13_year_stability_v6_4.csv": year_audit,
-        "14_weekly_coverage_summary_v6_4.csv": coverage,
-        "15_weekly_signal_calendar_v6_4.csv": calendar,
-        "16_historical_strength3_lifecycle_detail_v6_4.csv": history_early_export,
-        "17_historical_weekly_control_detail_v6_4.csv": history_weekly_export,
-        "18_recent_14d_strength3_candidates_v6_4.csv": recent_early_export,
-        "19_recent_14d_weekly_candidates_v6_4.csv": recent_weekly_export,
-        "20_latest_market_day_watch_pool_v6_4.csv": live_watch_export,
-        "21_cache_policy_v6_4.csv": cache_policy,
-        "22_rejection_audit_v6_4.csv": rejection_audit,
-        "23_metadata_v6_4.csv": metadata,
-        "24_api_errors_v6_4.csv": pd.DataFrame({"错误": API_ERRORS}),
+        "01_run_summary_v6_5.csv": run_summary,
+        "02_experiment_definitions_v6_5.csv": definitions,
+        "03_staged_position_lifecycle_v6_5.csv": staged_position,
+        "04_staged_lifecycle_by_action_v6_5.csv": staged_action,
+        "05_staged_lifecycle_by_year_v6_5.csv": staged_year,
+        "06_strength3_vs_weekly_outcomes_v6_5.csv": overall,
+        "07_confirmation_exit_7d_14d_v6_5.csv": gate_summary,
+        "08_early_outcomes_by_cross_state_v6_5.csv": cross_state_outcomes,
+        "09_fresh_cross_entry_by_state_v6_5.csv": cross_entry_outcomes,
+        "10_cross_state_by_year_v6_5.csv": cross_state_year,
+        "11_old_lifecycle_controls_v6_5.csv": realized_strategy,
+        "12_any_vs_selective_reentry_v6_5.csv": selective_reentry,
+        "13_reentry_week_coverage_v6_5.csv": reentry_week_coverage,
+        "14_confirmation_status_original_grade_v6_5.csv": gate_status_audit,
+        "15_weekly_momentum_priority_v6_5.csv": weekly_momentum,
+        "16_year_stability_v6_5.csv": year_audit,
+        "17_weekly_coverage_summary_v6_5.csv": coverage,
+        "18_weekly_signal_calendar_v6_5.csv": calendar,
+        "19_historical_strength3_lifecycle_detail_v6_5.csv": history_early_export,
+        "20_historical_weekly_control_detail_v6_5.csv": history_weekly_export,
+        "21_recent_14d_strength3_candidates_v6_5.csv": recent_early_export,
+        "22_recent_14d_weekly_candidates_v6_5.csv": recent_weekly_export,
+        "23_latest_market_day_watch_pool_v6_5.csv": live_watch_export,
+        "24_cache_policy_v6_5.csv": cache_policy,
+        "25_rejection_audit_v6_5.csv": rejection_audit,
+        "26_metadata_v6_5.csv": metadata,
+        "27_api_errors_v6_5.csv": pd.DataFrame({"错误": API_ERRORS}),
     }
     result_zip = make_zip(files)
     try:
@@ -9087,21 +9326,30 @@ def main() -> None:
 
     st.success(
         f"完成：成熟3%提前事件{len(early)}个，周线确认对照{len(weekly)}个；"
-        f"高质量确认{int(early['Future_Cross_State'].eq(V64_CROSS_HIGH).sum())}个，"
-        f"高质量成熟重入{int(true_mask(early, 'Selective_Reentry14_Has_40D').sum())}个；"
+        f"14日内高质量补仓资格"
+        f"{int(early['V65_Lifecycle_Action'].eq('14日内高质量确认_试仓升级').sum())}个，"
+        f"迟到高质量成熟重入"
+        f"{int(true_mask(early, 'Selective_Reentry14_Has_40D').sum())}个；"
         f"最近14日3%信号{len(recent_early)}个，最新观察池{len(live_watch)}只；"
         f"结果{'已保存' if persisted else '仅当前页面可下载'}。")
-    st.subheader("结论一：各生命周期方案的真实落袋收益")
-    render_plain_table(realized_strategy, 20)
-    st.subheader("结论二：确认速度与确认日状态")
+    st.subheader("结论一：100%直接买入与1/3、1/2试仓升级")
+    render_plain_table(staged_position, 20)
+    st.caption(
+        "粗略40日等效资本收益=实际收益均值÷平均资本暴露日×40；"
+        "仅用于判断闲置资金可复用时的资本效率，不等于三仓组合回测收益。")
+    st.subheader("结论二：每一种确认动作实际对应什么股票")
+    render_plain_table(staged_action, 20)
+    st.subheader("结论三：试仓升级方案逐年稳定性")
+    render_plain_table(staged_year, 30)
+    st.subheader("确认速度与确认日状态")
     render_plain_table(cross_state_outcomes, 30)
     st.caption("上表从3%提前买入者视角判卷；下表从确认后才新买入者视角判卷。")
     render_plain_table(cross_entry_outcomes, 30)
-    st.subheader("结论三：任何金叉重入与高质量确认重入")
-    render_plain_table(selective_reentry, 10)
-    render_plain_table(reentry_week_coverage, 10)
-    st.subheader("7日与14日未确认退出对照")
-    render_plain_table(gate_summary, 10)
+    with st.expander("V6.4旧退出与重入方案对照", expanded=False):
+        render_plain_table(realized_strategy, 20)
+        render_plain_table(selective_reentry, 10)
+        render_plain_table(reentry_week_coverage, 10)
+        render_plain_table(gate_summary, 10)
     st.subheader("最近14日3%提前候选")
     render_plain_table(recent_early_export.sort_values(
         [column for column in ["Signal_Date", "Current_Lifecycle_Status",
@@ -9118,8 +9366,8 @@ def main() -> None:
     st.subheader("运行摘要与覆盖率")
     render_plain_table(run_summary, 10)
     render_plain_table(coverage, 10)
-    st.caption("结果ZIP共24个CSV；历史成熟事件、最近候选和最新观察池严格分开。")
-    render_download(result_zip, result_name, f"v64_current_{request_signature}")
+    st.caption("结果ZIP共27个CSV；历史成熟事件、最近候选和最新观察池严格分开。")
+    render_download(result_zip, result_name, f"v65_current_{request_signature}")
 
 
 if __name__ == "__main__":
