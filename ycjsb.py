@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""周线SKDJ同分二级排序与三仓组合回测 V6.10。
+"""周线SKDJ走步S/A/B/F主排序与三仓组合回测 V6.11。
 
 本版根据V6.1结果，把周线N=6 SKDJ K位于15～25定义为观察池，并独立扫描
 日线MACD红柱周期内股价自红柱起点首次上涨3%、5%、8%和10%的四个强度确认
@@ -10,12 +10,13 @@
 共同样本，分别模拟第2、3、4、5日买入。该组使用了未来“能持续到第5日”的
 信息，只用于公平比较等待代价，绝不作为实盘规则或实时候选。
 
-V6.10沿用V6.9完全相同的事件引擎、30万元三仓撮合和1/2提前试仓，冻结
-“普通确认只保留恰好5分、固定持有至40日、禁止迟到重入、同日前3”。本版
-只验证2-2-1总分完全相同时，随机打散、日线MACD柱较小优先、周K变化较大
-优先、5周量比较大优先四种二级排序。四组方案对同一Path_No强制复用完全
-相同的随机种子，继续与完全随机选择对照，并保留逐年、盈利集中度、实际
-入场顺位和同分事件的S/A/B后验审计。
+V6.11沿用V6.10完全相同的事件引擎、30万元三仓撮合和1/2提前试仓，冻结
+“普通确认只保留恰好5分、固定持有至40日、禁止迟到重入、同日前3”，并把
+V6.10唯一有效的“MACD柱较小优先”固定为基线同分规则。本版只改变主排序：
+对比原2-2-1主分与严格走步的S>A>B>F成对排序。预测每个历史入场日时，训练
+集只允许使用40日结果已在此前结束的事件；训练不足时回退原2-2-1规则，不删
+候选、不删信号周。两组方案继续与完全随机选择公平配对，并直接验收实际买入
+事件胜率、S/A/B/F、逐年稳定性和利润集中度。
 """
 from __future__ import annotations
 
@@ -125,19 +126,19 @@ COHORT_RED_AGES = (2, 3, 4, 5)
 STRENGTH_MIN_REMAINING_PCT = 75.0
 STRENGTH_MAX_PRIOR_RALLY_PCT = 30.0
 
-# V6.10 ordinary-score-5 exact-tie audit.  Internal v63-v69 helper names
+# V6.11 walk-forward S/A/B/F primary-rank audit.  Internal v63-v610 helpers
 # are retained to minimize regression risk; the final ``main`` is the only
 # entry point.
 # The stock-level event rows are byte-compatible with V6.4, so its checkpoint
-# signature and directory are deliberately reused.  Results/jobs use new V6.10
+# signature and directory are deliberately reused.  Results/jobs use new V6.11
 # directories and cannot collide with a completed V6.4 result.
-V63_TITLE = "周线SKDJ同分二级排序与三仓组合回测 V6.10"
-V63_VERSION = "V6.10-SKDJ-SAME-SCORE-TIE-BREAK-AUDIT"
-V63_UI_PATCH = "V6.10-RANK3-RANDOM-VS-MACD-HIST-VS-K-CHANGE-VS-VOLUME"
+V63_TITLE = "周线SKDJ走步S/A/B/F主排序与三仓组合回测 V6.11"
+V63_VERSION = "V6.11-SKDJ-WALK-FORWARD-SABF-PRIMARY-RANK"
+V63_UI_PATCH = "V6.11-TOP3-SCORE221-MACD-VS-WALK-FORWARD-ORDINAL"
 V65_EVENT_ENGINE_VERSION = "V6.4-SKDJ-STATE-CONFIRMATION-SELECTIVE-REENTRY"
 V63_CHECKPOINT_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_4_checkpoints")
-V63_RESULT_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_10_results")
-V63_JOB_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_10_jobs")
+V63_RESULT_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_11_results")
+V63_JOB_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_11_jobs")
 V63_CONFIRM_DEADLINES = (7, 14)
 V63_REENTRY_WINDOW_DAYS = 42
 V63_STRENGTH_THRESHOLD = 3.0
@@ -159,6 +160,17 @@ V66_DEFAULT_DRAWS = 300
 V66_RANDOM_SEED = 20260827
 V68_ORDINARY_STOP_PCT = -10.0
 V68_RISK_WINDOWS = (0, 5, 10)
+V611_FEATURES = (
+    "Signal_K", "Signal_D", "Signal_KD_Spread", "Signal_K_Change_1W",
+    "Signal_Prior_Below25_Streak", "Signal_MA20_Slope_4W_pct",
+    "Signal_Volume_Ratio_5W", "Signal_Week_Return_pct",
+    "Daily_MACD_Red_Age", "Daily_MACD_Remaining_pct",
+    "Daily_MACD_Retention_pct", "Signal_Rally_From_Red_Start_pct",
+    "Turnover_Rate", "V611_MACD_Hist_to_Price",
+)
+V611_MIN_TRAIN_DATES = 20
+V611_MIN_TRAIN_ROWS = 160
+V611_MAX_PAIRS_PER_DATE = 80
 
 CORE_TECH_L1 = {"电子", "计算机", "通信", "国防军工"}
 EXTENDED_TECH_L1 = {"机械设备", "电力设备", "医药生物", "汽车", "基础化工", "有色金属", "建筑材料"}
@@ -8466,37 +8478,342 @@ def v65_staged_year_summary(early: pd.DataFrame) -> pd.DataFrame:
     return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
 
 
+def v611_add_feature_percentiles(
+        frame: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """Build signal-time, same-entry-date comparable model features."""
+    work = frame.copy()
+    raw_close = numeric(work, "Raw_Close").replace(0, np.nan)
+    work["V611_MACD_Hist_to_Price"] = (
+        numeric(work, "Daily_MACD_Hist") / raw_close * 10_000.0)
+    if "Entry_Date" not in work:
+        work["Entry_Date"] = ""
+    work["Entry_Date"] = work["Entry_Date"].map(normalize_date)
+    feature_columns: list[str] = []
+    for source in V611_FEATURES:
+        target = f"V611P_{source}"
+        values = numeric(work, source)
+        work[target] = (
+            work.assign(_v611_value=values).groupby("Entry_Date")[
+                "_v611_value"].rank(method="average", pct=True))
+        feature_columns.append(target)
+    return work, feature_columns
+
+
+def v611_fit_pairwise_ordinal(
+        train: pd.DataFrame, feature_columns: list[str]
+        ) -> dict[str, Any] | None:
+    """Fit an ordinal S>A>B>F pairwise model on already revealed dates."""
+    if train.empty:
+        return None
+    work = train.copy()
+    grade_map = {"F": 0.0, "B": 1.0, "A": 2.0, "S": 3.0}
+    work["_V611_Grade"] = work["Explosion_Class_40D"].astype(str).map(
+        grade_map)
+    work = work[work["_V611_Grade"].notna()].copy()
+    if (len(work) < V611_MIN_TRAIN_ROWS
+            or work["Entry_Date"].nunique() < V611_MIN_TRAIN_DATES
+            or work["_V611_Grade"].nunique() < 2):
+        return None
+
+    x_rows: list[np.ndarray] = []
+    y_rows: list[int] = []
+    weight_rows: list[float] = []
+    pair_count = 0
+    gain_map = {0: 0.0, 1: 1.0, 2: 3.0, 3: 7.0}
+    for entry_date, group in work.groupby("Entry_Date", sort=True):
+        group = group.reset_index(drop=True)
+        matrix = group[feature_columns].apply(
+            pd.to_numeric, errors="coerce").fillna(0.5).to_numpy(dtype=float)
+        labels = pd.to_numeric(
+            group["_V611_Grade"], errors="coerce").to_numpy(dtype=float)
+        possible: list[tuple[int, int]] = []
+        for left in range(len(group)):
+            for right in range(left + 1, len(group)):
+                if labels[left] == labels[right]:
+                    continue
+                high, low = ((left, right) if labels[left] > labels[right]
+                             else (right, left))
+                possible.append((high, low))
+        if not possible:
+            continue
+        if len(possible) > V611_MAX_PAIRS_PER_DATE:
+            rng = np.random.default_rng(_ltr_seed(f"V611|{entry_date}"))
+            chosen = rng.choice(
+                len(possible), size=V611_MAX_PAIRS_PER_DATE, replace=False)
+            pairs = [possible[int(position)]
+                     for position in sorted(chosen.tolist())]
+        else:
+            pairs = possible
+        raw_weights = np.array([
+            gain_map[int(labels[high])] - gain_map[int(labels[low])]
+            for high, low in pairs], dtype=float)
+        raw_weights /= max(float(raw_weights.sum()), 1.0)
+        for (high, low), pair_weight in zip(pairs, raw_weights):
+            difference = matrix[high] - matrix[low]
+            x_rows.extend([difference, -difference])
+            y_rows.extend([1, 0])
+            weight_rows.extend([
+                float(pair_weight) * 0.5, float(pair_weight) * 0.5])
+        pair_count += len(pairs)
+    if pair_count == 0:
+        return None
+    coefficients = _fit_weighted_pairwise_logit(
+        np.asarray(x_rows, dtype=float), np.asarray(y_rows, dtype=int),
+        np.asarray(weight_rows, dtype=float))
+    return {
+        "coefficients": coefficients,
+        "feature_columns": list(feature_columns),
+        "train_rows": int(len(work)),
+        "train_dates": int(work["Entry_Date"].nunique()),
+        "train_weeks": int(work["Signal_Week"].nunique()),
+        "pair_count": int(pair_count),
+        "train_start": str(work["Signal_Date"].astype(str).min()),
+        "train_end": str(work["Signal_Date"].astype(str).max()),
+        "max_maturity_date": str(
+            work["Entry_End_Date_40D"].astype(str).max()),
+    }
+
+
+def v611_predict_ordinal(
+        frame: pd.DataFrame, bundle: dict[str, Any] | None) -> pd.Series:
+    if frame.empty or bundle is None:
+        return pd.Series(np.nan, index=frame.index, dtype=float)
+    columns = list(bundle["feature_columns"])
+    matrix = frame[columns].apply(
+        pd.to_numeric, errors="coerce").fillna(0.5).to_numpy(dtype=float)
+    coefficients = np.asarray(bundle["coefficients"], dtype=float)
+    return pd.Series(matrix @ coefficients, index=frame.index, dtype=float)
+
+
+def v611_add_walk_forward_ordinal(
+        early: pd.DataFrame
+        ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any] | None]:
+    """Generate strict 40-day-maturity walk-forward scores per entry date."""
+    work, feature_columns = v611_add_feature_percentiles(early)
+    work["V611_OOS_Score"] = np.nan
+    work["V611_OOS_Rank"] = np.nan
+    work["V611_Model_Available"] = False
+    work["V611_Train_Rows"] = 0
+    work["V611_Train_Dates"] = 0
+    work["V611_Train_Weeks"] = 0
+    work["V611_Train_Max_Maturity_Date"] = ""
+    maturity = work["Entry_End_Date_40D"].map(normalize_date)
+    audit_rows: list[dict[str, Any]] = []
+    for entry_date, group in work.groupby("Entry_Date", sort=True):
+        revealed = maturity.lt(str(entry_date))
+        train = work[revealed].copy()
+        bundle = v611_fit_pairwise_ordinal(train, feature_columns)
+        max_maturity = str(maturity[revealed].max()) if revealed.any() else ""
+        audit_row = {
+            "预测入场日": str(entry_date), "当日候选": len(group),
+            "已揭晓训练事件": int(revealed.sum()),
+            "已揭晓训练入场日": int(train["Entry_Date"].nunique()),
+            "训练最大40日结束日期": max_maturity,
+            "严格早于预测日": bool(
+                not max_maturity or max_maturity < str(entry_date)),
+            "模型可用": bundle is not None,
+        }
+        if bundle is not None:
+            work.loc[group.index, "V611_OOS_Score"] = v611_predict_ordinal(
+                work.loc[group.index], bundle)
+            work.loc[group.index, "V611_Model_Available"] = True
+            work.loc[group.index, "V611_Train_Rows"] = bundle["train_rows"]
+            work.loc[group.index, "V611_Train_Dates"] = bundle["train_dates"]
+            work.loc[group.index, "V611_Train_Weeks"] = bundle["train_weeks"]
+            work.loc[group.index, "V611_Train_Max_Maturity_Date"] = (
+                bundle["max_maturity_date"])
+            audit_row.update({
+                "实际训练事件": bundle["train_rows"],
+                "实际训练入场日": bundle["train_dates"],
+                "实际训练信号周": bundle["train_weeks"],
+                "训练股票对": bundle["pair_count"],
+            })
+        else:
+            audit_row.update({
+                "实际训练事件": 0, "实际训练入场日": 0,
+                "实际训练信号周": 0, "训练股票对": 0,
+            })
+        audit_rows.append(audit_row)
+
+    valid = true_mask(work, "V611_Model_Available")
+    ranked = work[valid].sort_values(
+        ["Entry_Date", "V611_OOS_Score", "Timing_Score_221",
+         "Daily_MACD_Hist", "ts_code"],
+        ascending=[True, False, False, True, True]).copy()
+    ranked["V611_OOS_Rank"] = ranked.groupby("Entry_Date").cumcount() + 1
+    work.loc[ranked.index, "V611_OOS_Rank"] = ranked["V611_OOS_Rank"]
+    full_bundle = v611_fit_pairwise_ordinal(work, feature_columns)
+    return work, pd.DataFrame(audit_rows), full_bundle
+
+
+def v611_score_live_candidates(
+        live: pd.DataFrame, bundle: dict[str, Any] | None) -> pd.DataFrame:
+    if live.empty:
+        return live.copy()
+    work, feature_columns = v611_add_feature_percentiles(live)
+    work["V611_Live_Score"] = np.nan
+    work["V611_Live_Rank"] = np.nan
+    work["V611_Live_Model_Available"] = bundle is not None
+    if bundle is None:
+        return work
+    if feature_columns != list(bundle["feature_columns"]):
+        raise RuntimeError("V6.11实时特征列与历史训练不一致")
+    work["V611_Live_Score"] = v611_predict_ordinal(work, bundle)
+    ranked = work.sort_values(
+        ["Entry_Date", "V611_Live_Score", "Timing_Score_221",
+         "Daily_MACD_Hist", "ts_code"],
+        ascending=[True, False, False, True, True]).copy()
+    ranked["V611_Live_Rank"] = ranked.groupby("Entry_Date").cumcount() + 1
+    work.loc[ranked.index, "V611_Live_Rank"] = ranked["V611_Live_Rank"]
+    work["V611_Live_Train_Rows"] = int(bundle["train_rows"])
+    work["V611_Live_Train_Dates"] = int(bundle["train_dates"])
+    work["V611_Live_Train_Weeks"] = int(bundle["train_weeks"])
+    return work
+
+
+def v611_feature_coefficients(
+        bundle: dict[str, Any] | None) -> pd.DataFrame:
+    if bundle is None:
+        return pd.DataFrame(columns=["特征", "同日百分位系数", "模型方向"])
+    rows: list[dict[str, Any]] = []
+    for source, transformed, coefficient in zip(
+            V611_FEATURES, bundle["feature_columns"],
+            np.asarray(bundle["coefficients"], dtype=float)):
+        rows.append({
+            "特征": source, "模型字段": transformed,
+            "同日百分位系数": float(coefficient),
+            "模型方向": "数值较高有利" if coefficient > 0 else "数值较低有利",
+            "绝对影响": abs(float(coefficient)),
+            "训练事件": int(bundle["train_rows"]),
+            "训练入场日": int(bundle["train_dates"]),
+            "训练信号周": int(bundle["train_weeks"]),
+            "训练股票对": int(bundle["pair_count"]),
+        })
+    return pd.DataFrame(rows).sort_values(
+        "绝对影响", ascending=False).reset_index(drop=True)
+
+
+def v611_oos_grade_audit(early: pd.DataFrame) -> pd.DataFrame:
+    """Compare Top3 grades only on dates where the walk-forward model exists."""
+    pool = early[true_mask(early, "V611_Model_Available")].copy()
+    if pool.empty:
+        return pd.DataFrame()
+    pool["_Year"] = pool["Entry_Date"].astype(str).str[:4]
+
+    def deterministic_metrics(frame: pd.DataFrame, mode: str) -> dict[str, Any]:
+        chosen_parts: list[pd.DataFrame] = []
+        three_group_hits: list[bool] = []
+        for _, group in frame.groupby("Entry_Date", sort=True):
+            if mode == "WalkForwardSABF":
+                ordered = group.sort_values(
+                    ["V611_OOS_Score", "Timing_Score_221",
+                     "Daily_MACD_Hist", "ts_code"],
+                    ascending=[False, False, True, True])
+            else:
+                ordered = group.sort_values(
+                    ["Timing_Score_221", "Daily_MACD_Hist", "ts_code"],
+                    ascending=[False, True, True])
+            chosen = ordered.head(3)
+            chosen_parts.append(chosen)
+            if len(group) >= 3:
+                three_group_hits.append(
+                    bool(numeric(chosen, "Entry_Close_Return_Net_pct").gt(0).sum() >= 2))
+        selected = pd.concat(chosen_parts, ignore_index=True)
+        classes = selected["Explosion_Class_40D"].astype(str)
+        returns = numeric(selected, "Entry_Close_Return_Net_pct")
+        return {
+            "入选事件": len(selected),
+            "S级比例%": classes.eq("S").mean() * 100.0,
+            "A或S比例%": classes.isin(["S", "A"]).mean() * 100.0,
+            "B级以上比例%": classes.isin(["S", "A", "B"]).mean() * 100.0,
+            "F级比例%": classes.eq("F").mean() * 100.0,
+            "固定40日盈利比例%": returns.gt(0).mean() * 100.0,
+            "固定40日收益均值%": returns.mean(),
+            "三只候选组": len(three_group_hits),
+            "三只中至少两只盈利组比例%": (
+                np.mean(three_group_hits) * 100.0 if three_group_hits else np.nan),
+        }
+
+    def random_metrics(frame: pd.DataFrame) -> dict[str, Any]:
+        selected_count = 0
+        expected = defaultdict(float)
+        three_groups = 0
+        expected_two_wins = 0.0
+        for _, group in frame.groupby("Entry_Date", sort=True):
+            n, k = len(group), min(3, len(group))
+            if not n:
+                continue
+            selected_count += k
+            classes = group["Explosion_Class_40D"].astype(str)
+            returns = numeric(group, "Entry_Close_Return_Net_pct")
+            expected["S"] += k * classes.eq("S").mean()
+            expected["AS"] += k * classes.isin(["S", "A"]).mean()
+            expected["B"] += k * classes.isin(["S", "A", "B"]).mean()
+            expected["F"] += k * classes.eq("F").mean()
+            expected["Win"] += k * returns.gt(0).mean()
+            expected["Return"] += k * returns.mean()
+            if n >= 3:
+                three_groups += 1
+                wins = int(returns.gt(0).sum())
+                denominator = math.comb(n, 3)
+                probability = 0.0
+                for count in (2, 3):
+                    if count <= wins and 3 - count <= n - wins:
+                        probability += (
+                            math.comb(wins, count)
+                            * math.comb(n - wins, 3 - count) / denominator)
+                expected_two_wins += probability
+        denominator = max(selected_count, 1)
+        return {
+            "入选事件": selected_count,
+            "S级比例%": expected["S"] / denominator * 100.0,
+            "A或S比例%": expected["AS"] / denominator * 100.0,
+            "B级以上比例%": expected["B"] / denominator * 100.0,
+            "F级比例%": expected["F"] / denominator * 100.0,
+            "固定40日盈利比例%": expected["Win"] / denominator * 100.0,
+            "固定40日收益均值%": expected["Return"] / denominator,
+            "三只候选组": three_groups,
+            "三只中至少两只盈利组比例%": (
+                expected_two_wins / three_groups * 100.0
+                if three_groups else np.nan),
+        }
+
+    rows: list[dict[str, Any]] = []
+    periods = [("全部OOS", pool)] + [
+        (str(year), group) for year, group in pool.groupby("_Year", sort=True)]
+    for period, frame in periods:
+        common = {
+            "统计期": period, "模型可用入场日": frame["Entry_Date"].nunique(),
+            "覆盖信号周": frame["Signal_Week"].nunique(),
+        }
+        rows.append({**common, "排序方案": "随机Top3精确期望",
+                     **random_metrics(frame)})
+        rows.append({**common, "排序方案": "原2-2-1主分_MACD同分",
+                     **deterministic_metrics(frame, "Score221")})
+        rows.append({**common, "排序方案": "走步S>A>B>F主排序",
+                     **deterministic_metrics(frame, "WalkForwardSABF")})
+    return pd.DataFrame(rows)
+
+
 V66_PORTFOLIO_SCHEMES = (
     {
-        "key": "Trial50Score5Rank3TieRandom",
-        "label": "1/2试仓_普通仅5分固定40日_同日前3_同分随机",
+        "key": "Trial50Score5Top3Score221MACDTie",
+        "label": "1/2试仓_普通仅5分固定40日_Top3_2-2-1主分_MACD同分",
         "trial_weight": 0.5, "staged": True,
         "allow_late_reentry": False, "ordinary_keep_min_score": 5.0,
-        "max_signal_day_rank": 3, "tie_break_mode": "Random",
+        "max_signal_day_rank": 3,
+        "primary_rank_mode": "Score221MACDHistAsc",
+        "tie_break_mode": "DailyMACDHistAsc",
         "ordinary_risk_days": 0, "ordinary_stop_pct": V68_ORDINARY_STOP_PCT,
     },
     {
-        "key": "Trial50Score5Rank3TieMACDHistAsc",
-        "label": "1/2试仓_普通仅5分固定40日_同日前3_同分MACD柱较小优先",
+        "key": "Trial50Score5Top3WalkForwardSABF",
+        "label": "1/2试仓_普通仅5分固定40日_Top3_走步SABF主排序",
         "trial_weight": 0.5, "staged": True,
         "allow_late_reentry": False, "ordinary_keep_min_score": 5.0,
-        "max_signal_day_rank": 3, "tie_break_mode": "DailyMACDHistAsc",
-        "ordinary_risk_days": 0, "ordinary_stop_pct": V68_ORDINARY_STOP_PCT,
-    },
-    {
-        "key": "Trial50Score5Rank3TieKChangeDesc",
-        "label": "1/2试仓_普通仅5分固定40日_同日前3_同分周K变化较大优先",
-        "trial_weight": 0.5, "staged": True,
-        "allow_late_reentry": False, "ordinary_keep_min_score": 5.0,
-        "max_signal_day_rank": 3, "tie_break_mode": "KChangeDesc",
-        "ordinary_risk_days": 0, "ordinary_stop_pct": V68_ORDINARY_STOP_PCT,
-    },
-    {
-        "key": "Trial50Score5Rank3TieVolumeDesc",
-        "label": "1/2试仓_普通仅5分固定40日_同日前3_同分量比较大优先",
-        "trial_weight": 0.5, "staged": True,
-        "allow_late_reentry": False, "ordinary_keep_min_score": 5.0,
-        "max_signal_day_rank": 3, "tie_break_mode": "VolumeRatioDesc",
+        "max_signal_day_rank": 3,
+        "primary_rank_mode": "WalkForwardSABF",
+        "tie_break_mode": "DailyMACDHistAsc",
         "ordinary_risk_days": 0, "ordinary_stop_pct": V68_ORDINARY_STOP_PCT,
     },
 )
@@ -8585,10 +8902,11 @@ def v66_run_portfolio_path(
         ) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame]:
     """Chronological three-stock portfolio simulation with no future ranking.
 
-    The score remains the primary key.  Only exact score ties use the scheme's
-    signal-time secondary field, with seeded random order as the final tie.
-    The random control shuffles all candidates and intentionally ignores the
-    secondary field.  Future state is consulted only when its actual
+    The baseline uses 2-2-1 as primary and smaller MACD histogram for exact
+    ties.  The challenger uses the strict walk-forward ordinal score, then the
+    frozen baseline keys for exact model ties.  Dates without enough revealed
+    training history fall back to the baseline.  The random control shuffles
+    all candidates.  Future state is consulted only when its actual
     confirmation/exit execution date arrives.
     """
     rng = np.random.default_rng(int(seed))
@@ -8600,6 +8918,8 @@ def v66_run_portfolio_path(
     allow_late = bool(scheme["allow_late_reentry"])
     max_signal_day_rank = max(
         int(scheme.get("max_signal_day_rank", V66_MAX_STOCKS)), 1)
+    primary_rank_mode = str(
+        scheme.get("primary_rank_mode", "Score221MACDHistAsc"))
     tie_break_mode = str(scheme.get("tie_break_mode", "Random"))
     ordinary_keep_min_score = scheme.get("ordinary_keep_min_score")
     if ordinary_keep_min_score is not None:
@@ -8878,26 +9198,31 @@ def v66_run_portfolio_path(
         counters["候选中的高质量确认事件"] += sum(
             str(row.get("V65_Lifecycle_Action", ""))
             == "14日内高质量确认_试仓升级" for row in candidates)
-        if selection_mode == "现有2-2-1评分":
+        if selection_mode == "规则排序":
             tie = {str(row["_Event_ID"]): float(rng.random())
                    for row in candidates}
 
-            def secondary_key(row: dict[str, Any]) -> tuple[int, float]:
-                if tie_break_mode == "DailyMACDHistAsc":
-                    value = finite_num(row.get("Daily_MACD_Hist"))
-                    return ((0, value) if math.isfinite(value) else (1, 0.0))
-                if tie_break_mode == "KChangeDesc":
-                    value = finite_num(row.get("Signal_K_Change_1W"))
-                    return ((0, -value) if math.isfinite(value) else (1, 0.0))
-                if tie_break_mode == "VolumeRatioDesc":
-                    value = finite_num(row.get("Signal_Volume_Ratio_5W"))
-                    return ((0, -value) if math.isfinite(value) else (1, 0.0))
-                return 0, 0.0
+            def macd_key(row: dict[str, Any]) -> tuple[int, float]:
+                value = finite_num(row.get("Daily_MACD_Hist"))
+                return ((0, value) if math.isfinite(value) else (1, 0.0))
 
-            candidates.sort(key=lambda row: (
-                -finite_num(row.get("_Score_221")),
-                *secondary_key(row),
-                tie[str(row["_Event_ID"])]))
+            if (primary_rank_mode == "WalkForwardSABF"
+                    and candidates
+                    and all(to_bool(row.get("V611_Model_Available"))
+                            and math.isfinite(finite_num(
+                                row.get("V611_OOS_Score")))
+                            for row in candidates)):
+                candidates.sort(key=lambda row: (
+                    -finite_num(row.get("V611_OOS_Score")),
+                    -finite_num(row.get("_Score_221")),
+                    *macd_key(row), tie[str(row["_Event_ID"])]))
+                counters["走步模型排序候选日"] += 1
+            else:
+                candidates.sort(key=lambda row: (
+                    -finite_num(row.get("_Score_221")),
+                    *macd_key(row), tie[str(row["_Event_ID"])]))
+                if primary_rank_mode == "WalkForwardSABF" and candidates:
+                    counters["训练不足回退基线候选日"] += 1
         else:
             rng.shuffle(candidates)
         for selection_rank, row in enumerate(candidates, start=1):
@@ -8906,7 +9231,7 @@ def v66_run_portfolio_path(
                 "14日内高质量确认_试仓升级")
             # The Top3 gate is based on the original same-day candidate order.
             # A blocked/held higher-ranked stock never promotes a lower-ranked
-            # candidate; this admission rule is frozen across all four schemes.
+            # candidate; this admission rule is frozen across both schemes.
             if selection_rank > max_signal_day_rank:
                 counters["新试仓未执行_超过方案顺位"] += 1
                 if is_high:
@@ -8936,6 +9261,11 @@ def v66_run_portfolio_path(
             selected_events.add(event_id)
             selected_rank_by_event[event_id] = int(selection_rank)
             counters["实际初始买入事件"] += 1
+            if (primary_rank_mode == "WalkForwardSABF"
+                    and to_bool(row.get("V611_Model_Available"))):
+                counters["走步模型实际买入事件"] += 1
+            elif primary_rank_mode == "WalkForwardSABF":
+                counters["训练不足回退实际买入事件"] += 1
             if is_high:
                 counters["实际买入后高质量确认事件"] += 1
             schedule_selected_event(row, leg_id)
@@ -9090,6 +9420,7 @@ def v66_run_portfolio_path(
         "方案Key": str(scheme["key"]), "组合方案": str(scheme["label"]),
         "选择方式": selection_mode, "Seed": int(seed),
         "同日入场顺位上限": max_signal_day_rank,
+        "主排序方式": primary_rank_mode,
         "同分二级排序": tie_break_mode,
         "初始资金": initial_capital, "期末权益": cash,
         "总收益率%": total_return, "年化收益率%": annualized,
@@ -9108,6 +9439,12 @@ def v66_run_portfolio_path(
         "顺位过滤高质量确认": int(
             counters["错过高质量确认_超过方案顺位"]),
         "实际初始买入事件": int(counters["实际初始买入事件"]),
+        "走步模型排序候选日": int(counters["走步模型排序候选日"]),
+        "训练不足回退基线候选日": int(
+            counters["训练不足回退基线候选日"]),
+        "走步模型实际买入事件": int(counters["走步模型实际买入事件"]),
+        "训练不足回退实际买入事件": int(
+            counters["训练不足回退实际买入事件"]),
         "高质量确认候选": high_total,
         "买入后高质量确认": high_selected,
         "错过高质量确认": max(high_total - high_selected, 0),
@@ -9195,6 +9532,7 @@ def v66_ensemble_summary(paths: pd.DataFrame) -> pd.DataFrame:
         drawdown = numeric(group, "最大回撤%")
         rows.append({
             "方案Key": key, "组合方案": label, "选择方式": mode,
+            "主排序方式": str(group["主排序方式"].iloc[0]),
             "同分二级排序": str(group["同分二级排序"].iloc[0]),
             "路径数": len(group),
             "期末权益中位": clean_median(group, "期末权益"),
@@ -9216,6 +9554,10 @@ def v66_ensemble_summary(paths: pd.DataFrame) -> pd.DataFrame:
             "顺位过滤高质量确认中位": clean_median(
                 group, "顺位过滤高质量确认"),
             "初始买入事件中位": clean_median(group, "实际初始买入事件"),
+            "走步模型买入事件中位": clean_median(
+                group, "走步模型实际买入事件"),
+            "训练不足回退买入事件中位": clean_median(
+                group, "训练不足回退实际买入事件"),
             "高质量确认捕获率中位%": clean_median(
                 group, "高质量确认捕获率%"),
             "高质量补仓执行中位": clean_median(group, "高质量补仓执行"),
@@ -9248,42 +9590,42 @@ def v66_score_vs_random_summary(paths: pd.DataFrame) -> pd.DataFrame:
         key, label = keys
         fields = (
             "总收益率%", "高质量确认捕获率%", "最大回撤%")
-        score = group[group["选择方式"].eq("现有2-2-1评分")][
+        score = group[group["选择方式"].eq("规则排序")][
             ["Path_No", "Seed", *fields]].copy()
         random = group[group["选择方式"].eq("完全随机选择")][
             ["Path_No", "Seed", *fields]].copy()
         paired = score.merge(
             random, on=["Path_No", "Seed"], how="inner",
-            suffixes=("_评分", "_随机"))
+            suffixes=("_规则", "_随机"))
         if paired.empty:
             continue
-        score_return = numeric(paired, "总收益率%_评分")
+        score_return = numeric(paired, "总收益率%_规则")
         random_return = numeric(paired, "总收益率%_随机")
         delta = score_return - random_return
         rows.append({
             "方案Key": key, "组合方案": label, "配对路径": len(paired),
-            "评分总收益中位%": score_return.median(),
+            "规则总收益中位%": score_return.median(),
             "随机总收益中位%": random_return.median(),
-            "评分减随机收益均值百分点": delta.mean(),
-            "评分减随机收益中位百分点": delta.median(),
-            "评分优于随机比例%": delta.gt(0).mean() * 100.0,
-            "评分差值第10分位": delta.quantile(0.10),
-            "评分差值第90分位": delta.quantile(0.90),
-            "评分高质量捕获率中位%": numeric(
-                paired, "高质量确认捕获率%_评分").median(),
+            "规则减随机收益均值百分点": delta.mean(),
+            "规则减随机收益中位百分点": delta.median(),
+            "规则优于随机比例%": delta.gt(0).mean() * 100.0,
+            "规则差值第10分位": delta.quantile(0.10),
+            "规则差值第90分位": delta.quantile(0.90),
+            "规则高质量捕获率中位%": numeric(
+                paired, "高质量确认捕获率%_规则").median(),
             "随机高质量捕获率中位%": numeric(
                 paired, "高质量确认捕获率%_随机").median(),
-            "评分最大回撤中位%": numeric(
-                paired, "最大回撤%_评分").median(),
+            "规则最大回撤中位%": numeric(
+                paired, "最大回撤%_规则").median(),
             "随机最大回撤中位%": numeric(
                 paired, "最大回撤%_随机").median(),
         })
     return pd.DataFrame(rows)
 
 
-def v610_paired_tie_break_summary(paths: pd.DataFrame) -> pd.DataFrame:
-    """Compare each exact-tie rule with seeded random tie-breaking."""
-    baseline_key = "Trial50Score5Rank3TieRandom"
+def v611_paired_primary_rank_summary(paths: pd.DataFrame) -> pd.DataFrame:
+    """Compare walk-forward primary ranking with the frozen 2-2-1 baseline."""
+    baseline_key = "Trial50Score5Top3Score221MACDTie"
     baseline = paths[paths["方案Key"].eq(baseline_key)].copy()
     if baseline.empty:
         return pd.DataFrame()
@@ -9296,7 +9638,7 @@ def v610_paired_tie_break_summary(paths: pd.DataFrame) -> pd.DataFrame:
         if scheme["key"] == baseline_key:
             continue
         challenger = paths[paths["方案Key"].eq(scheme["key"])].copy()
-        for mode in ("现有2-2-1评分", "完全随机选择"):
+        for mode in ("规则排序", "完全随机选择"):
             base_mode = baseline[baseline["选择方式"].eq(mode)][
                 ["Path_No", "Seed", *metrics]].copy()
             new_mode = challenger[challenger["选择方式"].eq(mode)][
@@ -9350,8 +9692,8 @@ def v610_paired_tie_break_summary(paths: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def v610_seed_pairing_audit(paths: pd.DataFrame) -> pd.DataFrame:
-    """Verify every mode/Path_No reuses one seed across all tie schemes."""
+def v611_seed_pairing_audit(paths: pd.DataFrame) -> pd.DataFrame:
+    """Verify every mode/Path_No reuses one seed across both rank schemes."""
     if paths.empty:
         return pd.DataFrame()
     expected = len(V66_PORTFOLIO_SCHEMES)
@@ -9711,8 +10053,8 @@ def v68_exact_factor_combo_audit(early: pd.DataFrame) -> pd.DataFrame:
 
 
 def v68_score_rank_path_summary(paths: pd.DataFrame) -> pd.DataFrame:
-    """Summarize actual score-order ranks among executed initial entries."""
-    score_paths = paths[paths["选择方式"].eq("现有2-2-1评分")].copy()
+    """Summarize actual rule-order ranks among executed initial entries."""
+    score_paths = paths[paths["选择方式"].eq("规则排序")].copy()
     rows: list[dict[str, Any]] = []
 
     def median_or_nan(values: pd.Series) -> float:
@@ -9736,7 +10078,7 @@ def v68_score_rank_path_summary(paths: pd.DataFrame) -> pd.DataFrame:
                 group, f"入场顺位{rank}收益贡献百分点")
             rows.append({
                 "方案Key": key, "组合方案": label,
-                "评分入场顺位": rank, "路径数": len(group),
+                "规则入场顺位": rank, "路径数": len(group),
                 "实际买入事件中位": median_or_nan(count),
                 "事件胜率中位%": median_or_nan(win),
                 "事件平均收益中位%": median_or_nan(event_return),
@@ -9811,6 +10153,61 @@ def v68_representative_stock_profit(
     return grouped.sort_values(
         ["方案", "选择方式", "Seed", "盈利贡献排名"]
     ).reset_index(drop=True)
+
+
+def v611_actual_selected_grade_audit(
+        trades: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
+    """Audit actual bought events against the 66.7% and S/A/B objectives."""
+    if trades.empty or events.empty or "_Event_ID" not in events:
+        return pd.DataFrame()
+    lookup_columns = [
+        "_Event_ID", "Explosion_Class_40D", "V65_Lifecycle_Action",
+        "Timing_Score_221", "Signal_Date", "Entry_Date",
+    ]
+    lookup = events[[
+        column for column in lookup_columns if column in events.columns
+    ]].drop_duplicates("_Event_ID").rename(columns={"_Event_ID": "Event_ID"})
+    rows: list[dict[str, Any]] = []
+    for keys, group in trades.groupby(
+            ["方案", "选择方式", "Seed"], dropna=False):
+        label, mode, seed = keys
+        event = group.groupby("Event_ID", as_index=False).agg(
+            实际净利润=("Net_PnL", "sum"),
+            实际投入成本=("Entry_Cost", "sum"),
+            实际入场顺位=("Signal_Day_Selection_Rank", "min"),
+        ).merge(lookup, on="Event_ID", how="left")
+        event["实际事件收益%"] = np.where(
+            numeric(event, "实际投入成本").gt(0),
+            numeric(event, "实际净利润")
+            / numeric(event, "实际投入成本") * 100.0,
+            np.nan)
+        returns = numeric(event, "实际事件收益%")
+        classes = event["Explosion_Class_40D"].astype(str)
+        high = event["V65_Lifecycle_Action"].astype(str).eq(
+            "14日内高质量确认_试仓升级")
+        ordinary5 = (
+            event["V65_Lifecycle_Action"].astype(str).eq(
+                "14日内普通确认_只保留试仓")
+            & numeric(event, "Timing_Score_221").eq(5.0))
+        rows.append({
+            "组合方案": label, "选择方式": mode, "Seed": int(seed),
+            "实际买入事件": len(event),
+            "盈利事件": int(returns.gt(0).sum()),
+            "实际事件胜率%": returns.gt(0).mean() * 100.0,
+            "距三分之二目标百分点": returns.gt(0).mean() * 100.0 - 66.666667,
+            "S级比例%": classes.eq("S").mean() * 100.0,
+            "A或S比例%": classes.isin(["S", "A"]).mean() * 100.0,
+            "B级以上比例%": classes.isin(["S", "A", "B"]).mean() * 100.0,
+            "F级比例%": classes.eq("F").mean() * 100.0,
+            "高质量确认买入事件": int(high.sum()),
+            "高质量确认实际胜率%": returns[high].gt(0).mean() * 100.0
+            if high.any() else np.nan,
+            "普通确认5分买入事件": int(ordinary5.sum()),
+            "普通确认5分实际胜率%": returns[ordinary5].gt(0).mean() * 100.0
+            if ordinary5.any() else np.nan,
+            "总净利润": numeric(event, "实际净利润").sum(),
+        })
+    return pd.DataFrame(rows)
 
 
 def v68_ordinary_score5_risk_event_audit(
@@ -9912,12 +10309,12 @@ def v66_run_portfolio_ensemble(
     path_rows: list[dict[str, Any]] = []
     draw_count = max(int(draws), 1)
     for scheme in V66_PORTFOLIO_SCHEMES:
-        for mode in ("现有2-2-1评分", "完全随机选择"):
+        for mode in ("规则排序", "完全随机选择"):
             for path_no in range(draw_count):
                 # Common random numbers: the same Path_No reuses the exact
-                # same seed across every exact-tie rule and both selection
-                # modes.  Random controls must therefore be identical; score
-                # portfolio differences can only come from exact score ties.
+                # same seed across both primary-rank schemes and selection
+                # modes. Random controls must therefore be identical; rule
+                # portfolio differences can only come from the primary rank.
                 seed = V66_RANDOM_SEED + path_no
                 metrics, _, _ = v66_run_portfolio_path(
                     events, price_book, open_dates, config, scheme, mode, seed)
@@ -10238,7 +10635,7 @@ def v63_clear_job_active(signature: str) -> None:
         if os.path.exists(path):
             os.remove(path)
     except OSError as exc:
-        record_error(f"V6.10任务标记清除失败: {exc}")
+        record_error(f"V6.11任务标记清除失败: {exc}")
 
 
 def v63_is_job_active(signature: str) -> bool:
@@ -10265,7 +10662,7 @@ def v63_load_checkpoint(signature: str, ts_code: str) -> dict[str, Any] | None:
             return None
         return payload
     except Exception as exc:
-        record_error(f"V6.10兼容检查点损坏 {ts_code}: {exc}")
+        record_error(f"V6.11兼容检查点损坏 {ts_code}: {exc}")
         return None
 
 
@@ -10284,21 +10681,23 @@ def main() -> None:
     st.title(V63_TITLE)
     streamlit_version = str(getattr(st, "__version__", "unknown"))
     st.caption(f"{V63_UI_PATCH}｜Streamlit {streamlit_version}")
-    with st.expander("V6.10验证口径", expanded=True):
+    with st.expander("V6.11验证口径", expanded=True):
         st.markdown(f"""
 - **唯一提前买点**：最近完整周N=6、M=3的SKDJ K位于{EARLY_WEEKLY_K_MIN:g}～{EARLY_WEEKLY_K_MAX:g}；日线MACD红柱扩张或剩余强度≥{STRENGTH_MIN_REMAINING_PCT:g}%；本轮股价首次达到+{V63_STRENGTH_THRESHOLD:g}%后，下一市场交易日开盘试仓。
 - **真实三仓**：初始资金30万元，最多同时持有3只股票，每只满仓10万元；试仓也占用1个股票名额，买入数量按100股整手且计入交易成本。
 - **冻结Top3**：全部固定1/2试仓、普通确认恰好5分保留40日、禁止迟到重入并保留同日前3；V6.9已否定缩到前2或仅第1，本版不再改变顺位上限。
-- **四组同分对照**：2-2-1总分仍是第一排序键；只有总分完全相同时，分别使用随机打散、日线MACD柱较小、周K一周变化较大、5周量比较大作为第二排序键；再同值时用共用Seed随机打散。
+- **两组主排序对照**：基线为2-2-1主分、完全同分时MACD柱较小优先；挑战组为走步S>A>B>F主排序，模型同分时再依次使用2-2-1和MACD柱较小。
+- **严格走步防泄漏**：预测某个入场日时，只允许使用40日结果结束日期严格早于该入场日的事件；至少{V611_MIN_TRAIN_ROWS}个成熟事件和{V611_MIN_TRAIN_DATES}个成熟入场日才启用模型，训练不足自动回退基线。
+- **排序目标**：F/B/A/S映射为0/1/2/3，成对权重使用0/1/3/7，S相对F的排序权重最高；2-2-1只是模型特征所表达结构的一部分，不再是挑战组的硬主键。
 - **14日内高质量确认**：周线K上穿25当天，日线红柱扩张且本轮累计上涨10～30%，下一开盘用剩余资金补足至满仓；早仓和补仓腿分别观察40个市场日。
 - **14日内普通确认**：确认发生后才查看买入时已知的2-2-1分；只有5分保留原试仓且不补仓，其余下一可交易开盘退出腾位。
 - **顺位资格不递补**：顺位按当天全部候选的原始排序确定；较高顺位因已持仓、满仓或现金不足未成交时，较低顺位不会自动晋级。
 - **已涨超过30%**：只保护已有试仓，不补仓、不把周线确认解释为新追买点。
 - **14日未确认**：期限后的下一只可交易开盘退出试仓；无论以后出现何种确认，本版组合都不重入。
 - **日内顺序**：先执行既定退出释放名额和现金，再处理高质量补仓，最后才处理当日新试仓；收盘触发的风险退出一律等到下一开盘执行。
-- **公平配对**：同一Path_No在四种同分方案及评分/随机选择中复用完全相同的Seed；完全随机选择忽略二级字段，四组随机控制必须逐路径完全一致。
+- **公平配对**：同一Path_No在两种主排序方案及规则/随机选择中复用完全相同的Seed；完全随机选择忽略主排序，两组随机控制必须逐路径完全一致。
 - **随机对照**：随机组只随机排列同日全部候选，买入后的确认分层、固定40日和Top3上限与评分组完全相同。
-- **新增诊断**：逐路径记录实际评分入场第1/2/3顺位的胜率和利润贡献；另对同日同分组逐年审计固定40日收益和S/A/B后验比例，但后验字段绝不参与排序。
+- **新增诊断**：直接导出模型可用日期上的Top3 S/A/B/F、三只中至少两只盈利比例、实际三仓买入事件胜率、逐日训练成熟边界和最终模型系数。
 - **逐年验收**：每一条路径都单独记录各年收益、回撤、资金暴露和持股数；中位代表路径只作交易明细示例。
 - **判卷**：S/A/B仍为40日内先到+30/+20/+10且先于-10，其余为F；所有退出与补仓均按当时可见数据和下一可交易开盘执行并计入成本。
 - **缓存**：交易日历和股票基础资料72小时，行业成员7天，逐股票行情与检查点不主动过期；应用重启或重新部署仍可能清空实例内存和临时磁盘。
@@ -10307,39 +10706,39 @@ def main() -> None:
     with st.sidebar:
         st.header("运行参数")
         backtest_days = st.number_input(
-            "回测交易日数", 100, 1000, 500, 50, key="v610_days")
+            "回测交易日数", 100, 1000, 500, 50, key="v611_days")
         min_price = st.number_input(
             "最低股价（元）", 10.0, 20.0, 10.0, 10.0,
-            format="%.0f", key="v610_min_price")
+            format="%.0f", key="v611_min_price")
         min_mv = st.number_input(
             "最低流通市值（亿元）", 50.0, 100.0, 50.0, 50.0,
-            format="%.0f", key="v610_min_mv")
+            format="%.0f", key="v611_min_mv")
         signal_end_date = st.date_input(
             "历史买入信号截止（40日判卷）", date(2026, 6, 5),
-            key="v610_signal_end")
+            key="v611_signal_end")
         market_end_date = st.date_input(
             "最新信号观察截止（默认今天）", date.today(),
-            key="v610_market_end")
+            key="v611_market_end")
         pause = st.number_input(
-            "接口间隔(秒)", 0.0, 2.0, 0.12, 0.02, key="v610_pause")
+            "接口间隔(秒)", 0.0, 2.0, 0.12, 0.02, key="v611_pause")
         use_cache = st.checkbox(
-            "复用行情和72小时基础缓存", True, key="v610_cache")
+            "复用行情和72小时基础缓存", True, key="v611_cache")
         st.caption("逐股票行情不设TTL；本版兼容并复用V6.4逐股票检查点。")
         portfolio_draws = st.number_input(
             "每组随机路径数", 100, 1000, V66_DEFAULT_DRAWS, 100,
-            key="v610_draws")
-        st.caption("共4个同分方案×2种选择方式；300条时共2400次组合模拟。")
+            key="v611_draws")
+        st.caption("共2个主排序方案×2种选择方式；300条时共1200次组合模拟。")
         st.divider()
         commission_pct = st.number_input(
             "佣金率(%)", 0.0, 0.20, 0.025, 0.005,
-            format="%.3f", key="v610_commission")
+            format="%.3f", key="v611_commission")
         stamp_duty_pct = st.number_input(
             "卖出印花税率(%)", 0.0, 0.20, 0.05, 0.01,
-            format="%.3f", key="v610_stamp")
+            format="%.3f", key="v611_stamp")
         transfer_fee_pct = st.number_input(
             "过户费率(%)", 0.0, 0.05, 0.001, 0.001,
-            format="%.3f", key="v610_transfer")
-        if st.button("清除V6.10结果和运行状态", key="v610_clear"):
+            format="%.3f", key="v611_transfer")
+        if st.button("清除V6.11结果和运行状态", key="v611_clear"):
             shutil.rmtree(V63_RESULT_DIR, ignore_errors=True)
             shutil.rmtree(V63_JOB_DIR, ignore_errors=True)
             st.success("结果和运行状态已清除；逐股票检查点与行情缓存保留。")
@@ -10364,15 +10763,20 @@ def main() -> None:
         "full_slot_capital": V66_FULL_SLOT_CAPITAL,
         "portfolio_schemes": [item["key"] for item in V66_PORTFOLIO_SCHEMES],
         "entry_rank_caps": [3],
-        "same_score_tie_breakers": [
-            str(item["tie_break_mode"]) for item in V66_PORTFOLIO_SCHEMES],
+        "primary_rank_modes": [
+            str(item["primary_rank_mode"]) for item in V66_PORTFOLIO_SCHEMES],
+        "same_score_tie_breaker": "DailyMACDHistAsc",
+        "walk_forward_features": list(V611_FEATURES),
+        "walk_forward_min_train_rows": V611_MIN_TRAIN_ROWS,
+        "walk_forward_min_train_dates": V611_MIN_TRAIN_DATES,
+        "walk_forward_label_gain": {"F": 0, "B": 1, "A": 3, "S": 7},
         "portfolio_draws": int(portfolio_draws),
         "common_random_seed": V66_RANDOM_SEED,
         "paired_seed_across_schemes_and_modes": True,
         "upgrade_rule": "14d_high_confirm_add_to_full",
         "ordinary_rule": "keep_exact_score5_to_fixed40",
         "rank_gate_rule": "frozen_top3_original_same_day_rank_no_fallback",
-        "tie_break_rule": "score_primary_then_signal_time_secondary_exact_ties_only",
+        "primary_rank_rule": "score221_macd_vs_strict_mature40d_walk_forward_sabf",
         "timeout_rule": "exit_trial_and_never_reenter",
         "score_weights": [V63_SCORE_K_WEIGHT, V63_SCORE_AGE_WEIGHT,
                           V63_SCORE_KD_WEIGHT],
@@ -10380,7 +10784,7 @@ def main() -> None:
     request_signature = stable_signature(request_payload)
     result_path = os.path.join(V63_RESULT_DIR, f"{request_signature}.zip")
     result_name = (
-        f"weekly_skdj_score5_tie_break_audit_v6_10_"
+        f"weekly_skdj_walk_forward_sabf_rank_v6_11_"
         f"{int(backtest_days)}d_p{int(min_price)}_mv{int(min_mv)}.zip")
     completed_available = False
     if os.path.exists(result_path):
@@ -10391,7 +10795,7 @@ def main() -> None:
             v63_clear_job_active(request_signature)
             st.success("发现相同参数的已完成结果，可直接下载。")
             render_download(
-                saved_result, result_name, f"v610_saved_{request_signature}")
+                saved_result, result_name, f"v611_saved_{request_signature}")
         except Exception as exc:
             st.warning(f"已保存结果读取失败：{exc}")
 
@@ -10400,15 +10804,15 @@ def main() -> None:
         token = secret_token
         st.caption("已从Streamlit Secrets读取TUSHARE_TOKEN。")
     else:
-        token = st.text_input("Tushare Token", type="password", key="v610_token")
+        token = st.text_input("Tushare Token", type="password", key="v611_token")
     job_active = v63_is_job_active(request_signature)
     left, right = st.columns(2)
     with left:
         start_clicked = st.button(
-            "开始/重新运行V6.10", type="primary", key="v610_run")
+            "开始/重新运行V6.11", type="primary", key="v611_run")
     with right:
         stop_clicked = st.button(
-            "停止自动续跑", disabled=not job_active, key="v610_stop")
+            "停止自动续跑", disabled=not job_active, key="v611_stop")
     if stop_clicked:
         v63_clear_job_active(request_signature)
         st.success("已停止；逐股票检查点保留。")
@@ -10470,7 +10874,7 @@ def main() -> None:
         "transfer_fee_pct": float(transfer_fee_pct),
     }
     # Reuse V6.4 stock-level checkpoints: event generation is unchanged and
-    # V6.10继续复用V6.4事件行，只改变无未来函数的同分二级排序。
+    # V6.11继续复用V6.4事件行，只在组合层增加严格走步主排序。
     run_signature = stable_signature({
         "version": V65_EVENT_ENGINE_VERSION, **config})
     period_index = build_period_index(memberships)
@@ -10517,7 +10921,7 @@ def main() -> None:
                         run_signature, code, rows, stock_rejects)
                 except Exception as exc:
                     failures += 1
-                    record_error(f"V6.10逐股票分析失败 {code}: {exc}")
+                    record_error(f"V6.11逐股票分析失败 {code}: {exc}")
         processed = number + 1
         now = time.monotonic()
         if (processed == 1 or now - last_update >= UI_HEARTBEAT_SECONDS
@@ -10537,7 +10941,7 @@ def main() -> None:
 
     events_all = pd.DataFrame(event_rows)
     if events_all.empty:
-        st.error("本区间没有生成V6.10可用事件。")
+        st.error("本区间没有生成V6.11可用事件。")
         return
     events_all = v63_attach_breadth_and_rank(events_all, open_dates)
     events_all = events_all.sort_values(
@@ -10573,6 +10977,12 @@ def main() -> None:
 
     early = v64_add_state_lifecycle_columns(early)
     early = v65_add_staged_position_columns(early)
+    with st.spinner("逐入场日构建严格成熟窗S>A>B>F走步排序..."):
+        early, walk_forward_training_audit, v611_full_bundle = (
+            v611_add_walk_forward_ordinal(early))
+        walk_forward_oos_audit = v611_oos_grade_audit(early)
+        walk_forward_coefficients = v611_feature_coefficients(
+            v611_full_bundle)
 
     with st.spinner("复用本地行情缓存，构建30万元三仓撮合价格簿..."):
         price_book, portfolio_cache_hits, portfolio_missing = v66_load_price_book(
@@ -10606,7 +11016,7 @@ def main() -> None:
         return
 
     with st.spinner(
-            f"运行真实三仓组合：4个同分方案×2种选择×"
+            f"运行真实三仓组合：2个主排序方案×2种选择×"
             f"{int(portfolio_draws)}条路径..."):
         (portfolio_paths, portfolio_summary, score_vs_random,
          representative_equity, representative_trades,
@@ -10618,13 +11028,15 @@ def main() -> None:
         return
 
     early["Calendar_Year"] = early["Signal_Date"].astype(str).str[:4]
-    paired_tie_break = v610_paired_tie_break_summary(portfolio_paths)
-    seed_pairing_audit = v610_seed_pairing_audit(portfolio_paths)
-    tie_break_event_audit = v610_same_score_tie_break_audit(early)
+    paired_primary_rank = v611_paired_primary_rank_summary(portfolio_paths)
+    seed_pairing_audit = v611_seed_pairing_audit(portfolio_paths)
     score_rank_summary = v68_score_rank_path_summary(portfolio_paths)
     profit_concentration = v68_profit_concentration_summary(portfolio_paths)
     representative_stock_profit = v68_representative_stock_profit(
         representative_trades)
+    portfolio_event_audit = v66_prepare_portfolio_events(early, open_dates)
+    actual_selected_grade_audit = v611_actual_selected_grade_audit(
+        representative_trades, portfolio_event_audit)
     ordinary_factor_combo = v68_exact_factor_combo_audit(early)
     gate_summary = v63_gate_summary(early)
     realized_strategy = v64_realized_strategy_summary(early)
@@ -10685,6 +11097,8 @@ def main() -> None:
     if not recent_early.empty:
         recent_early["Current_Lifecycle_Status"] = v64_live_lifecycle_status(
             recent_early, latest_market_date)
+        recent_early = v611_score_live_candidates(
+            recent_early, v611_full_bundle)
     high_priority_weekly = weekly[
         weekly["Weekly_Momentum_Tier"].eq(
             "高优先级_红柱扩张且已涨10至30")].copy()
@@ -10706,7 +11120,18 @@ def main() -> None:
         "14日超时": int((~true_mask(early, "Confirm14_Confirmed")).sum()),
         "组合迟到重入方案": 0,
         "同日入场顺位方案": "固定前3",
-        "同分二级排序方案": "随机/MACD柱较小/周K变化较大/量比较大",
+        "主排序方案": "2-2-1主分/严格走步S>A>B>F",
+        "同分二级排序": "固定MACD柱较小优先",
+        "走步模型可用事件": int(true_mask(
+            early, "V611_Model_Available").sum()),
+        "走步模型可用入场日": int(early.loc[true_mask(
+            early, "V611_Model_Available"), "Entry_Date"].nunique()),
+        "训练不足回退入场日": int(early.loc[~true_mask(
+            early, "V611_Model_Available"), "Entry_Date"].nunique()),
+        "最终模型训练事件": int(
+            v611_full_bundle["train_rows"] if v611_full_bundle else 0),
+        "最终模型训练入场日": int(
+            v611_full_bundle["train_dates"] if v611_full_bundle else 0),
         "共用随机种子起点": V66_RANDOM_SEED,
         "公平配对是否全部通过": bool(
             not seed_pairing_audit.empty
@@ -10729,10 +11154,10 @@ def main() -> None:
         ("提前试仓", "周线K15至25；日线MACD质量合格；本轮首次上涨3%；次日开盘"),
         ("账户规模", "初始30万元；最多3只股票；每只满仓10万元"),
         ("名额规则", "试仓也占1个股票名额；同股试仓和补仓只占1个名额"),
-        ("试仓比例", "所有V6.10组合统一使用1/2试仓"),
+        ("试仓比例", "所有V6.11组合统一使用1/2试仓"),
         ("主确认期限", "14自然日内上穿25视为按时确认；7日只作速度对照"),
         ("高质量确认", "上穿日红柱扩张且本轮累计上涨10至30%；下一开盘补足满仓"),
-        ("普通确认规则", "四个方案均只保留买入时2-2-1恰好5分的原试仓"),
+        ("普通确认规则", "两个主排序方案均只保留买入时2-2-1恰好5分的原试仓"),
         ("普通5分固定方案", "确认后不再加仓，继续持有原1/2试仓至初始买入后的第40市场日"),
         ("同日顺位方案", "固定只允许原始同日候选顺位前3进入买入判断"),
         ("顺位不递补", "高顺位因已持仓、满仓或现金不足未成交时，低顺位不自动晋级"),
@@ -10741,11 +11166,15 @@ def main() -> None:
         ("迟到确认", "无论迟到高质量或普通确认，本版组合一律不重入"),
         ("资本核算", "日序模拟现金、整手股数和持仓市值；所有交易按净值复合"),
         ("当日优先级", "开盘退出→高质量补仓→新试仓；固定期限到期按收盘退出"),
-        ("排序对照", "2-2-1分为主键；同分分别随机、MACD柱较小、周K变化较大、量比较大优先"),
-        ("二级字段边界", "三个二级字段均为信号时已知；仅在2-2-1总分完全相同时生效"),
-        ("公平配对", "同一Path_No在四种同分方案和两种选择方式中复用同一Seed；四组随机控制必须一致"),
-        ("评分顺位审计", "按每条评分路径的真实候选顺序分别统计第1、第2、第3顺位交易贡献"),
-        ("S/A/B用途", "仍按40日先到+30/+20/+10且先于-10判卷；只作后验验收，不参与排序"),
+        ("基线主排序", "2-2-1分降序；完全同分时MACD柱较小优先"),
+        ("挑战主排序", "严格走步S>A>B>F模型分降序；同分再用2-2-1和MACD柱较小"),
+        ("模型标签", "等级序位F/B/A/S=0/1/2/3；成对权重按收益0/1/3/7，优先学习S相对F"),
+        ("模型特征", "14项信号时字段转为同入场日百分位；MACD柱先除以股价再比较"),
+        ("防泄漏", "每个预测入场日只训练40日结束日期严格早于该日的事件"),
+        ("训练不足回退", f"不足{V611_MIN_TRAIN_ROWS}事件或{V611_MIN_TRAIN_DATES}入场日时使用基线，不删候选"),
+        ("公平配对", "同一Path_No在两个主排序方案和规则/随机选择中复用同一Seed；随机控制必须一致"),
+        ("规则顺位审计", "按每条规则路径的真实候选顺序分别统计第1、第2、第3顺位交易贡献"),
+        ("S/A/B用途", "历史已成熟标签只训练未来日期；当前及未来事件不得读取自身40日标签"),
         ("精确因子组合", "K15至20、红柱3至5日、周K低于D拆成全部八种布尔组合，不再只看总分"),
         ("牛股依赖", "静态扣除每条路径最大和前三盈利股票的已实现净利润；不虚构释放仓位后的再投资"),
         ("全路径逐年验收", "每条路径保留各年收益、回撤、资金暴露和持股数"),
@@ -10757,7 +11186,7 @@ def main() -> None:
         ("股票基础资料", "Streamlit内存", "72小时", "实例重启可能提前消失"),
         ("申万科技行业成员", "Streamlit内存", "7天", "实例重启可能提前消失"),
         ("逐股票日线与daily_basic", "应用临时磁盘", "不自动过期", "重新部署可能清空"),
-        ("V6.4兼容逐股票检查点", "应用临时磁盘", "不自动过期", "V6.10直接复用相同事件"),
+        ("V6.4兼容逐股票检查点", "应用临时磁盘", "不自动过期", "V6.11直接复用相同事件"),
     ], columns=["对象", "位置", "设定时长", "实际边界"])
     rejection_audit = pd.DataFrame([
         {"剔除原因": key, "次数": value} for key, value in sorted(rejects.items())])
@@ -10771,10 +11200,15 @@ def main() -> None:
         "高质量确认": "红柱扩张且累计上涨10至30%",
         "试仓比例": "0.5000",
         "高质量补仓": "补足至100%",
-        "普通确认": "四个同分方案均为恰好5分固定40日",
+        "普通确认": "两个主排序方案均为恰好5分固定40日",
         "普通确认保留评分": "恰好5分",
         "同日入场顺位上限": "固定3",
-        "同分二级排序": "Random/DailyMACDHistAsc/KChangeDesc/VolumeRatioDesc",
+        "主排序": "Score221MACDHistAsc/WalkForwardSABF",
+        "同分二级排序": "DailyMACDHistAsc",
+        "走步最小训练事件": V611_MIN_TRAIN_ROWS,
+        "走步最小训练入场日": V611_MIN_TRAIN_DATES,
+        "走步特征": "/".join(V611_FEATURES),
+        "走步标签收益": "F0/B1/A3/S7",
         "顺位递补": "禁止",
         "共用随机种子起点": V66_RANDOM_SEED,
         "跨方案与选择方式共用Seed": True,
@@ -10858,6 +11292,10 @@ def main() -> None:
         column for column in early.columns
         if column.startswith("Lifecycle_") and column not in detail_columns
     ])
+    detail_columns.extend([
+        column for column in early.columns
+        if column.startswith("V611_") and column not in detail_columns
+    ])
     live_columns = [
         "Event_Type", "Strategy_Label", "ts_code", "name", "Signal_Date",
         "Signal_Week", "SW_L1", "SW_L2", "Raw_Close", "Circ_MV_Billion",
@@ -10870,6 +11308,9 @@ def main() -> None:
         "Future_Cross_State", "Future_Weekly_Cross25_Date",
         "Current_Lifecycle_Status",
         "Watch_Next_Strength_Threshold",
+        "V611_Live_Score", "V611_Live_Rank",
+        "V611_Live_Model_Available", "V611_Live_Train_Rows",
+        "V611_Live_Train_Dates", "V611_Live_Train_Weeks",
     ]
     history_early_export = early[[
         column for column in detail_columns if column in early.columns]].copy()
@@ -10884,38 +11325,41 @@ def main() -> None:
         column for column in live_columns if column in live_watch.columns]].copy()
     portfolio_event_audit = v66_prepare_portfolio_events(early, open_dates)
     files = {
-        "01_run_summary_v6_10.csv": run_summary,
-        "02_experiment_definitions_v6_10.csv": definitions,
-        "03_tie_break_ensemble_summary_v6_10.csv": portfolio_summary,
-        "04_paired_tie_break_comparison_v6_10.csv": paired_tie_break,
-        "05_score_vs_random_portfolio_v6_10.csv": score_vs_random,
-        "06_all_portfolio_paths_v6_10.csv": portfolio_paths,
-        "07_all_path_year_summary_v6_10.csv": all_path_year_summary,
-        "08_all_path_year_detail_v6_10.csv": all_path_year_detail,
-        "09_representative_path_annual_v6_10.csv": representative_annual,
-        "10_representative_path_equity_v6_10.csv": representative_equity,
-        "11_representative_path_trades_v6_10.csv": representative_trades,
-        "12_score_rank_1_2_3_path_summary_v6_10.csv": score_rank_summary,
-        "13_profit_concentration_ablation_v6_10.csv": profit_concentration,
-        "14_representative_stock_profit_contribution_v6_10.csv": representative_stock_profit,
-        "15_same_score_tie_break_event_audit_v6_10.csv": tie_break_event_audit,
-        "16_ordinary_exact_factor_combination_v6_10.csv": ordinary_factor_combo,
-        "17_common_seed_pairing_audit_v6_10.csv": seed_pairing_audit,
-        "18_portfolio_event_audit_v6_10.csv": portfolio_event_audit,
-        "19_ordinary_confirmation_by_exact_score_v6_10.csv": ordinary_score_audit,
-        "20_high_confirmation_by_exact_score_v6_10.csv": high_score_audit,
-        "21_early_outcomes_by_cross_state_v6_10.csv": cross_state_outcomes,
-        "22_fresh_cross_entry_by_state_v6_10.csv": cross_entry_outcomes,
-        "23_weekly_coverage_summary_v6_10.csv": coverage,
-        "24_weekly_signal_calendar_v6_10.csv": calendar,
-        "25_historical_weekly_control_detail_v6_10.csv": history_weekly_export,
-        "26_recent_14d_strength3_candidates_v6_10.csv": recent_early_export,
-        "27_recent_14d_weekly_candidates_v6_10.csv": recent_weekly_export,
-        "28_latest_market_day_watch_pool_v6_10.csv": live_watch_export,
-        "29_cache_policy_v6_10.csv": cache_policy,
-        "30_rejection_audit_v6_10.csv": rejection_audit,
-        "31_metadata_v6_10.csv": metadata,
-        "32_api_errors_v6_10.csv": pd.DataFrame({"错误": API_ERRORS}),
+        "01_run_summary_v6_11.csv": run_summary,
+        "02_experiment_definitions_v6_11.csv": definitions,
+        "03_primary_rank_ensemble_summary_v6_11.csv": portfolio_summary,
+        "04_paired_primary_rank_comparison_v6_11.csv": paired_primary_rank,
+        "05_rule_vs_random_portfolio_v6_11.csv": score_vs_random,
+        "06_all_portfolio_paths_v6_11.csv": portfolio_paths,
+        "07_all_path_year_summary_v6_11.csv": all_path_year_summary,
+        "08_all_path_year_detail_v6_11.csv": all_path_year_detail,
+        "09_representative_path_annual_v6_11.csv": representative_annual,
+        "10_representative_path_equity_v6_11.csv": representative_equity,
+        "11_representative_path_trades_v6_11.csv": representative_trades,
+        "12_actual_selected_grade_and_win_audit_v6_11.csv": actual_selected_grade_audit,
+        "13_rule_rank_1_2_3_path_summary_v6_11.csv": score_rank_summary,
+        "14_profit_concentration_ablation_v6_11.csv": profit_concentration,
+        "15_representative_stock_profit_contribution_v6_11.csv": representative_stock_profit,
+        "16_walk_forward_oos_grade_audit_v6_11.csv": walk_forward_oos_audit,
+        "17_walk_forward_training_leakage_audit_v6_11.csv": walk_forward_training_audit,
+        "18_walk_forward_final_coefficients_v6_11.csv": walk_forward_coefficients,
+        "19_common_seed_pairing_audit_v6_11.csv": seed_pairing_audit,
+        "20_portfolio_event_audit_v6_11.csv": portfolio_event_audit,
+        "21_ordinary_exact_factor_combination_v6_11.csv": ordinary_factor_combo,
+        "22_ordinary_confirmation_by_exact_score_v6_11.csv": ordinary_score_audit,
+        "23_high_confirmation_by_exact_score_v6_11.csv": high_score_audit,
+        "24_early_outcomes_by_cross_state_v6_11.csv": cross_state_outcomes,
+        "25_fresh_cross_entry_by_state_v6_11.csv": cross_entry_outcomes,
+        "26_weekly_coverage_summary_v6_11.csv": coverage,
+        "27_weekly_signal_calendar_v6_11.csv": calendar,
+        "28_historical_weekly_control_detail_v6_11.csv": history_weekly_export,
+        "29_recent_14d_strength3_candidates_v6_11.csv": recent_early_export,
+        "30_recent_14d_weekly_candidates_v6_11.csv": recent_weekly_export,
+        "31_latest_market_day_watch_pool_v6_11.csv": live_watch_export,
+        "32_cache_policy_v6_11.csv": cache_policy,
+        "33_rejection_audit_v6_11.csv": rejection_audit,
+        "34_metadata_v6_11.csv": metadata,
+        "35_api_errors_v6_11.csv": pd.DataFrame({"错误": API_ERRORS}),
     }
     result_zip = make_zip(files)
     try:
@@ -10935,32 +11379,40 @@ def main() -> None:
         f"{int((early['V65_Lifecycle_Action'].eq('14日内普通确认_只保留试仓') & numeric(early, 'Timing_Score_221').eq(5.0)).sum())}个；"
         f"最近14日3%信号{len(recent_early)}个，最新观察池{len(live_watch)}只；"
         f"结果{'已保存' if persisted else '仅当前页面可下载'}。")
-    st.subheader("结论一：固定Top3下的四种同分二级排序")
+    st.subheader("结论一：原2-2-1与走步S>A>B>F主排序的真实三仓结果")
     render_plain_table(portfolio_summary, 40)
     st.caption(
         "这是日序账户净值，不是事件收益平均。每组的中位、10%和90%分位"
         "同时列出静态剔除最大、前三盈利股票后的结果。")
-    st.subheader("结论二：相对同分随机的逐路径公平配对")
-    render_plain_table(paired_tie_break, 30)
+    st.subheader("结论二：走步主排序相对原2-2-1基线的逐路径配对")
+    render_plain_table(paired_primary_rank, 20)
     st.caption(
-        "三个因子方案与同分随机复用相同Path_No和Seed；完全随机选择下"
-        "四组路径应完全一致，评分路径差异只能来自2-2-1完全同分时的次序。")
-    st.subheader("结论三：每种同分规则下2-2-1选股是否优于随机")
+        "两个方案复用同一Path_No和Seed；完全随机选择下两组路径必须一致，"
+        "规则路径差异只能来自走步主排序，不能来自资金、生命周期或候选删减。")
+    st.subheader("结论三：实际买入是否达到三分之二盈利与S/A/B目标")
+    render_plain_table(actual_selected_grade_audit, 20)
+    st.caption("这张表按实际成交事件合并试仓和补仓腿，是66.7%目标的正式验收口径。")
+    st.subheader("结论四：模型可用日期上的Top3爆发等级与三只中两只盈利")
+    render_plain_table(walk_forward_oos_audit, 30)
+    st.caption(
+        "只比较走步模型已经具备训练历史的相同入场日；随机行为精确期望，"
+        "不删除单股或双股日期，三只中两只指标只在当日候选不少于3只时计算。")
+    st.subheader("结论五：两种规则排序是否优于完全随机")
     render_plain_table(score_vs_random, 30)
     st.caption(
-        "验收核心是‘评分优于随机比例’和收益差的10%～90%分位；"
-        "如果仅中位收益好看但评分优于随机约50%，评分仍然没有通过。")
-    st.subheader("结论四：评分实际入场第1/2/3顺位")
+        "验收核心是‘规则优于随机比例’和收益差的10%～90%分位；"
+        "如果仅中位收益好看但规则优于随机约50%，该排序仍然没有通过。")
+    st.subheader("结论六：规则排序实际入场第1/2/3顺位")
     render_plain_table(score_rank_summary, 30)
     st.caption(
-        "顺位来自每条评分路径当日的真实候选排序；补仓利润归回原始入场事件，"
+        "顺位来自每条规则路径当日的真实候选排序；补仓利润归回原始入场事件，"
         "因此可以直接判断第一、第二、第三名各自贡献。")
-    st.subheader("结论五：剔除头部盈利股票后的静态稳健性")
+    st.subheader("结论七：剔除头部盈利股票后的静态稳健性")
     render_plain_table(profit_concentration, 30)
     st.caption(
         "这里只扣除已实现净利润，不假设腾出的仓位会自动买到下一只股票；"
         "这是保守的利润集中度审计，不是重新撮合后的反事实回测。")
-    st.subheader("结论六：全部路径的逐年稳定性")
+    st.subheader("结论八：全部路径的逐年稳定性")
     render_plain_table(all_path_year_summary, 100)
     st.caption(
         "这张表使用每一条路径，而不是只挑总收益接近中位数的一条路径。"
@@ -10969,18 +11421,20 @@ def main() -> None:
         render_plain_table(representative_annual, 50)
     with st.expander("共用随机种子公平性审计", expanded=False):
         render_plain_table(seed_pairing_audit, 20)
-    with st.expander("同日同分事件的收益与S/A/B后验审计", expanded=False):
-        render_plain_table(tie_break_event_audit, 100)
+    with st.expander("逐入场日训练成熟边界与防泄漏审计", expanded=False):
+        render_plain_table(walk_forward_training_audit, 500)
         st.caption(
-            "这张表用40日结果判卷，只验证二级排序假设；S/A/B和未来收益"
-            "没有进入候选生成或排序。最终采用与否以上方真实三仓配对结果为准。")
+            "每个模型可用日的训练最大40日结束日期必须严格早于预测入场日；"
+            "任何一行不通过，都应判定本版结果无效。")
+    with st.expander("最终历史模型特征系数（仅用于最近实时候选）", expanded=False):
+        render_plain_table(walk_forward_coefficients, 50)
     with st.expander("三因子精确组合与原分数审计", expanded=False):
         render_plain_table(ordinary_factor_combo, 100)
         render_plain_table(ordinary_score_audit, 20)
         render_plain_table(high_score_audit, 20)
         st.caption(
             "精确组合用于拆开相同总分下的不同条件结构，不能代替真实三仓结果；"
-            "V6.10以上方真实现金、名额和持仓净值为准。")
+            "V6.11以上方真实现金、名额和持仓净值为准。")
     st.subheader("确认速度与确认日状态")
     render_plain_table(cross_state_outcomes, 30)
     st.caption("上表从3%提前买入者视角判卷；下表从确认后才新买入者视角判卷。")
@@ -11004,7 +11458,7 @@ def main() -> None:
     st.caption(
         f"结果ZIP共{len(files)}个CSV；历史成熟事件、组合路径、"
         "最近候选和最新观察池严格分开。")
-    render_download(result_zip, result_name, f"v610_current_{request_signature}")
+    render_download(result_zip, result_name, f"v611_current_{request_signature}")
 
 
 if __name__ == "__main__":
