@@ -1,15 +1,14 @@
 # -*- coding: utf-8 -*-
-"""周线SKDJ周内爆发力Learning-to-Rank与实盘观察 V6.0。
+"""周线SKDJ准备区与日线MACD提前买点时序审计 V6.1。
 
-历史研究与实盘观察使用两条互不污染的时间线：历史买入信号默认截止
-2026-06-05，只有已经走完W8且次周可成交的事件才能训练和判卷；实盘观察则把
-行情延伸到最近可用交易日，只显示最近完整交易周的候选，不进入历史收益、标签、
-随机基准或时间外验收。
+本版不继续修改评分模型，而是验证更基础的买入时点问题。方案一在全科技池中
+独立扫描“最近完成周N=6 SKDJ K位于15～35、日线MACD红柱第2～5天”的提前
+事件；是否后来上穿周线25只作为事后配对字段，绝不作为入选条件。方案二保留
+周线K上穿25，在信号当日按日线MACD扩张、健康缩短、临近翻绿或已经翻绿分组。
 
-本版保留宽候选池和V5.7双因子H2作为对照，不采用V5.9的52周股性硬剔除。新的
-主排名使用NumPy成对逻辑回归：只比较同一周中爆发等级不同的股票，按
-F/B/A/S=0/1/2/3学习相对次序，并以每个预测周以前已经完整揭晓W8结果的事件滚动
-训练。这样直接优化周内前三名，同时不增加XGBoost/LightGBM部署依赖。
+历史成绩只使用信号截止日以前且已有40个后续市场交易日的事件；截止日以后只
+用于显示最近观察信号，不进入历史统计。所有日线与周线状态均按当日收盘时已经
+完成的数据计算，买入统一为下一市场交易日开盘。
 """
 from __future__ import annotations
 
@@ -31,17 +30,17 @@ import pandas as pd
 import streamlit as st
 import tushare as ts
 
-TITLE = "周线SKDJ周内爆发力排名与本周候选 V6.0"
-VERSION = "V6.0-WEEKLY-SKDJ-PAIRWISE-LTR-LIVE"
-UI_PATCH = "V6.0-PAIRWISE-LTR-HISTORY-LIVE-SEPARATION"
+TITLE = "周线SKDJ准备区与日线MACD提前买点审计 V6.1"
+VERSION = "V6.1-WEEKLY-SKDJ-DAILY-MACD-TIMING-AUDIT"
+UI_PATCH = "V6.1-EARLY-DAILY-MACD-NO-FUTURE-CROSS-LEAKAGE"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # 沿用旧行情缓存目录，以便直接复用V4.7已经下载的更长历史数据。
 PRICE_CACHE_DIR = os.path.join(APP_DIR, "weekly_macd_validation_cache_v1_1")
 # 200周预热会改变历史周期字段，不能复用30周预热的逐股票检查点。
-CHECKPOINT_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_0_checkpoints")
-RESULT_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_0_results")
-JOB_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_0_jobs")
+CHECKPOINT_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_1_checkpoints")
+RESULT_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_1_results")
+JOB_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_1_jobs")
 
 SKDJ_NS = (6, 7, 9)
 SKDJ_M = 3
@@ -97,6 +96,20 @@ LTR_C = 0.35
 LTR_NEWTON_MAX_ITER = 100
 LTR_NEWTON_TOL = 1e-8
 LTR_PRIMARY_N = 6
+
+# V6.1 timing hypotheses.  The threshold sweep is deliberately exported so
+# that one attractive result cannot silently become the rule.
+EARLY_PRIMARY_N = 6
+EARLY_WEEKLY_K_MIN = 15.0
+EARLY_WEEKLY_K_MAX = 35.0
+EARLY_RED_AGE_MIN = 2
+EARLY_RED_AGE_MAX = 5
+DAILY_AUDIT_DAYS = 40
+DAILY_EXTENDED_DAYS = 60
+MACD_REMAINING_THRESHOLDS = (10.0, 20.0, 30.0)
+MACD_HEALTHY_REMAINING_PCT = 35.0
+MACD_HEALTHY_RETENTION_PCT = 75.0
+FUTURE_WEEKLY_CROSS_DAYS = 42
 
 CORE_TECH_L1 = {"电子", "计算机", "通信", "国防军工"}
 EXTENDED_TECH_L1 = {"机械设备", "电力设备", "医药生物", "汽车", "基础化工", "有色金属", "建筑材料"}
@@ -4963,7 +4976,519 @@ def slim_ltr_candidates(eligible: pd.DataFrame) -> pd.DataFrame:
     return eligible[[column for column in columns if column in eligible.columns]].copy()
 
 
-def main() -> None:
+# ---------------------------------------------------------------------------
+# V6.1 timing audit.  These definitions intentionally override the V6.0 stock
+# analyzer below while leaving the proven data/cache infrastructure untouched.
+# ---------------------------------------------------------------------------
+
+def add_daily_macd(daily: pd.DataFrame) -> pd.DataFrame:
+    """Add observable daily MACD-cycle features without looking ahead."""
+    work = normalize_price_frame(daily).sort_values("trade_date").reset_index(drop=True)
+    close = pd.to_numeric(work["close"], errors="coerce")
+    dif = close.ewm(span=12, adjust=False, min_periods=1).mean() - close.ewm(
+        span=26, adjust=False, min_periods=1).mean()
+    dea = dif.ewm(span=9, adjust=False, min_periods=1).mean()
+    hist = dif - dea
+    positive = hist.gt(0)
+    cycle_start = positive & ~positive.shift(1, fill_value=False)
+    cycle_number = cycle_start.cumsum().where(positive, 0).astype(int)
+    red_age = pd.Series(0, index=work.index, dtype=int)
+    positive_index = work.index[positive]
+    if len(positive_index):
+        red_age.loc[positive_index] = (
+            work.loc[positive_index].groupby(cycle_number.loc[positive_index]).cumcount() + 1
+        ).astype(int)
+    cycle_peak = pd.Series(np.nan, index=work.index, dtype=float)
+    cycle_start_close = pd.Series(np.nan, index=work.index, dtype=float)
+    if len(positive_index):
+        positive_cycles = cycle_number.loc[positive_index]
+        cycle_peak.loc[positive_index] = hist.loc[positive_index].groupby(
+            positive_cycles).cummax()
+        cycle_start_close.loc[positive_index] = close.loc[positive_index].groupby(
+            positive_cycles).transform("first")
+    previous_hist = hist.shift(1)
+    remaining = hist / cycle_peak.replace(0, np.nan) * 100.0
+    retention = (hist / previous_hist.replace(0, np.nan) * 100.0).where(
+        positive & previous_hist.gt(0))
+
+    state = pd.Series("已翻绿", index=work.index, dtype=object)
+    state.loc[positive & red_age.eq(1)] = "红柱首日"
+    state.loc[positive & retention.ge(100.0)] = "红柱扩张"
+    state.loc[
+        positive & retention.lt(100.0) & remaining.le(20.0)
+    ] = "临近翻绿"
+    state.loc[
+        positive & retention.lt(100.0)
+        & remaining.gt(20.0)
+        & remaining.ge(MACD_HEALTHY_REMAINING_PCT)
+        & retention.ge(MACD_HEALTHY_RETENTION_PCT)
+    ] = "健康缩短"
+    state.loc[
+        positive & retention.lt(100.0)
+        & ~state.isin(["临近翻绿", "健康缩短"])
+    ] = "明显衰减"
+
+    work["Daily_DIF"] = dif
+    work["Daily_DEA"] = dea
+    work["Daily_MACD_Hist"] = hist
+    work["Daily_MACD_Positive"] = positive
+    work["Daily_MACD_Cycle"] = cycle_number
+    work["Daily_MACD_Red_Age"] = red_age
+    work["Daily_MACD_Cycle_Peak"] = cycle_peak
+    work["Daily_MACD_Remaining_pct"] = remaining
+    work["Daily_MACD_Retention_pct"] = retention
+    work["Daily_MACD_State"] = state
+    work["Daily_MACD_Cycle_Start_Close"] = cycle_start_close
+    work["Daily_Return_Since_Red_Start_pct"] = (
+        close / cycle_start_close.replace(0, np.nan) - 1.0) * 100.0
+    return work
+
+
+def attach_latest_completed_weekly(
+        daily_macd: pd.DataFrame, indicator: pd.DataFrame) -> pd.DataFrame:
+    """Attach the latest complete N=6 weekly row known at each daily close."""
+    daily_work = daily_macd.copy()
+    daily_work["_dt"] = pd.to_datetime(daily_work["trade_date"], format="%Y%m%d")
+    weekly = indicator.copy()
+    weekly["_dt"] = pd.to_datetime(weekly["trade_date"], format="%Y%m%d")
+    weekly = weekly[[
+        "_dt", "trade_date", "K", "D", "K_Change_1W", "KD_Spread",
+        "Prior_Below25_Streak", "Close_to_MA20_pct", "MA20_Slope_4W_pct",
+        "Volume_Ratio_5W", "Signal_Week_Return_pct",
+    ]].rename(columns={
+        "trade_date": "Setup_Weekly_Date",
+        "K": "Setup_Weekly_K", "D": "Setup_Weekly_D",
+        "K_Change_1W": "Setup_Weekly_K_Change_1W",
+        "KD_Spread": "Setup_Weekly_KD_Spread",
+        "Prior_Below25_Streak": "Setup_Prior_Below25_Streak",
+        "Close_to_MA20_pct": "Setup_Close_to_MA20_pct",
+        "MA20_Slope_4W_pct": "Setup_MA20_Slope_4W_pct",
+        "Volume_Ratio_5W": "Setup_Volume_Ratio_5W",
+        "Signal_Week_Return_pct": "Setup_Week_Return_pct",
+    }).sort_values("_dt")
+    result = pd.merge_asof(
+        daily_work.sort_values("_dt"), weekly, on="_dt", direction="backward")
+    return result.drop(columns=["_dt"]).sort_values("trade_date").reset_index(drop=True)
+
+
+def macd_snapshot(row: pd.Series) -> dict[str, Any]:
+    cycle_value = finite_num(row.get("Daily_MACD_Cycle"))
+    age_value = finite_num(row.get("Daily_MACD_Red_Age"))
+    return {
+        "Daily_DIF": finite_num(row.get("Daily_DIF")),
+        "Daily_DEA": finite_num(row.get("Daily_DEA")),
+        "Daily_MACD_Hist": finite_num(row.get("Daily_MACD_Hist")),
+        "Daily_MACD_Positive": to_bool(row.get("Daily_MACD_Positive")),
+        "Daily_MACD_Cycle": int(cycle_value) if math.isfinite(cycle_value) else 0,
+        "Daily_MACD_Red_Age": int(age_value) if math.isfinite(age_value) else 0,
+        "Daily_MACD_Remaining_pct": finite_num(row.get("Daily_MACD_Remaining_pct")),
+        "Daily_MACD_Retention_pct": finite_num(row.get("Daily_MACD_Retention_pct")),
+        "Daily_MACD_State": str(row.get("Daily_MACD_State", "数据不足")),
+        "Daily_Return_Since_Red_Start_pct": finite_num(
+            row.get("Daily_Return_Since_Red_Start_pct")),
+    }
+
+
+def _cost_factors(config: dict[str, Any]) -> tuple[float, float]:
+    buy_cost = (config["commission_pct"] + config["transfer_fee_pct"]) / 100.0
+    sell_cost = (
+        config["commission_pct"] + config["transfer_fee_pct"]
+        + config["stamp_duty_pct"]) / 100.0
+    buy_factor = (1 + config["buy_slippage_pct"] / 100.0) * (1 + buy_cost)
+    sell_factor = (1 - config["sell_slippage_pct"] / 100.0) * (1 - sell_cost)
+    return buy_factor, sell_factor
+
+
+def _next_stock_open(
+        daily: pd.DataFrame, after_date: str, latest_date: str
+        ) -> tuple[str, float]:
+    future = daily[
+        daily["trade_date"].astype(str).gt(after_date)
+        & daily["trade_date"].astype(str).le(latest_date)
+    ].sort_values("trade_date")
+    if future.empty:
+        return "", np.nan
+    row = future.iloc[0]
+    return str(row["trade_date"]), finite_num(row.get("open"))
+
+
+def daily_timing_outcomes(
+        daily_macd: pd.DataFrame, signal_date: str, ts_code: str,
+        open_dates: list[str], open_pos: dict[str, int], config: dict[str, Any]
+        ) -> dict[str, Any]:
+    """Evaluate identical 40-session outcomes and observable MACD exits."""
+    out: dict[str, Any] = {
+        "Tradable": False, "Reason": "", "Date": "", "Raw_Open": np.nan,
+        "Has_40D": False, "End_Date_40D": "", "MFE_Net_pct": np.nan,
+        "MAE_Raw_pct": np.nan, "Close_Return_Net_pct": np.nan,
+        "Peak_Date_40D": "", "Peak_Market_Day_40D": np.nan,
+    }
+    for level in (10, 20, 30):
+        out[f"First_Hit_{level}_vs_Minus10_40D"] = ""
+        out[f"First_Hit_{level}_vs_Minus10_40D_Date"] = ""
+    for threshold in MACD_REMAINING_THRESHOLDS:
+        prefix = f"Exit_Remaining{int(threshold)}"
+        out.update({
+            f"{prefix}_Date": "", f"{prefix}_Reason": "",
+            f"{prefix}_Return_Net_pct": np.nan,
+            f"{prefix}_Hold_Market_Days": np.nan,
+            f"{prefix}_MAE_Raw_pct": np.nan,
+        })
+    if signal_date not in open_pos or open_pos[signal_date] + 1 >= len(open_dates):
+        out["Reason"] = "未来市场交易日不足"
+        return out
+    entry_pos = open_pos[signal_date] + 1
+    entry_date = open_dates[entry_pos]
+    entry_row = daily_macd[daily_macd["trade_date"].astype(str).eq(entry_date)]
+    if entry_row.empty:
+        out["Reason"] = "下一市场交易日停牌"
+        return out
+    first = entry_row.iloc[-1]
+    raw_entry = finite_num(first.get("open"))
+    if not math.isfinite(raw_entry) or raw_entry <= 0:
+        out["Reason"] = "开盘价无效"
+        return out
+    if str(ts_code).startswith(("600", "601", "603", "605", "000", "001", "002", "003")):
+        if float(first["open"]) == float(first["high"]) == float(first["low"]):
+            out["Reason"] = "主板下一交易日一字板"
+            return out
+    out.update({"Tradable": True, "Date": entry_date, "Raw_Open": raw_entry})
+    if entry_pos + DAILY_AUDIT_DAYS - 1 >= len(open_dates):
+        out["Reason"] = "未来40个市场交易日不足"
+        return out
+    end_date = open_dates[entry_pos + DAILY_AUDIT_DAYS - 1]
+    path = daily_macd[
+        daily_macd["trade_date"].astype(str).between(entry_date, end_date)
+    ].sort_values("trade_date").copy()
+    if path.empty:
+        out["Reason"] = "未来40日个股行情缺失"
+        return out
+    buy_factor, sell_factor = _cost_factors(config)
+    net_entry = raw_entry * buy_factor
+    high = finite_num(pd.to_numeric(path["high"], errors="coerce").max())
+    low = finite_num(pd.to_numeric(path["low"], errors="coerce").min())
+    close = finite_num(path.iloc[-1].get("close"))
+    highs = pd.to_numeric(path["high"], errors="coerce")
+    peak_date = ""
+    peak_day = np.nan
+    if highs.notna().any():
+        peak_index = highs.idxmax()
+        peak_date = str(path.loc[peak_index, "trade_date"])
+        peak_day = float(open_pos.get(peak_date, entry_pos) - entry_pos + 1)
+    out.update({
+        "Has_40D": True, "End_Date_40D": end_date,
+        "MFE_Net_pct": (high * sell_factor / net_entry - 1.0) * 100.0,
+        "MAE_Raw_pct": (low / raw_entry - 1.0) * 100.0,
+        "Close_Return_Net_pct": (close * sell_factor / net_entry - 1.0) * 100.0,
+        "Peak_Date_40D": peak_date, "Peak_Market_Day_40D": peak_day,
+    })
+    entry_period = pd.Timestamp(entry_date).to_period("W-FRI")
+    for level in (10, 20, 30):
+        label, hit_date, _ = first_hit_detail(path, raw_entry, float(level), entry_period)
+        out[f"First_Hit_{level}_vs_Minus10_40D"] = label
+        out[f"First_Hit_{level}_vs_Minus10_40D_Date"] = hit_date
+
+    # A close signal can only be acted on at a later open.  If the stock is
+    # suspended, use its first later available open, still inside the horizon.
+    decision_path = path[path["trade_date"].astype(str).ge(entry_date)].copy()
+    for threshold in MACD_REMAINING_THRESHOLDS:
+        prefix = f"Exit_Remaining{int(threshold)}"
+        hist = numeric(decision_path, "Daily_MACD_Hist")
+        remaining = numeric(decision_path, "Daily_MACD_Remaining_pct")
+        retention = numeric(decision_path, "Daily_MACD_Retention_pct")
+        green = hist.le(0)
+        near = hist.gt(0) & remaining.le(threshold) & retention.lt(100.0)
+        decisions = decision_path[green | near]
+        if decisions.empty:
+            exit_date, raw_exit, reason = end_date, close, "40日仍未触发_期末收盘"
+        else:
+            decision = decisions.iloc[0]
+            decision_date = str(decision["trade_date"])
+            reason = "红柱翻绿" if finite_num(decision.get("Daily_MACD_Hist")) <= 0 else f"红柱剩余≤{int(threshold)}%"
+            exit_date, raw_exit = _next_stock_open(daily_macd, decision_date, end_date)
+            if not exit_date or not math.isfinite(raw_exit):
+                exit_date, raw_exit, reason = end_date, close, f"{reason}_无后续开盘_期末收盘"
+        exit_path = path[path["trade_date"].astype(str).between(entry_date, exit_date)]
+        exit_low = finite_num(pd.to_numeric(exit_path["low"], errors="coerce").min())
+        out.update({
+            f"{prefix}_Date": exit_date,
+            f"{prefix}_Reason": reason,
+            f"{prefix}_Return_Net_pct": (raw_exit * sell_factor / net_entry - 1.0) * 100.0,
+            f"{prefix}_Hold_Market_Days": float(
+                open_pos.get(exit_date, entry_pos) - entry_pos + 1),
+            f"{prefix}_MAE_Raw_pct": (exit_low / raw_entry - 1.0) * 100.0,
+        })
+    return out
+
+
+def outcome_explosion_class(row: pd.Series) -> str:
+    if not to_bool(row.get("Entry_Has_40D")):
+        return "未成熟"
+    if str(row.get("Entry_First_Hit_30_vs_Minus10_40D", "")) == "先到+30%":
+        return "S"
+    if str(row.get("Entry_First_Hit_20_vs_Minus10_40D", "")) == "先到+20%":
+        return "A"
+    if str(row.get("Entry_First_Hit_10_vs_Minus10_40D", "")) == "先到+10%":
+        return "B"
+    return "F"
+
+
+def _event_base_row(
+        stock: pd.Series, membership: dict[str, str], signal_date: str,
+        snapshot: dict[str, float], event_type: str) -> dict[str, Any]:
+    return {
+        "Event_Type": event_type, "ts_code": str(stock["ts_code"]),
+        "name": str(stock["name"]), "SKDJ_N": EARLY_PRIMARY_N,
+        "SKDJ_M": SKDJ_M, "Signal_Date": signal_date,
+        "Signal_Week": str(pd.Timestamp(signal_date).to_period("W-FRI")),
+        "SW_L1": membership["l1"], "SW_L2": membership["l2"],
+        "SW_L3": membership["l3"], **snapshot,
+    }
+
+
+def analyze_stock(stock: pd.Series, periods: list[dict[str, str]], daily: pd.DataFrame,
+                  cached_basic: pd.DataFrame, storage_path: str,
+                  week_last_map: dict[pd.Timestamp, str], open_dates: list[str],
+                  open_pos: dict[str, int], market_weeks: list[tuple[pd.Period, str]],
+                  config: dict[str, Any], use_cache: bool, api_pause: float
+                  ) -> tuple[list[dict[str, Any]], dict[str, int],
+                             dict[str, dict[str, float]]]:
+    """Build independent early events plus late weekly-cross controls."""
+    del market_weeks  # V6.1 uses exact market-session horizons, not partial weeks.
+    rejects: dict[str, int] = {}
+    weekly_base = aggregate_complete_weekly(daily, week_last_map)
+    if weekly_base.empty:
+        return [], rejects, {}
+    n6 = add_skdj(weekly_base, EARLY_PRIMARY_N)
+    daily_macd = attach_latest_completed_weekly(add_daily_macd(daily), n6)
+    event_end = str(config.get("event_signal_end", config["signal_end"]))
+
+    early_mask = (
+        daily_macd["trade_date"].astype(str).between(config["signal_start"], event_end)
+        & numeric(daily_macd, "Setup_Weekly_K").between(
+            EARLY_WEEKLY_K_MIN, EARLY_WEEKLY_K_MAX, inclusive="both")
+        & numeric(daily_macd, "Daily_MACD_Red_Age").between(
+            EARLY_RED_AGE_MIN, EARLY_RED_AGE_MAX, inclusive="both")
+        & true_mask(daily_macd, "Daily_MACD_Positive")
+    )
+    early_candidates = daily_macd[early_mask].copy()
+    if not early_candidates.empty:
+        # One buy candidate per positive MACD cycle; if weekly K enters the
+        # setup range on day 4, day 4 is selected rather than inventing day 2.
+        early_candidates = early_candidates.sort_values("trade_date").groupby(
+            "Daily_MACD_Cycle", as_index=False, sort=False).first()
+    weekly_crosses = n6[
+        true_mask(n6, "K_Cross_25")
+        & n6["trade_date"].astype(str).between(config["signal_start"], event_end)
+    ].copy()
+    if early_candidates.empty and weekly_crosses.empty:
+        return [], rejects, {}
+
+    code = str(stock["ts_code"])
+    basic = ensure_daily_basic(
+        code, config["data_start"], config["market_end"], daily, cached_basic,
+        storage_path, use_cache, api_pause)
+    if basic.empty:
+        rejects["存在时序信号但daily_basic缺失"] = len(early_candidates) + len(weekly_crosses)
+        return [], rejects, {}
+
+    cross_dates = weekly_crosses["trade_date"].astype(str).sort_values().tolist()
+    rows: list[dict[str, Any]] = []
+
+    def valid_context(signal_date: str) -> tuple[dict[str, str] | None, dict[str, float], str]:
+        membership = membership_on_date(periods, signal_date)
+        snapshot = market_snapshot(basic, signal_date)
+        reason = ""
+        if membership is None:
+            reason = "信号日不在历史科技池"
+        elif not (str(stock["list_date"]) <= signal_date < str(stock["delist_date"])):
+            reason = "信号日上市状态无效"
+        elif not math.isfinite(snapshot["Raw_Close"]) or snapshot["Raw_Close"] < config["min_price"]:
+            reason = "信号日股价不足"
+        elif (not math.isfinite(snapshot["Circ_MV_Billion"])
+              or snapshot["Circ_MV_Billion"] < config["min_mv"]):
+            reason = "信号日流通市值不足"
+        return membership, snapshot, reason
+
+    for _, signal in early_candidates.iterrows():
+        signal_date = str(signal["trade_date"])
+        membership, snapshot, reason = valid_context(signal_date)
+        if reason or membership is None:
+            rejects[reason] = rejects.get(reason, 0) + 1
+            continue
+        outcome = daily_timing_outcomes(
+            daily_macd, signal_date, code, open_dates, open_pos, config)
+        future_cross = ""
+        for cross_date in cross_dates:
+            if cross_date >= signal_date and (
+                    pd.Timestamp(cross_date) - pd.Timestamp(signal_date)).days <= FUTURE_WEEKLY_CROSS_DAYS:
+                future_cross = cross_date
+                break
+        future_open_date = ""
+        future_open = np.nan
+        if future_cross:
+            future_open_date, future_open = _next_stock_open(
+                daily_macd, future_cross, config["market_end"])
+        early_open = finite_num(outcome.get("Raw_Open"))
+        price_advantage = (
+            (future_open / early_open - 1.0) * 100.0
+            if math.isfinite(early_open) and early_open > 0 and math.isfinite(future_open)
+            else np.nan)
+        row = _event_base_row(
+            stock, membership, signal_date, snapshot, "EARLY_DAILY_MACD")
+        row.update({
+            "Setup_Weekly_Date": str(signal.get("Setup_Weekly_Date", "")),
+            "Signal_K": finite_num(signal.get("Setup_Weekly_K")),
+            "Signal_D": finite_num(signal.get("Setup_Weekly_D")),
+            "Signal_KD_Spread": finite_num(signal.get("Setup_Weekly_KD_Spread")),
+            "Signal_K_Change_1W": finite_num(signal.get("Setup_Weekly_K_Change_1W")),
+            "Signal_Prior_Below25_Streak": finite_num(
+                signal.get("Setup_Prior_Below25_Streak")),
+            "Signal_Close_to_MA20_pct": finite_num(
+                signal.get("Setup_Close_to_MA20_pct")),
+            "Signal_MA20_Slope_4W_pct": finite_num(
+                signal.get("Setup_MA20_Slope_4W_pct")),
+            "Signal_Volume_Ratio_5W": finite_num(
+                signal.get("Setup_Volume_Ratio_5W")),
+            "Signal_Week_Return_pct": finite_num(
+                signal.get("Setup_Week_Return_pct")),
+            **macd_snapshot(signal),
+            "Future_Weekly_Cross25_Within42D": bool(future_cross),
+            "Future_Weekly_Cross25_Date": future_cross,
+            "Lead_Calendar_Days_to_Weekly_Cross": (
+                float((pd.Timestamp(future_cross) - pd.Timestamp(signal_date)).days)
+                if future_cross else np.nan),
+            "Future_Weekly_Entry_Date": future_open_date,
+            "Future_Weekly_Raw_Open": future_open,
+            "Early_Price_Advantage_vs_Weekly_pct": price_advantage,
+        })
+        row.update({f"Entry_{key}": value for key, value in outcome.items()})
+        rows.append(row)
+
+    macd_lookup = daily_macd.set_index(daily_macd["trade_date"].astype(str))
+    for _, signal in weekly_crosses.iterrows():
+        signal_date = str(signal["trade_date"])
+        membership, snapshot, reason = valid_context(signal_date)
+        if reason or membership is None:
+            rejects[reason] = rejects.get(reason, 0) + 1
+            continue
+        if signal_date in macd_lookup.index:
+            daily_signal = macd_lookup.loc[signal_date]
+            if isinstance(daily_signal, pd.DataFrame):
+                daily_signal = daily_signal.iloc[-1]
+        else:
+            before = daily_macd[daily_macd["trade_date"].astype(str).le(signal_date)]
+            daily_signal = before.iloc[-1] if not before.empty else pd.Series(dtype=object)
+        outcome = daily_timing_outcomes(
+            daily_macd, signal_date, code, open_dates, open_pos, config)
+        row = _event_base_row(
+            stock, membership, signal_date, snapshot, "WEEKLY_CROSS25")
+        row.update({
+            "Setup_Weekly_Date": signal_date,
+            "Signal_K": finite_num(signal.get("K")),
+            "Signal_D": finite_num(signal.get("D")),
+            "Signal_KD_Spread": finite_num(signal.get("KD_Spread")),
+            "Signal_K_Change_1W": finite_num(signal.get("K_Change_1W")),
+            "Signal_Prior_Below25_Streak": finite_num(
+                signal.get("Prior_Below25_Streak")),
+            "Signal_Close_to_MA20_pct": finite_num(signal.get("Close_to_MA20_pct")),
+            "Signal_MA20_Slope_4W_pct": finite_num(signal.get("MA20_Slope_4W_pct")),
+            "Signal_Volume_Ratio_5W": finite_num(signal.get("Volume_Ratio_5W")),
+            "Signal_Week_Return_pct": finite_num(signal.get("Signal_Week_Return_pct")),
+            **macd_snapshot(daily_signal),
+        })
+        row.update({f"Entry_{key}": value for key, value in outcome.items()})
+        rows.append(row)
+    return rows, rejects, {}
+
+
+def add_timing_labels(frame: pd.DataFrame) -> pd.DataFrame:
+    result = frame.copy()
+    if result.empty:
+        result["Explosion_Class_40D"] = pd.Series(dtype=str)
+        return result
+    result["Explosion_Class_40D"] = result.apply(outcome_explosion_class, axis=1)
+    result["Explosion_Grade_40D"] = result["Explosion_Class_40D"].map(
+        {"F": 0, "B": 1, "A": 2, "S": 3})
+    return result
+
+
+def timing_outcome_summary(
+        frame: pd.DataFrame, group_columns: list[str], scheme: str = ""
+        ) -> pd.DataFrame:
+    columns = group_columns if group_columns else ["_all"]
+    work = frame.copy()
+    if not group_columns:
+        work["_all"] = "全部"
+    rows: list[dict[str, Any]] = []
+    grouped = work.groupby(columns[0] if len(columns) == 1 else columns, dropna=False)
+    for key, group in grouped:
+        keys = (key,) if len(columns) == 1 else tuple(key)
+        classes = group["Explosion_Class_40D"].astype(str)
+        row = {column: value for column, value in zip(columns, keys)}
+        row.update({
+            "方案": scheme,
+            "事件数": len(group), "不同股票": group["ts_code"].nunique(),
+            "信号日": group["Signal_Date"].nunique(),
+            "信号周": group["Signal_Week"].nunique(),
+            "S级比例%": classes.eq("S").mean() * 100.0,
+            "A或S比例%": classes.isin(["A", "S"]).mean() * 100.0,
+            "B级以上比例%": classes.isin(["B", "A", "S"]).mean() * 100.0,
+            "F级比例%": classes.eq("F").mean() * 100.0,
+            "40日最大浮盈均值%": numeric(group, "Entry_MFE_Net_pct").mean(),
+            "40日最大浮盈中位%": numeric(group, "Entry_MFE_Net_pct").median(),
+            "40日最大回撤均值%": numeric(group, "Entry_MAE_Raw_pct").mean(),
+            "40日期末净收益均值%": numeric(group, "Entry_Close_Return_Net_pct").mean(),
+            "40日期末净收益中位%": numeric(group, "Entry_Close_Return_Net_pct").median(),
+            "40日期末胜率%": numeric(group, "Entry_Close_Return_Net_pct").gt(0).mean() * 100.0,
+        })
+        rows.append(row)
+    result = pd.DataFrame(rows)
+    return result.drop(columns=["_all"], errors="ignore")
+
+
+def timing_calendar(
+        open_dates: list[str], start_date: str, end_date: str,
+        early: pd.DataFrame, weekly: pd.DataFrame) -> pd.DataFrame:
+    days = [value for value in open_dates if start_date <= value <= end_date]
+    calendar = pd.DataFrame({"trade_date": days})
+    calendar["Signal_Week"] = pd.to_datetime(
+        calendar["trade_date"], format="%Y%m%d").dt.to_period("W-FRI").astype(str)
+    weeks = calendar.groupby("Signal_Week")["trade_date"].max().rename(
+        "Week_Last_Trading_Date").reset_index()
+    for name, source in (("提前日线信号", early), ("周线确认信号", weekly)):
+        counts = source.groupby("Signal_Week").size() if not source.empty else pd.Series(dtype=int)
+        weeks[name] = weeks["Signal_Week"].map(counts).fillna(0).astype(int)
+    return weeks
+
+
+def early_exit_strategy_audit(early: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    if early.empty:
+        return pd.DataFrame()
+    rows.append({
+        "退出方案": "固定40个市场交易日期末收盘", "事件数": len(early),
+        "净收益均值%": numeric(early, "Entry_Close_Return_Net_pct").mean(),
+        "净收益中位%": numeric(early, "Entry_Close_Return_Net_pct").median(),
+        "盈利比例%": numeric(early, "Entry_Close_Return_Net_pct").gt(0).mean() * 100.0,
+        "持有市场日均值": 40.0,
+        "持有期最大回撤均值%": numeric(early, "Entry_MAE_Raw_pct").mean(),
+    })
+    for threshold in MACD_REMAINING_THRESHOLDS:
+        prefix = f"Entry_Exit_Remaining{int(threshold)}"
+        returns = numeric(early, f"{prefix}_Return_Net_pct")
+        rows.append({
+            "退出方案": f"红柱剩余≤{int(threshold)}%或翻绿，次日开盘",
+            "事件数": int(returns.notna().sum()),
+            "净收益均值%": returns.mean(), "净收益中位%": returns.median(),
+            "盈利比例%": returns.gt(0).mean() * 100.0,
+            "持有市场日均值": numeric(early, f"{prefix}_Hold_Market_Days").mean(),
+            "持有期最大回撤均值%": numeric(early, f"{prefix}_MAE_Raw_pct").mean(),
+        })
+    return pd.DataFrame(rows)
+
+
+def legacy_main_v60() -> None:
     global pro, API_ERRORS
     st.set_page_config(page_title=TITLE, layout="wide")
     st.title(TITLE)
@@ -5515,6 +6040,580 @@ def main() -> None:
     render_plain_table(run_summary)
     st.caption("结果ZIP含15个文件；最近周候选与历史W8训练/验收在代码中严格分流。")
     render_download(result_zip, result_name, f"v60_current_{request_signature}")
+
+
+def main() -> None:
+    global pro, API_ERRORS
+    st.set_page_config(page_title=TITLE, layout="wide")
+    st.title(TITLE)
+    streamlit_version = str(getattr(st, "__version__", "unknown"))
+    st.caption(
+        f"{UI_PATCH}｜先验证买点时序，不训练评分模型。｜Streamlit {streamlit_version}")
+    with st.expander("本版验证的两个方案", expanded=True):
+        st.markdown(f"""
+- **方案一（提前买入）**：以最近已经完成的周线为准，N=6周线SKDJ的K处于{EARLY_WEEKLY_K_MIN:g}～{EARLY_WEEKLY_K_MAX:g}，日线MACD进入第{EARLY_RED_AGE_MIN}～{EARLY_RED_AGE_MAX}根红柱；信号收盘确认，下一市场交易日开盘买入。
+- **关键防泄漏**：方案一独立扫描全部历史科技池。后来是否上穿周线25只作为结果中的配对字段，**不参与信号生成**；从未在六周内上穿25的失败案例同样保留。
+- **方案二（周线确认过滤）**：继续在N=6周线K由25下方上穿25后，检查当日日线MACD是红柱扩张、健康缩短、明显衰减、临近翻绿还是已经翻绿。
+- **红柱状态**：`剩余强度=当日红柱/本轮最高红柱`；`单日保留=当日红柱/上一日红柱`。健康缩短暂记为剩余≥{MACD_HEALTHY_REMAINING_PCT:g}%且单日保留≥{MACD_HEALTHY_RETENTION_PCT:g}%；临近翻绿同时审计10%、20%、30%三道阈值，不预先挑最好的一条。
+- **历史判卷**：信号日不晚于历史截止、下一日可成交并已走完{DAILY_AUDIT_DAYS}个市场交易日；S/A/B/F从新买入价重新计算，分别代表先到+30/+20/+10或均未达到，全部与-10%比较。
+- **退出只是审计**：方案一同时比较固定40日，以及红柱剩余≤10/20/30%或翻绿后下一可交易日开盘退出；本版不会据结果自动修改规则。
+- **实时观察**：历史截止以后的事件单独列出，不进入历史收益率、等级和阈值比较。
+""")
+
+    with st.sidebar:
+        st.header("运行参数")
+        backtest_days = st.number_input(
+            "回测交易日数", 100, 1000, 500, 50, key="v61_days")
+        min_price = st.number_input(
+            "最低股价（元）", 10.0, 20.0, 10.0, 10.0,
+            format="%.0f", key="v61_min_price")
+        min_mv = st.number_input(
+            "最低流通市值（亿元）", 50.0, 100.0, 50.0, 50.0,
+            format="%.0f", key="v61_min_mv")
+        signal_end_date = st.date_input(
+            "历史买入信号截止（40日判卷）", date(2026, 6, 5),
+            key="v61_signal_end")
+        market_end_date = st.date_input(
+            "最新信号观察截止（默认今天）", date.today(),
+            key="v61_market_end")
+        st.caption(
+            "历史统计只用信号日≤历史截止的成熟事件；最新观察名单不进入历史结论。")
+        pause = st.number_input(
+            "接口间隔(秒)", 0.0, 2.0, 0.12, 0.02, key="v61_pause")
+        use_cache = st.checkbox("复用行情缓存", True, key="v61_cache")
+        st.divider()
+        commission_pct = st.number_input(
+            "佣金率(%)", 0.0, 0.20, 0.025, 0.005,
+            format="%.3f", key="v61_commission")
+        stamp_duty_pct = st.number_input(
+            "卖出印花税率(%)", 0.0, 0.20, 0.05, 0.01,
+            format="%.3f", key="v61_stamp")
+        transfer_fee_pct = st.number_input(
+            "过户费率(%)", 0.0, 0.05, 0.001, 0.001,
+            format="%.3f", key="v61_transfer")
+        if st.button("清除V6.1结果和运行状态", key="v61_clear"):
+            shutil.rmtree(RESULT_DIR, ignore_errors=True)
+            shutil.rmtree(JOB_DIR, ignore_errors=True)
+            st.success("V6.1结果和运行状态已清除；逐股票检查点及通用行情缓存保留。")
+
+    request_payload = {
+        "version": VERSION, "days": int(backtest_days),
+        "signal_end": signal_end_date.strftime("%Y%m%d"),
+        "market_end": market_end_date.strftime("%Y%m%d"),
+        "min_price": float(min_price), "min_mv": float(min_mv),
+        "commission": float(commission_pct), "stamp": float(stamp_duty_pct),
+        "transfer": float(transfer_fee_pct),
+        "early_k_min": EARLY_WEEKLY_K_MIN, "early_k_max": EARLY_WEEKLY_K_MAX,
+        "red_age": [EARLY_RED_AGE_MIN, EARLY_RED_AGE_MAX],
+    }
+    request_signature = stable_signature(request_payload)
+    result_path = os.path.join(RESULT_DIR, f"{request_signature}.zip")
+    result_name = (
+        f"weekly_skdj_daily_macd_timing_audit_v6_1_{int(backtest_days)}d_"
+        f"p{int(min_price)}_mv{int(min_mv)}.zip")
+    completed_available = False
+    if os.path.exists(result_path):
+        try:
+            with open(result_path, "rb") as handle:
+                saved_result = handle.read()
+            completed_available = True
+            clear_job_active(request_signature)
+            st.success("发现相同参数的已完成结果，可直接下载。")
+            render_download(
+                saved_result, result_name, f"v61_saved_{request_signature}")
+        except Exception as exc:
+            st.warning(f"已保存结果读取失败：{exc}")
+
+    secret_token = configured_tushare_token()
+    if secret_token:
+        token = secret_token
+        st.caption("已从Streamlit Secrets读取TUSHARE_TOKEN。")
+    else:
+        token = st.text_input("Tushare Token", type="password", key="v61_token")
+
+    job_active = is_job_active(request_signature)
+    left, right = st.columns(2)
+    with left:
+        start_clicked = st.button(
+            "开始/重新运行V6.1", type="primary", key="v61_run")
+    with right:
+        stop_clicked = st.button(
+            "停止自动续跑", disabled=not job_active, key="v61_stop")
+    if stop_clicked:
+        clear_job_active(request_signature)
+        st.success("已停止；已完成股票的检查点保留。")
+        return
+    if start_clicked:
+        if market_end_date <= signal_end_date:
+            st.error("最新信号观察截止必须晚于历史信号截止")
+            return
+        mark_job_active(request_signature)
+        job_active = True
+    if not token:
+        st.info("请输入Token；任务启动后如页面重连，会从逐股票检查点自动续跑。")
+        return
+    if not job_active:
+        st.caption(
+            "点击开始运行。" if not completed_available
+            else "相同参数结果已可下载；如需覆盖，请点击重新运行。")
+        return
+
+    API_ERRORS = []
+    ts.set_token(token)
+    pro = ts.pro_api()
+    signal_end = signal_end_date.strftime("%Y%m%d")
+    market_end = market_end_date.strftime("%Y%m%d")
+    try:
+        probe_start = signal_end_date - timedelta(days=int(backtest_days) * 2 + 120)
+        probe_dates = load_trade_calendar(probe_start.strftime("%Y%m%d"), signal_end)
+        signal_start = trailing_signal_start(probe_dates, signal_end, int(backtest_days))
+    except Exception as exc:
+        st.error(f"确定{int(backtest_days)}个交易日窗口失败：{exc}")
+        return
+    data_start_date = pd.Timestamp(signal_start).date() - timedelta(
+        weeks=WARMUP_WEEKS, days=7)
+    data_start = data_start_date.strftime("%Y%m%d")
+    config = {
+        "signal_start": signal_start, "signal_end": signal_end,
+        "event_signal_end": market_end, "data_start": data_start,
+        "market_end": market_end, "min_price": float(min_price),
+        "min_mv": float(min_mv), "buy_slippage_pct": 0.20,
+        "sell_slippage_pct": 0.20, "commission_pct": float(commission_pct),
+        "stamp_duty_pct": float(stamp_duty_pct),
+        "transfer_fee_pct": float(transfer_fee_pct),
+    }
+    run_signature = stable_signature({"version": VERSION, **config})
+
+    try:
+        with st.spinner("加载交易日历和历史科技池..."):
+            open_dates = load_trade_calendar(data_start, market_end)
+            extended_end = (market_end_date + timedelta(days=7)).strftime("%Y%m%d")
+            week_last_map = complete_week_last_dates(
+                load_trade_calendar(data_start, extended_end))
+            stock_basic = load_stock_basic()
+            memberships = load_tech_memberships(float(pause))
+    except Exception as exc:
+        st.error(f"基础数据加载失败：{exc}")
+        return
+    if not open_dates:
+        st.error("区间内没有市场交易日")
+        return
+    latest_market_date = max(value for value in open_dates if value <= market_end)
+    market_weeks = market_week_sequence(open_dates)
+    open_pos = {day: position for position, day in enumerate(open_dates)}
+    period_index = build_period_index(memberships)
+    active_codes = {
+        code for code, code_periods in period_index.items()
+        if periods_overlap(code_periods, signal_start, market_end)
+    }
+    stocks = stock_basic[stock_basic["ts_code"].isin(active_codes)].copy()
+    stocks = stocks[
+        ~stocks["list_date"].gt(market_end)
+        & ~stocks["delist_date"].lt(data_start)
+    ].sort_values("ts_code").reset_index(drop=True)
+
+    event_rows: list[dict[str, Any]] = []
+    rejects: dict[str, int] = {}
+    checkpoint_hits = price_cache_hits = failures = 0
+    progress, status = st.progress(0.0), st.empty()
+    last_update = 0.0
+    stopped = False
+    for number, stock in stocks.iterrows():
+        if not is_job_active(request_signature):
+            stopped = True
+            break
+        code = str(stock["ts_code"])
+        checkpoint = load_checkpoint(run_signature, code)
+        if checkpoint is not None:
+            event_rows.extend(checkpoint["events"])
+            merge_counts(rejects, checkpoint["rejects"])
+            checkpoint_hits += 1
+        else:
+            daily, cached_basic, storage_path, cache_hit = fetch_price(
+                code, data_start, market_end, bool(use_cache), float(pause))
+            price_cache_hits += int(cache_hit)
+            if daily.empty:
+                failures += 1
+            else:
+                try:
+                    rows, stock_rejects, stock_breadth = analyze_stock(
+                        stock, period_index.get(code, []), daily, cached_basic,
+                        storage_path, week_last_map, open_dates, open_pos,
+                        market_weeks, config, bool(use_cache), float(pause))
+                    event_rows.extend(rows)
+                    merge_counts(rejects, stock_rejects)
+                    save_checkpoint(
+                        run_signature, code, rows, stock_rejects, stock_breadth)
+                except Exception as exc:
+                    failures += 1
+                    record_error(f"逐股票分析失败 {code}: {exc}")
+        processed = number + 1
+        now = time.monotonic()
+        if (processed == 1 or now - last_update >= UI_HEARTBEAT_SECONDS
+                or processed == len(stocks)):
+            progress.progress(
+                processed / max(len(stocks), 1),
+                text=f"已处理{processed}/{len(stocks)}只股票，最近{code}")
+            status.caption(
+                f"时序事件{len(event_rows)}；检查点{checkpoint_hits}；"
+                f"行情缓存{price_cache_hits}；失败{failures}")
+            last_update = now
+    progress.empty()
+    status.empty()
+    if stopped:
+        st.warning("任务已停止，逐股票检查点已保留。")
+        return
+
+    events_all = pd.DataFrame(event_rows)
+    if events_all.empty:
+        st.error("本区间没有生成通过历史时点过滤的提前或周线确认事件。")
+        return
+    events_all = events_all.sort_values(
+        ["Signal_Date", "Event_Type", "ts_code"]).reset_index(drop=True)
+    history = events_all[events_all["Signal_Date"].astype(str).le(signal_end)].copy()
+    observation = events_all[
+        events_all["Signal_Date"].astype(str).gt(signal_end)
+        & events_all["Signal_Date"].astype(str).le(latest_market_date)
+    ].copy()
+    if history["Signal_Date"].astype(str).gt(signal_end).any():
+        raise RuntimeError("历史时序样本混入了观察截止后的事件")
+    mature = history[
+        true_mask(history, "Entry_Tradable")
+        & true_mask(history, "Entry_Has_40D")
+    ].copy()
+    if mature.empty:
+        st.error("存在时序信号，但没有可成交且已走完40个市场交易日的成熟事件。")
+        return
+    mature = add_timing_labels(mature)
+    early = mature[mature["Event_Type"].eq("EARLY_DAILY_MACD")].copy()
+    weekly = mature[mature["Event_Type"].eq("WEEKLY_CROSS25")].copy()
+    if early.empty or weekly.empty:
+        st.error("提前事件或周线确认对照为空，无法完成双方案比较。")
+        return
+
+    weekly["Weekly_MACD_Filter_Group"] = "中间状态_单独观察"
+    weekly.loc[
+        weekly["Daily_MACD_State"].isin(["红柱首日", "红柱扩张", "健康缩短"]),
+        "Weekly_MACD_Filter_Group"] = "方案二保留_扩张或健康缩短"
+    weekly.loc[
+        weekly["Daily_MACD_State"].isin(["临近翻绿", "已翻绿"]),
+        "Weekly_MACD_Filter_Group"] = "方案二剔除_临近或已经翻绿"
+
+    early["Weekly_K_Band"] = pd.cut(
+        numeric(early, "Signal_K"), [15, 20, 25, 30, 35],
+        labels=["15～20", "20～25", "25～30", "30～35"],
+        include_lowest=True, right=True).astype(str)
+    early["Daily_Red_Age_Group"] = numeric(
+        early, "Daily_MACD_Red_Age").round().astype("Int64").astype(str)
+    weekly["Daily_MACD_Remaining_Band"] = pd.cut(
+        numeric(weekly, "Daily_MACD_Remaining_pct"),
+        [-np.inf, 0, 10, 20, 30, 50, 75, 100, np.inf],
+        labels=["已翻绿/≤0", "0～10", "10～20", "20～30", "30～50",
+                "50～75", "75～100", ">100"], right=True).astype(str)
+    weekly["Daily_Red_Age_Band"] = pd.cut(
+        numeric(weekly, "Daily_MACD_Red_Age"),
+        [-np.inf, 0, 5, 10, 15, 20, np.inf],
+        labels=["已翻绿/0", "1～5", "6～10", "11～15", "16～20", ">20"],
+        right=True).astype(str)
+    weekly["Pre_Cross_Rally_Band"] = pd.cut(
+        numeric(weekly, "Daily_Return_Since_Red_Start_pct"),
+        [-np.inf, 0, 10, 20, 30, np.inf],
+        labels=["<0", "0～10", "10～20", "20～30", "≥30"],
+        right=True).astype(str)
+
+    overall_parts = [
+        timing_outcome_summary(early, [], "方案一：提前日线MACD第2～5红柱"),
+        timing_outcome_summary(weekly, [], "旧买点：周线K上穿25全部"),
+        timing_outcome_summary(
+            weekly[weekly["Weekly_MACD_Filter_Group"].eq(
+                "方案二保留_扩张或健康缩短")], [],
+            "方案二：周线确认且日线MACD健康"),
+        timing_outcome_summary(
+            weekly[weekly["Weekly_MACD_Filter_Group"].eq(
+                "方案二剔除_临近或已经翻绿")], [],
+            "方案二被剔除组"),
+    ]
+    overall_comparison = pd.concat(overall_parts, ignore_index=True)
+    weekly_state_audit = timing_outcome_summary(
+        weekly, ["Daily_MACD_State"], "周线确认当日日线状态")
+    weekly_remaining_audit = timing_outcome_summary(
+        weekly, ["Daily_MACD_Remaining_Band"], "周线确认红柱剩余强度")
+    weekly_red_age_audit = timing_outcome_summary(
+        weekly, ["Daily_Red_Age_Band"], "周线确认时红柱已经持续多久")
+    weekly_pre_rally_audit = timing_outcome_summary(
+        weekly, ["Pre_Cross_Rally_Band"], "周线确认前本轮日线上涨幅度")
+    weekly_lateness_overview = pd.DataFrame([{
+        "周线确认成熟事件": len(weekly),
+        "确认日MACD仍为红柱比例%": true_mask(
+            weekly, "Daily_MACD_Positive").mean() * 100.0,
+        "确认日红柱日龄均值": numeric(weekly, "Daily_MACD_Red_Age").mean(),
+        "确认日红柱日龄中位": numeric(weekly, "Daily_MACD_Red_Age").median(),
+        "确认时已持续11至15日比例%": numeric(
+            weekly, "Daily_MACD_Red_Age").between(11, 15).mean() * 100.0,
+        "确认前本轮日线上涨均值%": numeric(
+            weekly, "Daily_Return_Since_Red_Start_pct").mean(),
+        "确认前本轮日线上涨中位%": numeric(
+            weekly, "Daily_Return_Since_Red_Start_pct").median(),
+        "确认前已上涨10至30比例%": numeric(
+            weekly, "Daily_Return_Since_Red_Start_pct").between(10, 30).mean() * 100.0,
+        "确认日临近或已经翻绿比例%": weekly["Daily_MACD_State"].isin(
+            ["临近翻绿", "已翻绿"]).mean() * 100.0,
+    }])
+    scheme2_audit = timing_outcome_summary(
+        weekly, ["Weekly_MACD_Filter_Group"], "方案二三分组")
+    early_k_audit = timing_outcome_summary(
+        early, ["Weekly_K_Band"], "方案一周线准备区")
+    early_age_audit = timing_outcome_summary(
+        early, ["Daily_Red_Age_Group"], "方案一买在第几根红柱")
+    early_pair = early.copy()
+    early_pair["Future_Cross_Group"] = np.where(
+        true_mask(early_pair, "Future_Weekly_Cross25_Within42D"),
+        "六周内后来上穿25", "六周内没有上穿25")
+    early_pair_audit = timing_outcome_summary(
+        early_pair, ["Future_Cross_Group"], "方案一未来周线确认仅作审计")
+    pair_price_audit = (early_pair.groupby("Future_Cross_Group", dropna=False).agg(
+        事件数=("ts_code", "size"),
+        配对周线确认数=("Future_Weekly_Cross25_Date", lambda values: values.astype(str).ne("").sum()),
+        领先自然日均值=("Lead_Calendar_Days_to_Weekly_Cross", "mean"),
+        领先自然日中位=("Lead_Calendar_Days_to_Weekly_Cross", "median"),
+        周线确认买价相对提前买价涨幅均值_pct=("Early_Price_Advantage_vs_Weekly_pct", "mean"),
+        周线确认买价相对提前买价涨幅中位_pct=("Early_Price_Advantage_vs_Weekly_pct", "median"),
+    ).reset_index())
+    paired_events = early_pair[
+        true_mask(early_pair, "Future_Weekly_Cross25_Within42D")
+    ].merge(
+        weekly, left_on=["ts_code", "Future_Weekly_Cross25_Date"],
+        right_on=["ts_code", "Signal_Date"], how="inner",
+        suffixes=("_Early", "_Weekly"))
+    if paired_events.empty:
+        paired_timing_comparison = pd.DataFrame()
+        paired_event_export = pd.DataFrame()
+    else:
+        early_grade = paired_events["Explosion_Class_40D_Early"].map(
+            {"F": 0, "B": 1, "A": 2, "S": 3})
+        weekly_grade = paired_events["Explosion_Class_40D_Weekly"].map(
+            {"F": 0, "B": 1, "A": 2, "S": 3})
+        paired_timing_comparison = pd.DataFrame([{
+            "同股同轮成熟配对数": len(paired_events),
+            "提前买价相对优势均值%": numeric(
+                paired_events, "Early_Price_Advantage_vs_Weekly_pct_Early").mean(),
+            "提前买价相对优势中位%": numeric(
+                paired_events, "Early_Price_Advantage_vs_Weekly_pct_Early").median(),
+            "提前买S比例%": paired_events[
+                "Explosion_Class_40D_Early"].astype(str).eq("S").mean() * 100.0,
+            "周线确认买S比例%": paired_events[
+                "Explosion_Class_40D_Weekly"].astype(str).eq("S").mean() * 100.0,
+            "提前买A或S比例%": paired_events[
+                "Explosion_Class_40D_Early"].astype(str).isin(["A", "S"]).mean() * 100.0,
+            "周线确认买A或S比例%": paired_events[
+                "Explosion_Class_40D_Weekly"].astype(str).isin(["A", "S"]).mean() * 100.0,
+            "提前买F比例%": paired_events[
+                "Explosion_Class_40D_Early"].astype(str).eq("F").mean() * 100.0,
+            "周线确认买F比例%": paired_events[
+                "Explosion_Class_40D_Weekly"].astype(str).eq("F").mean() * 100.0,
+            "提前买等级高于周线确认比例%": early_grade.gt(weekly_grade).mean() * 100.0,
+            "提前买等级低于周线确认比例%": early_grade.lt(weekly_grade).mean() * 100.0,
+            "提前买40日最大浮盈均值%": numeric(
+                paired_events, "Entry_MFE_Net_pct_Early").mean(),
+            "周线确认买40日最大浮盈均值%": numeric(
+                paired_events, "Entry_MFE_Net_pct_Weekly").mean(),
+            "提前买40日最大回撤均值%": numeric(
+                paired_events, "Entry_MAE_Raw_pct_Early").mean(),
+            "周线确认买40日最大回撤均值%": numeric(
+                paired_events, "Entry_MAE_Raw_pct_Weekly").mean(),
+        }])
+        paired_columns = [
+            "ts_code", "name_Early", "Signal_Date_Early",
+            "Future_Weekly_Cross25_Date_Early", "Signal_Date_Weekly",
+            "Entry_Date_Early", "Entry_Raw_Open_Early",
+            "Entry_Date_Weekly", "Entry_Raw_Open_Weekly",
+            "Early_Price_Advantage_vs_Weekly_pct_Early",
+            "Explosion_Class_40D_Early", "Explosion_Class_40D_Weekly",
+            "Entry_MFE_Net_pct_Early", "Entry_MFE_Net_pct_Weekly",
+            "Entry_MAE_Raw_pct_Early", "Entry_MAE_Raw_pct_Weekly",
+            "Daily_MACD_State_Weekly", "Daily_MACD_Red_Age_Weekly",
+            "Daily_MACD_Remaining_pct_Weekly",
+        ]
+        paired_event_export = paired_events[[
+            column for column in paired_columns if column in paired_events.columns]].copy()
+    exit_audit = early_exit_strategy_audit(early)
+    calendar = timing_calendar(
+        open_dates, signal_start, signal_end, early, weekly)
+
+    latest_early_date = ""
+    latest_early = pd.DataFrame()
+    observation_early = observation[
+        observation["Event_Type"].eq("EARLY_DAILY_MACD")].copy()
+    if not observation_early.empty:
+        latest_early_date = str(observation_early["Signal_Date"].astype(str).max())
+        latest_early = observation_early[
+            observation_early["Signal_Date"].astype(str).eq(latest_early_date)].copy()
+    latest_weekly_date = ""
+    latest_weekly = pd.DataFrame()
+    observation_weekly = observation[
+        observation["Event_Type"].eq("WEEKLY_CROSS25")].copy()
+    if not observation_weekly.empty:
+        latest_weekly_date = str(observation_weekly["Signal_Date"].astype(str).max())
+        latest_weekly = observation_weekly[
+            observation_weekly["Signal_Date"].astype(str).eq(latest_weekly_date)].copy()
+
+    run_summary = pd.DataFrame([{
+        "程序版本": VERSION, "正式信号开始": signal_start,
+        "历史信号截止": signal_end, "行情观察截止": market_end,
+        "最新市场交易日": latest_market_date,
+        "方案一全部历史事件": len(history[history["Event_Type"].eq("EARLY_DAILY_MACD")]),
+        "方案一40日成熟事件": len(early),
+        "方案一不同股票": early["ts_code"].nunique(),
+        "方案一有信号周": early["Signal_Week"].nunique(),
+        "方案一空窗周": int(calendar["提前日线信号"].eq(0).sum()),
+        "方案一单周最多": int(calendar["提前日线信号"].max()),
+        "周线确认40日成熟事件": len(weekly),
+        "周线确认不同股票": weekly["ts_code"].nunique(),
+        "周线确认有信号周": weekly["Signal_Week"].nunique(),
+        "周线确认空窗周": int(calendar["周线确认信号"].eq(0).sum()),
+        "方案二保留事件": int(weekly["Weekly_MACD_Filter_Group"].eq(
+            "方案二保留_扩张或健康缩短").sum()),
+        "方案二剔除事件": int(weekly["Weekly_MACD_Filter_Group"].eq(
+            "方案二剔除_临近或已经翻绿").sum()),
+        "六周内后来上穿25的提前事件": int(true_mask(
+            early, "Future_Weekly_Cross25_Within42D").sum()),
+        "六周内未上穿25的提前事件": int((~true_mask(
+            early, "Future_Weekly_Cross25_Within42D")).sum()),
+        "历史截止后提前观察事件": len(observation_early),
+        "最近提前信号日期": latest_early_date,
+        "最近提前信号股票数": len(latest_early),
+        "处理股票数": len(stocks), "检查点恢复": checkpoint_hits,
+        "行情缓存命中": price_cache_hits, "失败股票": failures,
+    }])
+
+    definitions = pd.DataFrame([
+        ("方案一候选池", f"历史科技池、股价≥{min_price:g}元、流通市值≥{min_mv:g}亿元；不要求未来周线突破"),
+        ("方案一周线准备区", f"当日日线收盘时可见的最近完整周N=6 SKDJ K在{EARLY_WEEKLY_K_MIN:g}～{EARLY_WEEKLY_K_MAX:g}"),
+        ("方案一日线触发", f"日线MACD正柱连续第{EARLY_RED_AGE_MIN}～{EARLY_RED_AGE_MAX}日；同一轮红柱只取首次满足日"),
+        ("方案二原信号", "N=6上一完整周K<25、本完整周K≥25"),
+        ("方案二暂定保留", f"红柱首日/扩张，或缩短但剩余≥{MACD_HEALTHY_REMAINING_PCT:g}%且单日保留≥{MACD_HEALTHY_RETENTION_PCT:g}%"),
+        ("方案二暂定剔除", "周线确认日已经翻绿，或红柱缩短且仅剩本轮峰值20%以下"),
+        ("买入", "信号收盘确认后的下一市场交易日开盘；停牌和主板一字板不成交"),
+        ("成熟", f"买入后已有完整{DAILY_AUDIT_DAYS}个市场交易日；不把当前未成熟候选写入历史收益"),
+        ("等级", "S/A/B分别为40日内先到+30/+20/+10且先于-10；否则F；同日冲突保守按-10先"),
+        ("未来周线配对", f"只审计提前信号后{FUTURE_WEEKLY_CROSS_DAYS}自然日内是否K上穿25，绝不反向决定提前事件是否入池"),
+        ("MACD口径", "DIF=EMA12-EMA26，DEA=EMA(DIF,9)，柱=DIF-DEA；是否乘2不影响剩余强度和状态"),
+        ("防未来函数", "周线状态只用当日日线收盘前已经完成的周数据；日线退出信号收盘确认后下一可交易日开盘执行"),
+    ], columns=["项目", "定义"])
+    rejection_audit = pd.DataFrame([
+        {"剔除原因": key, "次数": value} for key, value in sorted(rejects.items())])
+    metadata = pd.DataFrame([{
+        "程序版本": VERSION, "SKDJ_N": EARLY_PRIMARY_N, "SKDJ_M": SKDJ_M,
+        "回测交易日": int(backtest_days), "预热周": WARMUP_WEEKS,
+        "历史信号开始": signal_start, "历史信号截止": signal_end,
+        "行情截止": market_end, "最低股价": float(min_price),
+        "最低流通市值亿元": float(min_mv),
+        "日线审计市场日": DAILY_AUDIT_DAYS,
+        "Streamlit": streamlit_version,
+    }])
+
+    event_columns = [
+        "Event_Type", "ts_code", "name", "Signal_Date", "Signal_Week",
+        "SW_L1", "SW_L2", "Raw_Close", "Circ_MV_Billion",
+        "Setup_Weekly_Date", "Signal_K", "Signal_D", "Signal_KD_Spread",
+        "Daily_MACD_State", "Daily_MACD_Red_Age",
+        "Daily_MACD_Remaining_pct", "Daily_MACD_Retention_pct",
+        "Daily_Return_Since_Red_Start_pct",
+        "Future_Weekly_Cross25_Within42D", "Future_Weekly_Cross25_Date",
+        "Lead_Calendar_Days_to_Weekly_Cross",
+        "Early_Price_Advantage_vs_Weekly_pct", "Entry_Date", "Entry_Raw_Open",
+        "Entry_MFE_Net_pct", "Entry_MAE_Raw_pct",
+        "Entry_Close_Return_Net_pct", "Explosion_Class_40D",
+        "Entry_First_Hit_10_vs_Minus10_40D",
+        "Entry_First_Hit_20_vs_Minus10_40D",
+        "Entry_First_Hit_30_vs_Minus10_40D",
+        "Entry_Exit_Remaining10_Date", "Entry_Exit_Remaining10_Reason",
+        "Entry_Exit_Remaining10_Return_Net_pct",
+        "Entry_Exit_Remaining20_Date", "Entry_Exit_Remaining20_Reason",
+        "Entry_Exit_Remaining20_Return_Net_pct",
+        "Entry_Exit_Remaining30_Date", "Entry_Exit_Remaining30_Reason",
+        "Entry_Exit_Remaining30_Return_Net_pct",
+    ]
+    history_early_export = early[[
+        column for column in event_columns if column in early.columns]].copy()
+    history_weekly_export = weekly[[
+        column for column in event_columns + [
+            "Weekly_MACD_Filter_Group", "Daily_MACD_Remaining_Band"]
+        if column in weekly.columns]].copy()
+    live_columns = [
+        "Event_Type", "ts_code", "name", "Signal_Date", "Signal_Week",
+        "SW_L1", "SW_L2", "Raw_Close", "Circ_MV_Billion",
+        "Setup_Weekly_Date", "Signal_K", "Signal_D", "Signal_KD_Spread",
+        "Daily_MACD_State", "Daily_MACD_Red_Age",
+        "Daily_MACD_Remaining_pct", "Daily_MACD_Retention_pct",
+        "Daily_Return_Since_Red_Start_pct",
+    ]
+    latest_early_export = latest_early[[
+        column for column in live_columns if column in latest_early.columns]].copy()
+    latest_weekly_export = latest_weekly[[
+        column for column in live_columns if column in latest_weekly.columns]].copy()
+    files = {
+        "01_run_summary_v6_1.csv": run_summary,
+        "02_experiment_definitions_v6_1.csv": definitions,
+        "03_early_vs_weekly_timing_outcomes_v6_1.csv": overall_comparison,
+        "04_weekly_cross_daily_macd_state_outcomes_v6_1.csv": weekly_state_audit,
+        "05_weekly_cross_remaining_strength_outcomes_v6_1.csv": weekly_remaining_audit,
+        "06_weekly_cross_lateness_overview_v6_1.csv": weekly_lateness_overview,
+        "07_weekly_cross_red_age_outcomes_v6_1.csv": weekly_red_age_audit,
+        "08_weekly_cross_pre_rally_outcomes_v6_1.csv": weekly_pre_rally_audit,
+        "09_scheme2_filter_audit_v6_1.csv": scheme2_audit,
+        "10_early_weekly_k_band_outcomes_v6_1.csv": early_k_audit,
+        "11_early_red_age_outcomes_v6_1.csv": early_age_audit,
+        "12_early_future_weekly_cross_outcomes_v6_1.csv": early_pair_audit,
+        "13_early_lead_and_price_advantage_v6_1.csv": pair_price_audit,
+        "14_same_stock_same_cycle_timing_comparison_v6_1.csv": paired_timing_comparison,
+        "15_same_stock_same_cycle_event_detail_v6_1.csv": paired_event_export,
+        "16_early_macd_exit_strategy_audit_v6_1.csv": exit_audit,
+        "17_weekly_signal_coverage_v6_1.csv": calendar,
+        "18_historical_early_events_v6_1.csv": history_early_export,
+        "19_historical_weekly_cross_events_v6_1.csv": history_weekly_export,
+        "20_latest_early_candidates_v6_1.csv": latest_early_export,
+        "21_latest_weekly_cross_candidates_v6_1.csv": latest_weekly_export,
+        "22_rejection_audit_v6_1.csv": rejection_audit,
+        "23_metadata_v6_1.csv": metadata,
+        "24_api_errors_v6_1.csv": pd.DataFrame({"错误": API_ERRORS}),
+    }
+    result_zip = make_zip(files)
+    try:
+        atomic_bytes(result_zip, result_path)
+        clear_job_active(request_signature)
+        persisted = True
+    except Exception as exc:
+        persisted = False
+        st.warning(f"结果未能持久保存，但当前页面仍可下载：{exc}")
+
+    st.success(
+        f"完成：方案一提前买点{len(early)}个成熟事件，周线确认对照{len(weekly)}个；"
+        f"方案一中{int(true_mask(early, 'Future_Weekly_Cross25_Within42D').sum())}个后来六周内上穿25，"
+        f"{int((~true_mask(early, 'Future_Weekly_Cross25_Within42D')).sum())}个未上穿；"
+        f"结果{'已保存' if persisted else '仅当前页面可下载'}。")
+    st.subheader("方案一、旧买点与方案二过滤的同口径比较")
+    render_plain_table(overall_comparison, 20)
+    st.subheader("周线K上穿25当日：日线MACD状态与后续等级")
+    render_plain_table(weekly_lateness_overview, 5)
+    render_plain_table(weekly_state_audit, 20)
+    st.subheader("方案一：周线K位置与日线红柱日龄")
+    render_plain_table(early_k_audit, 20)
+    render_plain_table(early_age_audit, 20)
+    st.subheader("提前信号是否后来得到周线25确认")
+    render_plain_table(early_pair_audit, 10)
+    render_plain_table(pair_price_audit, 10)
+    st.subheader("同一只股票同一轮：提前买与周线确认买")
+    render_plain_table(paired_timing_comparison, 5)
+    st.subheader(f"最近一次提前观察信号：{latest_early_date or '无'}")
+    st.caption(
+        f"最新市场交易日为{latest_market_date}；这里只展示历史截止{signal_end}之后最近一次有信号的日期，"
+        "它不是历史成绩，也没有未来等级。")
+    render_plain_table(latest_early_export, 100)
+    st.subheader("运行摘要")
+    render_plain_table(run_summary, 10)
+    st.caption("结果ZIP共24个CSV；历史成熟事件与最新观察事件严格分开。")
+    render_download(result_zip, result_name, f"v61_current_{request_signature}")
 
 
 if __name__ == "__main__":
