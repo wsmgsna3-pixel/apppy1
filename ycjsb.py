@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""周线SKDJ日线3%提前买入与周线确认生命周期审计 V6.3。
+"""周线SKDJ提前买入、状态确认与选择性重入审计 V6.4。
 
 本版根据V6.1结果，把周线N=6 SKDJ K位于15～25定义为观察池，并独立扫描
 日线MACD红柱周期内股价自红柱起点首次上涨3%、5%、8%和10%的四个强度确认
@@ -10,11 +10,11 @@
 共同样本，分别模拟第2、3、4、5日买入。该组使用了未来“能持续到第5日”的
 信息，只用于公平比较等待代价，绝不作为实盘规则或实时候选。
 
-V6.3只保留3%提前买点、周线K上穿25对照和最新观察池，新增7/14自然日确认
-期限：提前买入后若期限内周线K上穿25则继续持有，否则在期限届满后的下一只
-可交易开盘退出；以后六周内重新上穿时另行审计重新买入。市场广度只使用信号
-当日已经可见的当日数量、当周截至当日累计数量和过去5个市场交易日数量；完整
-周信号数严格标记为事后审计，绝不作为实盘条件。
+V6.4沿用3%提前买点，但不再把任何一次周线K上穿25都视为同等确认。程序在
+确认日按日线MACD状态和本轮累计涨幅分为高质量确认、普通确认与已涨超30%的
+早仓利润保护组；14日超时退出后，只允许后来出现“红柱扩张且已涨10～30%”
+的高质量确认重新买入。同时比较普通确认立即退出、红柱剩余10/20/30%退出，
+并统计选择性重入究竟填补了多少原本没有3%新信号的星期。
 """
 from __future__ import annotations
 
@@ -123,20 +123,26 @@ COHORT_RED_AGES = (2, 3, 4, 5)
 STRENGTH_MIN_REMAINING_PCT = 75.0
 STRENGTH_MAX_PRIOR_RALLY_PCT = 30.0
 
-# V6.3 lifecycle audit.  The existing V6.2 implementation remains below as a
-# frozen reference, while the last ``main`` function is the only entry point.
-V63_TITLE = "周线SKDJ日线3%提前买入与周线确认生命周期审计 V6.3"
-V63_VERSION = "V6.3-SKDJ-STRENGTH3-CONFIRMATION-LIFECYCLE"
-V63_UI_PATCH = "V6.3-3PCT-ENTRY-7D-14D-CONFIRM-EXIT-REENTRY-BREADTH-RANK"
-V63_CHECKPOINT_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_3_checkpoints")
-V63_RESULT_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_3_results")
-V63_JOB_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_3_jobs")
+# V6.4 state-aware lifecycle audit.  Internal v63 helper names are retained to
+# minimize regression risk; the final ``main`` is the only entry point.
+V63_TITLE = "周线SKDJ提前买入、状态确认与选择性重入审计 V6.4"
+V63_VERSION = "V6.4-SKDJ-STATE-CONFIRMATION-SELECTIVE-REENTRY"
+V63_UI_PATCH = "V6.4-3PCT-ENTRY-STATE-CONFIRM-SELECTIVE-REENTRY-MACD-EXIT"
+V63_CHECKPOINT_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_4_checkpoints")
+V63_RESULT_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_4_results")
+V63_JOB_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_4_jobs")
 V63_CONFIRM_DEADLINES = (7, 14)
 V63_REENTRY_WINDOW_DAYS = 42
 V63_STRENGTH_THRESHOLD = 3.0
 V63_SCORE_K_WEIGHT = 2
 V63_SCORE_AGE_WEIGHT = 2
 V63_SCORE_KD_WEIGHT = 1
+V64_PRIMARY_CONFIRM_DAYS = 14
+V64_CROSS_HIGH = "高质量确认_红柱扩张且已涨10至30"
+V64_CROSS_ORDINARY = "普通确认_不加仓"
+V64_CROSS_OVERHEATED = "已涨超过30_早仓保护_禁止新追"
+V64_CROSS_NONE = "42日内未确认"
+V64_POST_CROSS_REMAINING = (10.0, 20.0, 30.0)
 
 CORE_TECH_L1 = {"电子", "计算机", "通信", "国防军工"}
 EXTENDED_TECH_L1 = {"机械设备", "电力设备", "医药生物", "汽车", "基础化工", "有色金属", "建筑材料"}
@@ -7498,6 +7504,120 @@ def _v63_deadline_market_date(
     return value if value <= market_end else ""
 
 
+def v64_cross_state(signal: pd.Series) -> str:
+    """Classify only information observable at the weekly-cross close."""
+    rally = finite_num(signal.get("Daily_Return_Since_Red_Start_pct"))
+    state = str(signal.get("Daily_MACD_State", ""))
+    if math.isfinite(rally) and rally > 30.0:
+        return V64_CROSS_OVERHEATED
+    if (state == "红柱扩张" and math.isfinite(rally)
+            and 10.0 <= rally <= 30.0):
+        return V64_CROSS_HIGH
+    return V64_CROSS_ORDINARY
+
+
+def v64_original_position_exit_after_cross(
+        daily_macd: pd.DataFrame, entry_outcome: dict[str, Any],
+        cross_date: str, open_pos: dict[str, int], config: dict[str, Any],
+        remaining_threshold: float | None = None) -> dict[str, Any]:
+    """Exit the original early position using decisions known after cross.
+
+    ``remaining_threshold=None`` means exit at the first open after the weekly
+    confirmation.  Otherwise, start observing at the cross close and exit at
+    the next open after MACD turns green or remaining red-column strength falls
+    to the requested threshold.  If neither happens, use the original 40-day
+    endpoint.  No pre-confirmation daily state is allowed to trigger an exit.
+    """
+    out: dict[str, Any] = {
+        "Has_Result": False, "Decision_Date": "", "Exit_Date": "",
+        "Reason": "", "Return_Net_pct": np.nan, "MFE_Net_pct": np.nan,
+        "MAE_Raw_pct": np.nan, "Hold_Market_Days": np.nan,
+    }
+    if not to_bool(entry_outcome.get("Has_40D")):
+        out["Reason"] = "原提前买点没有40日结果"
+        return out
+    entry_date = str(entry_outcome.get("Date", ""))
+    end_date = str(entry_outcome.get("End_Date_40D", ""))
+    raw_entry = finite_num(entry_outcome.get("Raw_Open"))
+    if (not entry_date or not end_date or not cross_date
+            or cross_date > end_date or not math.isfinite(raw_entry)
+            or raw_entry <= 0):
+        out["Reason"] = "确认日或原买入数据无效"
+        return out
+    decision_path = daily_macd[
+        daily_macd["trade_date"].astype(str).between(cross_date, end_date)
+    ].copy().sort_values("trade_date")
+    if decision_path.empty:
+        out["Reason"] = "确认后没有日线数据"
+        return out
+    if remaining_threshold is None:
+        decision_date = cross_date
+        reason = "周线确认后下一开盘退出"
+    else:
+        hist = numeric(decision_path, "Daily_MACD_Hist")
+        remaining = numeric(decision_path, "Daily_MACD_Remaining_pct")
+        retention = numeric(decision_path, "Daily_MACD_Retention_pct")
+        triggered = decision_path[
+            hist.le(0)
+            | (hist.gt(0) & remaining.le(float(remaining_threshold))
+               & retention.lt(100.0))
+        ]
+        if triggered.empty:
+            decision_date = end_date
+            reason = "确认后未触发MACD退出_40日期末"
+        else:
+            decision = triggered.iloc[0]
+            decision_date = str(decision["trade_date"])
+            reason = (
+                "确认后红柱翻绿" if finite_num(
+                    decision.get("Daily_MACD_Hist")) <= 0
+                else f"确认后红柱剩余≤{int(remaining_threshold)}%")
+    if decision_date == end_date:
+        end_row = daily_macd[
+            daily_macd["trade_date"].astype(str).eq(end_date)]
+        if end_row.empty:
+            out["Reason"] = "40日期末行情缺失"
+            return out
+        exit_date = end_date
+        raw_exit = finite_num(end_row.iloc[-1].get("close"))
+    else:
+        exit_date, raw_exit = _next_stock_open(
+            daily_macd, decision_date, end_date)
+        if not exit_date or not math.isfinite(raw_exit):
+            end_row = daily_macd[
+                daily_macd["trade_date"].astype(str).eq(end_date)]
+            if end_row.empty:
+                out["Reason"] = "退出后没有可交易开盘"
+                return out
+            exit_date = end_date
+            raw_exit = finite_num(end_row.iloc[-1].get("close"))
+            reason = f"{reason}_无后续开盘_40日期末"
+    path = daily_macd[
+        daily_macd["trade_date"].astype(str).between(entry_date, exit_date)
+    ].copy().sort_values("trade_date")
+    if path.empty or not math.isfinite(raw_exit):
+        out["Reason"] = "原仓位退出路径不足"
+        return out
+    buy_factor, sell_factor = _cost_factors(config)
+    net_entry = raw_entry * buy_factor
+    high = finite_num(pd.to_numeric(path.get("high"), errors="coerce").max())
+    low = finite_num(pd.to_numeric(path.get("low"), errors="coerce").min())
+    out.update({
+        "Has_Result": True, "Decision_Date": decision_date,
+        "Exit_Date": exit_date, "Reason": reason,
+        "Return_Net_pct": (raw_exit * sell_factor / net_entry - 1.0) * 100.0,
+        "MFE_Net_pct": (
+            (high * sell_factor / net_entry - 1.0) * 100.0
+            if math.isfinite(high) else np.nan),
+        "MAE_Raw_pct": (
+            (low / raw_entry - 1.0) * 100.0
+            if math.isfinite(low) else np.nan),
+        "Hold_Market_Days": float(
+            open_pos.get(exit_date, 0) - open_pos.get(entry_date, 0) + 1),
+    })
+    return out
+
+
 def v63_confirmation_outcomes(
         daily_macd: pd.DataFrame, signal_date: str, ts_code: str,
         cross_dates: list[str], entry_outcome: dict[str, Any],
@@ -7659,7 +7779,7 @@ def analyze_stock_v63(
         code, config["data_start"], config["market_end"], daily,
         cached_basic, storage_path, use_cache, api_pause)
     if basic.empty:
-        rejects["存在V6.3信号但daily_basic缺失"] = estimated
+        rejects["存在V6.4信号但daily_basic缺失"] = estimated
         return [], rejects, {}
     cross_dates = weekly_crosses["trade_date"].astype(str).sort_values().tolist()
     outcome_cache: dict[str, dict[str, Any]] = {}
@@ -7702,9 +7822,31 @@ def analyze_stock_v63(
                     pd.Timestamp(value) - pd.Timestamp(signal_date)).days
                 <= FUTURE_WEEKLY_CROSS_DAYS), "")
         future_open_date, future_open = "", np.nan
+        cross_state = V64_CROSS_NONE
+        cross_macd_state = ""
+        cross_rally = np.nan
+        cross_outcome: dict[str, Any] = {}
         if future_cross:
             future_open_date, future_open = _next_stock_open(
                 daily_macd, future_cross, config["market_end"])
+            cross_frame = daily_macd[
+                daily_macd["trade_date"].astype(str).eq(future_cross)]
+            if cross_frame.empty:
+                cross_frame = daily_macd[
+                    daily_macd["trade_date"].astype(str).le(future_cross)]
+            if not cross_frame.empty:
+                cross_signal = cross_frame.iloc[-1]
+                cross_state = v64_cross_state(cross_signal)
+                cross_macd_state = str(
+                    cross_signal.get("Daily_MACD_State", ""))
+                cross_rally = finite_num(
+                    cross_signal.get("Daily_Return_Since_Red_Start_pct"))
+            if calculate_outcome:
+                if future_cross not in outcome_cache:
+                    outcome_cache[future_cross] = daily_timing_outcomes(
+                        daily_macd, future_cross, code, open_dates, open_pos,
+                        config)
+                cross_outcome = outcome_cache[future_cross]
         entry_open = finite_num(outcome.get("Raw_Open"))
         price_advantage = (
             (future_open / entry_open - 1.0) * 100.0
@@ -7723,18 +7865,92 @@ def analyze_stock_v63(
             "Future_Weekly_Entry_Date": future_open_date,
             "Future_Weekly_Raw_Open": future_open,
             "Entry_Price_Advantage_vs_Weekly_pct": price_advantage,
+            "Future_Cross_State": cross_state,
+            "Future_Cross_Daily_MACD_State": cross_macd_state,
+            "Future_Cross_Rally_From_Red_Start_pct": cross_rally,
             "Watch_Next_Strength_Threshold": _v62_next_threshold(
                 finite_num(signal.get("Daily_Return_Since_Red_Start_pct"))),
         })
         if calculate_outcome:
             row.update({f"Entry_{key}": value for key, value in outcome.items()})
         if event_type == "STRENGTH_3" and calculate_outcome:
+            if future_cross:
+                row.update({
+                    "CrossEntry_Date": str(cross_outcome.get("Date", "")),
+                    "CrossEntry_Tradable": to_bool(
+                        cross_outcome.get("Tradable")),
+                    "CrossEntry_Has_40D": to_bool(
+                        cross_outcome.get("Has_40D")),
+                    "CrossEntry_Class_40D": _v63_class_from_outcome(
+                        cross_outcome),
+                    "CrossEntry_MFE_Net_pct": finite_num(
+                        cross_outcome.get("MFE_Net_pct")),
+                    "CrossEntry_MAE_Raw_pct": finite_num(
+                        cross_outcome.get("MAE_Raw_pct")),
+                    "CrossEntry_Close_Return_Net_pct": finite_num(
+                        cross_outcome.get("Close_Return_Net_pct")),
+                })
+                immediate = v64_original_position_exit_after_cross(
+                    daily_macd, outcome, future_cross, open_pos, config)
+                row.update({
+                    f"CrossImmediate_{key}": value
+                    for key, value in immediate.items()})
+                for threshold in V64_POST_CROSS_REMAINING:
+                    exit_outcome = v64_original_position_exit_after_cross(
+                        daily_macd, outcome, future_cross, open_pos, config,
+                        remaining_threshold=threshold)
+                    row.update({
+                        f"CrossRemaining{int(threshold)}_{key}": value
+                        for key, value in exit_outcome.items()})
             for deadline in V63_CONFIRM_DEADLINES:
                 gate = v63_confirmation_outcomes(
                     daily_macd, signal_date, code, cross_dates, outcome,
                     deadline, open_dates, open_pos, config)
                 row.update({f"Confirm{int(deadline)}_{key}": value
                             for key, value in gate.items()})
+            confirm14 = {
+                key.removeprefix("Confirm14_"): value
+                for key, value in row.items() if key.startswith("Confirm14_")
+            }
+            timeout14 = (
+                not to_bool(confirm14.get("Confirmed"))
+                and "未确认_下一开盘退出" in str(
+                    confirm14.get("Status", "")))
+            selective = bool(
+                timeout14 and future_cross
+                and cross_state == V64_CROSS_HIGH)
+            early_exit_return = finite_num(
+                confirm14.get("Strategy_Return_Net_pct"))
+            reentry_return = finite_num(
+                cross_outcome.get("Close_Return_Net_pct"))
+            selective_combined = (
+                ((1.0 + early_exit_return / 100.0)
+                 * (1.0 + reentry_return / 100.0) - 1.0) * 100.0
+                if selective and to_bool(cross_outcome.get("Has_40D"))
+                and math.isfinite(early_exit_return)
+                and math.isfinite(reentry_return) else np.nan)
+            row.update({
+                "Selective_Reentry14_Qualified": selective,
+                "Selective_Reentry14_Signal_Date": (
+                    future_cross if selective else ""),
+                "Selective_Reentry14_Entry_Date": (
+                    str(cross_outcome.get("Date", "")) if selective else ""),
+                "Selective_Reentry14_Has_40D": bool(
+                    selective and to_bool(cross_outcome.get("Has_40D"))),
+                "Selective_Reentry14_Class_40D": (
+                    _v63_class_from_outcome(cross_outcome)
+                    if selective else ""),
+                "Selective_Reentry14_MFE_Net_pct": (
+                    finite_num(cross_outcome.get("MFE_Net_pct"))
+                    if selective else np.nan),
+                "Selective_Reentry14_MAE_Raw_pct": (
+                    finite_num(cross_outcome.get("MAE_Raw_pct"))
+                    if selective else np.nan),
+                "Selective_Reentry14_Close_Return_Net_pct": (
+                    reentry_return if selective else np.nan),
+                "Selective_Reentry14_Combined_Return_Net_pct": (
+                    selective_combined),
+            })
         rows.append(row)
 
     for _, signal in strength3.iterrows():
@@ -7919,6 +8135,302 @@ def v63_reentry_summary(early: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def v64_add_state_lifecycle_columns(early: pd.DataFrame) -> pd.DataFrame:
+    """Build executable strategy variants without using the final grade."""
+    result = early.copy()
+    crossed = true_mask(result, "Future_Weekly_Cross25_Within42D")
+    confirm7 = true_mask(result, "Confirm7_Confirmed")
+    confirm14 = true_mask(result, "Confirm14_Confirmed")
+    result["Cross_Delay_Group"] = V64_CROSS_NONE
+    result.loc[crossed & confirm7, "Cross_Delay_Group"] = "7日内确认"
+    result.loc[crossed & ~confirm7 & confirm14,
+               "Cross_Delay_Group"] = "8至14日确认"
+    result.loc[crossed & ~confirm14,
+               "Cross_Delay_Group"] = "15至42日确认"
+    result["Future_Cross_State"] = result.get(
+        "Future_Cross_State", pd.Series(V64_CROSS_NONE, index=result.index)
+    ).fillna(V64_CROSS_NONE).astype(str)
+
+    base_return = numeric(result, "Entry_Close_Return_Net_pct")
+    gate_return = numeric(result, "Confirm14_Strategy_Return_Net_pct")
+    gate_hold = numeric(result, "Confirm14_Strategy_Hold_Market_Days")
+    result["Lifecycle_Baseline40_Return_Net_pct"] = base_return
+    result["Lifecycle_Baseline40_Hold_Market_Days"] = 40.0
+    result["Lifecycle_Baseline40_Round_Trips"] = 1.0
+    result["Lifecycle_Confirm14_Return_Net_pct"] = gate_return
+    result["Lifecycle_Confirm14_Hold_Market_Days"] = gate_hold
+    result["Lifecycle_Confirm14_Round_Trips"] = 1.0
+
+    any_reentry = numeric(result, "Confirm14_Combined_Return_Net_pct")
+    any_lifecycle = gate_return.copy()
+    any_used = ~confirm14 & any_reentry.notna()
+    any_lifecycle.loc[any_used] = any_reentry.loc[any_used]
+    result["Lifecycle_AnyReentry14_Return_Net_pct"] = any_lifecycle
+    result["Lifecycle_AnyReentry14_Round_Trips"] = 1.0 + any_used.astype(float)
+
+    selective_reentry = numeric(
+        result, "Selective_Reentry14_Combined_Return_Net_pct")
+    selective_lifecycle = gate_return.copy()
+    selective_used = ~confirm14 & selective_reentry.notna()
+    selective_lifecycle.loc[selective_used] = selective_reentry.loc[
+        selective_used]
+    result["Lifecycle_HighOnlyReentry14_Return_Net_pct"] = selective_lifecycle
+    result["Lifecycle_HighOnlyReentry14_Round_Trips"] = (
+        1.0 + selective_used.astype(float))
+
+    high = result["Future_Cross_State"].eq(V64_CROSS_HIGH)
+    ordinary = result["Future_Cross_State"].eq(V64_CROSS_ORDINARY)
+    overheated = result["Future_Cross_State"].eq(V64_CROSS_OVERHEATED)
+
+    def mixed_strategy(
+            return_column: str, hold_column: str,
+            protect_overheated: bool = False) -> tuple[pd.Series, pd.Series]:
+        strategy_return = gate_return.copy()
+        strategy_hold = gate_hold.copy()
+        confirmed_strong = confirm14 & (high | overheated)
+        strategy_return.loc[confirmed_strong] = base_return.loc[
+            confirmed_strong]
+        strategy_hold.loc[confirmed_strong] = 40.0
+        ordinary_return = numeric(result, return_column)
+        ordinary_hold = numeric(result, hold_column)
+        use_ordinary = confirm14 & ordinary & ordinary_return.notna()
+        strategy_return.loc[use_ordinary] = ordinary_return.loc[use_ordinary]
+        strategy_hold.loc[use_ordinary] = ordinary_hold.loc[use_ordinary]
+        if protect_overheated:
+            immediate_return = numeric(
+                result, "CrossImmediate_Return_Net_pct")
+            immediate_hold = numeric(
+                result, "CrossImmediate_Hold_Market_Days")
+            protect = confirm14 & overheated & immediate_return.notna()
+            strategy_return.loc[protect] = immediate_return.loc[protect]
+            strategy_hold.loc[protect] = immediate_hold.loc[protect]
+        return strategy_return, strategy_hold
+
+    immediate_return, immediate_hold = mixed_strategy(
+        "CrossImmediate_Return_Net_pct",
+        "CrossImmediate_Hold_Market_Days")
+    result["Lifecycle_State14_OrdinaryImmediate_Return_Net_pct"] = immediate_return
+    result["Lifecycle_State14_OrdinaryImmediate_Hold_Market_Days"] = immediate_hold
+    result["Lifecycle_State14_OrdinaryImmediate_Round_Trips"] = 1.0
+
+    for threshold in V64_POST_CROSS_REMAINING:
+        number = int(threshold)
+        strategy_return, strategy_hold = mixed_strategy(
+            f"CrossRemaining{number}_Return_Net_pct",
+            f"CrossRemaining{number}_Hold_Market_Days")
+        result[
+            f"Lifecycle_State14_OrdinaryMACD{number}_Return_Net_pct"
+        ] = strategy_return
+        result[
+            f"Lifecycle_State14_OrdinaryMACD{number}_Hold_Market_Days"
+        ] = strategy_hold
+        result[
+            f"Lifecycle_State14_OrdinaryMACD{number}_Round_Trips"
+        ] = 1.0
+
+    protect_return, protect_hold = mixed_strategy(
+        "CrossRemaining20_Return_Net_pct",
+        "CrossRemaining20_Hold_Market_Days", protect_overheated=True)
+    result[
+        "Lifecycle_State14_MACD20_ProtectOver30_Return_Net_pct"
+    ] = protect_return
+    result[
+        "Lifecycle_State14_MACD20_ProtectOver30_Hold_Market_Days"
+    ] = protect_hold
+    result[
+        "Lifecycle_State14_MACD20_ProtectOver30_Round_Trips"
+    ] = 1.0
+    return result
+
+
+def v64_realized_strategy_summary(early: pd.DataFrame) -> pd.DataFrame:
+    labels = (
+        ("提前买入固定40日", "Baseline40"),
+        ("14日任意确认_未确认退出", "Confirm14"),
+        ("14日退出_任意金叉重入", "AnyReentry14"),
+        ("14日退出_只在高质量确认重入", "HighOnlyReentry14"),
+        ("状态管理_普通确认立即退出", "State14_OrdinaryImmediate"),
+        ("状态管理_普通确认MACD剩余10退出", "State14_OrdinaryMACD10"),
+        ("状态管理_普通确认MACD剩余20退出", "State14_OrdinaryMACD20"),
+        ("状态管理_普通确认MACD剩余30退出", "State14_OrdinaryMACD30"),
+        ("状态管理_MACD20且涨超30立即保护", "State14_MACD20_ProtectOver30"),
+    )
+    rows: list[dict[str, Any]] = []
+    for label, key in labels:
+        return_column = f"Lifecycle_{key}_Return_Net_pct"
+        if return_column not in early:
+            continue
+        returns = numeric(early, return_column).dropna()
+        if returns.empty:
+            continue
+        hold_column = f"Lifecycle_{key}_Hold_Market_Days"
+        trips_column = f"Lifecycle_{key}_Round_Trips"
+        rows.append({
+            "可执行方案": label, "有结果事件": len(returns),
+            "实际收益均值%": returns.mean(),
+            "实际收益中位%": returns.median(),
+            "实际盈利比例%": returns.gt(0).mean() * 100.0,
+            "实际达到10%比例%": returns.ge(10).mean() * 100.0,
+            "实际达到20%比例%": returns.ge(20).mean() * 100.0,
+            "实际达到30%比例%": returns.ge(30).mean() * 100.0,
+            "实际亏损10%以上比例%": returns.le(-10).mean() * 100.0,
+            "收益第10分位%": returns.quantile(0.10),
+            "最差10%平均收益%": returns[returns.le(
+                returns.quantile(0.10))].mean(),
+            "平均持有市场日": (
+                numeric(early.loc[returns.index], hold_column).mean()
+                if hold_column in early else np.nan),
+            "平均完整交易次数": (
+                numeric(early.loc[returns.index], trips_column).mean()
+                if trips_column in early else np.nan),
+        })
+    return pd.DataFrame(rows)
+
+
+def v64_cross_entry_summary(early: pd.DataFrame) -> pd.DataFrame:
+    mature = early[true_mask(early, "CrossEntry_Has_40D")].copy()
+    rows: list[dict[str, Any]] = []
+    for keys, group in mature.groupby(
+            ["Cross_Delay_Group", "Future_Cross_State"], dropna=False):
+        delay, state = keys
+        classes = group["CrossEntry_Class_40D"].astype(str)
+        returns = numeric(group, "CrossEntry_Close_Return_Net_pct")
+        rows.append({
+            "确认速度": delay, "确认日状态": state,
+            "确认后新买成熟事件": len(group),
+            "不同股票": group["ts_code"].nunique(),
+            "确认周": pd.to_datetime(
+                group["Future_Weekly_Cross25_Date"].astype(str),
+                format="%Y%m%d", errors="coerce").dt.to_period(
+                    "W-FRI").nunique(),
+            "新买S级比例%": classes.eq("S").mean() * 100.0,
+            "新买A或S比例%": classes.isin(["S", "A"]).mean() * 100.0,
+            "新买B级以上比例%": classes.isin(
+                ["S", "A", "B"]).mean() * 100.0,
+            "新买F级比例%": classes.eq("F").mean() * 100.0,
+            "新买最大浮盈中位%": numeric(
+                group, "CrossEntry_MFE_Net_pct").median(),
+            "新买最大回撤均值%": numeric(
+                group, "CrossEntry_MAE_Raw_pct").mean(),
+            "新买40日收益均值%": returns.mean(),
+            "新买40日收益中位%": returns.median(),
+            "新买40日盈利比例%": returns.gt(0).mean() * 100.0,
+        })
+    return pd.DataFrame(rows)
+
+
+def v64_selective_reentry_summary(early: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    schemes = (
+        ("任意后来上穿25都重入", true_mask(
+            early, "Confirm14_Reentry_Has_40D"), "Confirm14_Reentry_"),
+        ("只在高质量确认时重入", true_mask(
+            early, "Selective_Reentry14_Has_40D"),
+         "Selective_Reentry14_"),
+    )
+    for label, mask, prefix in schemes:
+        group = early[mask].copy()
+        classes = group[f"{prefix}Class_40D"].astype(str)
+        combined = numeric(group, f"{prefix}Combined_Return_Net_pct")
+        signal_dates = group[f"{prefix}Signal_Date"].astype(str)
+        rows.append({
+            "重入方案": label, "成熟重入事件": len(group),
+            "不同股票": group["ts_code"].nunique(),
+            "重入信号日": signal_dates[signal_dates.str.len().eq(8)].nunique(),
+            "重入信号周": pd.to_datetime(
+                signal_dates, format="%Y%m%d", errors="coerce").dt.to_period(
+                    "W-FRI").nunique(),
+            "重入S级比例%": classes.eq("S").mean() * 100.0,
+            "重入A或S比例%": classes.isin(["S", "A"]).mean() * 100.0,
+            "重入B级以上比例%": classes.isin(
+                ["S", "A", "B"]).mean() * 100.0,
+            "重入F级比例%": classes.eq("F").mean() * 100.0,
+            "重入最大浮盈中位%": numeric(
+                group, f"{prefix}MFE_Net_pct").median(),
+            "重入最大回撤均值%": numeric(
+                group, f"{prefix}MAE_Raw_pct").mean(),
+            "重入40日收益均值%": numeric(
+                group, f"{prefix}Close_Return_Net_pct").mean(),
+            "重入40日收益中位%": numeric(
+                group, f"{prefix}Close_Return_Net_pct").median(),
+            "退出再重入复合收益均值%": combined.mean(),
+            "退出再重入复合收益中位%": combined.median(),
+            "退出再重入复合盈利比例%": combined.gt(0).mean() * 100.0,
+        })
+    return pd.DataFrame(rows)
+
+
+def v64_reentry_week_coverage(
+        early: pd.DataFrame, calendar: pd.DataFrame,
+        start_date: str, end_date: str) -> pd.DataFrame:
+    all_weeks = set(calendar["Signal_Week"].astype(str))
+    base_weeks = set(early["Signal_Week"].astype(str)) & all_weeks
+    rows: list[dict[str, Any]] = []
+    schemes = (
+        ("原3%提前信号", None),
+        ("3%提前信号+任意金叉重入", "Confirm14_Reentry_Signal_Date"),
+        ("3%提前信号+高质量确认重入", "Selective_Reentry14_Signal_Date"),
+    )
+    for label, column in schemes:
+        if column is None:
+            reentry_events = 0
+            reentry_weeks: set[str] = set()
+        else:
+            dates = early[column].astype(str)
+            dates = dates[
+                dates.str.len().eq(8) & dates.between(start_date, end_date)]
+            reentry_events = len(dates)
+            reentry_weeks = set(pd.to_datetime(
+                dates, format="%Y%m%d", errors="coerce").dt.to_period(
+                    "W-FRI").dropna().astype(str)) & all_weeks
+        combined_weeks = base_weeks | reentry_weeks
+        rows.append({
+            "覆盖方案": label, "原3%信号周": len(base_weeks),
+            "区间内重入事件": reentry_events,
+            "重入信号周": len(reentry_weeks),
+            "与原信号周重合": len(reentry_weeks & base_weeks),
+            "实际填补原空窗周": len(reentry_weeks - base_weeks),
+            "合并后有交易信号周": len(combined_weeks),
+            "合并后空窗周": len(all_weeks - combined_weeks),
+        })
+    return pd.DataFrame(rows)
+
+
+def v64_live_lifecycle_status(
+        frame: pd.DataFrame, latest_market_date: str) -> pd.Series:
+    statuses = pd.Series("", index=frame.index, dtype=object)
+    for index, row in frame.iterrows():
+        cross_date = normalize_date(row.get("Future_Weekly_Cross25_Date"))
+        if cross_date:
+            signal_date = normalize_date(row.get("Signal_Date"))
+            delay = (
+                (pd.Timestamp(cross_date) - pd.Timestamp(signal_date)).days
+                if signal_date else 999)
+            state = str(row.get(
+                "Future_Cross_State", V64_CROSS_ORDINARY))
+            on_time = delay <= V64_PRIMARY_CONFIRM_DAYS or to_bool(
+                row.get("Confirm14_Confirmed"))
+            if on_time and state == V64_CROSS_HIGH:
+                statuses.loc[index] = "14日内高质量确认_继续持有或加仓"
+            elif on_time and state == V64_CROSS_OVERHEATED:
+                statuses.loc[index] = "14日内已涨超30_早仓保护_禁止追买"
+            elif on_time:
+                statuses.loc[index] = "14日内普通确认_不加仓"
+            elif state == V64_CROSS_HIGH:
+                statuses.loc[index] = "14日退出后高质量确认_允许选择性重入"
+            else:
+                statuses.loc[index] = "14日退出后非高质量确认_禁止重入"
+            continue
+        signal_date = normalize_date(row.get("Signal_Date"))
+        elapsed = (
+            (pd.Timestamp(latest_market_date) - pd.Timestamp(signal_date)).days
+            if signal_date else 999)
+        statuses.loc[index] = (
+            "等待14日周线确认" if elapsed <= V64_PRIMARY_CONFIRM_DAYS
+            else "14日仍未确认_退出观察")
+    return statuses
+
+
 def v63_weighted_rank_summary(frame: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     schemes = (
@@ -8008,7 +8520,7 @@ def v63_clear_job_active(signature: str) -> None:
         if os.path.exists(path):
             os.remove(path)
     except OSError as exc:
-        record_error(f"V6.3任务标记清除失败: {exc}")
+        record_error(f"V6.4任务标记清除失败: {exc}")
 
 
 def v63_is_job_active(signature: str) -> bool:
@@ -8035,7 +8547,7 @@ def v63_load_checkpoint(signature: str, ts_code: str) -> dict[str, Any] | None:
             return None
         return payload
     except Exception as exc:
-        record_error(f"V6.3检查点损坏 {ts_code}: {exc}")
+        record_error(f"V6.4检查点损坏 {ts_code}: {exc}")
         return None
 
 
@@ -8054,49 +8566,50 @@ def main() -> None:
     st.title(V63_TITLE)
     streamlit_version = str(getattr(st, "__version__", "unknown"))
     st.caption(f"{V63_UI_PATCH}｜Streamlit {streamlit_version}")
-    with st.expander("V6.3验证口径", expanded=True):
+    with st.expander("V6.4验证口径", expanded=True):
         st.markdown(f"""
 - **唯一提前买点**：最近完整周N=6、M=3的SKDJ K位于{EARLY_WEEKLY_K_MIN:g}～{EARLY_WEEKLY_K_MAX:g}；日线MACD红柱扩张或剩余强度≥{STRENGTH_MIN_REMAINING_PCT:g}%；本轮股价首次达到+{V63_STRENGTH_THRESHOLD:g}%后，下一市场交易日开盘买入。
-- **确认生命周期**：分别观察{V63_CONFIRM_DEADLINES[0]}和{V63_CONFIRM_DEADLINES[1]}自然日。期限内周线K上穿25则继续持有至统一40日观察终点；未上穿则在期限届满后的下一只可交易开盘退出。
-- **延迟重入**：超时退出后，如果原信号起{V63_REENTRY_WINDOW_DAYS}自然日内后来上穿25，按下一市场交易日开盘重新买入并重新观察40个市场交易日。
-- **市场广度防泄漏**：当日信号数、当周截至当日累计数、过去5个市场交易日信号数均可实盘使用；完整周总信号数只能在周末知道，明确标为未来审计字段。
-- **2-2-1结构分**：周线K在15～20加{V63_SCORE_K_WEIGHT}分，日线红柱第3～5日加{V63_SCORE_AGE_WEIGHT}分，周线K低于D加{V63_SCORE_KD_WEIGHT}分。同日Top3采用分数档位内等概率，避免股票代码等任意顺序制造虚假排名。
-- **判卷**：原事件S/A/B分别为40日内先到+30/+20/+10且先于-10，其余为F；确认退出策略另看真实退出收益，不用未来等级决定退出。
+- **主确认期限**：提前买入后观察{V64_PRIMARY_CONFIRM_DAYS}自然日。未上穿25则在期限后的下一只可交易开盘退出；7日结果只保留为速度对照。
+- **确认状态**：上穿25当天，红柱扩张且本轮累计上涨10～30%为高质量确认；累计上涨超过30%属于已有早仓的利润保护组，禁止把它解释为新的追高买点；其余为普通确认。
+- **普通确认退出审计**：分别测试确认后立即退出，以及从确认日开始等待日线MACD红柱翻绿或剩余强度≤10/20/30%再退出。确认前出现过的日线变化不能触发退出。
+- **选择性重入**：14日超时退出后，原信号起{V63_REENTRY_WINDOW_DAYS}自然日内只有后来出现高质量确认才允许重入；“任何上穿25都重入”仅作为失败对照。
+- **空窗检验**：分别统计任意重入和高质量重入真正填补了多少原3%信号空窗周，不把重入伪装成新的候选股票。
+- **判卷**：S/A/B仍为40日内先到+30/+20/+10且先于-10，其余为F；所有退出与重入均按当时可见数据和下一可交易开盘执行并计入成本。
 - **缓存**：交易日历和股票基础资料72小时，行业成员7天，逐股票行情与检查点不主动过期；应用重启或重新部署仍可能清空实例内存和临时磁盘。
 """)
 
     with st.sidebar:
         st.header("运行参数")
         backtest_days = st.number_input(
-            "回测交易日数", 100, 1000, 500, 50, key="v63_days")
+            "回测交易日数", 100, 1000, 500, 50, key="v64_days")
         min_price = st.number_input(
             "最低股价（元）", 10.0, 20.0, 10.0, 10.0,
-            format="%.0f", key="v63_min_price")
+            format="%.0f", key="v64_min_price")
         min_mv = st.number_input(
             "最低流通市值（亿元）", 50.0, 100.0, 50.0, 50.0,
-            format="%.0f", key="v63_min_mv")
+            format="%.0f", key="v64_min_mv")
         signal_end_date = st.date_input(
             "历史买入信号截止（40日判卷）", date(2026, 6, 5),
-            key="v63_signal_end")
+            key="v64_signal_end")
         market_end_date = st.date_input(
             "最新信号观察截止（默认今天）", date.today(),
-            key="v63_market_end")
+            key="v64_market_end")
         pause = st.number_input(
-            "接口间隔(秒)", 0.0, 2.0, 0.12, 0.02, key="v63_pause")
+            "接口间隔(秒)", 0.0, 2.0, 0.12, 0.02, key="v64_pause")
         use_cache = st.checkbox(
-            "复用行情和72小时基础缓存", True, key="v63_cache")
+            "复用行情和72小时基础缓存", True, key="v64_cache")
         st.caption("逐股票行情和检查点不设TTL；同参数页面重连会自动续跑。")
         st.divider()
         commission_pct = st.number_input(
             "佣金率(%)", 0.0, 0.20, 0.025, 0.005,
-            format="%.3f", key="v63_commission")
+            format="%.3f", key="v64_commission")
         stamp_duty_pct = st.number_input(
             "卖出印花税率(%)", 0.0, 0.20, 0.05, 0.01,
-            format="%.3f", key="v63_stamp")
+            format="%.3f", key="v64_stamp")
         transfer_fee_pct = st.number_input(
             "过户费率(%)", 0.0, 0.05, 0.001, 0.001,
-            format="%.3f", key="v63_transfer")
-        if st.button("清除V6.3结果和运行状态", key="v63_clear"):
+            format="%.3f", key="v64_transfer")
+        if st.button("清除V6.4结果和运行状态", key="v64_clear"):
             shutil.rmtree(V63_RESULT_DIR, ignore_errors=True)
             shutil.rmtree(V63_JOB_DIR, ignore_errors=True)
             st.success("结果和运行状态已清除；逐股票检查点与行情缓存保留。")
@@ -8112,13 +8625,16 @@ def main() -> None:
         "strength": V63_STRENGTH_THRESHOLD,
         "deadlines": list(V63_CONFIRM_DEADLINES),
         "reentry_window": V63_REENTRY_WINDOW_DAYS,
+        "cross_states": [V64_CROSS_HIGH, V64_CROSS_ORDINARY,
+                         V64_CROSS_OVERHEATED],
+        "post_cross_remaining": list(V64_POST_CROSS_REMAINING),
         "score_weights": [V63_SCORE_K_WEIGHT, V63_SCORE_AGE_WEIGHT,
                           V63_SCORE_KD_WEIGHT],
     }
     request_signature = stable_signature(request_payload)
     result_path = os.path.join(V63_RESULT_DIR, f"{request_signature}.zip")
     result_name = (
-        f"weekly_skdj_confirmation_lifecycle_audit_v6_3_"
+        f"weekly_skdj_state_confirmation_reentry_audit_v6_4_"
         f"{int(backtest_days)}d_p{int(min_price)}_mv{int(min_mv)}.zip")
     completed_available = False
     if os.path.exists(result_path):
@@ -8129,7 +8645,7 @@ def main() -> None:
             v63_clear_job_active(request_signature)
             st.success("发现相同参数的已完成结果，可直接下载。")
             render_download(
-                saved_result, result_name, f"v63_saved_{request_signature}")
+                saved_result, result_name, f"v64_saved_{request_signature}")
         except Exception as exc:
             st.warning(f"已保存结果读取失败：{exc}")
 
@@ -8138,15 +8654,15 @@ def main() -> None:
         token = secret_token
         st.caption("已从Streamlit Secrets读取TUSHARE_TOKEN。")
     else:
-        token = st.text_input("Tushare Token", type="password", key="v63_token")
+        token = st.text_input("Tushare Token", type="password", key="v64_token")
     job_active = v63_is_job_active(request_signature)
     left, right = st.columns(2)
     with left:
         start_clicked = st.button(
-            "开始/重新运行V6.3", type="primary", key="v63_run")
+            "开始/重新运行V6.4", type="primary", key="v64_run")
     with right:
         stop_clicked = st.button(
-            "停止自动续跑", disabled=not job_active, key="v63_stop")
+            "停止自动续跑", disabled=not job_active, key="v64_stop")
     if stop_clicked:
         v63_clear_job_active(request_signature)
         st.success("已停止；逐股票检查点保留。")
@@ -8252,7 +8768,7 @@ def main() -> None:
                         run_signature, code, rows, stock_rejects)
                 except Exception as exc:
                     failures += 1
-                    record_error(f"V6.3逐股票分析失败 {code}: {exc}")
+                    record_error(f"V6.4逐股票分析失败 {code}: {exc}")
         processed = number + 1
         now = time.monotonic()
         if (processed == 1 or now - last_update >= UI_HEARTBEAT_SECONDS
@@ -8272,7 +8788,7 @@ def main() -> None:
 
     events_all = pd.DataFrame(event_rows)
     if events_all.empty:
-        st.error("本区间没有生成V6.3事件。")
+        st.error("本区间没有生成V6.4事件。")
         return
     events_all = v63_attach_breadth_and_rank(events_all, open_dates)
     events_all = events_all.sort_values(
@@ -8306,9 +8822,11 @@ def main() -> None:
         numeric(weekly, "Daily_Return_Since_Red_Start_pct").gt(30),
         "Weekly_Momentum_Tier"] = "风险组_已涨超过30"
 
+    early = v64_add_state_lifecycle_columns(early)
+
     overall = timing_outcome_summary(
         mature[mature["Event_Type"].isin(["STRENGTH_3", "WEEKLY_CROSS25"])],
-        ["Event_Type", "Strategy_Label"], "V6.3基础买点")
+        ["Event_Type", "Strategy_Label"], "V6.4基础买点")
     score_audit = timing_outcome_summary(
         early, ["Timing_Score_221"], "2-2-1结构分档")
     three_factor_audit = timing_outcome_summary(
@@ -8324,6 +8842,17 @@ def main() -> None:
     rank_year = pd.concat(rank_year_rows, ignore_index=True) if rank_year_rows else pd.DataFrame()
     gate_summary = v63_gate_summary(early)
     reentry_summary = v63_reentry_summary(early)
+    realized_strategy = v64_realized_strategy_summary(early)
+    cross_state_outcomes = timing_outcome_summary(
+        early, ["Cross_Delay_Group", "Future_Cross_State"],
+        "提前买入后按确认速度和确认日状态分组")
+    cross_entry_outcomes = v64_cross_entry_summary(early)
+    selective_reentry = v64_selective_reentry_summary(early)
+    cross_state_year = timing_outcome_summary(
+        early.assign(
+            Calendar_Year=lambda x: x["Signal_Date"].astype(str).str[:4]),
+        ["Calendar_Year", "Future_Cross_State"],
+        "确认日状态逐年稳定性")
     gate_status_parts: list[pd.DataFrame] = []
     for deadline in V63_CONFIRM_DEADLINES:
         part = timing_outcome_summary(
@@ -8350,6 +8879,8 @@ def main() -> None:
         ["Event_Type", "Calendar_Year"], "逐年稳定性")
     calendar = v63_week_calendar(open_dates, signal_start, signal_end, mature)
     coverage = v63_coverage_summary(calendar)
+    reentry_week_coverage = v64_reentry_week_coverage(
+        early, calendar, signal_start, signal_end)
 
     recent_start = (
         pd.Timestamp(latest_market_date) - pd.Timedelta(days=14)
@@ -8362,6 +8893,9 @@ def main() -> None:
         observation["Event_Type"].eq("WEEKLY_CROSS25")
         & observation["Signal_Date"].astype(str).between(
             recent_start, latest_market_date)].copy()
+    if not recent_early.empty:
+        recent_early["Current_Lifecycle_Status"] = v64_live_lifecycle_status(
+            recent_early, latest_market_date)
     high_priority_weekly = weekly[
         weekly["Weekly_Momentum_Tier"].eq(
             "高优先级_红柱扩张且已涨10至30")].copy()
@@ -8372,6 +8906,13 @@ def main() -> None:
         "最新市场交易日": latest_market_date,
         "成熟3%提前事件": len(early), "成熟周线确认事件": len(weekly),
         "高优先级周线事件": len(high_priority_weekly),
+        "提前事件后来高质量确认": int(
+            early["Future_Cross_State"].eq(V64_CROSS_HIGH).sum()),
+        "14日超时": int((~true_mask(early, "Confirm14_Confirmed")).sum()),
+        "任意金叉成熟重入": int(true_mask(
+            early, "Confirm14_Reentry_Has_40D").sum()),
+        "高质量确认成熟重入": int(true_mask(
+            early, "Selective_Reentry14_Has_40D").sum()),
         "3%提前信号周": early["Signal_Week"].nunique(),
         "最近14日3%提前信号": len(recent_early),
         "最近14日周线确认信号": len(recent_weekly),
@@ -8381,12 +8922,14 @@ def main() -> None:
     }])
     definitions = pd.DataFrame([
         ("提前买点", "周线K15至25；日线MACD质量合格；本轮首次上涨3%；次日开盘"),
-        ("7日或14日确认", "期限内周线K上穿25继续持有；否则期限后下一可交易开盘退出"),
-        ("重新买入", "超时退出后，原信号起42自然日内后来上穿25则次日开盘重入"),
-        ("可用广度", "信号当日数量、当周截至当日累计、过去5市场日累计"),
-        ("未来广度", "完整周总数仅用于验证，周中买入时不可见"),
-        ("2-2-1评分", "K15至20加2；红柱第3至5日加2；周线K低于D加1"),
-        ("同日Top3", "只在同一信号日横向比较；同分档等概率，不用股票代码强行破同分"),
+        ("主确认期限", "14自然日内上穿25视为按时确认；7日只作速度对照"),
+        ("高质量确认", "上穿日红柱扩张且本轮累计上涨10至30%"),
+        ("普通确认", "不满足高质量且累计上涨未超过30%；不自动加仓"),
+        ("已涨超过30", "已有早仓测试持有或保护；确认后禁止作为新买点追入"),
+        ("普通确认退出", "从确认日开始测试立即退出或MACD剩余10/20/30%退出"),
+        ("选择性重入", "14日退出后只在42日窗口内出现高质量确认才重新买入"),
+        ("失败对照", "14日退出后任何上穿25都重入"),
+        ("空窗统计", "重入与原3%新信号分开，统计实际填补空窗周"),
         ("历史与实时", "历史只到默认20260605并要求40日成熟；以后只展示观察名单"),
         ("缓存", "交易日历与股票基础资料72小时；行业7天；行情和检查点不设TTL"),
     ], columns=["项目", "定义"])
@@ -8395,7 +8938,7 @@ def main() -> None:
         ("股票基础资料", "Streamlit内存", "72小时", "实例重启可能提前消失"),
         ("申万科技行业成员", "Streamlit内存", "7天", "实例重启可能提前消失"),
         ("逐股票日线与daily_basic", "应用临时磁盘", "不自动过期", "重新部署可能清空"),
-        ("V6.3逐股票检查点", "应用临时磁盘", "不自动过期", "参数变化使用新签名"),
+        ("V6.4逐股票检查点", "应用临时磁盘", "不自动过期", "参数变化使用新签名"),
     ], columns=["对象", "位置", "设定时长", "实际边界"])
     rejection_audit = pd.DataFrame([
         {"剔除原因": key, "次数": value} for key, value in sorted(rejects.items())])
@@ -8407,6 +8950,10 @@ def main() -> None:
         "最低流通市值亿元": float(min_mv), "提前涨幅阈值%": V63_STRENGTH_THRESHOLD,
         "确认期限自然日": "/".join(str(v) for v in V63_CONFIRM_DEADLINES),
         "延迟重入窗口自然日": V63_REENTRY_WINDOW_DAYS,
+        "高质量确认": "红柱扩张且累计上涨10至30%",
+        "普通确认退出阈值": "/".join(
+            str(int(v)) for v in V64_POST_CROSS_REMAINING),
+        "选择性重入": "只允许高质量确认",
         "评分权重": f"{V63_SCORE_K_WEIGHT}-{V63_SCORE_AGE_WEIGHT}-{V63_SCORE_KD_WEIGHT}",
         "内存缓存小时": CACHE_TTL_SECONDS / 3600,
         "Streamlit": streamlit_version,
@@ -8430,9 +8977,26 @@ def main() -> None:
         "Random_Top20_Expected_Weight",
         "Future_Weekly_Cross25_Within42D", "Future_Weekly_Cross25_Date",
         "Lead_Calendar_Days_to_Weekly_Cross", "Entry_Date", "Entry_Raw_Open",
+        "Future_Cross_State", "Future_Cross_Daily_MACD_State",
+        "Future_Cross_Rally_From_Red_Start_pct", "Cross_Delay_Group",
+        "CrossEntry_Date", "CrossEntry_Tradable", "CrossEntry_Has_40D",
+        "CrossEntry_Class_40D", "CrossEntry_MFE_Net_pct",
+        "CrossEntry_MAE_Raw_pct", "CrossEntry_Close_Return_Net_pct",
+        "CrossImmediate_Decision_Date", "CrossImmediate_Exit_Date",
+        "CrossImmediate_Reason", "CrossImmediate_Return_Net_pct",
+        "CrossImmediate_MFE_Net_pct", "CrossImmediate_MAE_Raw_pct",
+        "CrossImmediate_Hold_Market_Days",
         "Entry_MFE_Net_pct", "Entry_MAE_Raw_pct",
         "Entry_Close_Return_Net_pct", "Explosion_Class_40D",
     ]
+    for threshold in V64_POST_CROSS_REMAINING:
+        prefix = f"CrossRemaining{int(threshold)}_"
+        detail_columns.extend([
+            f"{prefix}Decision_Date", f"{prefix}Exit_Date",
+            f"{prefix}Reason", f"{prefix}Return_Net_pct",
+            f"{prefix}MFE_Net_pct", f"{prefix}MAE_Raw_pct",
+            f"{prefix}Hold_Market_Days",
+        ])
     for deadline in V63_CONFIRM_DEADLINES:
         prefix = f"Confirm{int(deadline)}_"
         detail_columns.extend([
@@ -8447,6 +9011,21 @@ def main() -> None:
             f"{prefix}Reentry_Close_Return_Net_pct",
             f"{prefix}Combined_Return_Net_pct",
         ])
+    detail_columns.extend([
+        "Selective_Reentry14_Qualified",
+        "Selective_Reentry14_Signal_Date",
+        "Selective_Reentry14_Entry_Date",
+        "Selective_Reentry14_Has_40D",
+        "Selective_Reentry14_Class_40D",
+        "Selective_Reentry14_MFE_Net_pct",
+        "Selective_Reentry14_MAE_Raw_pct",
+        "Selective_Reentry14_Close_Return_Net_pct",
+        "Selective_Reentry14_Combined_Return_Net_pct",
+    ])
+    detail_columns.extend([
+        column for column in early.columns
+        if column.startswith("Lifecycle_") and column not in detail_columns
+    ])
     live_columns = [
         "Event_Type", "Strategy_Label", "ts_code", "name", "Signal_Date",
         "Signal_Week", "SW_L1", "SW_L2", "Raw_Close", "Circ_MV_Billion",
@@ -8456,6 +9035,8 @@ def main() -> None:
         "Signal_Day_Strength3_Count", "Signal_Week_Cumulative_Strength3_Count",
         "Trailing5D_Strength3_Count", "Timing_Score_221",
         "Timing_Three_Factor_Count", "Score_Top3_Expected_Weight",
+        "Future_Cross_State", "Future_Weekly_Cross25_Date",
+        "Current_Lifecycle_Status",
         "Watch_Next_Strength_Threshold",
     ]
     history_early_export = early[[
@@ -8470,33 +9051,30 @@ def main() -> None:
     live_watch_export = live_watch[[
         column for column in live_columns if column in live_watch.columns]].copy()
     files = {
-        "01_run_summary_v6_3.csv": run_summary,
-        "02_experiment_definitions_v6_3.csv": definitions,
-        "03_strength3_vs_weekly_outcomes_v6_3.csv": overall,
-        "04_confirmation_exit_summary_v6_3.csv": gate_summary,
-        "05_confirmation_status_original_grade_v6_3.csv": gate_status_audit,
-        "06_delayed_reentry_summary_v6_3.csv": reentry_summary,
-        "07_timing_score_221_audit_v6_3.csv": score_audit,
-        "08_three_factor_count_audit_v6_3.csv": three_factor_audit,
-        "09_same_day_rank_vs_random_v6_3.csv": rank_summary,
-        "10_same_day_rank_by_year_v6_3.csv": rank_year,
-        "11_actionable_signal_day_breadth_v6_3.csv": day_breadth,
-        "12_actionable_week_cumulative_breadth_v6_3.csv": cumulative_breadth,
-        "13_actionable_trailing5d_breadth_v6_3.csv": trailing_breadth,
-        "14_future_full_week_breadth_audit_v6_3.csv": future_full_week,
-        "15_weekly_momentum_priority_v6_3.csv": weekly_momentum,
-        "16_year_stability_v6_3.csv": year_audit,
-        "17_weekly_coverage_summary_v6_3.csv": coverage,
-        "18_weekly_signal_calendar_v6_3.csv": calendar,
-        "19_historical_strength3_detail_v6_3.csv": history_early_export,
-        "20_historical_weekly_control_detail_v6_3.csv": history_weekly_export,
-        "21_recent_14d_strength3_candidates_v6_3.csv": recent_early_export,
-        "22_recent_14d_weekly_candidates_v6_3.csv": recent_weekly_export,
-        "23_latest_market_day_watch_pool_v6_3.csv": live_watch_export,
-        "24_cache_policy_v6_3.csv": cache_policy,
-        "25_rejection_audit_v6_3.csv": rejection_audit,
-        "26_metadata_v6_3.csv": metadata,
-        "27_api_errors_v6_3.csv": pd.DataFrame({"错误": API_ERRORS}),
+        "01_run_summary_v6_4.csv": run_summary,
+        "02_experiment_definitions_v6_4.csv": definitions,
+        "03_strength3_vs_weekly_outcomes_v6_4.csv": overall,
+        "04_confirmation_exit_7d_14d_v6_4.csv": gate_summary,
+        "05_early_outcomes_by_cross_state_v6_4.csv": cross_state_outcomes,
+        "06_fresh_cross_entry_by_state_v6_4.csv": cross_entry_outcomes,
+        "07_cross_state_by_year_v6_4.csv": cross_state_year,
+        "08_realized_lifecycle_strategy_v6_4.csv": realized_strategy,
+        "09_any_vs_selective_reentry_v6_4.csv": selective_reentry,
+        "10_reentry_week_coverage_v6_4.csv": reentry_week_coverage,
+        "11_confirmation_status_original_grade_v6_4.csv": gate_status_audit,
+        "12_weekly_momentum_priority_v6_4.csv": weekly_momentum,
+        "13_year_stability_v6_4.csv": year_audit,
+        "14_weekly_coverage_summary_v6_4.csv": coverage,
+        "15_weekly_signal_calendar_v6_4.csv": calendar,
+        "16_historical_strength3_lifecycle_detail_v6_4.csv": history_early_export,
+        "17_historical_weekly_control_detail_v6_4.csv": history_weekly_export,
+        "18_recent_14d_strength3_candidates_v6_4.csv": recent_early_export,
+        "19_recent_14d_weekly_candidates_v6_4.csv": recent_weekly_export,
+        "20_latest_market_day_watch_pool_v6_4.csv": live_watch_export,
+        "21_cache_policy_v6_4.csv": cache_policy,
+        "22_rejection_audit_v6_4.csv": rejection_audit,
+        "23_metadata_v6_4.csv": metadata,
+        "24_api_errors_v6_4.csv": pd.DataFrame({"错误": API_ERRORS}),
     }
     result_zip = make_zip(files)
     try:
@@ -8509,24 +9087,30 @@ def main() -> None:
 
     st.success(
         f"完成：成熟3%提前事件{len(early)}个，周线确认对照{len(weekly)}个；"
+        f"高质量确认{int(early['Future_Cross_State'].eq(V64_CROSS_HIGH).sum())}个，"
+        f"高质量成熟重入{int(true_mask(early, 'Selective_Reentry14_Has_40D').sum())}个；"
         f"最近14日3%信号{len(recent_early)}个，最新观察池{len(live_watch)}只；"
         f"结果{'已保存' if persisted else '仅当前页面可下载'}。")
-    st.subheader("7日与14日周线确认、超时退出")
+    st.subheader("结论一：各生命周期方案的真实落袋收益")
+    render_plain_table(realized_strategy, 20)
+    st.subheader("结论二：确认速度与确认日状态")
+    render_plain_table(cross_state_outcomes, 30)
+    st.caption("上表从3%提前买入者视角判卷；下表从确认后才新买入者视角判卷。")
+    render_plain_table(cross_entry_outcomes, 30)
+    st.subheader("结论三：任何金叉重入与高质量确认重入")
+    render_plain_table(selective_reentry, 10)
+    render_plain_table(reentry_week_coverage, 10)
+    st.subheader("7日与14日未确认退出对照")
     render_plain_table(gate_summary, 10)
-    st.subheader("超时退出后延迟上穿再买")
-    render_plain_table(reentry_summary, 10)
-    st.subheader("2-2-1结构评分：同日Top3与同日随机")
-    render_plain_table(rank_summary, 10)
-    render_plain_table(score_audit, 10)
-    st.subheader("实盘当时可见的市场广度")
-    render_plain_table(day_breadth, 10)
-    render_plain_table(cumulative_breadth, 10)
-    render_plain_table(trailing_breadth, 10)
-    st.warning("完整周总信号数只有周末才知道，以下表格只用于验证，不能作为周中买点条件。")
-    render_plain_table(future_full_week, 10)
     st.subheader("最近14日3%提前候选")
     render_plain_table(recent_early_export.sort_values(
-        ["Signal_Date", "Timing_Score_221"], ascending=[False, False]), 300)
+        [column for column in ["Signal_Date", "Current_Lifecycle_Status",
+                               "Signal_Rally_From_Red_Start_pct"]
+         if column in recent_early_export.columns],
+        ascending=[False, True, False][:
+            len([column for column in ["Signal_Date", "Current_Lifecycle_Status",
+                                       "Signal_Rally_From_Red_Start_pct"]
+                 if column in recent_early_export.columns])]), 300)
     st.subheader(f"最新交易日周线K15至25观察池：{latest_market_date}")
     render_plain_table(live_watch_export.sort_values(
         [column for column in ["Signal_K", "Signal_KD_Spread"]
@@ -8534,8 +9118,8 @@ def main() -> None:
     st.subheader("运行摘要与覆盖率")
     render_plain_table(run_summary, 10)
     render_plain_table(coverage, 10)
-    st.caption("结果ZIP共27个CSV；历史成熟事件、最近候选和最新观察池严格分开。")
-    render_download(result_zip, result_name, f"v63_current_{request_signature}")
+    st.caption("结果ZIP共24个CSV；历史成熟事件、最近候选和最新观察池严格分开。")
+    render_download(result_zip, result_name, f"v64_current_{request_signature}")
 
 
 if __name__ == "__main__":
