@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""周线SKDJ普通5分风控与三仓组合回测 V6.8。
+"""周线SKDJ普通5分入场顺位与三仓组合回测 V6.9。
 
 本版根据V6.1结果，把周线N=6 SKDJ K位于15～25定义为观察池，并独立扫描
 日线MACD红柱周期内股价自红柱起点首次上涨3%、5%、8%和10%的四个强度确认
@@ -10,11 +10,11 @@
 共同样本，分别模拟第2、3、4、5日买入。该组使用了未来“能持续到第5日”的
 信息，只用于公平比较等待代价，绝不作为实盘规则或实时候选。
 
-V6.8沿用V6.8完全相同的事件引擎、30万元三仓撮合和1/2提前试仓，固定
-“普通确认只保留5分、禁止迟到重入”，只验证普通5分仓位在确认后继续固定
-持有至40日，还是在确认后的W1或W1/W2内跌破-10%后下一开盘退出。全部方案
-继续与完全随机选股对照，并新增三因子精确组合、实际入场第1/2/3名、静态
-剔除最大/前三盈利股票后的收益审计，避免把单一大牛股误认为稳定规则。
+V6.9沿用V6.8完全相同的事件引擎、30万元三仓撮合和1/2提前试仓，冻结
+“普通确认只保留恰好5分、固定持有至40日、禁止迟到重入”，只验证同一交易日
+候选允许买入前3名、前2名还是仅第1名。三组方案对同一Path_No强制复用完全
+相同的随机种子和同分打散顺序，继续与完全随机选择对照，并保留逐年、盈利
+集中度和实际入场顺位审计。
 """
 from __future__ import annotations
 
@@ -124,19 +124,19 @@ COHORT_RED_AGES = (2, 3, 4, 5)
 STRENGTH_MIN_REMAINING_PCT = 75.0
 STRENGTH_MAX_PRIOR_RALLY_PCT = 30.0
 
-# V6.8 ordinary-score-5 risk-exit audit.  Internal v63-v67 helper names
+# V6.9 ordinary-score-5 entry-rank audit.  Internal v63-v68 helper names
 # are retained to minimize regression risk; the final ``main`` is the only
 # entry point.
 # The stock-level event rows are byte-compatible with V6.4, so its checkpoint
-# signature and directory are deliberately reused.  Results/jobs use new V6.8
+# signature and directory are deliberately reused.  Results/jobs use new V6.9
 # directories and cannot collide with a completed V6.4 result.
-V63_TITLE = "周线SKDJ普通5分风控与三仓组合回测 V6.8"
-V63_VERSION = "V6.8-SKDJ-ORDINARY-SCORE5-W1-W2-RISK-LIFECYCLE"
-V63_UI_PATCH = "V6.8-SCORE5-FIXED40-VS-W1-W2-STOP10"
+V63_TITLE = "周线SKDJ普通5分入场顺位与三仓组合回测 V6.9"
+V63_VERSION = "V6.9-SKDJ-ORDINARY-SCORE5-ENTRY-RANK-GATE"
+V63_UI_PATCH = "V6.9-SCORE5-FIXED40-RANK3-VS-RANK2-VS-RANK1"
 V65_EVENT_ENGINE_VERSION = "V6.4-SKDJ-STATE-CONFIRMATION-SELECTIVE-REENTRY"
 V63_CHECKPOINT_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_4_checkpoints")
-V63_RESULT_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_8_results")
-V63_JOB_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_8_jobs")
+V63_RESULT_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_9_results")
+V63_JOB_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_9_jobs")
 V63_CONFIRM_DEADLINES = (7, 14)
 V63_REENTRY_WINDOW_DAYS = 42
 V63_STRENGTH_THRESHOLD = 3.0
@@ -8467,32 +8467,28 @@ def v65_staged_year_summary(early: pd.DataFrame) -> pd.DataFrame:
 
 V66_PORTFOLIO_SCHEMES = (
     {
-        "key": "Trial50ExitAllNoLate",
-        "label": "1/2试仓_普通全退_禁止重入_对照",
+        "key": "Trial50KeepScore5Rank3Fixed40",
+        "label": "1/2试仓_普通仅5分固定40日_同日前3",
         "trial_weight": 0.5, "staged": True,
-        "allow_late_reentry": False, "ordinary_keep_min_score": None,
+        "allow_late_reentry": False, "ordinary_keep_min_score": 5.0,
+        "max_signal_day_rank": 3,
         "ordinary_risk_days": 0, "ordinary_stop_pct": V68_ORDINARY_STOP_PCT,
     },
     {
-        "key": "Trial50KeepScore5Fixed40",
-        "label": "1/2试仓_普通仅5分保留40日_禁止重入",
+        "key": "Trial50KeepScore5Rank2Fixed40",
+        "label": "1/2试仓_普通仅5分固定40日_同日前2",
         "trial_weight": 0.5, "staged": True,
         "allow_late_reentry": False, "ordinary_keep_min_score": 5.0,
+        "max_signal_day_rank": 2,
         "ordinary_risk_days": 0, "ordinary_stop_pct": V68_ORDINARY_STOP_PCT,
     },
     {
-        "key": "Trial50KeepScore5W1Stop10",
-        "label": "1/2试仓_普通仅5分_确认后W1跌破10%退出",
+        "key": "Trial50KeepScore5Rank1Fixed40",
+        "label": "1/2试仓_普通仅5分固定40日_同日仅第1",
         "trial_weight": 0.5, "staged": True,
         "allow_late_reentry": False, "ordinary_keep_min_score": 5.0,
-        "ordinary_risk_days": 5, "ordinary_stop_pct": V68_ORDINARY_STOP_PCT,
-    },
-    {
-        "key": "Trial50KeepScore5W1W2Stop10",
-        "label": "1/2试仓_普通仅5分_确认后W1W2跌破10%退出",
-        "trial_weight": 0.5, "staged": True,
-        "allow_late_reentry": False, "ordinary_keep_min_score": 5.0,
-        "ordinary_risk_days": 10, "ordinary_stop_pct": V68_ORDINARY_STOP_PCT,
+        "max_signal_day_rank": 1,
+        "ordinary_risk_days": 0, "ordinary_stop_pct": V68_ORDINARY_STOP_PCT,
     },
 )
 
@@ -8592,6 +8588,8 @@ def v66_run_portfolio_path(
     trial_weight = float(scheme["trial_weight"])
     staged = bool(scheme["staged"])
     allow_late = bool(scheme["allow_late_reentry"])
+    max_signal_day_rank = max(
+        int(scheme.get("max_signal_day_rank", V66_MAX_STOCKS)), 1)
     ordinary_keep_min_score = scheme.get("ordinary_keep_min_score")
     if ordinary_keep_min_score is not None:
         ordinary_keep_min_score = float(ordinary_keep_min_score)
@@ -8881,6 +8879,14 @@ def v66_run_portfolio_path(
             code = str(row.get("ts_code", ""))
             is_high = str(row.get("V65_Lifecycle_Action", "")) == (
                 "14日内高质量确认_试仓升级")
+            # The rank gate is based on the original same-day candidate order.
+            # A blocked/held higher-ranked stock never promotes a lower-ranked
+            # candidate, so Rank1 means exactly Rank1 and may leave cash idle.
+            if selection_rank > max_signal_day_rank:
+                counters["新试仓未执行_超过方案顺位"] += 1
+                if is_high:
+                    counters["错过高质量确认_超过方案顺位"] += 1
+                continue
             if code in code_legs:
                 counters["新试仓未执行_同股已持有"] += 1
                 if is_high:
@@ -9058,6 +9064,7 @@ def v66_run_portfolio_path(
     metrics = {
         "方案Key": str(scheme["key"]), "组合方案": str(scheme["label"]),
         "选择方式": selection_mode, "Seed": int(seed),
+        "同日入场顺位上限": max_signal_day_rank,
         "初始资金": initial_capital, "期末权益": cash,
         "总收益率%": total_return, "年化收益率%": annualized,
         "最大回撤%": drawdown.min(),
@@ -9071,6 +9078,9 @@ def v66_run_portfolio_path(
         "空仓日比例%": numeric(
             equity_frame, "Held_Stocks").eq(0).mean() * 100.0,
         "候选事件": int(counters["候选事件"]),
+        "顺位过滤事件": int(counters["新试仓未执行_超过方案顺位"]),
+        "顺位过滤高质量确认": int(
+            counters["错过高质量确认_超过方案顺位"]),
         "实际初始买入事件": int(counters["实际初始买入事件"]),
         "高质量确认候选": high_total,
         "买入后高质量确认": high_selected,
@@ -9083,7 +9093,8 @@ def v66_run_portfolio_path(
         "迟到高质量重入执行": int(counters["迟到高质量重入执行"]),
         "允许迟到高质量重入": allow_late,
         "普通确认风控窗口市场日": ordinary_risk_days,
-        "普通确认风控阈值%": ordinary_stop_pct,
+        "普通确认风控阈值%": (
+            ordinary_stop_pct if ordinary_risk_days > 0 else np.nan),
         "普通确认规则": (
             (f"评分={int(ordinary_keep_min_score)}保留"
              if ordinary_keep_min_score == 5.0
@@ -9172,6 +9183,11 @@ def v66_ensemble_summary(paths: pd.DataFrame) -> pd.DataFrame:
             "平均资金暴露中位%": clean_median(group, "平均资金暴露%"),
             "平均持股数中位": clean_median(group, "平均持股数"),
             "空仓日比例中位%": clean_median(group, "空仓日比例%"),
+            "同日入场顺位上限": clean_median(
+                group, "同日入场顺位上限"),
+            "顺位过滤事件中位": clean_median(group, "顺位过滤事件"),
+            "顺位过滤高质量确认中位": clean_median(
+                group, "顺位过滤高质量确认"),
             "初始买入事件中位": clean_median(group, "实际初始买入事件"),
             "高质量确认捕获率中位%": clean_median(
                 group, "高质量确认捕获率%"),
@@ -9203,16 +9219,22 @@ def v66_score_vs_random_summary(paths: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     for keys, group in paths.groupby(["方案Key", "组合方案"], dropna=False):
         key, label = keys
-        score = group[group["选择方式"].eq("现有2-2-1评分")].sort_values("Path_No")
-        random = group[group["选择方式"].eq("完全随机选择")].sort_values("Path_No")
-        common = min(len(score), len(random))
-        if common <= 0:
+        fields = (
+            "总收益率%", "高质量确认捕获率%", "最大回撤%")
+        score = group[group["选择方式"].eq("现有2-2-1评分")][
+            ["Path_No", "Seed", *fields]].copy()
+        random = group[group["选择方式"].eq("完全随机选择")][
+            ["Path_No", "Seed", *fields]].copy()
+        paired = score.merge(
+            random, on=["Path_No", "Seed"], how="inner",
+            suffixes=("_评分", "_随机"))
+        if paired.empty:
             continue
-        score_return = numeric(score.iloc[:common], "总收益率%").reset_index(drop=True)
-        random_return = numeric(random.iloc[:common], "总收益率%").reset_index(drop=True)
+        score_return = numeric(paired, "总收益率%_评分")
+        random_return = numeric(paired, "总收益率%_随机")
         delta = score_return - random_return
         rows.append({
-            "方案Key": key, "组合方案": label, "配对路径": common,
+            "方案Key": key, "组合方案": label, "配对路径": len(paired),
             "评分总收益中位%": score_return.median(),
             "随机总收益中位%": random_return.median(),
             "评分减随机收益均值百分点": delta.mean(),
@@ -9221,11 +9243,111 @@ def v66_score_vs_random_summary(paths: pd.DataFrame) -> pd.DataFrame:
             "评分差值第10分位": delta.quantile(0.10),
             "评分差值第90分位": delta.quantile(0.90),
             "评分高质量捕获率中位%": numeric(
-                score, "高质量确认捕获率%").median(),
+                paired, "高质量确认捕获率%_评分").median(),
             "随机高质量捕获率中位%": numeric(
-                random, "高质量确认捕获率%").median(),
-            "评分最大回撤中位%": numeric(score, "最大回撤%").median(),
-            "随机最大回撤中位%": numeric(random, "最大回撤%").median(),
+                paired, "高质量确认捕获率%_随机").median(),
+            "评分最大回撤中位%": numeric(
+                paired, "最大回撤%_评分").median(),
+            "随机最大回撤中位%": numeric(
+                paired, "最大回撤%_随机").median(),
+        })
+    return pd.DataFrame(rows)
+
+
+def v69_paired_rank_gate_summary(paths: pd.DataFrame) -> pd.DataFrame:
+    """Causal rank-gate comparison using identical seeds and Path_No."""
+    baseline_key = "Trial50KeepScore5Rank3Fixed40"
+    baseline = paths[paths["方案Key"].eq(baseline_key)].copy()
+    if baseline.empty:
+        return pd.DataFrame()
+    metrics = (
+        "总收益率%", "最大回撤%", "平均资金暴露%", "高质量确认捕获率%",
+        "实际初始买入事件", "空仓日比例%", "静态剔除前三盈利股票后总收益%",
+    )
+    rows: list[dict[str, Any]] = []
+    for scheme in V66_PORTFOLIO_SCHEMES:
+        if scheme["key"] == baseline_key:
+            continue
+        challenger = paths[paths["方案Key"].eq(scheme["key"])].copy()
+        for mode in ("现有2-2-1评分", "完全随机选择"):
+            base_mode = baseline[baseline["选择方式"].eq(mode)][
+                ["Path_No", "Seed", *metrics]].copy()
+            new_mode = challenger[challenger["选择方式"].eq(mode)][
+                ["Path_No", "Seed", *metrics]].copy()
+            paired = base_mode.merge(
+                new_mode, on=["Path_No", "Seed"], how="inner",
+                suffixes=("_基线", "_方案"))
+            if paired.empty:
+                continue
+            base_return = numeric(paired, "总收益率%_基线")
+            new_return = numeric(paired, "总收益率%_方案")
+            return_delta = new_return - base_return
+            drawdown_delta = (
+                numeric(paired, "最大回撤%_方案")
+                - numeric(paired, "最大回撤%_基线"))
+            rows.append({
+                "基线方案Key": baseline_key,
+                "对比方案Key": scheme["key"],
+                "对比方案": scheme["label"],
+                "选择方式": mode,
+                "配对路径": len(paired),
+                "种子完全一致": bool(
+                    len(paired) == len(base_mode) == len(new_mode)
+                    and paired["Path_No"].nunique() == len(paired)),
+                "基线总收益中位%": base_return.median(),
+                "对比总收益中位%": new_return.median(),
+                "对比总收益第10分位%": new_return.quantile(0.10),
+                "对比总收益第90分位%": new_return.quantile(0.90),
+                "对比减基线收益均值百分点": return_delta.mean(),
+                "对比减基线收益中位百分点": return_delta.median(),
+                "收益差第10分位": return_delta.quantile(0.10),
+                "收益差第90分位": return_delta.quantile(0.90),
+                "对比优于基线比例%": return_delta.gt(0).mean() * 100.0,
+                "最大回撤改善中位百分点": drawdown_delta.median(),
+                "资金暴露变化中位百分点": (
+                    numeric(paired, "平均资金暴露%_方案")
+                    - numeric(paired, "平均资金暴露%_基线")).median(),
+                "高质量捕获率变化中位百分点": (
+                    numeric(paired, "高质量确认捕获率%_方案")
+                    - numeric(paired, "高质量确认捕获率%_基线")).median(),
+                "初始买入事件变化中位": (
+                    numeric(paired, "实际初始买入事件_方案")
+                    - numeric(paired, "实际初始买入事件_基线")).median(),
+                "空仓日比例变化中位百分点": (
+                    numeric(paired, "空仓日比例%_方案")
+                    - numeric(paired, "空仓日比例%_基线")).median(),
+                "剔除前三盈利股后收益变化中位百分点": (
+                    numeric(paired, "静态剔除前三盈利股票后总收益%_方案")
+                    - numeric(paired, "静态剔除前三盈利股票后总收益%_基线")).median(),
+            })
+    return pd.DataFrame(rows)
+
+
+def v69_seed_pairing_audit(paths: pd.DataFrame) -> pd.DataFrame:
+    """Verify every mode/Path_No reuses one seed across all rank schemes."""
+    if paths.empty:
+        return pd.DataFrame()
+    expected = len(V66_PORTFOLIO_SCHEMES)
+    grouped = paths.groupby(["选择方式", "Path_No"], as_index=False).agg(
+        方案数=("方案Key", "nunique"),
+        种子数=("Seed", "nunique"),
+        Seed=("Seed", "min"),
+    )
+    rows: list[dict[str, Any]] = []
+    for mode, group in grouped.groupby("选择方式", dropna=False):
+        rows.append({
+            "选择方式": mode,
+            "Path_No数": group["Path_No"].nunique(),
+            "应有方案数": expected,
+            "每路径最少方案数": int(group["方案数"].min()),
+            "每路径最多方案数": int(group["方案数"].max()),
+            "方案缺失路径": int(group["方案数"].ne(expected).sum()),
+            "种子不一致路径": int(group["种子数"].ne(1).sum()),
+            "首个Seed": int(group["Seed"].min()),
+            "最后Seed": int(group["Seed"].max()),
+            "公平配对通过": bool(
+                group["方案数"].eq(expected).all()
+                and group["种子数"].eq(1).all()),
         })
     return pd.DataFrame(rows)
 
@@ -9652,12 +9774,14 @@ def v66_run_portfolio_ensemble(
     events = v66_prepare_portfolio_events(early, open_dates)
     path_rows: list[dict[str, Any]] = []
     draw_count = max(int(draws), 1)
-    for scheme_number, scheme in enumerate(V66_PORTFOLIO_SCHEMES):
-        for mode_number, mode in enumerate(
-                ("现有2-2-1评分", "完全随机选择")):
+    for scheme in V66_PORTFOLIO_SCHEMES:
+        for mode in ("现有2-2-1评分", "完全随机选择"):
             for path_no in range(draw_count):
-                seed = (V66_RANDOM_SEED + scheme_number * 1_000_000
-                        + mode_number * 500_000 + path_no)
+                # Common random numbers: the same Path_No reuses the exact
+                # same seed across every rank gate and both selection modes.
+                # Candidate ordering remains nested across Rank3/2/1, so any
+                # portfolio difference is caused by the rank admission rule.
+                seed = V66_RANDOM_SEED + path_no
                 metrics, _, _ = v66_run_portfolio_path(
                     events, price_book, open_dates, config, scheme, mode, seed)
                 if metrics:
@@ -9977,7 +10101,7 @@ def v63_clear_job_active(signature: str) -> None:
         if os.path.exists(path):
             os.remove(path)
     except OSError as exc:
-        record_error(f"V6.8任务标记清除失败: {exc}")
+        record_error(f"V6.9任务标记清除失败: {exc}")
 
 
 def v63_is_job_active(signature: str) -> bool:
@@ -10004,7 +10128,7 @@ def v63_load_checkpoint(signature: str, ts_code: str) -> dict[str, Any] | None:
             return None
         return payload
     except Exception as exc:
-        record_error(f"V6.8兼容检查点损坏 {ts_code}: {exc}")
+        record_error(f"V6.9兼容检查点损坏 {ts_code}: {exc}")
         return None
 
 
@@ -10023,18 +10147,19 @@ def main() -> None:
     st.title(V63_TITLE)
     streamlit_version = str(getattr(st, "__version__", "unknown"))
     st.caption(f"{V63_UI_PATCH}｜Streamlit {streamlit_version}")
-    with st.expander("V6.8验证口径", expanded=True):
+    with st.expander("V6.9验证口径", expanded=True):
         st.markdown(f"""
 - **唯一提前买点**：最近完整周N=6、M=3的SKDJ K位于{EARLY_WEEKLY_K_MIN:g}～{EARLY_WEEKLY_K_MAX:g}；日线MACD红柱扩张或剩余强度≥{STRENGTH_MIN_REMAINING_PCT:g}%；本轮股价首次达到+{V63_STRENGTH_THRESHOLD:g}%后，下一市场交易日开盘试仓。
 - **真实三仓**：初始资金30万元，最多同时持有3只股票，每只满仓10万元；试仓也占用1个股票名额，买入数量按100股整手且计入交易成本。
-- **四组精确对照**：全部固定1/2试仓并禁止迟到重入；设置普通确认全部腾位对照、5分固定40日、5分确认后W1跌破-10%退出、5分确认后W1/W2跌破-10%退出。
+- **三组顺位对照**：全部固定1/2试仓、普通确认恰好5分保留40日且禁止迟到重入；只改变同日允许入场的候选顺位：前3、前2、仅第1。
 - **14日内高质量确认**：周线K上穿25当天，日线红柱扩张且本轮累计上涨10～30%，下一开盘用剩余资金补足至满仓；早仓和补仓腿分别观察40个市场日。
 - **14日内普通确认**：确认发生后才查看买入时已知的2-2-1分；只有5分保留原试仓且不补仓，其余下一可交易开盘退出腾位。
-- **W1/W2风险线**：仅在普通确认已经发生后才开始监控；以原试仓买入价计算，当确认后前5或10个市场日任一收盘跌至-10%或以下，下一只可交易开盘退出。确认前绝不根据事后分类提前止损。
+- **顺位资格不递补**：顺位按当天全部候选的原始排序确定；较高顺位因已持仓、满仓或现金不足未成交时，较低顺位不会自动晋级。仅第1名方案可以主动空仓。
 - **已涨超过30%**：只保护已有试仓，不补仓、不把周线确认解释为新追买点。
 - **14日未确认**：期限后的下一只可交易开盘退出试仓；无论以后出现何种确认，本版组合都不重入。
 - **日内顺序**：先执行既定退出释放名额和现金，再处理高质量补仓，最后才处理当日新试仓；收盘触发的风险退出一律等到下一开盘执行。
-- **排名测试**：保留现有2-2-1分与完全随机选择两组；随机组只随机选候选，买入后的普通确认分层与评分组完全相同，因而评分与随机的差只来自最初选股。
+- **公平配对**：同一Path_No在三种顺位方案及评分/随机选择中复用完全相同的Seed；同一种选择方式的候选顺序一致，方案差异只来自顺位资格。
+- **随机对照**：随机组只随机排列同日候选，买入后的确认分层、固定40日和顺位上限与评分组完全相同。
 - **新增诊断**：逐路径记录实际评分入场第1/2/3顺位的胜率和利润贡献；另按三项布尔条件拆开全部精确组合，并静态扣除最大、前三盈利股票检查牛股依赖。
 - **逐年验收**：每一条路径都单独记录各年收益、回撤、资金暴露和持股数；中位代表路径只作交易明细示例。
 - **判卷**：S/A/B仍为40日内先到+30/+20/+10且先于-10，其余为F；所有退出与补仓均按当时可见数据和下一可交易开盘执行并计入成本。
@@ -10044,39 +10169,39 @@ def main() -> None:
     with st.sidebar:
         st.header("运行参数")
         backtest_days = st.number_input(
-            "回测交易日数", 100, 1000, 500, 50, key="v68_days")
+            "回测交易日数", 100, 1000, 500, 50, key="v69_days")
         min_price = st.number_input(
             "最低股价（元）", 10.0, 20.0, 10.0, 10.0,
-            format="%.0f", key="v68_min_price")
+            format="%.0f", key="v69_min_price")
         min_mv = st.number_input(
             "最低流通市值（亿元）", 50.0, 100.0, 50.0, 50.0,
-            format="%.0f", key="v68_min_mv")
+            format="%.0f", key="v69_min_mv")
         signal_end_date = st.date_input(
             "历史买入信号截止（40日判卷）", date(2026, 6, 5),
-            key="v68_signal_end")
+            key="v69_signal_end")
         market_end_date = st.date_input(
             "最新信号观察截止（默认今天）", date.today(),
-            key="v68_market_end")
+            key="v69_market_end")
         pause = st.number_input(
-            "接口间隔(秒)", 0.0, 2.0, 0.12, 0.02, key="v68_pause")
+            "接口间隔(秒)", 0.0, 2.0, 0.12, 0.02, key="v69_pause")
         use_cache = st.checkbox(
-            "复用行情和72小时基础缓存", True, key="v68_cache")
+            "复用行情和72小时基础缓存", True, key="v69_cache")
         st.caption("逐股票行情不设TTL；本版兼容并复用V6.4逐股票检查点。")
         portfolio_draws = st.number_input(
             "每组随机路径数", 100, 1000, V66_DEFAULT_DRAWS, 100,
-            key="v68_draws")
-        st.caption("共4个组合方案×2种选择方式；300条时共2400次组合模拟。")
+            key="v69_draws")
+        st.caption("共3个顺位方案×2种选择方式；300条时共1800次组合模拟。")
         st.divider()
         commission_pct = st.number_input(
             "佣金率(%)", 0.0, 0.20, 0.025, 0.005,
-            format="%.3f", key="v68_commission")
+            format="%.3f", key="v69_commission")
         stamp_duty_pct = st.number_input(
             "卖出印花税率(%)", 0.0, 0.20, 0.05, 0.01,
-            format="%.3f", key="v68_stamp")
+            format="%.3f", key="v69_stamp")
         transfer_fee_pct = st.number_input(
             "过户费率(%)", 0.0, 0.05, 0.001, 0.001,
-            format="%.3f", key="v68_transfer")
-        if st.button("清除V6.8结果和运行状态", key="v68_clear"):
+            format="%.3f", key="v69_transfer")
+        if st.button("清除V6.9结果和运行状态", key="v69_clear"):
             shutil.rmtree(V63_RESULT_DIR, ignore_errors=True)
             shutil.rmtree(V63_JOB_DIR, ignore_errors=True)
             st.success("结果和运行状态已清除；逐股票检查点与行情缓存保留。")
@@ -10100,11 +10225,15 @@ def main() -> None:
         "max_stocks": V66_MAX_STOCKS,
         "full_slot_capital": V66_FULL_SLOT_CAPITAL,
         "portfolio_schemes": [item["key"] for item in V66_PORTFOLIO_SCHEMES],
+        "entry_rank_caps": [
+            int(item["max_signal_day_rank"])
+            for item in V66_PORTFOLIO_SCHEMES],
         "portfolio_draws": int(portfolio_draws),
+        "common_random_seed": V66_RANDOM_SEED,
+        "paired_seed_across_schemes_and_modes": True,
         "upgrade_rule": "14d_high_confirm_add_to_full",
-        "ordinary_rule": "exit_all_control_or_keep_exact_score5",
-        "ordinary_risk_windows": list(V68_RISK_WINDOWS),
-        "ordinary_stop_pct": V68_ORDINARY_STOP_PCT,
+        "ordinary_rule": "keep_exact_score5_to_fixed40",
+        "rank_gate_rule": "original_same_day_rank_no_fallback",
         "timeout_rule": "exit_trial_and_never_reenter",
         "score_weights": [V63_SCORE_K_WEIGHT, V63_SCORE_AGE_WEIGHT,
                           V63_SCORE_KD_WEIGHT],
@@ -10112,7 +10241,7 @@ def main() -> None:
     request_signature = stable_signature(request_payload)
     result_path = os.path.join(V63_RESULT_DIR, f"{request_signature}.zip")
     result_name = (
-        f"weekly_skdj_score5_w1w2_risk_lifecycle_v6_8_"
+        f"weekly_skdj_score5_entry_rank_gate_v6_9_"
         f"{int(backtest_days)}d_p{int(min_price)}_mv{int(min_mv)}.zip")
     completed_available = False
     if os.path.exists(result_path):
@@ -10123,7 +10252,7 @@ def main() -> None:
             v63_clear_job_active(request_signature)
             st.success("发现相同参数的已完成结果，可直接下载。")
             render_download(
-                saved_result, result_name, f"v68_saved_{request_signature}")
+                saved_result, result_name, f"v69_saved_{request_signature}")
         except Exception as exc:
             st.warning(f"已保存结果读取失败：{exc}")
 
@@ -10132,15 +10261,15 @@ def main() -> None:
         token = secret_token
         st.caption("已从Streamlit Secrets读取TUSHARE_TOKEN。")
     else:
-        token = st.text_input("Tushare Token", type="password", key="v68_token")
+        token = st.text_input("Tushare Token", type="password", key="v69_token")
     job_active = v63_is_job_active(request_signature)
     left, right = st.columns(2)
     with left:
         start_clicked = st.button(
-            "开始/重新运行V6.8", type="primary", key="v68_run")
+            "开始/重新运行V6.9", type="primary", key="v69_run")
     with right:
         stop_clicked = st.button(
-            "停止自动续跑", disabled=not job_active, key="v68_stop")
+            "停止自动续跑", disabled=not job_active, key="v69_stop")
     if stop_clicked:
         v63_clear_job_active(request_signature)
         st.success("已停止；逐股票检查点保留。")
@@ -10202,7 +10331,7 @@ def main() -> None:
         "transfer_fee_pct": float(transfer_fee_pct),
     }
     # Reuse V6.4 stock-level checkpoints: event generation is unchanged and
-    # V6.8继续复用V6.4事件行，只增加无未来函数的资金组合撮合。
+    # V6.9继续复用V6.4事件行，只改变无未来函数的组合入场顺位资格。
     run_signature = stable_signature({
         "version": V65_EVENT_ENGINE_VERSION, **config})
     period_index = build_period_index(memberships)
@@ -10249,7 +10378,7 @@ def main() -> None:
                         run_signature, code, rows, stock_rejects)
                 except Exception as exc:
                     failures += 1
-                    record_error(f"V6.8逐股票分析失败 {code}: {exc}")
+                    record_error(f"V6.9逐股票分析失败 {code}: {exc}")
         processed = number + 1
         now = time.monotonic()
         if (processed == 1 or now - last_update >= UI_HEARTBEAT_SECONDS
@@ -10269,7 +10398,7 @@ def main() -> None:
 
     events_all = pd.DataFrame(event_rows)
     if events_all.empty:
-        st.error("本区间没有生成V6.8可用事件。")
+        st.error("本区间没有生成V6.9可用事件。")
         return
     events_all = v63_attach_breadth_and_rank(events_all, open_dates)
     events_all = events_all.sort_values(
@@ -10338,7 +10467,7 @@ def main() -> None:
         return
 
     with st.spinner(
-            f"运行真实三仓组合：4个方案×2种选择×"
+            f"运行真实三仓组合：3个顺位方案×2种选择×"
             f"{int(portfolio_draws)}条路径..."):
         (portfolio_paths, portfolio_summary, score_vs_random,
          representative_equity, representative_trades,
@@ -10350,13 +10479,13 @@ def main() -> None:
         return
 
     early["Calendar_Year"] = early["Signal_Date"].astype(str).str[:4]
+    paired_rank_gate = v69_paired_rank_gate_summary(portfolio_paths)
+    seed_pairing_audit = v69_seed_pairing_audit(portfolio_paths)
     score_rank_summary = v68_score_rank_path_summary(portfolio_paths)
     profit_concentration = v68_profit_concentration_summary(portfolio_paths)
     representative_stock_profit = v68_representative_stock_profit(
         representative_trades)
     ordinary_factor_combo = v68_exact_factor_combo_audit(early)
-    ordinary_score5_risk_event = v68_ordinary_score5_risk_event_audit(
-        early, price_book, open_dates, config)
     gate_summary = v63_gate_summary(early)
     realized_strategy = v64_realized_strategy_summary(early)
     ordinary_score_audit = v67_action_score_audit(
@@ -10434,16 +10563,13 @@ def main() -> None:
             early["V65_Lifecycle_Action"].eq(
                 "14日内普通确认_只保留试仓")
             & numeric(early, "Timing_Score_221").eq(5.0)).sum()),
-        "普通5分W1止损触发事件": int((
-            ordinary_score5_risk_event["方案"].eq("确认后W1跌破-10%")
-            & true_mask(ordinary_score5_risk_event, "是否触发")).sum())
-        if not ordinary_score5_risk_event.empty else 0,
-        "普通5分W1W2止损触发事件": int((
-            ordinary_score5_risk_event["方案"].eq("确认后W1W2跌破-10%")
-            & true_mask(ordinary_score5_risk_event, "是否触发")).sum())
-        if not ordinary_score5_risk_event.empty else 0,
         "14日超时": int((~true_mask(early, "Confirm14_Confirmed")).sum()),
         "组合迟到重入方案": 0,
+        "同日入场顺位方案": "前3/前2/仅第1",
+        "共用随机种子起点": V66_RANDOM_SEED,
+        "公平配对是否全部通过": bool(
+            not seed_pairing_audit.empty
+            and true_mask(seed_pairing_audit, "公平配对通过").all()),
         "3%提前信号周": early["Signal_Week"].nunique(),
         "最近14日3%提前信号": len(recent_early),
         "最近14日周线确认信号": len(recent_weekly),
@@ -10462,19 +10588,20 @@ def main() -> None:
         ("提前试仓", "周线K15至25；日线MACD质量合格；本轮首次上涨3%；次日开盘"),
         ("账户规模", "初始30万元；最多3只股票；每只满仓10万元"),
         ("名额规则", "试仓也占1个股票名额；同股试仓和补仓只占1个名额"),
-        ("试仓比例", "所有V6.8组合统一使用1/2试仓"),
+        ("试仓比例", "所有V6.9组合统一使用1/2试仓"),
         ("主确认期限", "14自然日内上穿25视为按时确认；7日只作速度对照"),
         ("高质量确认", "上穿日红柱扩张且本轮累计上涨10至30%；下一开盘补足满仓"),
-        ("普通确认规则", "全部腾位仅作对照；正式候选只保留买入时2-2-1恰好5分的原试仓"),
+        ("普通确认规则", "三个方案均只保留买入时2-2-1恰好5分的原试仓"),
         ("普通5分固定方案", "确认后不再加仓，继续持有原1/2试仓至初始买入后的第40市场日"),
-        ("普通5分W1风控", "确认后5个市场日内任一收盘相对原买价跌至-10%或以下，下一开盘退出"),
-        ("普通5分W1W2风控", "确认后10个市场日内任一收盘相对原买价跌至-10%或以下，下一开盘退出"),
+        ("同日顺位方案", "分别只允许原始同日候选顺位前3、前2、仅第1进入买入判断"),
+        ("顺位不递补", "高顺位因已持仓、满仓或现金不足未成交时，低顺位不自动晋级"),
         ("已涨超过30", "只保护已有试仓；不补仓、不追买"),
         ("未确认退出", "14日仍未上穿25，下一可交易开盘退出试仓"),
         ("迟到确认", "无论迟到高质量或普通确认，本版组合一律不重入"),
         ("资本核算", "日序模拟现金、整手股数和持仓市值；所有交易按净值复合"),
-        ("当日优先级", "开盘退出→高质量补仓→新试仓；收盘判定风险线与固定期限"),
-        ("排序对照", "现有2-2-1分同分随机打散，与完全随机各运行多条路径；两组买后分层规则相同"),
+        ("当日优先级", "开盘退出→高质量补仓→新试仓；固定期限到期按收盘退出"),
+        ("排序对照", "现有2-2-1分同分随机打散，与完全随机各运行多条路径；两组买后规则相同"),
+        ("公平配对", "同一Path_No在三种顺位方案和两种选择方式中复用同一Seed；同一选择方式候选顺序一致"),
         ("评分顺位审计", "按每条评分路径的真实候选顺序分别统计第1、第2、第3顺位交易贡献"),
         ("精确因子组合", "K15至20、红柱3至5日、周K低于D拆成全部八种布尔组合，不再只看总分"),
         ("牛股依赖", "静态扣除每条路径最大和前三盈利股票的已实现净利润；不虚构释放仓位后的再投资"),
@@ -10487,7 +10614,7 @@ def main() -> None:
         ("股票基础资料", "Streamlit内存", "72小时", "实例重启可能提前消失"),
         ("申万科技行业成员", "Streamlit内存", "7天", "实例重启可能提前消失"),
         ("逐股票日线与daily_basic", "应用临时磁盘", "不自动过期", "重新部署可能清空"),
-        ("V6.4兼容逐股票检查点", "应用临时磁盘", "不自动过期", "V6.8直接复用相同事件"),
+        ("V6.4兼容逐股票检查点", "应用临时磁盘", "不自动过期", "V6.9直接复用相同事件"),
     ], columns=["对象", "位置", "设定时长", "实际边界"])
     rejection_audit = pd.DataFrame([
         {"剔除原因": key, "次数": value} for key, value in sorted(rejects.items())])
@@ -10501,10 +10628,12 @@ def main() -> None:
         "高质量确认": "红柱扩张且累计上涨10至30%",
         "试仓比例": "0.5000",
         "高质量补仓": "补足至100%",
-        "普通确认": "全退对照/仅5分固定40日/仅5分W1风控/仅5分W1W2风控",
+        "普通确认": "三个顺位方案均为恰好5分固定40日",
         "普通确认保留评分": "恰好5分",
-        "普通确认风控窗口市场日": "0/5/10",
-        "普通确认止损阈值%": V68_ORDINARY_STOP_PCT,
+        "同日入场顺位上限": "3/2/1",
+        "顺位递补": "禁止",
+        "共用随机种子起点": V66_RANDOM_SEED,
+        "跨方案与选择方式共用Seed": True,
         "迟到确认重入": "全部禁止",
         "评分权重": f"{V63_SCORE_K_WEIGHT}-{V63_SCORE_AGE_WEIGHT}-{V63_SCORE_KD_WEIGHT}",
         "组合初始资金": V66_INITIAL_CAPITAL,
@@ -10611,36 +10740,37 @@ def main() -> None:
         column for column in live_columns if column in live_watch.columns]].copy()
     portfolio_event_audit = v66_prepare_portfolio_events(early, open_dates)
     files = {
-        "01_run_summary_v6_8.csv": run_summary,
-        "02_experiment_definitions_v6_8.csv": definitions,
-        "03_score5_risk_exit_ensemble_summary_v6_8.csv": portfolio_summary,
-        "04_score_vs_random_portfolio_v6_8.csv": score_vs_random,
-        "05_all_portfolio_paths_v6_8.csv": portfolio_paths,
-        "06_all_path_year_summary_v6_8.csv": all_path_year_summary,
-        "07_all_path_year_detail_v6_8.csv": all_path_year_detail,
-        "08_representative_path_annual_v6_8.csv": representative_annual,
-        "09_representative_path_equity_v6_8.csv": representative_equity,
-        "10_representative_path_trades_v6_8.csv": representative_trades,
-        "11_score_rank_1_2_3_path_summary_v6_8.csv": score_rank_summary,
-        "12_profit_concentration_ablation_v6_8.csv": profit_concentration,
-        "13_representative_stock_profit_contribution_v6_8.csv": representative_stock_profit,
-        "14_ordinary_score5_w1_w2_event_audit_v6_8.csv": ordinary_score5_risk_event,
-        "15_ordinary_exact_factor_combination_v6_8.csv": ordinary_factor_combo,
-        "16_portfolio_event_audit_v6_8.csv": portfolio_event_audit,
-        "17_ordinary_confirmation_by_exact_score_v6_8.csv": ordinary_score_audit,
-        "18_high_confirmation_by_exact_score_v6_8.csv": high_score_audit,
-        "19_early_outcomes_by_cross_state_v6_8.csv": cross_state_outcomes,
-        "20_fresh_cross_entry_by_state_v6_8.csv": cross_entry_outcomes,
-        "21_weekly_coverage_summary_v6_8.csv": coverage,
-        "22_weekly_signal_calendar_v6_8.csv": calendar,
-        "23_historical_weekly_control_detail_v6_8.csv": history_weekly_export,
-        "24_recent_14d_strength3_candidates_v6_8.csv": recent_early_export,
-        "25_recent_14d_weekly_candidates_v6_8.csv": recent_weekly_export,
-        "26_latest_market_day_watch_pool_v6_8.csv": live_watch_export,
-        "27_cache_policy_v6_8.csv": cache_policy,
-        "28_rejection_audit_v6_8.csv": rejection_audit,
-        "29_metadata_v6_8.csv": metadata,
-        "30_api_errors_v6_8.csv": pd.DataFrame({"错误": API_ERRORS}),
+        "01_run_summary_v6_9.csv": run_summary,
+        "02_experiment_definitions_v6_9.csv": definitions,
+        "03_entry_rank_gate_ensemble_summary_v6_9.csv": portfolio_summary,
+        "04_paired_rank_gate_comparison_v6_9.csv": paired_rank_gate,
+        "05_score_vs_random_portfolio_v6_9.csv": score_vs_random,
+        "06_all_portfolio_paths_v6_9.csv": portfolio_paths,
+        "07_all_path_year_summary_v6_9.csv": all_path_year_summary,
+        "08_all_path_year_detail_v6_9.csv": all_path_year_detail,
+        "09_representative_path_annual_v6_9.csv": representative_annual,
+        "10_representative_path_equity_v6_9.csv": representative_equity,
+        "11_representative_path_trades_v6_9.csv": representative_trades,
+        "12_score_rank_1_2_3_path_summary_v6_9.csv": score_rank_summary,
+        "13_profit_concentration_ablation_v6_9.csv": profit_concentration,
+        "14_representative_stock_profit_contribution_v6_9.csv": representative_stock_profit,
+        "15_ordinary_exact_factor_combination_v6_9.csv": ordinary_factor_combo,
+        "16_common_seed_pairing_audit_v6_9.csv": seed_pairing_audit,
+        "17_portfolio_event_audit_v6_9.csv": portfolio_event_audit,
+        "18_ordinary_confirmation_by_exact_score_v6_9.csv": ordinary_score_audit,
+        "19_high_confirmation_by_exact_score_v6_9.csv": high_score_audit,
+        "20_early_outcomes_by_cross_state_v6_9.csv": cross_state_outcomes,
+        "21_fresh_cross_entry_by_state_v6_9.csv": cross_entry_outcomes,
+        "22_weekly_coverage_summary_v6_9.csv": coverage,
+        "23_weekly_signal_calendar_v6_9.csv": calendar,
+        "24_historical_weekly_control_detail_v6_9.csv": history_weekly_export,
+        "25_recent_14d_strength3_candidates_v6_9.csv": recent_early_export,
+        "26_recent_14d_weekly_candidates_v6_9.csv": recent_weekly_export,
+        "27_latest_market_day_watch_pool_v6_9.csv": live_watch_export,
+        "28_cache_policy_v6_9.csv": cache_policy,
+        "29_rejection_audit_v6_9.csv": rejection_audit,
+        "30_metadata_v6_9.csv": metadata,
+        "31_api_errors_v6_9.csv": pd.DataFrame({"错误": API_ERRORS}),
     }
     result_zip = make_zip(files)
     try:
@@ -10660,42 +10790,47 @@ def main() -> None:
         f"{int((early['V65_Lifecycle_Action'].eq('14日内普通确认_只保留试仓') & numeric(early, 'Timing_Score_221').eq(5.0)).sum())}个；"
         f"最近14日3%信号{len(recent_early)}个，最新观察池{len(live_watch)}只；"
         f"结果{'已保存' if persisted else '仅当前页面可下载'}。")
-    st.subheader("结论一：普通5分W1/W2风控的真实三仓结果")
+    st.subheader("结论一：普通5分固定40日的三种入场顺位")
     render_plain_table(portfolio_summary, 40)
     st.caption(
         "这是日序账户净值，不是事件收益平均。每组的中位、10%和90%分位"
         "同时列出静态剔除最大、前三盈利股票后的结果。")
-    st.subheader("结论二：每种风控下2-2-1选股是否优于随机")
+    st.subheader("结论二：相对同日前3的逐路径公平配对")
+    render_plain_table(paired_rank_gate, 20)
+    st.caption(
+        "前2和仅第1都与同日前3复用相同Path_No、Seed和候选顺序；"
+        "收益差来自顺位资格及其后续真实名额变化。")
+    st.subheader("结论三：每种顺位上限下2-2-1选股是否优于随机")
     render_plain_table(score_vs_random, 30)
     st.caption(
         "验收核心是‘评分优于随机比例’和收益差的10%～90%分位；"
         "如果仅中位收益好看但评分优于随机约50%，评分仍然没有通过。")
-    st.subheader("结论三：评分实际入场第1/2/3顺位")
+    st.subheader("结论四：评分实际入场第1/2/3顺位")
     render_plain_table(score_rank_summary, 30)
     st.caption(
         "顺位来自每条评分路径当日的真实候选排序；补仓利润归回原始入场事件，"
         "因此可以直接判断第一、第二、第三名各自贡献。")
-    st.subheader("结论四：剔除头部盈利股票后的静态稳健性")
+    st.subheader("结论五：剔除头部盈利股票后的静态稳健性")
     render_plain_table(profit_concentration, 30)
     st.caption(
         "这里只扣除已实现净利润，不假设腾出的仓位会自动买到下一只股票；"
         "这是保守的利润集中度审计，不是重新撮合后的反事实回测。")
-    st.subheader("结论五：全部路径的逐年稳定性")
+    st.subheader("结论六：全部路径的逐年稳定性")
     render_plain_table(all_path_year_summary, 100)
     st.caption(
         "这张表使用每一条路径，而不是只挑总收益接近中位数的一条路径。"
         "要求有效阈值在各年的收益中位、第10分位和盈利路径比例都不恶化。")
     with st.expander("中位代表路径逐年表（仅供查交易明细）", expanded=False):
         render_plain_table(representative_annual, 50)
-    with st.expander("普通5分W1/W2事件级风控明细", expanded=False):
-        render_plain_table(ordinary_score5_risk_event, 300)
+    with st.expander("共用随机种子公平性审计", expanded=False):
+        render_plain_table(seed_pairing_audit, 20)
     with st.expander("三因子精确组合与原分数审计", expanded=False):
         render_plain_table(ordinary_factor_combo, 100)
         render_plain_table(ordinary_score_audit, 20)
         render_plain_table(high_score_audit, 20)
         st.caption(
             "精确组合用于拆开相同总分下的不同条件结构，不能代替真实三仓结果；"
-            "V6.8以上方真实现金、名额和持仓净值为准。")
+            "V6.9以上方真实现金、名额和持仓净值为准。")
     st.subheader("确认速度与确认日状态")
     render_plain_table(cross_state_outcomes, 30)
     st.caption("上表从3%提前买入者视角判卷；下表从确认后才新买入者视角判卷。")
@@ -10719,7 +10854,7 @@ def main() -> None:
     st.caption(
         f"结果ZIP共{len(files)}个CSV；历史成熟事件、组合路径、"
         "最近候选和最新观察池严格分开。")
-    render_download(result_zip, result_name, f"v68_current_{request_signature}")
+    render_download(result_zip, result_name, f"v69_current_{request_signature}")
 
 
 if __name__ == "__main__":
