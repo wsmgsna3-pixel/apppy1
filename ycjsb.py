@@ -1,26 +1,19 @@
 # -*- coding: utf-8 -*-
-"""周线SKDJ全额三仓与F级早期失败退出回测 V6.12。
+"""周线SKDJ参数对齐与日线MACD红柱第2日买点回测 V6.13。
 
-本版根据V6.1结果，把周线N=6 SKDJ K位于15～25定义为观察池，并独立扫描
-日线MACD红柱周期内股价自红柱起点首次上涨3%、5%、8%和10%的四个强度确认
-买点。触发时还必须满足红柱扩张或本轮红柱剩余强度不低于75%。是否后来上穿
-周线25只作为事后审计字段，绝不参与买点生成。
+本版先解决人工图表与程序SKDJ数值不一致的问题：使用用户提供的同花顺
+SKDJ公式和四个历史K/D校准点，对N=2～60、M=2～10逐项扫描并输出误差
+排名。N=9、M=3只作为待验证的主假设，N=6、M=3保留为严格对照；程序
+不会把“常用默认参数”误写成已经校准成功。
 
-另设严格诊断组：只取红柱第2日已进入观察池且同一红柱周期确实持续到第5日的
-共同样本，分别模拟第2、3、4、5日买入。该组使用了未来“能持续到第5日”的
-信息，只用于公平比较等待代价，绝不作为实盘规则或实时候选。
+买点研究把周线SKDJ降为准备区判断，把日线MACD作为执行时钟。新主方案和
+对照方案均在截至信号日收盘可见的动态周线K处于10～25且较上一完整周上升
+时进入观察，并在日线MACD第2根红柱收盘确认、下一交易日开盘全额买入。
+旧N=6、周线K15～25、日线上涨3%确认继续作为冻结基准。三套信号均按30万
+元、最多3只、每只约10万元完整名额进行真实撮合，不试仓、不补仓。
 
-V6.12否决V6.11走步主排序，恢复并冻结“2-2-1主分、完全同分时MACD柱较小
-优先、同日前3”。实盘资金30万元直接分成三个10万元股票名额，每只股票首次
-买入即使用完整名额，不再半仓试错、不再补仓；高质量确认只表示继续持有。
-普通确认仍只保留买入时恰好5分者至40日，其余下一开盘退出；14日未确认退出，
-禁止迟到重入。
-
-本版只测试买入后第3、5、7市场日的硬失败退出：当日收盘若日线MACD已经翻绿，
-或红柱剩余不高于10%且较前日继续缩短，或者相对买入开盘跌幅达到5%，且此前尚未形成受保护的
-高质量/过热确认或普通5分确认，则下一可交易开盘全额退出。所有决策只使用当时
-可见数据。结果重点验收F级占仓天数、F级退出精度、S/A误杀、释放名额后的真实
-循环补位收益、逐年稳定性和利润集中度。
+以下保留V6.12及更早版本的函数，最后定义的V6.13 ``main`` 是唯一入口，
+以降低重写历史数据、行业池、缓存和交易成本基础设施带来的回归风险。
 """
 from __future__ import annotations
 
@@ -12543,6 +12536,1596 @@ def main() -> None:
         f"结果ZIP共{len(files)}个CSV；历史成熟事件、组合路径、"
         "最近候选和最新观察池严格分开。")
     render_download(result_zip, result_name, f"v612_current_{request_signature}")
+
+
+# ---------------------------------------------------------------------------
+# V6.13 SKDJ calibration and MACD-red-day-2 entry audit.
+# This block deliberately overrides the V6.12 ``main`` above while reusing its
+# data, cache, universe, cost and 40-session outcome infrastructure.
+# ---------------------------------------------------------------------------
+
+V613_TITLE = "周线SKDJ参数对齐与日线MACD红柱第2日买点回测 V6.13"
+V613_VERSION = "V6.13-SKDJ-CALIBRATION-N9-N6-RED2-ENTRY"
+V613_UI_PATCH = "V6.13-CALIBRATE-N2-60-M2-10-N9PRIMARY-N6CONTROL"
+V613_RESULT_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_13_results")
+V613_JOB_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_13_jobs")
+V613_CHECKPOINT_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_13_checkpoints")
+V613_EVENT_ENGINE_VERSION = "V6.13-DYNAMIC-WEEKLY-RED2-EVENTS-R1"
+V613_PRIMARY_N = 9
+V613_CONTROL_N = 6
+V613_M = 3
+V613_APPROACH_K_MIN = 10.0
+V613_APPROACH_K_MAX = 25.0
+V613_PARAMETER_N_RANGE = tuple(range(2, 61))
+V613_PARAMETER_M_RANGE = tuple(range(2, 11))
+V613_CALIBRATION_TOLERANCE = 0.10
+V613_RANDOM_SEED = 20260828
+V613_PORTFOLIO_EXITS = (
+    ("Fixed40", "固定40日"),
+    ("EarlyFailureD3", "第3市场日硬失败否则40日"),
+)
+V613_STRATEGIES = (
+    {
+        "key": "OLD_N6_STRENGTH3",
+        "label": "旧基准_N6_完整周K15至25_上涨3%",
+        "n": 6,
+        "weekly_mode": "最近完整周",
+        "entry_mode": "首次上涨3%",
+    },
+    {
+        "key": "N6_DYNAMIC_RED2",
+        "label": "对照_N6_动态周线接近25_红柱第2日",
+        "n": 6,
+        "weekly_mode": "截至当日动态周线",
+        "entry_mode": "MACD红柱第2日",
+    },
+    {
+        "key": "N9_DYNAMIC_RED2",
+        "label": "主假设_N9_动态周线接近25_红柱第2日",
+        "n": 9,
+        "weekly_mode": "截至当日动态周线",
+        "entry_mode": "MACD红柱第2日",
+    },
+)
+V613_CALIBRATION_REFERENCES = (
+    {
+        "ts_code": "688361.SH", "name": "中科飞测", "period": "W",
+        "date": "20250411", "target_k": 25.10, "target_d": 25.78,
+    },
+    {
+        "ts_code": "603290.SH", "name": "斯达半导", "period": "D",
+        "date": "20260721", "target_k": 7.43, "target_d": 5.32,
+    },
+    {
+        "ts_code": "688783.SH", "name": "西安奕材", "period": "D",
+        "date": "20260624", "target_k": 60.80, "target_d": 70.26,
+    },
+    {
+        "ts_code": "688249.SH", "name": "晶合集成", "period": "D",
+        "date": "20260806", "target_k": 26.05, "target_d": 17.75,
+    },
+)
+
+
+def v613_skdj_values(frame: pd.DataFrame, n: int, m: int) -> pd.DataFrame:
+    """Implement the supplied Tonghuashun EMA-EMA-MA formula exactly."""
+    work = normalize_price_frame(frame).sort_values(
+        "trade_date").reset_index(drop=True)
+    lowv = numeric(work, "low").rolling(int(n), min_periods=int(n)).min()
+    highv = numeric(work, "high").rolling(int(n), min_periods=int(n)).max()
+    raw = (
+        (numeric(work, "close") - lowv)
+        / (highv - lowv).replace(0, np.nan) * 100.0
+    )
+    rsv = raw.ewm(span=int(m), adjust=False, min_periods=1).mean()
+    k_value = rsv.ewm(span=int(m), adjust=False, min_periods=1).mean()
+    d_value = k_value.rolling(int(m), min_periods=int(m)).mean()
+    work["SKDJ_Raw"] = raw
+    work["SKDJ_RSV_EMA"] = rsv
+    work["SKDJ_K"] = k_value
+    work["SKDJ_D"] = d_value
+    work["SKDJ_KD_Spread"] = k_value - d_value
+    return work
+
+
+def v613_dynamic_weekly_skdj(
+        daily: pd.DataFrame, weekly_base: pd.DataFrame, n: int,
+        m: int = V613_M) -> pd.DataFrame:
+    """Calculate an observable partial-week SKDJ at every daily close.
+
+    Previous weeks are complete bars.  The current week uses only highs, lows
+    and the close observed through that day.  Friday therefore equals the
+    completed weekly value, while Monday through Thursday never use future
+    prices from the rest of the week.
+    """
+    daily_work = normalize_price_frame(daily).sort_values(
+        "trade_date").reset_index(drop=True)
+    if daily_work.empty or weekly_base.empty:
+        return pd.DataFrame(columns=[
+            "trade_date", "Dynamic_Weekly_K", "Dynamic_Weekly_D",
+            "Dynamic_Weekly_KD_Spread", "Dynamic_Weekly_K_Change",
+            "Dynamic_Prior_Weekly_Date"])
+    full = v613_skdj_values(weekly_base, int(n), int(m))
+    full["_period"] = pd.to_datetime(
+        full["trade_date"], format="%Y%m%d").dt.to_period("W-FRI")
+    daily_work["_period"] = pd.to_datetime(
+        daily_work["trade_date"], format="%Y%m%d").dt.to_period("W-FRI")
+    alpha = 2.0 / (float(m) + 1.0)
+    rows: list[dict[str, Any]] = []
+    for period, group in daily_work.groupby("_period", sort=True):
+        prior = full[full["_period"].lt(period)].sort_values("_period")
+        prior_valid = prior[
+            numeric(prior, "SKDJ_RSV_EMA").notna()
+            & numeric(prior, "SKDJ_K").notna()
+        ]
+        prior_range = prior.tail(max(int(n) - 1, 0))
+        enough_range = len(prior_range) >= max(int(n) - 1, 0)
+        enough_smooth = len(prior_valid) >= max(int(m) - 1, 1)
+        previous_rsv = (
+            finite_num(prior_valid.iloc[-1].get("SKDJ_RSV_EMA"))
+            if enough_smooth else np.nan)
+        previous_k = (
+            finite_num(prior_valid.iloc[-1].get("SKDJ_K"))
+            if enough_smooth else np.nan)
+        previous_k_values = (
+            numeric(prior_valid.tail(max(int(m) - 1, 0)), "SKDJ_K").tolist()
+            if enough_smooth else [])
+        historical_low = (
+            finite_num(numeric(prior_range, "low").min())
+            if enough_range and len(prior_range) else np.nan)
+        historical_high = (
+            finite_num(numeric(prior_range, "high").max())
+            if enough_range and len(prior_range) else np.nan)
+        prior_date = (
+            str(prior.iloc[-1]["trade_date"]) if not prior.empty else "")
+        partial_low = numeric(group, "low").cummin()
+        partial_high = numeric(group, "high").cummax()
+        for position, (_, row) in enumerate(group.iterrows()):
+            if int(n) == 1:
+                lowv = finite_num(partial_low.iloc[position])
+                highv = finite_num(partial_high.iloc[position])
+            elif enough_range:
+                lowv = min(
+                    historical_low, finite_num(partial_low.iloc[position]))
+                highv = max(
+                    historical_high, finite_num(partial_high.iloc[position]))
+            else:
+                lowv = highv = np.nan
+            close = finite_num(row.get("close"))
+            raw = (
+                (close - lowv) / (highv - lowv) * 100.0
+                if math.isfinite(lowv) and math.isfinite(highv)
+                and highv > lowv and math.isfinite(close) else np.nan)
+            rsv = (
+                alpha * raw + (1.0 - alpha) * previous_rsv
+                if math.isfinite(raw) and math.isfinite(previous_rsv)
+                else np.nan)
+            k_value = (
+                alpha * rsv + (1.0 - alpha) * previous_k
+                if math.isfinite(rsv) and math.isfinite(previous_k)
+                else np.nan)
+            d_values = previous_k_values + [k_value]
+            d_value = (
+                float(np.mean(d_values[-int(m):]))
+                if len(d_values) >= int(m)
+                and all(math.isfinite(value) for value in d_values[-int(m):])
+                else np.nan)
+            rows.append({
+                "trade_date": str(row["trade_date"]),
+                "Dynamic_Weekly_K": k_value,
+                "Dynamic_Weekly_D": d_value,
+                "Dynamic_Weekly_KD_Spread": k_value - d_value,
+                "Dynamic_Weekly_K_Change": k_value - previous_k,
+                "Dynamic_Weekly_Raw": raw,
+                "Dynamic_Prior_Weekly_Date": prior_date,
+            })
+    return pd.DataFrame(rows)
+
+
+def v613_k_band(value: Any) -> str:
+    number = finite_num(value)
+    if not math.isfinite(number):
+        return "数据不足"
+    if 10.0 <= number < 15.0:
+        return "10至15"
+    if 15.0 <= number < 20.0:
+        return "15至20"
+    if 20.0 <= number <= 25.0:
+        return "20至25"
+    return "区间外"
+
+
+def v613_checkpoint_path(signature: str, ts_code: str) -> str:
+    return os.path.join(
+        V613_CHECKPOINT_DIR, signature,
+        f"{str(ts_code).replace('.', '_')}.pkl")
+
+
+def v613_load_checkpoint(
+        signature: str, ts_code: str) -> dict[str, Any] | None:
+    path = v613_checkpoint_path(signature, ts_code)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "rb") as handle:
+            payload = pickle.load(handle)
+        if (not isinstance(payload, dict)
+                or payload.get("signature") != signature
+                or payload.get("ts_code") != str(ts_code)
+                or "events" not in payload or "rejects" not in payload):
+            return None
+        return payload
+    except Exception as exc:
+        record_error(f"V6.13检查点损坏 {ts_code}: {exc}")
+        return None
+
+
+def v613_save_checkpoint(
+        signature: str, ts_code: str, events: list[dict[str, Any]],
+        rejects: dict[str, int]) -> None:
+    atomic_pickle({
+        "signature": signature, "ts_code": str(ts_code),
+        "events": events, "rejects": rejects,
+    }, v613_checkpoint_path(signature, ts_code))
+
+
+def v613_active_job_path(signature: str) -> str:
+    return os.path.join(V613_JOB_DIR, f"{signature}.active")
+
+
+def v613_mark_job_active(signature: str) -> None:
+    atomic_bytes(json.dumps({
+        "signature": signature, "version": V613_VERSION,
+        "updated_at": pd.Timestamp.utcnow().isoformat(),
+    }, ensure_ascii=False).encode("utf-8"), v613_active_job_path(signature))
+
+
+def v613_clear_job_active(signature: str) -> None:
+    path = v613_active_job_path(signature)
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError as exc:
+        record_error(f"V6.13任务标记清除失败: {exc}")
+
+
+def v613_is_job_active(signature: str) -> bool:
+    return os.path.exists(v613_active_job_path(signature))
+
+
+def v613_daily_indicator_frame(
+        daily: pd.DataFrame, weekly_base: pd.DataFrame) -> pd.DataFrame:
+    base = add_daily_macd(normalize_price_frame(daily))
+    for n in (V613_CONTROL_N, V613_PRIMARY_N):
+        daily_skdj = v613_skdj_values(base, n, V613_M)[[
+            "trade_date", "SKDJ_K", "SKDJ_D", "SKDJ_KD_Spread"]]
+        daily_skdj = daily_skdj.rename(columns={
+            "SKDJ_K": f"Daily_SKDJ_N{n}_K",
+            "SKDJ_D": f"Daily_SKDJ_N{n}_D",
+            "SKDJ_KD_Spread": f"Daily_SKDJ_N{n}_KD_Spread",
+        })
+        base = base.merge(daily_skdj, on="trade_date", how="left")
+        dynamic = v613_dynamic_weekly_skdj(
+            base, weekly_base, n, V613_M).rename(columns={
+                "Dynamic_Weekly_K": f"Dynamic_N{n}_Weekly_K",
+                "Dynamic_Weekly_D": f"Dynamic_N{n}_Weekly_D",
+                "Dynamic_Weekly_KD_Spread": f"Dynamic_N{n}_Weekly_KD_Spread",
+                "Dynamic_Weekly_K_Change": f"Dynamic_N{n}_Weekly_K_Change",
+                "Dynamic_Weekly_Raw": f"Dynamic_N{n}_Weekly_Raw",
+                "Dynamic_Prior_Weekly_Date": f"Dynamic_N{n}_Prior_Weekly_Date",
+            })
+        base = base.merge(dynamic, on="trade_date", how="left")
+    return base
+
+
+def v613_analyze_stock(
+        stock: pd.Series, periods: list[dict[str, str]], daily: pd.DataFrame,
+        cached_basic: pd.DataFrame, storage_path: str,
+        week_last_map: dict[pd.Timestamp, str], open_dates: list[str],
+        open_pos: dict[str, int], config: dict[str, Any], use_cache: bool,
+        api_pause: float) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    rejects: dict[str, int] = {}
+    weekly_base = aggregate_complete_weekly(daily, week_last_map)
+    if weekly_base.empty:
+        return [], rejects
+    daily_features = v613_daily_indicator_frame(daily, weekly_base)
+    weekly_by_n = {
+        n: add_skdj(weekly_base, n)
+        for n in (V613_CONTROL_N, V613_PRIMARY_N)
+    }
+    attached = {
+        n: attach_latest_completed_weekly(daily_features, weekly_by_n[n])
+        for n in (V613_CONTROL_N, V613_PRIMARY_N)
+    }
+    event_end = str(config.get("event_signal_end", config["signal_end"]))
+    specifications: list[tuple[dict[str, Any], pd.DataFrame]] = []
+    for spec in V613_STRATEGIES:
+        n = int(spec["n"])
+        frame = attached[n].copy()
+        dates = frame["trade_date"].astype(str)
+        formal = dates.between(config["signal_start"], event_end)
+        positive = true_mask(frame, "Daily_MACD_Positive")
+        if spec["entry_mode"] == "首次上涨3%":
+            quality = (
+                frame["Daily_MACD_State"].astype(str).eq("红柱扩张")
+                | numeric(frame, "Daily_MACD_Remaining_pct").ge(
+                    STRENGTH_MIN_REMAINING_PCT))
+            mask = (
+                formal & positive & quality
+                & numeric(frame, "Setup_Weekly_K").between(
+                    EARLY_WEEKLY_K_MIN, EARLY_WEEKLY_K_MAX,
+                    inclusive="both")
+                & numeric(frame, "Daily_Return_Since_Red_Start_pct").ge(
+                    V63_STRENGTH_THRESHOLD))
+        else:
+            dynamic_k = numeric(frame, f"Dynamic_N{n}_Weekly_K")
+            dynamic_change = numeric(
+                frame, f"Dynamic_N{n}_Weekly_K_Change")
+            mask = (
+                formal & positive
+                & numeric(frame, "Daily_MACD_Red_Age").eq(2)
+                & dynamic_k.between(
+                    V613_APPROACH_K_MIN, V613_APPROACH_K_MAX,
+                    inclusive="both")
+                & dynamic_change.gt(0))
+        selected = frame[mask].copy().sort_values("trade_date")
+        if not selected.empty:
+            selected = selected.groupby(
+                "Daily_MACD_Cycle", as_index=False, sort=False).first()
+        specifications.append((spec, selected))
+
+    latest_date = str(config.get("latest_market_date", config["market_end"]))
+    watch_specs: list[tuple[dict[str, Any], pd.DataFrame]] = []
+    for n in (V613_CONTROL_N, V613_PRIMARY_N):
+        frame = attached[n]
+        dynamic_k = numeric(frame, f"Dynamic_N{n}_Weekly_K")
+        dynamic_change = numeric(frame, f"Dynamic_N{n}_Weekly_K_Change")
+        watch = frame[
+            frame["trade_date"].astype(str).eq(latest_date)
+            & dynamic_k.between(
+                V613_APPROACH_K_MIN, V613_APPROACH_K_MAX,
+                inclusive="both")
+            & dynamic_change.gt(0)
+        ].copy().tail(1)
+        watch_specs.append(({
+            "key": f"N{n}_LIVE_WATCH",
+            "label": f"N{n}_动态周线接近25观察池",
+            "n": n, "weekly_mode": "截至当日动态周线",
+            "entry_mode": "仅观察",
+        }, watch))
+
+    estimated = sum(len(frame) for _, frame in specifications + watch_specs)
+    if estimated == 0:
+        return [], rejects
+    code = str(stock["ts_code"])
+    basic = ensure_daily_basic(
+        code, config["data_start"], config["market_end"], daily,
+        cached_basic, storage_path, use_cache, api_pause)
+    if basic.empty:
+        rejects["存在V6.13信号但daily_basic缺失"] = estimated
+        return [], rejects
+    rows: list[dict[str, Any]] = []
+    outcome_cache: dict[str, dict[str, Any]] = {}
+    daily_lookup = daily_features.set_index(
+        daily_features["trade_date"].astype(str))
+
+    def append_signal(
+            spec: dict[str, Any], signal: pd.Series,
+            is_watch: bool = False) -> None:
+        signal_date = str(signal["trade_date"])
+        membership = membership_on_date(periods, signal_date)
+        snapshot = market_snapshot(basic, signal_date)
+        reason = ""
+        if membership is None:
+            reason = "信号日不在历史科技池"
+        elif not (str(stock["list_date"]) <= signal_date
+                  < str(stock["delist_date"])):
+            reason = "信号日上市状态无效"
+        elif (not math.isfinite(snapshot["Raw_Close"])
+              or snapshot["Raw_Close"] < config["min_price"]):
+            reason = "信号日股价不足"
+        elif (not math.isfinite(snapshot["Circ_MV_Billion"])
+              or snapshot["Circ_MV_Billion"] < config["min_mv"]):
+            reason = "信号日流通市值不足"
+        if reason or membership is None:
+            rejects[reason] = rejects.get(reason, 0) + 1
+            return
+        n = int(spec["n"])
+        if spec["weekly_mode"] == "最近完整周":
+            signal_k = finite_num(signal.get("Setup_Weekly_K"))
+            signal_d = finite_num(signal.get("Setup_Weekly_D"))
+            signal_k_change = finite_num(
+                signal.get("Setup_Weekly_K_Change_1W"))
+            setup_date = str(signal.get("Setup_Weekly_Date", ""))
+        else:
+            signal_k = finite_num(signal.get(f"Dynamic_N{n}_Weekly_K"))
+            signal_d = finite_num(signal.get(f"Dynamic_N{n}_Weekly_D"))
+            signal_k_change = finite_num(
+                signal.get(f"Dynamic_N{n}_Weekly_K_Change"))
+            setup_date = str(
+                signal.get(f"Dynamic_N{n}_Prior_Weekly_Date", ""))
+        score_k = int(math.isfinite(signal_k) and 15.0 <= signal_k <= 20.0)
+        red_age = int(finite_num(signal.get("Daily_MACD_Red_Age")))
+        score_age = int(3 <= red_age <= 5)
+        score_kd = int(
+            math.isfinite(signal_k) and math.isfinite(signal_d)
+            and signal_k < signal_d)
+        row: dict[str, Any] = {
+            "Event_Type": "LIVE_WATCH" if is_watch else "ENTRY_SIGNAL",
+            "Strategy_Key": str(spec["key"]),
+            "Strategy_Label": str(spec["label"]),
+            "Weekly_SKDJ_N": n, "SKDJ_M": V613_M,
+            "Weekly_Data_Mode": str(spec["weekly_mode"]),
+            "Entry_Trigger_Mode": str(spec["entry_mode"]),
+            "ts_code": code, "name": str(stock["name"]),
+            "Signal_Date": signal_date,
+            "Signal_Week": str(
+                pd.Timestamp(signal_date).to_period("W-FRI")),
+            "SW_L1": membership["l1"], "SW_L2": membership["l2"],
+            "SW_L3": membership["l3"], **snapshot,
+            "Setup_Weekly_Date": setup_date,
+            "Signal_K": signal_k, "Signal_D": signal_d,
+            "Signal_KD_Spread": signal_k - signal_d,
+            "Signal_K_Change_1W": signal_k_change,
+            "Weekly_K_Approach_Band": v613_k_band(signal_k),
+            **macd_snapshot(signal),
+            "Signal_Rally_From_Red_Start_pct": finite_num(
+                signal.get("Daily_Return_Since_Red_Start_pct")),
+            "Signal_Daily_SKDJ_N6_K": finite_num(
+                signal.get("Daily_SKDJ_N6_K")),
+            "Signal_Daily_SKDJ_N6_D": finite_num(
+                signal.get("Daily_SKDJ_N6_D")),
+            "Signal_Daily_SKDJ_N9_K": finite_num(
+                signal.get("Daily_SKDJ_N9_K")),
+            "Signal_Daily_SKDJ_N9_D": finite_num(
+                signal.get("Daily_SKDJ_N9_D")),
+            "Timing_K15_20_Pass": bool(score_k),
+            "Timing_RedAge3_5_Pass": bool(score_age),
+            "Timing_WeeklyK_BelowD_Pass": bool(score_kd),
+            "Timing_Score_221": (
+                V63_SCORE_K_WEIGHT * score_k
+                + V63_SCORE_AGE_WEIGHT * score_age
+                + V63_SCORE_KD_WEIGHT * score_kd),
+            "Timing_Three_Factor_Count": score_k + score_age + score_kd,
+        }
+        if not is_watch:
+            if signal_date not in outcome_cache:
+                outcome_cache[signal_date] = daily_timing_outcomes(
+                    daily_features, signal_date, code, open_dates, open_pos,
+                    config)
+            outcome = outcome_cache[signal_date]
+            row.update({f"Entry_{key}": value for key, value in outcome.items()})
+            row["Explosion_Class_40D"] = _v63_class_from_outcome(outcome)
+            row["Explosion_Grade_40D"] = {
+                "F": 0, "B": 1, "A": 2, "S": 3,
+            }.get(row["Explosion_Class_40D"], np.nan)
+            entry_date = normalize_date(outcome.get("Date"))
+            entry_frame = (
+                daily_lookup.loc[[entry_date]] if entry_date in daily_lookup.index
+                else pd.DataFrame())
+            if not entry_frame.empty:
+                entry_row = entry_frame.iloc[-1]
+                row.update({
+                    "Entry_Close_MACD_Red_Age_Audit": int(finite_num(
+                        entry_row.get("Daily_MACD_Red_Age"))),
+                    "Entry_Close_MACD_State_Audit": str(
+                        entry_row.get("Daily_MACD_State", "")),
+                    "Entry_Close_Daily_SKDJ_N6_K_Audit": finite_num(
+                        entry_row.get("Daily_SKDJ_N6_K")),
+                    "Entry_Close_Daily_SKDJ_N6_D_Audit": finite_num(
+                        entry_row.get("Daily_SKDJ_N6_D")),
+                    "Entry_Close_Daily_SKDJ_N9_K_Audit": finite_num(
+                        entry_row.get("Daily_SKDJ_N9_K")),
+                    "Entry_Close_Daily_SKDJ_N9_D_Audit": finite_num(
+                        entry_row.get("Daily_SKDJ_N9_D")),
+                })
+        rows.append(row)
+
+    for spec, selected in specifications:
+        for _, signal in selected.iterrows():
+            append_signal(spec, signal, False)
+    for spec, watch in watch_specs:
+        for _, signal in watch.iterrows():
+            append_signal(spec, signal, True)
+    return rows, rejects
+
+
+def v613_calibration_audit(
+        data_start: str, market_end: str,
+        week_last_map: dict[pd.Timestamp, str], use_cache: bool,
+        api_pause: float) -> tuple[pd.DataFrame, pd.DataFrame]:
+    reference_frames: list[tuple[dict[str, Any], pd.DataFrame]] = []
+    missing_rows: list[dict[str, Any]] = []
+    for reference in V613_CALIBRATION_REFERENCES:
+        daily, _, _, _ = fetch_price(
+            str(reference["ts_code"]), data_start, market_end,
+            use_cache, api_pause)
+        if daily.empty:
+            missing_rows.append({
+                **reference, "状态": "行情缺失"})
+            continue
+        frame = (
+            aggregate_complete_weekly(daily, week_last_map)
+            if reference["period"] == "W"
+            else normalize_price_frame(daily))
+        if frame.empty or not frame["trade_date"].astype(str).eq(
+                str(reference["date"])).any():
+            missing_rows.append({
+                **reference, "状态": "校准日期行情缺失"})
+            continue
+        reference_frames.append((reference, frame))
+    detail_rows: list[dict[str, Any]] = []
+    for n in V613_PARAMETER_N_RANGE:
+        for m in V613_PARAMETER_M_RANGE:
+            for reference, frame in reference_frames:
+                calculated = v613_skdj_values(frame, n, m)
+                selected = calculated[
+                    calculated["trade_date"].astype(str).eq(
+                        str(reference["date"]))]
+                k_value = (
+                    finite_num(selected.iloc[-1].get("SKDJ_K"))
+                    if not selected.empty else np.nan)
+                d_value = (
+                    finite_num(selected.iloc[-1].get("SKDJ_D"))
+                    if not selected.empty else np.nan)
+                detail_rows.append({
+                    "N": n, "M": m,
+                    "股票代码": reference["ts_code"],
+                    "股票名称": reference["name"],
+                    "周期": "周线" if reference["period"] == "W" else "日线",
+                    "日期": reference["date"],
+                    "目标K": reference["target_k"],
+                    "目标D": reference["target_d"],
+                    "计算K": k_value, "计算D": d_value,
+                    "K绝对误差": abs(k_value - float(reference["target_k"])),
+                    "D绝对误差": abs(d_value - float(reference["target_d"])),
+                })
+    detail = pd.DataFrame(detail_rows)
+    if detail.empty:
+        return pd.DataFrame(missing_rows), detail
+    detail["单点总绝对误差"] = (
+        numeric(detail, "K绝对误差") + numeric(detail, "D绝对误差"))
+    summary_rows: list[dict[str, Any]] = []
+    expected_points = len(V613_CALIBRATION_REFERENCES)
+    for (n, m), group in detail.groupby(["N", "M"], sort=True):
+        errors = pd.concat([
+            numeric(group, "K绝对误差"), numeric(group, "D绝对误差")
+        ], ignore_index=True).dropna()
+        summary_rows.append({
+            "N": int(n), "M": int(m),
+            "成功校准点": len(group), "要求校准点": expected_points,
+            "K与D平均绝对误差": errors.mean(),
+            "K与D最大绝对误差": errors.max(),
+            "四点总绝对误差": numeric(
+                group, "单点总绝对误差").sum(),
+            "全部点误差不超过0.10": bool(
+                len(group) == expected_points
+                and errors.le(V613_CALIBRATION_TOLERANCE).all()),
+        })
+    summary = pd.DataFrame(summary_rows).sort_values(
+        ["成功校准点", "四点总绝对误差", "K与D最大绝对误差"],
+        ascending=[False, True, True]).reset_index(drop=True)
+    summary["误差排名"] = np.arange(1, len(summary) + 1)
+    summary["参数身份"] = "其他候选"
+    summary.loc[
+        numeric(summary, "N").eq(9) & numeric(summary, "M").eq(3),
+        "参数身份"] = "推测默认_N9_M3"
+    summary.loc[
+        numeric(summary, "N").eq(6) & numeric(summary, "M").eq(3),
+        "参数身份"] = "旧代码_N6_M3"
+    if missing_rows:
+        missing = pd.DataFrame(missing_rows)
+        missing["N"] = np.nan
+        missing["M"] = np.nan
+    return summary, detail
+
+
+def v613_event_summary(events: pd.DataFrame) -> pd.DataFrame:
+    if events.empty:
+        return pd.DataFrame()
+    rows: list[dict[str, Any]] = []
+    group_columns = ["Strategy_Key", "Strategy_Label"]
+    for keys, group in events.groupby(group_columns, dropna=False):
+        strategy_key, label = keys
+        classes = group["Explosion_Class_40D"].astype(str)
+        returns = numeric(group, "Entry_Close_Return_Net_pct")
+        rows.append({
+            "Strategy_Key": strategy_key, "策略": label,
+            "成熟事件": len(group), "不同股票": group["ts_code"].nunique(),
+            "信号日": group["Signal_Date"].nunique(),
+            "信号周": group["Signal_Week"].nunique(),
+            "红柱日龄均值": numeric(group, "Daily_MACD_Red_Age").mean(),
+            "S级比例%": classes.eq("S").mean() * 100.0,
+            "A或S比例%": classes.isin(["A", "S"]).mean() * 100.0,
+            "B级以上比例%": classes.isin(["B", "A", "S"]).mean() * 100.0,
+            "F级比例%": classes.eq("F").mean() * 100.0,
+            "40日盈利比例%": returns.gt(0).mean() * 100.0,
+            "40日收益均值%": returns.mean(),
+            "40日收益中位%": returns.median(),
+            "最大浮盈中位%": numeric(group, "Entry_MFE_Net_pct").median(),
+            "最大回撤均值%": numeric(group, "Entry_MAE_Raw_pct").mean(),
+        })
+    return pd.DataFrame(rows)
+
+
+def v613_band_summary(events: pd.DataFrame) -> pd.DataFrame:
+    if events.empty:
+        return pd.DataFrame()
+    rows: list[dict[str, Any]] = []
+    for keys, group in events.groupby(
+            ["Strategy_Label", "Weekly_K_Approach_Band"], dropna=False):
+        label, band = keys
+        classes = group["Explosion_Class_40D"].astype(str)
+        returns = numeric(group, "Entry_Close_Return_Net_pct")
+        rows.append({
+            "策略": label, "周线K区间": band, "事件": len(group),
+            "S或A比例%": classes.isin(["S", "A"]).mean() * 100.0,
+            "F级比例%": classes.eq("F").mean() * 100.0,
+            "40日盈利比例%": returns.gt(0).mean() * 100.0,
+            "40日收益均值%": returns.mean(),
+            "40日收益中位%": returns.median(),
+        })
+    return pd.DataFrame(rows)
+
+
+def v613_matched_entry_audit(
+        events: pd.DataFrame, open_dates: list[str]
+        ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if events.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    old = events[events["Strategy_Key"].eq("OLD_N6_STRENGTH3")].copy()
+    new = events[events["Strategy_Key"].isin(
+        ["N6_DYNAMIC_RED2", "N9_DYNAMIC_RED2"])].copy()
+    if old.empty or new.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    match_columns = ["ts_code", "Daily_MACD_Cycle"]
+    old = old.sort_values("Signal_Date").drop_duplicates(match_columns)
+    old = old[match_columns + [
+        "Signal_Date", "Entry_Date", "Entry_Raw_Open",
+        "Entry_Close_Return_Net_pct", "Explosion_Class_40D",
+    ]].rename(columns={
+        "Signal_Date": "Old_Signal_Date",
+        "Entry_Date": "Old_Entry_Date",
+        "Entry_Raw_Open": "Old_Entry_Raw_Open",
+        "Entry_Close_Return_Net_pct": "Old_40D_Return_pct",
+        "Explosion_Class_40D": "Old_Explosion_Class",
+    })
+    detail = new.merge(old, on=match_columns, how="left")
+    open_pos = {value: position for position, value in enumerate(open_dates)}
+    detail["Matched_Old_Strength3"] = detail["Old_Entry_Date"].map(
+        normalize_date).str.len().eq(8)
+    detail["Entry_Market_Days_Earlier"] = [
+        (open_pos.get(normalize_date(old_date), np.nan)
+         - open_pos.get(normalize_date(new_date), np.nan))
+        for new_date, old_date in zip(
+            detail["Entry_Date"], detail["Old_Entry_Date"])
+    ]
+    detail["Earlier_Entry_Price_Advantage_pct"] = np.where(
+        numeric(detail, "Entry_Raw_Open").gt(0)
+        & numeric(detail, "Old_Entry_Raw_Open").gt(0),
+        (numeric(detail, "Old_Entry_Raw_Open")
+         / numeric(detail, "Entry_Raw_Open") - 1.0) * 100.0,
+        np.nan)
+    rows: list[dict[str, Any]] = []
+    for label, group in detail.groupby("Strategy_Label", dropna=False):
+        matched = group[true_mask(group, "Matched_Old_Strength3")]
+        rows.append({
+            "新策略": label, "全部红2事件": len(group),
+            "后来形成旧3%信号": len(matched),
+            "后来形成旧3%信号比例%": len(matched) / len(group) * 100.0,
+            "未形成旧3%信号的真实早期机会": len(group) - len(matched),
+            "匹配样本提前市场日中位": numeric(
+                matched, "Entry_Market_Days_Earlier").median(),
+            "匹配样本价格优势中位%": numeric(
+                matched, "Earlier_Entry_Price_Advantage_pct").median(),
+            "匹配样本价格优势5至15比例%": numeric(
+                matched, "Earlier_Entry_Price_Advantage_pct").between(
+                    5, 15).mean() * 100.0,
+        })
+    return pd.DataFrame(rows), detail
+
+
+def v613_weekly_coverage(
+        events: pd.DataFrame, open_dates: list[str], start_date: str,
+        end_date: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    days = [value for value in open_dates if start_date <= value <= end_date]
+    calendar = pd.DataFrame({"trade_date": days})
+    calendar["Signal_Week"] = pd.to_datetime(
+        calendar["trade_date"], format="%Y%m%d").dt.to_period(
+            "W-FRI").astype(str)
+    weeks = calendar.groupby("Signal_Week")["trade_date"].max().rename(
+        "Week_Last_Trading_Date").reset_index()
+    rows: list[dict[str, Any]] = []
+    for spec in V613_STRATEGIES:
+        group = events[events["Strategy_Key"].eq(spec["key"])]
+        counts = group.groupby("Signal_Week").size()
+        column = str(spec["key"])
+        weeks[column] = weeks["Signal_Week"].map(counts).fillna(0).astype(int)
+        values = numeric(weeks, column)
+        rows.append({
+            "Strategy_Key": column, "策略": spec["label"],
+            "总事件": int(values.sum()),
+            "有信号周": int(values.gt(0).sum()),
+            "空窗周": int(values.eq(0).sum()),
+            "覆盖率%": values.gt(0).mean() * 100.0,
+            "最长连续空窗周": max_empty_run(values),
+            "每周信号均值": values.mean(), "单周最多": int(values.max()),
+        })
+    return pd.DataFrame(rows), weeks
+
+
+def v613_price_asof(book: dict[str, Any], field: str, value: str) -> float:
+    direct = finite_num(book.get(field, {}).get(value))
+    if math.isfinite(direct) and direct > 0:
+        return direct
+    dates = list(book.get("dates", []))
+    position = bisect.bisect_right(dates, value) - 1
+    while position >= 0:
+        price = finite_num(book.get(field, {}).get(dates[position]))
+        if math.isfinite(price) and price > 0:
+            return price
+        position -= 1
+    return np.nan
+
+
+def v613_next_stock_date(book: dict[str, Any], after_date: str) -> str:
+    dates = list(book.get("dates", []))
+    position = bisect.bisect_right(dates, after_date)
+    return str(dates[position]) if position < len(dates) else ""
+
+
+def v613_run_portfolio_path(
+        strategy_events: pd.DataFrame,
+        price_book: dict[str, dict[str, Any]], open_dates: list[str],
+        config: dict[str, Any], exit_mode: str, selection_mode: str,
+        seed: int, keep_details: bool = False
+        ) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame]:
+    events = strategy_events.copy()
+    if events.empty:
+        return {}, pd.DataFrame(), pd.DataFrame()
+    for column in ("Signal_Date", "Entry_Date", "Entry_End_Date_40D"):
+        events[column] = events[column].map(normalize_date)
+    events = events[
+        events["Entry_Date"].str.len().eq(8)
+        & events["Entry_End_Date_40D"].str.len().eq(8)
+        & events["ts_code"].astype(str).isin(price_book)
+    ].copy().reset_index(drop=True)
+    if events.empty:
+        return {}, pd.DataFrame(), pd.DataFrame()
+    events["_Event_ID"] = [
+        f"{row.Strategy_Key}:{row.ts_code}:{row.Signal_Date}:{number}"
+        for number, row in events.iterrows()
+    ]
+    candidates_by_date: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for record in events.to_dict("records"):
+        candidates_by_date[str(record["Entry_Date"])].append(record)
+    first_date = min(candidates_by_date)
+    last_date = max(events["Entry_End_Date_40D"].astype(str))
+    simulation_dates = [
+        value for value in open_dates if first_date <= value <= last_date]
+    if not simulation_dates:
+        return {}, pd.DataFrame(), pd.DataFrame()
+    rng = np.random.default_rng(int(seed))
+    buy_factor, sell_factor = _cost_factors(config)
+    open_pos = {value: position for position, value in enumerate(open_dates)}
+    cash = float(V66_INITIAL_CAPITAL)
+    positions: dict[str, dict[str, Any]] = {}
+    pending_open_exits: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    selected_event_ids: set[str] = set()
+    equity_rows: list[dict[str, Any]] = []
+    trade_rows: list[dict[str, Any]] = []
+    leg_number = 0
+
+    def close_position(
+            code: str, exit_date: str, field: str, reason: str) -> bool:
+        nonlocal cash
+        position = positions.get(code)
+        if position is None:
+            return False
+        book = price_book.get(code, {})
+        raw_exit = finite_num(book.get(field, {}).get(exit_date))
+        if field == "close" and (not math.isfinite(raw_exit) or raw_exit <= 0):
+            # Match the 40-day outcome engine: if the stock is suspended on
+            # the common market end date, value the planned close at its last
+            # observable close inside the horizon rather than leaving an
+            # unclosed position out of the trade audit.
+            raw_exit = v613_price_asof(book, "close", exit_date)
+        if not math.isfinite(raw_exit) or raw_exit <= 0:
+            return False
+        proceeds = float(position["shares"]) * raw_exit * sell_factor
+        cash += proceeds
+        entry_cost = float(position["entry_cost"])
+        pnl = proceeds - entry_cost
+        event = position["event"]
+        entry_date = str(position["entry_date"])
+        hold_days = (
+            open_pos.get(exit_date, -1) - open_pos.get(entry_date, -1) + 1
+            if entry_date in open_pos and exit_date in open_pos else np.nan)
+        trade_rows.append({
+            "Strategy_Key": event.get("Strategy_Key"),
+            "策略": event.get("Strategy_Label"),
+            "退出方案": exit_mode, "选择方式": selection_mode,
+            "Seed": int(seed), "Leg_ID": position["leg_id"],
+            "Event_ID": event.get("_Event_ID"),
+            "ts_code": code, "name": event.get("name"),
+            "信号日": event.get("Signal_Date"),
+            "买入日": entry_date, "买入开盘": position["raw_entry"],
+            "股数": position["shares"], "投入成本": entry_cost,
+            "信号日原始顺位": position["selection_rank"],
+            "退出日": exit_date, "退出价格": raw_exit,
+            "退出价格字段": field, "退出原因": reason,
+            "净回收": proceeds, "净利润": pnl,
+            "实际交易收益%": pnl / entry_cost * 100.0,
+            "持有市场日": hold_days,
+            "Explosion_Class_40D": event.get("Explosion_Class_40D"),
+            "Entry_Close_Return_Net_pct": event.get(
+                "Entry_Close_Return_Net_pct"),
+            "Entry_MFE_Net_pct": event.get("Entry_MFE_Net_pct"),
+            "Entry_MAE_Raw_pct": event.get("Entry_MAE_Raw_pct"),
+            "Weekly_K_Approach_Band": event.get("Weekly_K_Approach_Band"),
+        })
+        positions.pop(code, None)
+        return True
+
+    for trade_date in simulation_dates:
+        # A close signal from a previous day can only be executed now.
+        for code, reason in pending_open_exits.pop(trade_date, []):
+            if not close_position(code, trade_date, "open", reason):
+                next_date = v613_next_stock_date(
+                    price_book.get(code, {}), trade_date)
+                position = positions.get(code)
+                if (next_date and position is not None
+                        and next_date <= str(position["base_exit_date"])):
+                    pending_open_exits[next_date].append((code, reason))
+
+        day_candidates = candidates_by_date.get(trade_date, [])
+        if day_candidates:
+            day = pd.DataFrame(day_candidates).drop_duplicates(
+                "ts_code", keep="first")
+            if selection_mode == "规则排序":
+                day = day.sort_values(
+                    ["Timing_Score_221", "Daily_MACD_Hist", "ts_code"],
+                    ascending=[False, True, True])
+            else:
+                order = rng.permutation(len(day))
+                day = day.iloc[order]
+            day = day.head(V66_MAX_STOCKS).copy()
+            day["_Selection_Rank"] = np.arange(1, len(day) + 1)
+            # No fallback: only the original daily Top3 may be considered.
+            for event in day.to_dict("records"):
+                event_id = str(event.get("_Event_ID", ""))
+                code = str(event.get("ts_code", ""))
+                if (event_id in selected_event_ids or code in positions
+                        or len(positions) >= V66_MAX_STOCKS):
+                    continue
+                book = price_book.get(code, {})
+                raw_open = finite_num(book.get("open", {}).get(trade_date))
+                if not math.isfinite(raw_open) or raw_open <= 0:
+                    continue
+                budget = min(float(V66_FULL_SLOT_CAPITAL), cash)
+                shares = math.floor(
+                    budget / (raw_open * buy_factor * V66_BOARD_LOT)
+                ) * V66_BOARD_LOT
+                if shares < V66_BOARD_LOT:
+                    continue
+                entry_cost = float(shares) * raw_open * buy_factor
+                if entry_cost > cash + 1e-7:
+                    continue
+                cash -= entry_cost
+                leg_number += 1
+                base_exit = normalize_date(event.get("Entry_End_Date_40D"))
+                d3_date = v66_market_date_offset(
+                    trade_date, 2, open_dates, open_pos)
+                positions[code] = {
+                    "event": event, "entry_date": trade_date,
+                    "raw_entry": raw_open, "shares": int(shares),
+                    "entry_cost": entry_cost, "base_exit_date": base_exit,
+                    "d3_date": d3_date, "d3_scheduled": False,
+                    "selection_rank": int(event.get("_Selection_Rank", 0)),
+                    "leg_id": f"L{leg_number}",
+                }
+                selected_event_ids.add(event_id)
+
+        # D3 hard failure is evaluated at the close and traded later.
+        if exit_mode == "EarlyFailureD3":
+            for code, position in list(positions.items()):
+                if (position["d3_scheduled"]
+                        or str(position["d3_date"]) != trade_date):
+                    continue
+                book = price_book.get(code, {})
+                close = finite_num(book.get("close", {}).get(trade_date))
+                hist = finite_num(book.get("macd_hist", {}).get(trade_date))
+                remaining = finite_num(
+                    book.get("macd_remaining", {}).get(trade_date))
+                retention = finite_num(
+                    book.get("macd_retention", {}).get(trade_date))
+                price_fail = (
+                    math.isfinite(close) and close > 0
+                    and (close / float(position["raw_entry"]) - 1.0) * 100.0
+                    <= V612_PRICE_FAILURE_PCT)
+                green = math.isfinite(hist) and hist <= 0
+                exhausted = (
+                    math.isfinite(hist) and hist > 0
+                    and math.isfinite(remaining)
+                    and remaining <= V612_MACD_REMAINING_PCT
+                    and math.isfinite(retention) and retention < 100.0)
+                reasons = []
+                if green:
+                    reasons.append("MACD翻绿")
+                if exhausted:
+                    reasons.append("红柱剩余≤10且缩短")
+                if price_fail:
+                    reasons.append("相对买入≤-5%")
+                if reasons:
+                    next_date = v613_next_stock_date(book, trade_date)
+                    if (next_date and next_date
+                            <= str(position["base_exit_date"])):
+                        pending_open_exits[next_date].append((
+                            code, "D3硬失败_" + "+".join(reasons)))
+                        position["d3_scheduled"] = True
+
+        # Fixed-horizon exits occur at that day's close.
+        for code, position in list(positions.items()):
+            if str(position["base_exit_date"]) == trade_date:
+                close_position(code, trade_date, "close", "固定40日收盘")
+
+        market_value = 0.0
+        for code, position in positions.items():
+            close = v613_price_asof(
+                price_book.get(code, {}), "close", trade_date)
+            if math.isfinite(close):
+                market_value += float(position["shares"]) * close
+        equity = cash + market_value
+        equity_rows.append({
+            "Strategy_Key": events.iloc[0]["Strategy_Key"],
+            "策略": events.iloc[0]["Strategy_Label"],
+            "退出方案": exit_mode, "选择方式": selection_mode,
+            "Seed": int(seed), "trade_date": trade_date,
+            "Cash": cash, "Market_Value": market_value,
+            "Equity": equity, "Positions": len(positions),
+            "Exposure_pct": (
+                market_value / equity * 100.0 if equity > 0 else np.nan),
+        })
+
+    equity_frame = pd.DataFrame(equity_rows)
+    trades = pd.DataFrame(trade_rows)
+    if equity_frame.empty:
+        return {}, equity_frame, trades
+    equity_values = numeric(equity_frame, "Equity")
+    drawdown = (equity_values / equity_values.cummax() - 1.0) * 100.0
+    if trades.empty:
+        classes = pd.Series(dtype=str)
+        actual_returns = pd.Series(dtype=float)
+    else:
+        classes = trades["Explosion_Class_40D"].astype(str)
+        actual_returns = numeric(trades, "实际交易收益%")
+
+    sequential_triples: list[bool] = []
+    same_day_triples: list[bool] = []
+    if len(trades) >= 3:
+        ordered = trades.sort_values(
+            ["买入日", "信号日原始顺位", "Leg_ID"]).reset_index(drop=True)
+        for start in range(0, len(ordered) - 2, 3):
+            group = ordered.iloc[start:start + 3]
+            if len(group) == 3:
+                sequential_triples.append(
+                    bool(numeric(group, "实际交易收益%").gt(0).sum() >= 2))
+        for _, group in trades.groupby("买入日", sort=True):
+            if len(group) == 3:
+                same_day_triples.append(
+                    bool(numeric(group, "Entry_Close_Return_Net_pct")
+                         .gt(0).sum() >= 2))
+    f_mask = classes.eq("F")
+    sa_mask = classes.isin(["S", "A"])
+    metrics = {
+        "Strategy_Key": events.iloc[0]["Strategy_Key"],
+        "策略": events.iloc[0]["Strategy_Label"],
+        "退出方案Key": exit_mode,
+        "退出方案": dict(V613_PORTFOLIO_EXITS).get(exit_mode, exit_mode),
+        "选择方式": selection_mode, "Seed": int(seed),
+        "期初资金": V66_INITIAL_CAPITAL,
+        "期末权益": float(equity_values.iloc[-1]),
+        "总收益率%": (
+            equity_values.iloc[-1] / V66_INITIAL_CAPITAL - 1.0) * 100.0,
+        "最大回撤%": drawdown.min(),
+        "平均资金暴露%": numeric(
+            equity_frame, "Exposure_pct").mean(),
+        "平均持股数": numeric(equity_frame, "Positions").mean(),
+        "最大持股数": int(numeric(equity_frame, "Positions").max()),
+        "实际买入事件": len(trades),
+        "实际交易胜率%": (
+            actual_returns.gt(0).mean() * 100.0 if len(trades) else np.nan),
+        "S级比例%": (
+            classes.eq("S").mean() * 100.0 if len(trades) else np.nan),
+        "A或S比例%": (
+            sa_mask.mean() * 100.0 if len(trades) else np.nan),
+        "F级比例%": (
+            f_mask.mean() * 100.0 if len(trades) else np.nan),
+        "F级名额占用市场日": (
+            numeric(trades[f_mask], "持有市场日").sum()
+            if len(trades) else 0.0),
+        "S或A平均持有市场日": (
+            numeric(trades[sa_mask], "持有市场日").mean()
+            if len(trades) else np.nan),
+        "实际买入覆盖周": (
+            pd.to_datetime(trades["买入日"], format="%Y%m%d")
+            .dt.to_period("W-FRI").nunique() if len(trades) else 0),
+        "连续每3笔组数": len(sequential_triples),
+        "连续3笔至少2笔盈利比例%": (
+            np.mean(sequential_triples) * 100.0
+            if sequential_triples else np.nan),
+        "同日正好买3只组数": len(same_day_triples),
+        "同日3只至少2只40日盈利比例%": (
+            np.mean(same_day_triples) * 100.0
+            if same_day_triples else np.nan),
+    }
+    return (
+        metrics,
+        equity_frame if keep_details else pd.DataFrame(),
+        trades if keep_details else pd.DataFrame(),
+    )
+
+
+def v613_run_portfolio_ensemble(
+        events: pd.DataFrame, price_book: dict[str, dict[str, Any]],
+        open_dates: list[str], config: dict[str, Any], draws: int
+        ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    path_rows: list[dict[str, Any]] = []
+    equity_parts: list[pd.DataFrame] = []
+    trade_parts: list[pd.DataFrame] = []
+    for spec in V613_STRATEGIES:
+        strategy = events[events["Strategy_Key"].eq(spec["key"])].copy()
+        if strategy.empty:
+            continue
+        for exit_key, _ in V613_PORTFOLIO_EXITS:
+            metrics, equity, trades = v613_run_portfolio_path(
+                strategy, price_book, open_dates, config, exit_key,
+                "规则排序", V613_RANDOM_SEED, keep_details=True)
+            if metrics:
+                metrics["Path_No"] = 0
+                path_rows.append(metrics)
+            if not equity.empty:
+                equity_parts.append(equity)
+            if not trades.empty:
+                trade_parts.append(trades)
+            for path_no in range(max(int(draws), 1)):
+                seed = V613_RANDOM_SEED + path_no
+                random_metrics, _, _ = v613_run_portfolio_path(
+                    strategy, price_book, open_dates, config, exit_key,
+                    "完全随机选择", seed, keep_details=False)
+                if random_metrics:
+                    random_metrics["Path_No"] = path_no
+                    path_rows.append(random_metrics)
+    paths = pd.DataFrame(path_rows)
+    summary_rows: list[dict[str, Any]] = []
+    metrics_columns = [
+        "期末权益", "总收益率%", "最大回撤%", "平均资金暴露%",
+        "平均持股数", "实际买入事件", "实际交易胜率%", "S级比例%",
+        "A或S比例%", "F级比例%", "F级名额占用市场日",
+        "实际买入覆盖周", "连续3笔至少2笔盈利比例%",
+        "同日3只至少2只40日盈利比例%",
+    ]
+    if not paths.empty:
+        for keys, group in paths.groupby(
+                ["Strategy_Key", "策略", "退出方案Key", "退出方案",
+                 "选择方式"], dropna=False):
+            strategy_key, label, exit_key, exit_label, mode = keys
+            row: dict[str, Any] = {
+                "Strategy_Key": strategy_key, "策略": label,
+                "退出方案Key": exit_key, "退出方案": exit_label,
+                "选择方式": mode, "路径数": len(group),
+            }
+            for column in metrics_columns:
+                values = numeric(group, column)
+                row[column] = values.median()
+                if mode == "完全随机选择":
+                    row[f"{column}_P10"] = values.quantile(0.10)
+                    row[f"{column}_P90"] = values.quantile(0.90)
+            summary_rows.append(row)
+    return (
+        paths,
+        pd.DataFrame(summary_rows),
+        pd.concat(equity_parts, ignore_index=True)
+        if equity_parts else pd.DataFrame(),
+        pd.concat(trade_parts, ignore_index=True)
+        if trade_parts else pd.DataFrame(),
+    )
+
+
+def v613_main() -> None:
+    global pro, API_ERRORS
+    st.set_page_config(page_title=V613_TITLE, layout="wide")
+    st.title(V613_TITLE)
+    streamlit_version = str(getattr(st, "__version__", "unknown"))
+    st.caption(f"{V613_UI_PATCH}｜Streamlit {streamlit_version}")
+    with st.expander("V6.13验证口径", expanded=True):
+        st.markdown(f"""
+- **先校准再下结论**：按用户提供的EMA—EMA—MA公式，扫描N=2～60、M=2～10，同时匹配1个周线和3个日线K/D参照点；N=9、M=3只是主假设，不预设为正确答案。
+- **旧基准**：最近完整周N=6、K在15～25，日线MACD质量合格且本轮首次上涨3%，收盘确认后下一市场交易日开盘买入。
+- **新主方案**：截至每个信号日收盘可见的动态周线N=9、K在{V613_APPROACH_K_MIN:g}～{V613_APPROACH_K_MAX:g}且高于上一完整周K；日线MACD第2根红柱收盘确认，下一市场交易日开盘买入。实际买入日回看通常已是第3根红柱。
+- **N=6对照**：与新主方案完全相同，只把周线N改为6，用于判断N=9的平滑是否真正减少F，而不是凭默认参数猜测。
+- **动态周线无未来数据**：周一至周四只使用当周截至当天的最高、最低和收盘；周五收盘值等于完整周线。程序同时导出最近完整周日期和动态K/D。
+- **全额等分三仓**：初始资金30万元，最多3只，每只一次性投入约10万元，100股整手，计入滑点、佣金、过户费和印花税；不试仓、不加仓。
+- **冻结排序**：继续使用2-2-1分降序、完全同分时MACD柱较小优先；同日只认原始Top3，不因已持仓或现金不足向下递补。红柱第2日方案的日龄项恒为0，因此不会伪造新的评分优势。
+- **两个退出口径**：固定40日用于纯粹比较买点；D3组只在第3市场日收盘出现MACD翻绿、红柱剩余≤10%且缩短、或相对买入≤-5%时于下一可交易开盘退出，否则仍持有40日。
+- **完整早期机会**：红柱第2日策略纳入所有当时合格周期，包括后来从未上涨3%的失败周期；匹配旧信号的价格优势单独标注为幸存者样本，不能替代全样本结果。
+- **判卷**：S/A/B/F从各自新的买入价重新计算；同时验收F比例、S/A比例、真实三仓收益与回撤、覆盖周、F名额占用日以及每3笔至少2笔盈利。
+""")
+
+    with st.sidebar:
+        st.header("运行参数")
+        backtest_days = st.number_input(
+            "回测交易日数", 100, 1000, 500, 50, key="v613_days")
+        min_price = st.number_input(
+            "最低股价（元）", 10.0, 20.0, 10.0, 10.0,
+            format="%.0f", key="v613_min_price")
+        min_mv = st.number_input(
+            "最低流通市值（亿元）", 50.0, 100.0, 50.0, 50.0,
+            format="%.0f", key="v613_min_mv")
+        signal_end_date = st.date_input(
+            "历史买入信号截止（40日判卷）", date(2026, 6, 5),
+            key="v613_signal_end")
+        market_end_date = st.date_input(
+            "最新信号观察截止（默认今天）", date.today(),
+            key="v613_market_end")
+        pause = st.number_input(
+            "接口间隔(秒)", 0.0, 2.0, 0.12, 0.02,
+            key="v613_pause")
+        use_cache = st.checkbox(
+            "复用行情和72小时基础缓存", True, key="v613_cache")
+        portfolio_draws = st.number_input(
+            "每组随机对照路径数", 50, 500, 100, 50,
+            key="v613_draws")
+        st.caption("3套买点×2种退出；规则路径各1条，随机路径用于判断Top3排序是否提供优势。")
+        st.divider()
+        commission_pct = st.number_input(
+            "佣金率(%)", 0.0, 0.20, 0.025, 0.005,
+            format="%.3f", key="v613_commission")
+        stamp_duty_pct = st.number_input(
+            "卖出印花税率(%)", 0.0, 0.20, 0.05, 0.01,
+            format="%.3f", key="v613_stamp")
+        transfer_fee_pct = st.number_input(
+            "过户费率(%)", 0.0, 0.05, 0.001, 0.001,
+            format="%.3f", key="v613_transfer")
+        if st.button("清除V6.13结果和运行状态", key="v613_clear"):
+            shutil.rmtree(V613_RESULT_DIR, ignore_errors=True)
+            shutil.rmtree(V613_JOB_DIR, ignore_errors=True)
+            st.success("结果和运行状态已清除；行情缓存与逐股票检查点保留。")
+
+    request_payload = {
+        "version": V613_VERSION, "days": int(backtest_days),
+        "signal_end": signal_end_date.strftime("%Y%m%d"),
+        "market_end": market_end_date.strftime("%Y%m%d"),
+        "min_price": float(min_price), "min_mv": float(min_mv),
+        "commission": float(commission_pct),
+        "stamp": float(stamp_duty_pct),
+        "transfer": float(transfer_fee_pct),
+        "calibration_n": list(V613_PARAMETER_N_RANGE),
+        "calibration_m": list(V613_PARAMETER_M_RANGE),
+        "calibration_references": list(V613_CALIBRATION_REFERENCES),
+        "strategies": list(V613_STRATEGIES),
+        "approach_k": [V613_APPROACH_K_MIN, V613_APPROACH_K_MAX],
+        "red_age": 2, "initial_capital": V66_INITIAL_CAPITAL,
+        "max_stocks": V66_MAX_STOCKS,
+        "slot_capital": V66_FULL_SLOT_CAPITAL,
+        "exit_modes": [value[0] for value in V613_PORTFOLIO_EXITS],
+        "portfolio_draws": int(portfolio_draws),
+    }
+    request_signature = stable_signature(request_payload)
+    result_path = os.path.join(
+        V613_RESULT_DIR, f"{request_signature}.zip")
+    result_name = (
+        f"weekly_skdj_n9_red2_entry_timing_v6_13_"
+        f"{int(backtest_days)}d_p{int(min_price)}_mv{int(min_mv)}.zip")
+    completed_available = False
+    if os.path.exists(result_path):
+        try:
+            with open(result_path, "rb") as handle:
+                saved_result = handle.read()
+            completed_available = True
+            v613_clear_job_active(request_signature)
+            st.success("发现相同参数的V6.13已完成结果，可直接下载。")
+            render_download(
+                saved_result, result_name,
+                f"v613_saved_{request_signature}")
+        except Exception as exc:
+            st.warning(f"已保存结果读取失败：{exc}")
+
+    secret_token = configured_tushare_token()
+    if secret_token:
+        token = secret_token
+        st.caption("已从Streamlit Secrets读取TUSHARE_TOKEN。")
+    else:
+        token = st.text_input(
+            "Tushare Token", type="password", key="v613_token")
+    job_active = v613_is_job_active(request_signature)
+    left, right = st.columns(2)
+    with left:
+        start_clicked = st.button(
+            "开始/重新运行V6.13", type="primary", key="v613_run")
+    with right:
+        stop_clicked = st.button(
+            "停止自动续跑", disabled=not job_active, key="v613_stop")
+    if stop_clicked:
+        v613_clear_job_active(request_signature)
+        st.success("已停止；逐股票检查点保留。")
+        return
+    if start_clicked:
+        if market_end_date <= signal_end_date:
+            st.error("最新观察截止必须晚于历史信号截止")
+            return
+        v613_mark_job_active(request_signature)
+        job_active = True
+    if not token:
+        st.info("请输入Token；启动后页面重连会从逐股票检查点续跑。")
+        return
+    if not job_active:
+        st.caption(
+            "点击开始运行。" if not completed_available
+            else "相同参数结果已可下载；如需覆盖请点击重新运行。")
+        return
+
+    API_ERRORS = []
+    ts.set_token(token)
+    pro = ts.pro_api()
+    signal_end = signal_end_date.strftime("%Y%m%d")
+    market_end = market_end_date.strftime("%Y%m%d")
+    try:
+        probe_start = signal_end_date - timedelta(
+            days=int(backtest_days) * 2 + 120)
+        probe_dates = load_trade_calendar(
+            probe_start.strftime("%Y%m%d"), signal_end)
+        signal_start = trailing_signal_start(
+            probe_dates, signal_end, int(backtest_days))
+    except Exception as exc:
+        st.error(f"确定{int(backtest_days)}个交易日窗口失败：{exc}")
+        return
+    data_start = (
+        pd.Timestamp(signal_start).date()
+        - timedelta(weeks=WARMUP_WEEKS, days=7)
+    ).strftime("%Y%m%d")
+    try:
+        with st.spinner("加载交易日历、历史科技池和校准行情..."):
+            open_dates = load_trade_calendar(data_start, market_end)
+            extended_end = (
+                market_end_date + timedelta(days=7)).strftime("%Y%m%d")
+            week_last_map = complete_week_last_dates(
+                load_trade_calendar(data_start, extended_end))
+            stock_basic = load_stock_basic()
+            memberships = load_tech_memberships(float(pause))
+            calibration_summary, calibration_detail = (
+                v613_calibration_audit(
+                    data_start, market_end, week_last_map,
+                    bool(use_cache), float(pause)))
+    except Exception as exc:
+        st.error(f"基础数据或参数校准加载失败：{exc}")
+        return
+    eligible_market_dates = [
+        value for value in open_dates if value <= market_end]
+    if not eligible_market_dates:
+        st.error("行情截止日前没有可用市场交易日")
+        return
+    latest_market_date = max(eligible_market_dates)
+    open_pos = {value: position for position, value in enumerate(open_dates)}
+    config = {
+        "signal_start": signal_start, "signal_end": signal_end,
+        "event_signal_end": market_end, "data_start": data_start,
+        "market_end": market_end, "latest_market_date": latest_market_date,
+        "min_price": float(min_price), "min_mv": float(min_mv),
+        "buy_slippage_pct": 0.20, "sell_slippage_pct": 0.20,
+        "commission_pct": float(commission_pct),
+        "stamp_duty_pct": float(stamp_duty_pct),
+        "transfer_fee_pct": float(transfer_fee_pct),
+    }
+    run_signature = stable_signature({
+        "version": V613_EVENT_ENGINE_VERSION, **config,
+        "primary_n": V613_PRIMARY_N, "control_n": V613_CONTROL_N,
+        "m": V613_M, "approach_k": [
+            V613_APPROACH_K_MIN, V613_APPROACH_K_MAX],
+    })
+    period_index = build_period_index(memberships)
+    active_codes = {
+        code for code, code_periods in period_index.items()
+        if periods_overlap(code_periods, signal_start, market_end)}
+    stocks = stock_basic[stock_basic["ts_code"].isin(active_codes)].copy()
+    stocks = stocks[
+        ~stocks["list_date"].gt(market_end)
+        & ~stocks["delist_date"].lt(data_start)
+    ].sort_values("ts_code").reset_index(drop=True)
+
+    event_rows: list[dict[str, Any]] = []
+    rejects: dict[str, int] = {}
+    checkpoint_hits = price_cache_hits = failures = 0
+    progress, status = st.progress(0.0), st.empty()
+    last_update = 0.0
+    stopped = False
+    for number, stock in stocks.iterrows():
+        if not v613_is_job_active(request_signature):
+            stopped = True
+            break
+        code = str(stock["ts_code"])
+        checkpoint = (
+            v613_load_checkpoint(run_signature, code)
+            if bool(use_cache) else None)
+        if checkpoint is not None:
+            event_rows.extend(checkpoint["events"])
+            merge_counts(rejects, checkpoint["rejects"])
+            checkpoint_hits += 1
+        else:
+            daily, cached_basic, storage_path, cache_hit = fetch_price(
+                code, data_start, market_end, bool(use_cache), float(pause))
+            price_cache_hits += int(cache_hit)
+            if daily.empty:
+                failures += 1
+            else:
+                try:
+                    rows, stock_rejects = v613_analyze_stock(
+                        stock, period_index.get(code, []), daily,
+                        cached_basic, storage_path, week_last_map,
+                        open_dates, open_pos, config, bool(use_cache),
+                        float(pause))
+                    event_rows.extend(rows)
+                    merge_counts(rejects, stock_rejects)
+                    v613_save_checkpoint(
+                        run_signature, code, rows, stock_rejects)
+                except Exception as exc:
+                    failures += 1
+                    record_error(f"V6.13逐股票分析失败 {code}: {exc}")
+        processed = number + 1
+        now = time.monotonic()
+        if (processed == 1 or now - last_update >= UI_HEARTBEAT_SECONDS
+                or processed == len(stocks)):
+            progress.progress(
+                processed / max(len(stocks), 1),
+                text=f"已处理{processed}/{len(stocks)}只股票，最近{code}")
+            status.caption(
+                f"事件/观察{len(event_rows)}；检查点{checkpoint_hits}；"
+                f"行情缓存{price_cache_hits}；失败{failures}")
+            last_update = now
+    progress.empty()
+    status.empty()
+    if stopped:
+        st.warning("任务已停止，逐股票检查点已保留。")
+        return
+    events_all = pd.DataFrame(event_rows)
+    if events_all.empty:
+        st.error("本区间没有生成V6.13事件或观察池。")
+        return
+    events_all = events_all.sort_values(
+        ["Signal_Date", "Event_Type", "Strategy_Key", "ts_code"]
+    ).reset_index(drop=True)
+    live_watch = events_all[events_all["Event_Type"].eq("LIVE_WATCH")].copy()
+    signals = events_all[events_all["Event_Type"].eq("ENTRY_SIGNAL")].copy()
+    history = signals[signals["Signal_Date"].astype(str).le(signal_end)].copy()
+    observation = signals[
+        signals["Signal_Date"].astype(str).gt(signal_end)
+        & signals["Signal_Date"].astype(str).le(latest_market_date)
+    ].copy()
+    mature = history[
+        true_mask(history, "Entry_Tradable")
+        & true_mask(history, "Entry_Has_40D")].copy()
+    if mature.empty:
+        st.error("存在信号，但没有走完40个市场日的成熟事件。")
+        return
+    event_summary = v613_event_summary(mature)
+    band_summary = v613_band_summary(mature)
+    matched_summary, matched_detail = v613_matched_entry_audit(
+        mature, open_dates)
+    coverage_summary, coverage_calendar = v613_weekly_coverage(
+        mature, open_dates, signal_start, signal_end)
+
+    with st.spinner("复用本地行情，构建三仓价格簿..."):
+        price_book, portfolio_cache_hits, portfolio_missing = (
+            v66_load_price_book(mature, data_start, market_end))
+        recovered = 0
+        still_missing: list[str] = []
+        for code in portfolio_missing:
+            daily, _, _, _ = fetch_price(
+                code, data_start, market_end, True, float(pause))
+            if daily.empty:
+                still_missing.append(code)
+                continue
+            daily = add_daily_macd(normalize_price_frame(daily))
+            dates = daily["trade_date"].astype(str).tolist()
+            price_book[code] = {
+                "dates": dates,
+                "open": dict(zip(dates, numeric(daily, "open"))),
+                "close": dict(zip(dates, numeric(daily, "close"))),
+                "high": dict(zip(dates, numeric(daily, "high"))),
+                "low": dict(zip(dates, numeric(daily, "low"))),
+                "macd_hist": dict(zip(
+                    dates, numeric(daily, "Daily_MACD_Hist"))),
+                "macd_remaining": dict(zip(
+                    dates, numeric(daily, "Daily_MACD_Remaining_pct"))),
+                "macd_retention": dict(zip(
+                    dates, numeric(daily, "Daily_MACD_Retention_pct"))),
+            }
+            recovered += 1
+        portfolio_missing = still_missing
+    if portfolio_missing:
+        st.error(
+            f"三仓回测缺少{len(portfolio_missing)}只股票行情，"
+            "为避免样本偏差本次停止；保留检查点后重新运行即可补齐。")
+        st.dataframe(pd.DataFrame({"缺失股票": portfolio_missing}),
+                     use_container_width=True, hide_index=True)
+        return
+    with st.spinner(
+            f"运行3套买点×2种退出的真实三仓及{int(portfolio_draws)}条随机对照..."):
+        portfolio_paths, portfolio_summary, deterministic_equity, (
+            deterministic_trades) = v613_run_portfolio_ensemble(
+                mature, price_book, open_dates, config,
+                int(portfolio_draws))
+    if portfolio_paths.empty:
+        st.error("成熟事件存在，但三仓撮合没有生成可执行路径。")
+        return
+
+    recent_start = (
+        pd.Timestamp(latest_market_date) - pd.Timedelta(days=30)
+    ).strftime("%Y%m%d")
+    recent_candidates = observation[
+        observation["Signal_Date"].astype(str).between(
+            recent_start, latest_market_date)].copy()
+    calibration_top = calibration_summary.head(30).copy()
+    n6n9_calibration = calibration_summary[
+        numeric(calibration_summary, "N").isin([6, 9])
+        & numeric(calibration_summary, "M").eq(3)].copy()
+    best_calibrated = (
+        calibration_summary.iloc[0].to_dict()
+        if not calibration_summary.empty else {})
+    n9_row = n6n9_calibration[
+        numeric(n6n9_calibration, "N").eq(9)]
+    n9_confirmed = bool(
+        not n9_row.empty
+        and to_bool(n9_row.iloc[0].get("全部点误差不超过0.10")))
+    run_summary = pd.DataFrame([{
+        "程序版本": V613_VERSION,
+        "历史信号开始": signal_start, "历史信号截止": signal_end,
+        "行情观察截止": market_end,
+        "最新市场交易日": latest_market_date,
+        "校准最佳N": best_calibrated.get("N", np.nan),
+        "校准最佳M": best_calibrated.get("M", np.nan),
+        "校准最佳总绝对误差": best_calibrated.get(
+            "四点总绝对误差", np.nan),
+        "N9_M3是否四点误差均不超过0.10": n9_confirmed,
+        "成熟事件总数": len(mature),
+        "旧N6上涨3%成熟事件": int(
+            mature["Strategy_Key"].eq("OLD_N6_STRENGTH3").sum()),
+        "N6红2成熟事件": int(
+            mature["Strategy_Key"].eq("N6_DYNAMIC_RED2").sum()),
+        "N9红2成熟事件": int(
+            mature["Strategy_Key"].eq("N9_DYNAMIC_RED2").sum()),
+        "最近30日候选": len(recent_candidates),
+        "最新观察池": len(live_watch),
+        "组合路径": len(portfolio_paths),
+        "组合行情缓存命中": portfolio_cache_hits,
+        "组合行情补下载": recovered,
+        "处理股票": len(stocks), "检查点恢复": checkpoint_hits,
+        "行情缓存命中": price_cache_hits, "失败股票": failures,
+    }])
+    definitions = pd.DataFrame([
+        ("参数校准", "N2至60、M2至10；四个用户图表K/D点同时最小误差"),
+        ("N9身份", "主假设；只有四点误差均≤0.10才标记校准通过"),
+        ("旧基准", "完整周N6 K15至25；日线上涨3%；下一开盘"),
+        ("新主方案", "动态周线N9 K10至25且上升；MACD红2；下一开盘"),
+        ("参数对照", "动态周线N6 K10至25且上升；MACD红2；下一开盘"),
+        ("仓位", "30万元；最多3只；每只约10万元；整手；不加仓"),
+        ("固定40日", "隔离买点差异；第40市场日收盘退出"),
+        ("D3硬失败", "D3收盘MACD翻绿/红柱耗尽/跌5%；下一开盘退出"),
+        ("等级", "从各自买入价重新计算S/A/B/F；不沿用旧等级"),
+        ("价格优势", "只在同股同MACD周期且后来形成旧3%信号的配对样本计算"),
+        ("防幸存偏差", "红2全量事件包含后来从未达到上涨3%的周期"),
+    ], columns=["项目", "定义"])
+    rejection_audit = pd.DataFrame([
+        {"剔除原因": key, "次数": value}
+        for key, value in sorted(rejects.items())])
+    cache_policy = pd.DataFrame([
+        ("交易日历/基础资料", "Streamlit内存", "72小时"),
+        ("行业成员", "Streamlit内存", "7天"),
+        ("逐股票前复权行情", "应用临时磁盘", "不主动过期"),
+        ("V6.13逐股票事件检查点", "应用临时磁盘", "不主动过期"),
+    ], columns=["对象", "位置", "设定时长"])
+    detail_columns = [
+        "Strategy_Key", "Strategy_Label", "ts_code", "name",
+        "Signal_Date", "Signal_Week", "Entry_Date", "Entry_Raw_Open",
+        "Weekly_SKDJ_N", "SKDJ_M", "Weekly_Data_Mode",
+        "Entry_Trigger_Mode", "Setup_Weekly_Date", "Signal_K", "Signal_D",
+        "Signal_KD_Spread", "Signal_K_Change_1W",
+        "Weekly_K_Approach_Band", "Daily_MACD_Red_Age",
+        "Daily_MACD_State", "Daily_MACD_Hist",
+        "Daily_MACD_Remaining_pct", "Daily_MACD_Retention_pct",
+        "Signal_Rally_From_Red_Start_pct", "Signal_Daily_SKDJ_N6_K",
+        "Signal_Daily_SKDJ_N6_D", "Signal_Daily_SKDJ_N9_K",
+        "Signal_Daily_SKDJ_N9_D", "Entry_Close_MACD_Red_Age_Audit",
+        "Entry_Close_MACD_State_Audit",
+        "Entry_Close_Daily_SKDJ_N6_K_Audit",
+        "Entry_Close_Daily_SKDJ_N6_D_Audit",
+        "Entry_Close_Daily_SKDJ_N9_K_Audit",
+        "Entry_Close_Daily_SKDJ_N9_D_Audit", "Timing_Score_221",
+        "Entry_End_Date_40D", "Entry_MFE_Net_pct", "Entry_MAE_Raw_pct",
+        "Entry_Close_Return_Net_pct", "Explosion_Class_40D",
+        "SW_L1", "SW_L2", "Circ_MV_Billion", "Raw_Close",
+    ]
+    history_export = mature[[
+        column for column in detail_columns if column in mature.columns]].copy()
+    recent_export = recent_candidates[[
+        column for column in detail_columns
+        if column in recent_candidates.columns]].copy()
+    watch_columns = [
+        column for column in detail_columns
+        if column in live_watch.columns and not column.startswith("Entry_")]
+    live_watch_export = live_watch[watch_columns].copy()
+    files = {
+        "01_run_summary_v6_13.csv": run_summary,
+        "02_experiment_definitions_v6_13.csv": definitions,
+        "03_skdj_parameter_calibration_rank_v6_13.csv": calibration_summary,
+        "04_skdj_parameter_calibration_detail_v6_13.csv": calibration_detail,
+        "05_n6_n9_calibration_comparison_v6_13.csv": n6n9_calibration,
+        "06_entry_event_summary_v6_13.csv": event_summary,
+        "07_weekly_k_band_outcomes_v6_13.csv": band_summary,
+        "08_red2_vs_old3_matched_summary_v6_13.csv": matched_summary,
+        "09_red2_vs_old3_matched_detail_v6_13.csv": matched_detail,
+        "10_weekly_coverage_summary_v6_13.csv": coverage_summary,
+        "11_weekly_signal_calendar_v6_13.csv": coverage_calendar,
+        "12_full_slot_portfolio_summary_v6_13.csv": portfolio_summary,
+        "13_all_portfolio_paths_v6_13.csv": portfolio_paths,
+        "14_rule_path_trades_v6_13.csv": deterministic_trades,
+        "15_rule_path_equity_v6_13.csv": deterministic_equity,
+        "16_historical_mature_event_detail_v6_13.csv": history_export,
+        "17_recent_30d_candidates_v6_13.csv": recent_export,
+        "18_latest_dynamic_weekly_watch_pool_v6_13.csv": live_watch_export,
+        "19_rejection_audit_v6_13.csv": rejection_audit,
+        "20_cache_policy_v6_13.csv": cache_policy,
+        "21_api_errors_v6_13.csv": pd.DataFrame({"错误": API_ERRORS}),
+    }
+    result_zip = make_zip(files)
+    try:
+        atomic_bytes(result_zip, result_path)
+        v613_clear_job_active(request_signature)
+        persisted = True
+    except Exception as exc:
+        persisted = False
+        st.warning(f"结果未能持久保存，但当前页面仍可下载：{exc}")
+
+    st.success(
+        f"完成：校准最佳参数N={best_calibrated.get('N', 'NA')}、"
+        f"M={best_calibrated.get('M', 'NA')}；"
+        f"N9/M3校准{'通过' if n9_confirmed else '未通过或证据不足'}。"
+        f"成熟事件{len(mature)}个，组合路径{len(portfolio_paths)}条，"
+        f"结果{'已保存' if persisted else '仅当前页面可下载'}。")
+    st.subheader("结论一：SKDJ隐藏参数反推")
+    render_plain_table(calibration_top, 30)
+    st.caption("先看最佳参数和N9/M3、N6/M3的误差；只有四个点同时吻合才算对齐。")
+    st.subheader("结论二：三套买点的全量事件质量")
+    render_plain_table(event_summary, 20)
+    st.caption("红2方案包含后来未达到上涨3%的失败周期，这是实盘可见的完整机会集。")
+    st.subheader("结论三：真实全额三仓")
+    render_plain_table(portfolio_summary, 40)
+    st.caption("规则排序各1条真实路径；随机组显示中位及P10/P90，便于判断Top3排序是否有效。")
+    st.subheader("结论四：匹配旧3%信号后的提前天数与价格优势")
+    render_plain_table(matched_summary, 20)
+    st.caption("这里只回答同一股票同一红柱周期提前买便宜多少，不能代替红2全样本F比例。")
+    st.subheader("结论五：周线K接近25的分段结果")
+    render_plain_table(band_summary, 30)
+    st.subheader("结论六：信号覆盖")
+    render_plain_table(coverage_summary, 20)
+    st.subheader("最近30日候选")
+    render_plain_table(recent_export.sort_values(
+        [column for column in ["Signal_Date", "Strategy_Key", "Timing_Score_221"]
+         if column in recent_export.columns],
+        ascending=[False, True, False][:
+            len([column for column in ["Signal_Date", "Strategy_Key", "Timing_Score_221"]
+                 if column in recent_export.columns])]), 300)
+    st.subheader(f"最新交易日动态周线观察池：{latest_market_date}")
+    render_plain_table(live_watch_export, 300)
+    st.subheader("运行摘要")
+    render_plain_table(run_summary, 10)
+    st.caption(f"结果ZIP共{len(files)}个CSV；参数校准、事件质量和三仓路径分开导出。")
+    render_download(
+        result_zip, result_name, f"v613_current_{request_signature}")
+
+
+def main() -> None:
+    v613_main()
 
 
 if __name__ == "__main__":
