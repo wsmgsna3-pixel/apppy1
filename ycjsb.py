@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""周线SKDJ走步S/A/B/F主排序与三仓组合回测 V6.11。
+"""周线SKDJ全额三仓与F级早期失败退出回测 V6.12。
 
 本版根据V6.1结果，把周线N=6 SKDJ K位于15～25定义为观察池，并独立扫描
 日线MACD红柱周期内股价自红柱起点首次上涨3%、5%、8%和10%的四个强度确认
@@ -10,13 +10,17 @@
 共同样本，分别模拟第2、3、4、5日买入。该组使用了未来“能持续到第5日”的
 信息，只用于公平比较等待代价，绝不作为实盘规则或实时候选。
 
-V6.11沿用V6.10完全相同的事件引擎、30万元三仓撮合和1/2提前试仓，冻结
-“普通确认只保留恰好5分、固定持有至40日、禁止迟到重入、同日前3”，并把
-V6.10唯一有效的“MACD柱较小优先”固定为基线同分规则。本版只改变主排序：
-对比原2-2-1主分与严格走步的S>A>B>F成对排序。预测每个历史入场日时，训练
-集只允许使用40日结果已在此前结束的事件；训练不足时回退原2-2-1规则，不删
-候选、不删信号周。两组方案继续与完全随机选择公平配对，并直接验收实际买入
-事件胜率、S/A/B/F、逐年稳定性和利润集中度。
+V6.12否决V6.11走步主排序，恢复并冻结“2-2-1主分、完全同分时MACD柱较小
+优先、同日前3”。实盘资金30万元直接分成三个10万元股票名额，每只股票首次
+买入即使用完整名额，不再半仓试错、不再补仓；高质量确认只表示继续持有。
+普通确认仍只保留买入时恰好5分者至40日，其余下一开盘退出；14日未确认退出，
+禁止迟到重入。
+
+本版只测试买入后第3、5、7市场日的硬失败退出：当日收盘若日线MACD已经翻绿，
+或红柱剩余不高于10%且较前日继续缩短，或者相对买入开盘跌幅达到5%，且此前尚未形成受保护的
+高质量/过热确认或普通5分确认，则下一可交易开盘全额退出。所有决策只使用当时
+可见数据。结果重点验收F级占仓天数、F级退出精度、S/A误杀、释放名额后的真实
+循环补位收益、逐年稳定性和利润集中度。
 """
 from __future__ import annotations
 
@@ -126,19 +130,19 @@ COHORT_RED_AGES = (2, 3, 4, 5)
 STRENGTH_MIN_REMAINING_PCT = 75.0
 STRENGTH_MAX_PRIOR_RALLY_PCT = 30.0
 
-# V6.11 walk-forward S/A/B/F primary-rank audit.  Internal v63-v610 helpers
+# V6.12 full-slot early-F exit audit.  Internal v63-v611 helpers
 # are retained to minimize regression risk; the final ``main`` is the only
 # entry point.
 # The stock-level event rows are byte-compatible with V6.4, so its checkpoint
-# signature and directory are deliberately reused.  Results/jobs use new V6.11
+# signature and directory are deliberately reused.  Results/jobs use new V6.12
 # directories and cannot collide with a completed V6.4 result.
-V63_TITLE = "周线SKDJ走步S/A/B/F主排序与三仓组合回测 V6.11"
-V63_VERSION = "V6.11-SKDJ-WALK-FORWARD-SABF-PRIMARY-RANK"
-V63_UI_PATCH = "V6.11-TOP3-SCORE221-MACD-VS-WALK-FORWARD-ORDINAL"
+V63_TITLE = "周线SKDJ全额三仓与F级早期失败退出回测 V6.12"
+V63_VERSION = "V6.12-SKDJ-FULL-SLOT-EARLY-F-EXIT"
+V63_UI_PATCH = "V6.12-FULL100-TOP3-D3-D5-D7-HARD-FAILURE"
 V65_EVENT_ENGINE_VERSION = "V6.4-SKDJ-STATE-CONFIRMATION-SELECTIVE-REENTRY"
 V63_CHECKPOINT_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_4_checkpoints")
-V63_RESULT_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_11_results")
-V63_JOB_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_11_jobs")
+V63_RESULT_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_12_results")
+V63_JOB_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_12_jobs")
 V63_CONFIRM_DEADLINES = (7, 14)
 V63_REENTRY_WINDOW_DAYS = 42
 V63_STRENGTH_THRESHOLD = 3.0
@@ -171,6 +175,9 @@ V611_FEATURES = (
 V611_MIN_TRAIN_DATES = 20
 V611_MIN_TRAIN_ROWS = 160
 V611_MAX_PAIRS_PER_DATE = 80
+V612_EARLY_FAILURE_DAYS = (3, 5, 7)
+V612_PRICE_FAILURE_PCT = -5.0
+V612_MACD_REMAINING_PCT = 10.0
 
 CORE_TECH_L1 = {"电子", "计算机", "通信", "国防军工"}
 EXTENDED_TECH_L1 = {"机械设备", "电力设备", "医药生物", "汽车", "基础化工", "有色金属", "建筑材料"}
@@ -8797,24 +8804,56 @@ def v611_oos_grade_audit(early: pd.DataFrame) -> pd.DataFrame:
 
 V66_PORTFOLIO_SCHEMES = (
     {
-        "key": "Trial50Score5Top3Score221MACDTie",
-        "label": "1/2试仓_普通仅5分固定40日_Top3_2-2-1主分_MACD同分",
-        "trial_weight": 0.5, "staged": True,
+        "key": "Full100Top3NoEarlyFailure",
+        "label": "全额三仓_Top3_无早退_14日生命周期基线",
+        "trial_weight": 1.0, "staged": True,
         "allow_late_reentry": False, "ordinary_keep_min_score": 5.0,
         "max_signal_day_rank": 3,
         "primary_rank_mode": "Score221MACDHistAsc",
         "tie_break_mode": "DailyMACDHistAsc",
         "ordinary_risk_days": 0, "ordinary_stop_pct": V68_ORDINARY_STOP_PCT,
+        "early_failure_day": 0,
+        "early_price_stop_pct": V612_PRICE_FAILURE_PCT,
+        "early_macd_remaining_pct": V612_MACD_REMAINING_PCT,
     },
     {
-        "key": "Trial50Score5Top3WalkForwardSABF",
-        "label": "1/2试仓_普通仅5分固定40日_Top3_走步SABF主排序",
-        "trial_weight": 0.5, "staged": True,
+        "key": "Full100Top3EarlyFailureD3",
+        "label": "全额三仓_Top3_第3日硬失败退出",
+        "trial_weight": 1.0, "staged": True,
         "allow_late_reentry": False, "ordinary_keep_min_score": 5.0,
         "max_signal_day_rank": 3,
-        "primary_rank_mode": "WalkForwardSABF",
+        "primary_rank_mode": "Score221MACDHistAsc",
         "tie_break_mode": "DailyMACDHistAsc",
         "ordinary_risk_days": 0, "ordinary_stop_pct": V68_ORDINARY_STOP_PCT,
+        "early_failure_day": 3,
+        "early_price_stop_pct": V612_PRICE_FAILURE_PCT,
+        "early_macd_remaining_pct": V612_MACD_REMAINING_PCT,
+    },
+    {
+        "key": "Full100Top3EarlyFailureD5",
+        "label": "全额三仓_Top3_第5日硬失败退出",
+        "trial_weight": 1.0, "staged": True,
+        "allow_late_reentry": False, "ordinary_keep_min_score": 5.0,
+        "max_signal_day_rank": 3,
+        "primary_rank_mode": "Score221MACDHistAsc",
+        "tie_break_mode": "DailyMACDHistAsc",
+        "ordinary_risk_days": 0, "ordinary_stop_pct": V68_ORDINARY_STOP_PCT,
+        "early_failure_day": 5,
+        "early_price_stop_pct": V612_PRICE_FAILURE_PCT,
+        "early_macd_remaining_pct": V612_MACD_REMAINING_PCT,
+    },
+    {
+        "key": "Full100Top3EarlyFailureD7",
+        "label": "全额三仓_Top3_第7日硬失败退出",
+        "trial_weight": 1.0, "staged": True,
+        "allow_late_reentry": False, "ordinary_keep_min_score": 5.0,
+        "max_signal_day_rank": 3,
+        "primary_rank_mode": "Score221MACDHistAsc",
+        "tie_break_mode": "DailyMACDHistAsc",
+        "ordinary_risk_days": 0, "ordinary_stop_pct": V68_ORDINARY_STOP_PCT,
+        "early_failure_day": 7,
+        "early_price_stop_pct": V612_PRICE_FAILURE_PCT,
+        "early_macd_remaining_pct": V612_MACD_REMAINING_PCT,
     },
 )
 
@@ -8884,12 +8923,20 @@ def v66_load_price_book(
         if daily.empty:
             missing.append(code)
             continue
-        daily = normalize_price_frame(daily)
+        daily = add_daily_macd(normalize_price_frame(daily))
         dates = daily["trade_date"].astype(str).tolist()
         book[code] = {
             "dates": dates,
             "open": dict(zip(dates, numeric(daily, "open"))),
             "close": dict(zip(dates, numeric(daily, "close"))),
+            "high": dict(zip(dates, numeric(daily, "high"))),
+            "low": dict(zip(dates, numeric(daily, "low"))),
+            "macd_hist": dict(zip(
+                dates, numeric(daily, "Daily_MACD_Hist"))),
+            "macd_remaining": dict(zip(
+                dates, numeric(daily, "Daily_MACD_Remaining_pct"))),
+            "macd_retention": dict(zip(
+                dates, numeric(daily, "Daily_MACD_Retention_pct"))),
         }
         cache_hits += 1
     return book, cache_hits, missing
@@ -8902,12 +8949,11 @@ def v66_run_portfolio_path(
         ) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame]:
     """Chronological three-stock portfolio simulation with no future ranking.
 
-    The baseline uses 2-2-1 as primary and smaller MACD histogram for exact
-    ties.  The challenger uses the strict walk-forward ordinal score, then the
-    frozen baseline keys for exact model ties.  Dates without enough revealed
-    training history fall back to the baseline.  The random control shuffles
-    all candidates.  Future state is consulted only when its actual
-    confirmation/exit execution date arrives.
+    Every executable scheme buys one complete 100,000-yuan slot.  The frozen
+    ranking is 2-2-1 descending with smaller MACD histogram for exact ties.
+    Early-failure challengers inspect only the configured D3/D5/D7 close and
+    execute at the next tradable open.  Future state is consulted only after
+    its actual confirmation date has arrived.
     """
     rng = np.random.default_rng(int(seed))
     buy_factor, sell_factor = _cost_factors(config)
@@ -8927,6 +8973,11 @@ def v66_run_portfolio_path(
     ordinary_risk_days = max(int(scheme.get("ordinary_risk_days", 0)), 0)
     ordinary_stop_pct = float(
         scheme.get("ordinary_stop_pct", V68_ORDINARY_STOP_PCT))
+    early_failure_day = max(int(scheme.get("early_failure_day", 0)), 0)
+    early_price_stop_pct = float(scheme.get(
+        "early_price_stop_pct", V612_PRICE_FAILURE_PCT))
+    early_macd_remaining_pct = float(scheme.get(
+        "early_macd_remaining_pct", V612_MACD_REMAINING_PCT))
     open_pos = {value: position for position, value in enumerate(open_dates)}
 
     records = events.to_dict("records")
@@ -8940,7 +8991,9 @@ def v66_run_portfolio_path(
     if not candidates_by_date:
         return {}, pd.DataFrame(), pd.DataFrame()
     first_date = min(candidates_by_date)
-    planned_columns = ["_Base_Exit_Date", "_Add_Exit_Date"]
+    planned_columns = ["_Base_Exit_Date"]
+    if staged and trial_weight < 1.0 - 1e-9:
+        planned_columns.append("_Add_Exit_Date")
     if allow_late:
         planned_columns.append("_Reentry_Exit_Date")
     last_planned = max(
@@ -8967,6 +9020,7 @@ def v66_run_portfolio_path(
     open_exit_reason_by_leg: dict[str, str] = {}
     add_schedule: dict[str, list[str]] = defaultdict(list)
     reentry_schedule: dict[str, list[str]] = defaultdict(list)
+    early_failure_schedule: dict[str, list[str]] = defaultdict(list)
     close_exit_schedule: dict[str, list[str]] = defaultdict(list)
     ordinary_risk_rules: dict[str, dict[str, Any]] = {}
     selected_rank_by_event: dict[str, int] = {}
@@ -9068,9 +9122,12 @@ def v66_run_portfolio_path(
             if exit_date:
                 close_exit_schedule[exit_date].append(trial_leg)
             add_date = normalize_date(row.get("CrossEntry_Date"))
-            if add_date and to_bool(row.get("CrossEntry_Has_40D")):
+            if (trial_weight < 1.0 - 1e-9
+                    and add_date and to_bool(row.get("CrossEntry_Has_40D"))):
                 add_schedule[add_date].append(event_id)
                 counters["高质量补仓资格"] += 1
+            elif add_date:
+                counters["高质量确认全额持仓继续持有"] += 1
             return
         if action == "14日内普通确认_只保留试仓":
             counters["已买入的普通确认事件"] += 1
@@ -9141,6 +9198,8 @@ def v66_run_portfolio_path(
             if sell_leg(leg_id, trade_date, "open", exit_reason):
                 if exit_reason.startswith("普通5分"):
                     counters["普通5分风控退出执行"] += 1
+                if exit_reason.startswith("第") and "硬失败" in exit_reason:
+                    counters["早期硬失败退出执行"] += 1
             else:
                 delayed = next_stock_date(code, trade_date)
                 if delayed and delayed > trade_date and delayed <= last_date:
@@ -9248,8 +9307,11 @@ def v66_run_portfolio_path(
                     counters["错过高质量确认_无股票名额"] += 1
                 continue
             desired = slot_capital * trial_weight
+            entry_kind = (
+                "全额提前买入" if trial_weight >= 1.0 - 1e-9
+                else ("试仓" if staged else "满仓提前买入"))
             leg_id = buy_leg(
-                row, trade_date, "试仓" if staged else "满仓提前买入",
+                row, trade_date, entry_kind,
                 desired, row.get("Entry_Raw_Open"),
                 selection_rank=selection_rank)
             if not leg_id:
@@ -9269,12 +9331,83 @@ def v66_run_portfolio_path(
             if is_high:
                 counters["实际买入后高质量确认事件"] += 1
             schedule_selected_event(row, leg_id)
+            if early_failure_day > 0:
+                check_date = v66_market_date_offset(
+                    trade_date, early_failure_day - 1,
+                    open_dates, open_pos)
+                if check_date and check_date <= last_date:
+                    early_failure_schedule[check_date].append(leg_id)
+                    counters["早期硬失败检查资格"] += 1
 
         # Update mark-to-market closes, then execute fixed-horizon close sales.
         for code in list(code_legs):
             close_value = exact_price(code, trade_date, "close")
             if math.isfinite(close_value) and close_value > 0:
                 last_close[code] = close_value
+
+        # V6.12 hard-failure milestone.  Entry day is D1; the configured D3,
+        # D5 or D7 close is inspected once and any decision executes at the
+        # next available open.  A confirmation protects the holding only when
+        # that cross has actually occurred by this close.
+        for leg_id in list(early_failure_schedule.pop(trade_date, [])):
+            leg = active_legs.get(leg_id)
+            if leg is None:
+                continue
+            row = event_by_id.get(str(leg.get("Event_ID")))
+            if row is None:
+                continue
+            action = str(row.get("V65_Lifecycle_Action", ""))
+            cross_date = normalize_date(row.get("Future_Weekly_Cross25_Date"))
+            score_value = finite_num(row.get("_Score_221"))
+            cross_observed = bool(cross_date and cross_date <= trade_date)
+            protected = bool(cross_observed and (
+                action in {
+                    "14日内高质量确认_试仓升级",
+                    "14日内已涨超30_保护试仓不追买",
+                }
+                or (action == "14日内普通确认_只保留试仓"
+                    and ordinary_keep_min_score is not None
+                    and math.isfinite(score_value)
+                    and score_value >= ordinary_keep_min_score)))
+            if protected:
+                counters["早期硬失败检查_确认后受保护"] += 1
+                continue
+            code = str(leg.get("ts_code", ""))
+            raw_close = exact_price(code, trade_date, "close")
+            raw_entry = finite_num(leg.get("Raw_Entry"))
+            hist = exact_price(code, trade_date, "macd_hist")
+            remaining = exact_price(code, trade_date, "macd_remaining")
+            retention = exact_price(code, trade_date, "macd_retention")
+            raw_return = (
+                (raw_close / raw_entry - 1.0) * 100.0
+                if (math.isfinite(raw_close) and raw_close > 0
+                    and math.isfinite(raw_entry) and raw_entry > 0)
+                else np.nan)
+            macd_failure = bool(
+                math.isfinite(hist) and (
+                    hist <= 0
+                    or (hist > 0 and math.isfinite(remaining)
+                        and remaining <= early_macd_remaining_pct
+                        and math.isfinite(retention) and retention < 100.0)))
+            price_failure = bool(
+                math.isfinite(raw_return)
+                and raw_return <= early_price_stop_pct)
+            if not (macd_failure or price_failure):
+                counters["早期硬失败检查_通过"] += 1
+                continue
+            next_date = next_stock_date(code, trade_date)
+            if not next_date or next_date > last_date:
+                counters["早期硬失败触发但无后续开盘"] += 1
+                continue
+            cause = (
+                "MACD及跌幅" if macd_failure and price_failure
+                else ("MACD" if macd_failure else "跌幅"))
+            open_exit_schedule[next_date].append(leg_id)
+            open_exit_reason_by_leg[leg_id] = (
+                f"第{early_failure_day}日硬失败_{cause}_下一开盘")
+            counters["早期硬失败触发"] += 1
+            counters[f"早期硬失败触发_{cause}"] += 1
+
         for leg_id in list(close_exit_schedule.pop(trade_date, [])):
             leg = active_legs.get(leg_id)
             if leg is None:
@@ -9422,6 +9555,12 @@ def v66_run_portfolio_path(
         "同日入场顺位上限": max_signal_day_rank,
         "主排序方式": primary_rank_mode,
         "同分二级排序": tie_break_mode,
+        "首次买入仓位比例": trial_weight,
+        "早期硬失败检查日": early_failure_day,
+        "早期跌幅阈值%": (
+            early_price_stop_pct if early_failure_day > 0 else np.nan),
+        "早期MACD剩余阈值%": (
+            early_macd_remaining_pct if early_failure_day > 0 else np.nan),
         "初始资金": initial_capital, "期末权益": cash,
         "总收益率%": total_return, "年化收益率%": annualized,
         "最大回撤%": drawdown.min(),
@@ -9477,6 +9616,22 @@ def v66_run_portfolio_path(
         "普通5分风控触发": int(counters["普通5分风控触发"]),
         "普通5分风控退出执行": int(
             counters["普通5分风控退出执行"]),
+        "早期硬失败检查资格": int(counters["早期硬失败检查资格"]),
+        "早期硬失败检查_确认后受保护": int(
+            counters["早期硬失败检查_确认后受保护"]),
+        "早期硬失败检查_通过": int(
+            counters["早期硬失败检查_通过"]),
+        "早期硬失败触发": int(counters["早期硬失败触发"]),
+        "早期硬失败触发_MACD": int(
+            counters["早期硬失败触发_MACD"]),
+        "早期硬失败触发_跌幅": int(
+            counters["早期硬失败触发_跌幅"]),
+        "早期硬失败触发_MACD及跌幅": int(
+            counters["早期硬失败触发_MACD及跌幅"]),
+        "早期硬失败退出执行": int(
+            counters["早期硬失败退出执行"]),
+        "高质量确认全额持仓继续持有": int(
+            counters["高质量确认全额持仓继续持有"]),
         "完成交易腿": len(trade_frame),
         "交易腿胜率%": trade_returns.gt(0).mean() * 100.0
         if not trade_returns.empty else np.nan,
@@ -9534,6 +9689,10 @@ def v66_ensemble_summary(paths: pd.DataFrame) -> pd.DataFrame:
             "方案Key": key, "组合方案": label, "选择方式": mode,
             "主排序方式": str(group["主排序方式"].iloc[0]),
             "同分二级排序": str(group["同分二级排序"].iloc[0]),
+            "首次买入仓位比例": clean_median(
+                group, "首次买入仓位比例"),
+            "早期硬失败检查日": clean_median(
+                group, "早期硬失败检查日"),
             "路径数": len(group),
             "期末权益中位": clean_median(group, "期末权益"),
             "总收益中位%": returns.median(),
@@ -9554,15 +9713,10 @@ def v66_ensemble_summary(paths: pd.DataFrame) -> pd.DataFrame:
             "顺位过滤高质量确认中位": clean_median(
                 group, "顺位过滤高质量确认"),
             "初始买入事件中位": clean_median(group, "实际初始买入事件"),
-            "走步模型买入事件中位": clean_median(
-                group, "走步模型实际买入事件"),
-            "训练不足回退买入事件中位": clean_median(
-                group, "训练不足回退实际买入事件"),
             "高质量确认捕获率中位%": clean_median(
                 group, "高质量确认捕获率%"),
-            "高质量补仓执行中位": clean_median(group, "高质量补仓执行"),
-            "迟到高质量重入执行中位": clean_median(
-                group, "迟到高质量重入执行"),
+            "高质量确认全额继续持有中位": clean_median(
+                group, "高质量确认全额持仓继续持有"),
             "普通确认保留中位": clean_median(
                 group, "普通确认评分达标保留"),
             "普通确认腾位中位": clean_median(
@@ -9571,6 +9725,14 @@ def v66_ensemble_summary(paths: pd.DataFrame) -> pd.DataFrame:
                 group, "普通5分风控触发"),
             "普通5分风控退出中位": clean_median(
                 group, "普通5分风控退出执行"),
+            "早期硬失败触发中位": clean_median(
+                group, "早期硬失败触发"),
+            "早期硬失败退出中位": clean_median(
+                group, "早期硬失败退出执行"),
+            "早期检查受保护中位": clean_median(
+                group, "早期硬失败检查_确认后受保护"),
+            "早期检查通过中位": clean_median(
+                group, "早期硬失败检查_通过"),
             "交易腿胜率中位%": clean_median(group, "交易腿胜率%"),
             "静态剔除最大盈利股票后总收益中位%": clean_median(
                 group, "静态剔除最大盈利股票后总收益%"),
@@ -9623,15 +9785,16 @@ def v66_score_vs_random_summary(paths: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def v611_paired_primary_rank_summary(paths: pd.DataFrame) -> pd.DataFrame:
-    """Compare walk-forward primary ranking with the frozen 2-2-1 baseline."""
-    baseline_key = "Trial50Score5Top3Score221MACDTie"
+def v612_paired_early_failure_summary(paths: pd.DataFrame) -> pd.DataFrame:
+    """Compare each D3/D5/D7 exit with the full-slot no-early-exit baseline."""
+    baseline_key = "Full100Top3NoEarlyFailure"
     baseline = paths[paths["方案Key"].eq(baseline_key)].copy()
     if baseline.empty:
         return pd.DataFrame()
     metrics = (
         "总收益率%", "最大回撤%", "平均资金暴露%", "高质量确认捕获率%",
         "实际初始买入事件", "空仓日比例%", "静态剔除前三盈利股票后总收益%",
+        "早期硬失败退出执行",
     )
     rows: list[dict[str, Any]] = []
     for scheme in V66_PORTFOLIO_SCHEMES:
@@ -9682,6 +9845,9 @@ def v611_paired_primary_rank_summary(paths: pd.DataFrame) -> pd.DataFrame:
                 "初始买入事件变化中位": (
                     numeric(paired, "实际初始买入事件_方案")
                     - numeric(paired, "实际初始买入事件_基线")).median(),
+                "早期硬失败退出增加中位": (
+                    numeric(paired, "早期硬失败退出执行_方案")
+                    - numeric(paired, "早期硬失败退出执行_基线")).median(),
                 "空仓日比例变化中位百分点": (
                     numeric(paired, "空仓日比例%_方案")
                     - numeric(paired, "空仓日比例%_基线")).median(),
@@ -9693,7 +9859,7 @@ def v611_paired_primary_rank_summary(paths: pd.DataFrame) -> pd.DataFrame:
 
 
 def v611_seed_pairing_audit(paths: pd.DataFrame) -> pd.DataFrame:
-    """Verify every mode/Path_No reuses one seed across both rank schemes."""
+    """Verify every mode/Path_No reuses one seed across lifecycle schemes."""
     if paths.empty:
         return pd.DataFrame()
     expected = len(V66_PORTFOLIO_SCHEMES)
@@ -10174,6 +10340,7 @@ def v611_actual_selected_grade_audit(
         event = group.groupby("Event_ID", as_index=False).agg(
             实际净利润=("Net_PnL", "sum"),
             实际投入成本=("Entry_Cost", "sum"),
+            实际买入日=("Entry_Date", "min"),
             实际入场顺位=("Signal_Day_Selection_Rank", "min"),
         ).merge(lookup, on="Event_ID", how="left")
         event["实际事件收益%"] = np.where(
@@ -10189,12 +10356,44 @@ def v611_actual_selected_grade_audit(
             event["V65_Lifecycle_Action"].astype(str).eq(
                 "14日内普通确认_只保留试仓")
             & numeric(event, "Timing_Score_221").eq(5.0))
+        ordered = event.sort_values(
+            ["实际买入日", "实际入场顺位", "Event_ID"]
+        ).reset_index(drop=True)
+        complete_three = len(ordered) // 3
+        triple_passes = 0
+        if complete_three:
+            triple_frame = ordered.iloc[:complete_three * 3].copy()
+            triple_frame["_Triple"] = np.arange(len(triple_frame)) // 3
+            triple_passes = int(triple_frame.groupby("_Triple")[
+                "实际事件收益%"].apply(
+                    lambda values: numeric(
+                        pd.DataFrame({"value": values}), "value"
+                    ).gt(0).sum() >= 2).sum())
+        same_day_groups = 0
+        same_day_passes = 0
+        for _, day_group in ordered.groupby("实际买入日", sort=True):
+            if len(day_group) < 3:
+                continue
+            day_three = day_group.head(3)
+            same_day_groups += 1
+            same_day_passes += int(
+                numeric(day_three, "实际事件收益%").gt(0).sum() >= 2)
         rows.append({
             "组合方案": label, "选择方式": mode, "Seed": int(seed),
             "实际买入事件": len(event),
             "盈利事件": int(returns.gt(0).sum()),
             "实际事件胜率%": returns.gt(0).mean() * 100.0,
             "距三分之二目标百分点": returns.gt(0).mean() * 100.0 - 66.666667,
+            "连续每3笔完整组": complete_three,
+            "连续3笔中至少2笔盈利组": triple_passes,
+            "连续3笔中至少2笔盈利比例%": (
+                triple_passes / complete_three * 100.0
+                if complete_three else np.nan),
+            "同日买满3只批次": same_day_groups,
+            "同日3只中至少2只盈利批次": same_day_passes,
+            "同日3只中至少2只盈利比例%": (
+                same_day_passes / same_day_groups * 100.0
+                if same_day_groups else np.nan),
             "S级比例%": classes.eq("S").mean() * 100.0,
             "A或S比例%": classes.isin(["S", "A"]).mean() * 100.0,
             "B级以上比例%": classes.isin(["S", "A", "B"]).mean() * 100.0,
@@ -10205,6 +10404,216 @@ def v611_actual_selected_grade_audit(
             "普通确认5分买入事件": int(ordinary5.sum()),
             "普通确认5分实际胜率%": returns[ordinary5].gt(0).mean() * 100.0
             if ordinary5.any() else np.nan,
+            "总净利润": numeric(event, "实际净利润").sum(),
+        })
+    return pd.DataFrame(rows)
+
+
+def v612_early_failure_event_audit(
+        events: pd.DataFrame, price_book: dict[str, dict[str, Any]],
+        open_dates: list[str], config: dict[str, Any]
+        ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Audit D3/D5/D7 hard failures using only each milestone close."""
+    if events.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    open_pos = {value: position for position, value in enumerate(open_dates)}
+    buy_factor, sell_factor = _cost_factors(config)
+    detail_rows: list[dict[str, Any]] = []
+    for row in events.to_dict("records"):
+        code = str(row.get("ts_code", ""))
+        book = price_book.get(code, {})
+        stock_dates = list(book.get("dates", []))
+        entry_date = normalize_date(row.get("Entry_Date"))
+        raw_entry = finite_num(row.get("Entry_Raw_Open"))
+        if (not stock_dates or not entry_date or entry_date not in open_pos
+                or not math.isfinite(raw_entry) or raw_entry <= 0):
+            continue
+        action = str(row.get("V65_Lifecycle_Action", ""))
+        cross_date = normalize_date(row.get("Future_Weekly_Cross25_Date"))
+        score_value = finite_num(row.get("_Score_221"))
+        grade = str(row.get("Explosion_Class_40D", ""))
+        for day in V612_EARLY_FAILURE_DAYS:
+            check_date = v66_market_date_offset(
+                entry_date, day - 1, open_dates, open_pos)
+            if not check_date:
+                continue
+            cross_observed = bool(cross_date and cross_date <= check_date)
+            protected = bool(cross_observed and (
+                action in {
+                    "14日内高质量确认_试仓升级",
+                    "14日内已涨超30_保护试仓不追买",
+                }
+                or (action == "14日内普通确认_只保留试仓"
+                    and math.isfinite(score_value) and score_value >= 5.0)))
+            raw_close = finite_num(book.get("close", {}).get(check_date))
+            hist = finite_num(book.get("macd_hist", {}).get(check_date))
+            remaining = finite_num(
+                book.get("macd_remaining", {}).get(check_date))
+            retention = finite_num(
+                book.get("macd_retention", {}).get(check_date))
+            raw_return = (
+                (raw_close / raw_entry - 1.0) * 100.0
+                if math.isfinite(raw_close) and raw_close > 0 else np.nan)
+            macd_failure = bool(
+                math.isfinite(hist) and (
+                    hist <= 0
+                    or (hist > 0 and math.isfinite(remaining)
+                        and remaining <= V612_MACD_REMAINING_PCT
+                        and math.isfinite(retention) and retention < 100.0)))
+            price_failure = bool(
+                math.isfinite(raw_return)
+                and raw_return <= V612_PRICE_FAILURE_PCT)
+            triggered = bool(not protected and (
+                macd_failure or price_failure))
+            next_position = bisect.bisect_right(stock_dates, check_date)
+            exit_date = (
+                stock_dates[next_position]
+                if triggered and next_position < len(stock_dates) else "")
+            raw_exit = finite_num(book.get("open", {}).get(exit_date))
+            exit_return = (
+                (raw_exit * sell_factor / (raw_entry * buy_factor) - 1.0)
+                * 100.0
+                if (exit_date and math.isfinite(raw_exit) and raw_exit > 0)
+                else np.nan)
+            cause = (
+                "MACD及跌幅" if macd_failure and price_failure
+                else ("MACD" if macd_failure else (
+                    "跌幅" if price_failure else "未触发")))
+            detail_rows.append({
+                "Event_ID": row.get("_Event_ID"), "ts_code": code,
+                "name": row.get("name"), "Signal_Date": row.get("Signal_Date"),
+                "Entry_Date": entry_date, "检查市场日": int(day),
+                "检查日期": check_date, "当日收盘相对买入开盘%": raw_return,
+                "MACD柱": hist, "MACD剩余强度%": remaining,
+                "MACD较前日保留%": retention,
+                "此前确认受保护": protected,
+                "MACD硬失败": macd_failure, "跌幅硬失败": price_failure,
+                "硬失败触发": triggered, "触发原因": cause,
+                "模拟退出日": exit_date, "模拟净收益%": exit_return,
+                "40日等级": grade,
+                "是否S或A": grade in {"S", "A"}, "是否F": grade == "F",
+                "40日期末是否盈利": finite_num(
+                    row.get("Entry_Close_Return_Net_pct")) > 0,
+            })
+    detail = pd.DataFrame(detail_rows)
+    if detail.empty:
+        return pd.DataFrame(), detail
+    rows: list[dict[str, Any]] = []
+    for day, group in detail.groupby("检查市场日", sort=True):
+        triggered = group[true_mask(group, "硬失败触发")].copy()
+        all_f = true_mask(group, "是否F")
+        all_sa = true_mask(group, "是否S或A")
+        trigger_f = true_mask(triggered, "是否F")
+        trigger_sa = true_mask(triggered, "是否S或A")
+        rows.append({
+            "检查市场日": int(day), "可评估事件": len(group),
+            "此前确认受保护": int(true_mask(
+                group, "此前确认受保护").sum()),
+            "硬失败触发事件": len(triggered),
+            "触发比例%": len(triggered) / len(group) * 100.0,
+            "仅MACD触发": int((
+                true_mask(group, "MACD硬失败")
+                & ~true_mask(group, "跌幅硬失败")
+                & true_mask(group, "硬失败触发")).sum()),
+            "仅跌幅触发": int((
+                ~true_mask(group, "MACD硬失败")
+                & true_mask(group, "跌幅硬失败")
+                & true_mask(group, "硬失败触发")).sum()),
+            "双重触发": int((
+                true_mask(group, "MACD硬失败")
+                & true_mask(group, "跌幅硬失败")
+                & true_mask(group, "硬失败触发")).sum()),
+            "触发中F级比例%": (
+                trigger_f.mean() * 100.0 if len(triggered) else np.nan),
+            "触发中S或A比例%": (
+                trigger_sa.mean() * 100.0 if len(triggered) else np.nan),
+            "清除全部F级比例%": (
+                trigger_f.sum() / all_f.sum() * 100.0
+                if all_f.sum() else np.nan),
+            "误杀全部S或A比例%": (
+                trigger_sa.sum() / all_sa.sum() * 100.0
+                if all_sa.sum() else np.nan),
+            "触发组40日期末盈利比例%": (
+                true_mask(triggered, "40日期末是否盈利").mean() * 100.0
+                if len(triggered) else np.nan),
+            "模拟退出收益均值%": numeric(
+                triggered, "模拟净收益%").mean(),
+            "模拟退出收益中位%": numeric(
+                triggered, "模拟净收益%").median(),
+        })
+    return pd.DataFrame(rows), detail
+
+
+def v612_actual_f_slot_audit(
+        trades: pd.DataFrame, events: pd.DataFrame,
+        open_dates: list[str]) -> pd.DataFrame:
+    """Measure F slot-days and S/A false exits on representative paths."""
+    if trades.empty or events.empty or "_Event_ID" not in events:
+        return pd.DataFrame()
+    open_pos = {value: position for position, value in enumerate(open_dates)}
+    lookup = events[[
+        "_Event_ID", "Explosion_Class_40D", "V65_Lifecycle_Action",
+        "Timing_Score_221", "Signal_Date",
+    ]].drop_duplicates("_Event_ID").rename(columns={"_Event_ID": "Event_ID"})
+    rows: list[dict[str, Any]] = []
+    for keys, group in trades.groupby(
+            ["方案", "选择方式", "Seed"], dropna=False):
+        label, mode, seed = keys
+        event = group.groupby("Event_ID", as_index=False).agg(
+            实际净利润=("Net_PnL", "sum"),
+            实际投入成本=("Entry_Cost", "sum"),
+            买入日=("Entry_Date", "min"), 退出日=("Exit_Date", "max"),
+            退出原因=("Exit_Reason", lambda values: "|".join(
+                sorted(set(str(value) for value in values)))),
+        ).merge(lookup, on="Event_ID", how="left")
+        event["实际事件收益%"] = np.where(
+            numeric(event, "实际投入成本").gt(0),
+            numeric(event, "实际净利润")
+            / numeric(event, "实际投入成本") * 100.0, np.nan)
+        event["持有市场日"] = [
+            (open_pos.get(normalize_date(exit_date), -1)
+             - open_pos.get(normalize_date(entry_date), -1) + 1)
+            if (normalize_date(entry_date) in open_pos
+                and normalize_date(exit_date) in open_pos) else np.nan
+            for entry_date, exit_date in zip(event["买入日"], event["退出日"])
+        ]
+        classes = event["Explosion_Class_40D"].astype(str)
+        f_mask = classes.eq("F")
+        sa_mask = classes.isin(["S", "A"])
+        early_mask = event["退出原因"].astype(str).str.contains(
+            "硬失败", regex=False)
+        early = event[early_mask]
+        early_f = early["Explosion_Class_40D"].astype(str).eq("F")
+        early_sa = early["Explosion_Class_40D"].astype(str).isin(["S", "A"])
+        rows.append({
+            "组合方案": label, "选择方式": mode, "Seed": int(seed),
+            "实际买入事件": len(event),
+            "实际事件胜率%": numeric(
+                event, "实际事件收益%").gt(0).mean() * 100.0,
+            "S级比例%": classes.eq("S").mean() * 100.0,
+            "A或S比例%": sa_mask.mean() * 100.0,
+            "F级比例%": f_mask.mean() * 100.0,
+            "F级事件": int(f_mask.sum()),
+            "F级平均持有市场日": numeric(
+                event[f_mask], "持有市场日").mean(),
+            "F级股票名额占用日": numeric(
+                event[f_mask], "持有市场日").sum(),
+            "F级净利润": numeric(event[f_mask], "实际净利润").sum(),
+            "S或A平均持有市场日": numeric(
+                event[sa_mask], "持有市场日").mean(),
+            "早期硬失败退出事件": int(early_mask.sum()),
+            "早退中F级事件": int(early_f.sum()),
+            "早退中F级比例%": (
+                early_f.mean() * 100.0 if len(early) else np.nan),
+            "买入F级被早退比例%": (
+                early_f.sum() / f_mask.sum() * 100.0
+                if f_mask.sum() else np.nan),
+            "早退中S或A事件": int(early_sa.sum()),
+            "买入S或A被早退比例%": (
+                early_sa.sum() / sa_mask.sum() * 100.0
+                if sa_mask.sum() else np.nan),
+            "早退收益均值%": numeric(
+                early, "实际事件收益%").mean(),
             "总净利润": numeric(event, "实际净利润").sum(),
         })
     return pd.DataFrame(rows)
@@ -10312,9 +10721,9 @@ def v66_run_portfolio_ensemble(
         for mode in ("规则排序", "完全随机选择"):
             for path_no in range(draw_count):
                 # Common random numbers: the same Path_No reuses the exact
-                # same seed across both primary-rank schemes and selection
-                # modes. Random controls must therefore be identical; rule
-                # portfolio differences can only come from the primary rank.
+                # same seed across lifecycle schemes and selection modes.
+                # Exits change slot availability, so realized later trades
+                # can legitimately differ even under the random control.
                 seed = V66_RANDOM_SEED + path_no
                 metrics, _, _ = v66_run_portfolio_path(
                     events, price_book, open_dates, config, scheme, mode, seed)
@@ -10635,7 +11044,7 @@ def v63_clear_job_active(signature: str) -> None:
         if os.path.exists(path):
             os.remove(path)
     except OSError as exc:
-        record_error(f"V6.11任务标记清除失败: {exc}")
+        record_error(f"V6.12任务标记清除失败: {exc}")
 
 
 def v63_is_job_active(signature: str) -> bool:
@@ -10662,7 +11071,7 @@ def v63_load_checkpoint(signature: str, ts_code: str) -> dict[str, Any] | None:
             return None
         return payload
     except Exception as exc:
-        record_error(f"V6.11兼容检查点损坏 {ts_code}: {exc}")
+        record_error(f"V6.12兼容检查点损坏 {ts_code}: {exc}")
         return None
 
 
@@ -10675,7 +11084,7 @@ def v63_save_checkpoint(
     }, v63_checkpoint_path(signature, ts_code))
 
 
-def main() -> None:
+def _v611_main_legacy() -> None:
     global pro, API_ERRORS
     st.set_page_config(page_title=V63_TITLE, layout="wide")
     st.title(V63_TITLE)
@@ -11459,6 +11868,681 @@ def main() -> None:
         f"结果ZIP共{len(files)}个CSV；历史成熟事件、组合路径、"
         "最近候选和最新观察池严格分开。")
     render_download(result_zip, result_name, f"v611_current_{request_signature}")
+
+
+def main() -> None:
+    global pro, API_ERRORS
+    st.set_page_config(page_title=V63_TITLE, layout="wide")
+    st.title(V63_TITLE)
+    streamlit_version = str(getattr(st, "__version__", "unknown"))
+    st.caption(f"{V63_UI_PATCH}｜Streamlit {streamlit_version}")
+    with st.expander("V6.12验证口径", expanded=True):
+        st.markdown(f"""
+- **唯一提前买点**：最近完整周N=6、M=3的SKDJ K位于{EARLY_WEEKLY_K_MIN:g}～{EARLY_WEEKLY_K_MAX:g}；日线MACD红柱扩张或剩余强度≥{STRENGTH_MIN_REMAINING_PCT:g}%；本轮股价首次达到+{V63_STRENGTH_THRESHOLD:g}%后，下一市场交易日开盘买入。
+- **全额等分三仓**：初始资金30万元，最多同时持有3只股票；每个名额一次性投入约10万元，按100股整手并计入成本。只有1～2只合格候选时，其余名额保持现金。
+- **不试仓、不加仓**：买入时已经使用完整单股名额；高质量确认只代表继续持有，不再产生第二笔买入。
+- **冻结Top3排序**：2-2-1分降序；分数完全相同时，日线MACD柱较小者优先；只允许当天原始顺位前3进入买入判断，顺位不递补。
+- **四组生命周期**：无早退基线，以及买入后的第3、第5、第7个市场日收盘检查组；四组的买点、排序、资金和14日确认规则完全相同。
+- **早期硬失败**：检查日尚未得到保护，且日线MACD柱≤0；或红柱虽为正但剩余强度≤{V612_MACD_REMAINING_PCT:g}%且较前日保留率<100%；或收盘相对买入开盘≤{V612_PRICE_FAILURE_PCT:g}%。触发后在该股下一可交易日开盘退出。
+- **确认保护**：检查日之前已经观察到高质量确认、已涨超30%的确认，或普通确认且买入时2-2-1恰好5分，不执行早期硬失败退出。
+- **14日生命周期**：高质量确认继续持有；普通确认只有恰好5分继续持有；其他普通确认及14日未确认者在下一可交易日开盘退出；禁止迟到重入。
+- **持有上限**：被保留的股票持有至初始买入后的第40个市场日收盘；早期失败只缩短失败股占用名额的时间，不延长任何股票。
+- **日内顺序**：开盘先执行退出释放现金和名额，再处理当天新候选；因此早退释放的约10万元可在同日买入新的完整名额。
+- **判卷不参与交易**：S/A/B/F仍按买入后40日内先到+30/+20/+10且先于-10判定，只用于事后检验；交易时只读取当时已经出现的数据。
+- **验收重点**：比较D3/D5/D7能否减少F级持有日和亏损，同时不明显误杀S/A，并检查真实三仓总收益、回撤、覆盖、每三只至少两只盈利及头部股票依赖。
+- **随机对照与配对**：相同Path_No复用相同Seed；各生命周期方案因退出后名额可用时间不同，后续随机成交可以不同，这是策略路径的真实结果。
+""")
+
+    with st.sidebar:
+        st.header("运行参数")
+        backtest_days = st.number_input(
+            "回测交易日数", 100, 1000, 500, 50, key="v612_days")
+        min_price = st.number_input(
+            "最低股价（元）", 10.0, 20.0, 10.0, 10.0,
+            format="%.0f", key="v612_min_price")
+        min_mv = st.number_input(
+            "最低流通市值（亿元）", 50.0, 100.0, 50.0, 50.0,
+            format="%.0f", key="v612_min_mv")
+        signal_end_date = st.date_input(
+            "历史买入信号截止（40日判卷）", date(2026, 6, 5),
+            key="v612_signal_end")
+        market_end_date = st.date_input(
+            "最新信号观察截止（默认今天）", date.today(),
+            key="v612_market_end")
+        pause = st.number_input(
+            "接口间隔(秒)", 0.0, 2.0, 0.12, 0.02, key="v612_pause")
+        use_cache = st.checkbox(
+            "复用行情和72小时基础缓存", True, key="v612_cache")
+        st.caption("逐股票行情不设TTL；继续复用兼容的逐股票事件检查点。")
+        portfolio_draws = st.number_input(
+            "每组随机路径数", 100, 1000, V66_DEFAULT_DRAWS, 100,
+            key="v612_draws")
+        st.caption("共4个生命周期方案×2种选择方式；300条时共2400次组合模拟。")
+        st.divider()
+        commission_pct = st.number_input(
+            "佣金率(%)", 0.0, 0.20, 0.025, 0.005,
+            format="%.3f", key="v612_commission")
+        stamp_duty_pct = st.number_input(
+            "卖出印花税率(%)", 0.0, 0.20, 0.05, 0.01,
+            format="%.3f", key="v612_stamp")
+        transfer_fee_pct = st.number_input(
+            "过户费率(%)", 0.0, 0.05, 0.001, 0.001,
+            format="%.3f", key="v612_transfer")
+        if st.button("清除V6.12结果和运行状态", key="v612_clear"):
+            shutil.rmtree(V63_RESULT_DIR, ignore_errors=True)
+            shutil.rmtree(V63_JOB_DIR, ignore_errors=True)
+            st.success("结果和运行状态已清除；逐股票检查点与行情缓存保留。")
+
+    request_payload = {
+        "version": V63_VERSION,
+        "days": int(backtest_days),
+        "signal_end": signal_end_date.strftime("%Y%m%d"),
+        "market_end": market_end_date.strftime("%Y%m%d"),
+        "min_price": float(min_price), "min_mv": float(min_mv),
+        "commission": float(commission_pct),
+        "stamp": float(stamp_duty_pct),
+        "transfer": float(transfer_fee_pct),
+        "watch_k": [EARLY_WEEKLY_K_MIN, EARLY_WEEKLY_K_MAX],
+        "strength": V63_STRENGTH_THRESHOLD,
+        "confirm_deadline_days": 14,
+        "initial_position_ratio": 1.0,
+        "add_position": False,
+        "initial_capital": V66_INITIAL_CAPITAL,
+        "max_stocks": V66_MAX_STOCKS,
+        "full_slot_capital": V66_FULL_SLOT_CAPITAL,
+        "portfolio_schemes": [item["key"] for item in V66_PORTFOLIO_SCHEMES],
+        "early_failure_days": list(V612_EARLY_FAILURE_DAYS),
+        "early_price_failure_pct": V612_PRICE_FAILURE_PCT,
+        "early_macd_remaining_pct": V612_MACD_REMAINING_PCT,
+        "entry_rank_cap": 3,
+        "primary_rank_rule": "Score221Desc_DailyMACDHistAsc_ExactTieSeed",
+        "ordinary_rule": "keep_exact_score5_to_fixed40",
+        "late_reentry": False,
+        "portfolio_draws": int(portfolio_draws),
+        "common_random_seed": V66_RANDOM_SEED,
+    }
+    request_signature = stable_signature(request_payload)
+    result_path = os.path.join(V63_RESULT_DIR, f"{request_signature}.zip")
+    result_name = (
+        f"weekly_skdj_full_slot_early_f_exit_v6_12_"
+        f"{int(backtest_days)}d_p{int(min_price)}_mv{int(min_mv)}.zip")
+    completed_available = False
+    if os.path.exists(result_path):
+        try:
+            with open(result_path, "rb") as handle:
+                saved_result = handle.read()
+            completed_available = True
+            v63_clear_job_active(request_signature)
+            st.success("发现相同参数的已完成结果，可直接下载。")
+            render_download(
+                saved_result, result_name, f"v612_saved_{request_signature}")
+        except Exception as exc:
+            st.warning(f"已保存结果读取失败：{exc}")
+
+    secret_token = configured_tushare_token()
+    if secret_token:
+        token = secret_token
+        st.caption("已从Streamlit Secrets读取TUSHARE_TOKEN。")
+    else:
+        token = st.text_input("Tushare Token", type="password", key="v612_token")
+    job_active = v63_is_job_active(request_signature)
+    left, right = st.columns(2)
+    with left:
+        start_clicked = st.button(
+            "开始/重新运行V6.12", type="primary", key="v612_run")
+    with right:
+        stop_clicked = st.button(
+            "停止自动续跑", disabled=not job_active, key="v612_stop")
+    if stop_clicked:
+        v63_clear_job_active(request_signature)
+        st.success("已停止；逐股票检查点保留。")
+        return
+    if start_clicked:
+        if market_end_date <= signal_end_date:
+            st.error("最新观察截止必须晚于历史信号截止")
+            return
+        v63_mark_job_active(request_signature)
+        job_active = True
+    if not token:
+        st.info("请输入Token；任务启动后若页面重连，会从逐股票检查点自动续跑。")
+        return
+    if not job_active:
+        st.caption(
+            "点击开始运行。" if not completed_available
+            else "相同参数结果已可下载；如需覆盖请点击重新运行。")
+        return
+
+    API_ERRORS = []
+    ts.set_token(token)
+    pro = ts.pro_api()
+    signal_end = signal_end_date.strftime("%Y%m%d")
+    market_end = market_end_date.strftime("%Y%m%d")
+    try:
+        probe_start = signal_end_date - timedelta(
+            days=int(backtest_days) * 2 + 120)
+        probe_dates = load_trade_calendar(
+            probe_start.strftime("%Y%m%d"), signal_end)
+        signal_start = trailing_signal_start(
+            probe_dates, signal_end, int(backtest_days))
+    except Exception as exc:
+        st.error(f"确定{int(backtest_days)}个交易日窗口失败：{exc}")
+        return
+    data_start = (
+        pd.Timestamp(signal_start).date()
+        - timedelta(weeks=WARMUP_WEEKS, days=7)
+    ).strftime("%Y%m%d")
+    try:
+        with st.spinner("加载交易日历和历史科技池..."):
+            open_dates = load_trade_calendar(data_start, market_end)
+            extended_end = (
+                market_end_date + timedelta(days=7)).strftime("%Y%m%d")
+            week_last_map = complete_week_last_dates(
+                load_trade_calendar(data_start, extended_end))
+            stock_basic = load_stock_basic()
+            memberships = load_tech_memberships(float(pause))
+    except Exception as exc:
+        st.error(f"基础数据加载失败：{exc}")
+        return
+    if not open_dates:
+        st.error("区间内没有市场交易日")
+        return
+    eligible_market_dates = [
+        value for value in open_dates if value <= market_end]
+    if not eligible_market_dates:
+        st.error("行情截止日前没有可用市场交易日")
+        return
+    latest_market_date = max(eligible_market_dates)
+    open_pos = {value: position for position, value in enumerate(open_dates)}
+    config = {
+        "signal_start": signal_start, "signal_end": signal_end,
+        "event_signal_end": market_end, "data_start": data_start,
+        "market_end": market_end, "latest_market_date": latest_market_date,
+        "min_price": float(min_price), "min_mv": float(min_mv),
+        "buy_slippage_pct": 0.20, "sell_slippage_pct": 0.20,
+        "commission_pct": float(commission_pct),
+        "stamp_duty_pct": float(stamp_duty_pct),
+        "transfer_fee_pct": float(transfer_fee_pct),
+    }
+
+    # Event generation is unchanged, so the compatible V6.4 stock checkpoints
+    # remain valid. V6.12 changes only the portfolio lifecycle and audits.
+    run_signature = stable_signature({
+        "version": V65_EVENT_ENGINE_VERSION, **config})
+    period_index = build_period_index(memberships)
+    active_codes = {
+        code for code, code_periods in period_index.items()
+        if periods_overlap(code_periods, signal_start, market_end)}
+    stocks = stock_basic[stock_basic["ts_code"].isin(active_codes)].copy()
+    stocks = stocks[
+        ~stocks["list_date"].gt(market_end)
+        & ~stocks["delist_date"].lt(data_start)
+    ].sort_values("ts_code").reset_index(drop=True)
+
+    event_rows: list[dict[str, Any]] = []
+    rejects: dict[str, int] = {}
+    checkpoint_hits = price_cache_hits = failures = 0
+    progress, status = st.progress(0.0), st.empty()
+    last_update = 0.0
+    stopped = False
+    for number, stock in stocks.iterrows():
+        if not v63_is_job_active(request_signature):
+            stopped = True
+            break
+        code = str(stock["ts_code"])
+        checkpoint = v63_load_checkpoint(run_signature, code)
+        if checkpoint is not None:
+            event_rows.extend(checkpoint["events"])
+            merge_counts(rejects, checkpoint["rejects"])
+            checkpoint_hits += 1
+        else:
+            daily, cached_basic, storage_path, cache_hit = fetch_price(
+                code, data_start, market_end, bool(use_cache), float(pause))
+            price_cache_hits += int(cache_hit)
+            if daily.empty:
+                failures += 1
+            else:
+                try:
+                    rows, stock_rejects, _ = analyze_stock_v63(
+                        stock, period_index.get(code, []), daily,
+                        cached_basic, storage_path, week_last_map, open_dates,
+                        open_pos, config, bool(use_cache), float(pause))
+                    event_rows.extend(rows)
+                    merge_counts(rejects, stock_rejects)
+                    v63_save_checkpoint(
+                        run_signature, code, rows, stock_rejects)
+                except Exception as exc:
+                    failures += 1
+                    record_error(f"V6.12逐股票分析失败 {code}: {exc}")
+        processed = number + 1
+        now = time.monotonic()
+        if (processed == 1 or now - last_update >= UI_HEARTBEAT_SECONDS
+                or processed == len(stocks)):
+            progress.progress(
+                processed / max(len(stocks), 1),
+                text=f"已处理{processed}/{len(stocks)}只股票，最近{code}")
+            status.caption(
+                f"事件{len(event_rows)}；检查点{checkpoint_hits}；"
+                f"行情缓存{price_cache_hits}；失败{failures}")
+            last_update = now
+    progress.empty()
+    status.empty()
+    if stopped:
+        st.warning("任务已停止，逐股票检查点已保留。")
+        return
+
+    events_all = pd.DataFrame(event_rows)
+    if events_all.empty:
+        st.error("本区间没有生成V6.12可用事件。")
+        return
+    events_all = v63_attach_breadth_and_rank(events_all, open_dates)
+    events_all = events_all.sort_values(
+        ["Signal_Date", "Event_Type", "ts_code"]).reset_index(drop=True)
+    live_watch = events_all[events_all["Event_Type"].eq("LIVE_WATCH")].copy()
+    research = events_all[~events_all["Event_Type"].eq("LIVE_WATCH")].copy()
+    history = research[
+        research["Signal_Date"].astype(str).le(signal_end)].copy()
+    observation = research[
+        research["Signal_Date"].astype(str).gt(signal_end)
+        & research["Signal_Date"].astype(str).le(latest_market_date)
+    ].copy()
+    mature = history[
+        true_mask(history, "Entry_Tradable")
+        & true_mask(history, "Entry_Has_40D")].copy()
+    if mature.empty:
+        st.error("存在信号，但没有可成交且走完40个市场交易日的成熟事件。")
+        return
+    mature = add_timing_labels(mature)
+    early = mature[mature["Event_Type"].eq("STRENGTH_3")].copy()
+    weekly = mature[mature["Event_Type"].eq("WEEKLY_CROSS25")].copy()
+    if early.empty or weekly.empty:
+        st.error("3%提前买点或周线确认对照为空。")
+        return
+
+    weekly["Weekly_Momentum_Tier"] = "普通周线确认"
+    weekly.loc[
+        weekly["Daily_MACD_State"].astype(str).eq("红柱扩张")
+        & numeric(weekly, "Daily_Return_Since_Red_Start_pct").between(10, 30),
+        "Weekly_Momentum_Tier"] = "高优先级_红柱扩张且已涨10至30"
+    weekly.loc[
+        numeric(weekly, "Daily_Return_Since_Red_Start_pct").gt(30),
+        "Weekly_Momentum_Tier"] = "风险组_已涨超过30"
+    early = v64_add_state_lifecycle_columns(early)
+    early = v65_add_staged_position_columns(early)
+
+    with st.spinner("复用本地行情缓存，构建全额三仓撮合与D3/D5/D7检查价格簿..."):
+        price_book, portfolio_cache_hits, portfolio_missing = (
+            v66_load_price_book(early, data_start, market_end))
+        recovered_price_files = 0
+        still_missing: list[str] = []
+        for code in portfolio_missing:
+            daily, _, _, _ = fetch_price(
+                code, data_start, market_end, True, float(pause))
+            if daily.empty:
+                still_missing.append(code)
+                continue
+            daily = add_daily_macd(normalize_price_frame(daily))
+            dates = daily["trade_date"].astype(str).tolist()
+            price_book[code] = {
+                "dates": dates,
+                "open": dict(zip(dates, numeric(daily, "open"))),
+                "close": dict(zip(dates, numeric(daily, "close"))),
+                "high": dict(zip(dates, numeric(daily, "high"))),
+                "low": dict(zip(dates, numeric(daily, "low"))),
+                "macd_hist": dict(zip(
+                    dates, numeric(daily, "Daily_MACD_Hist"))),
+                "macd_remaining": dict(zip(
+                    dates, numeric(daily, "Daily_MACD_Remaining_pct"))),
+                "macd_retention": dict(zip(
+                    dates, numeric(daily, "Daily_MACD_Retention_pct"))),
+            }
+            recovered_price_files += 1
+        portfolio_missing = still_missing
+    if portfolio_missing:
+        st.error(
+            f"三仓组合回测缺少{len(portfolio_missing)}只股票的完整行情，"
+            "为避免样本偏差本次不继续。请保留检查点后重新运行。")
+        st.dataframe(pd.DataFrame({"缺失股票": portfolio_missing}),
+                     use_container_width=True, hide_index=True)
+        return
+
+    portfolio_event_audit = v66_prepare_portfolio_events(early, open_dates)
+    early_failure_event_summary, early_failure_event_detail = (
+        v612_early_failure_event_audit(
+            portfolio_event_audit, price_book, open_dates, config))
+    with st.spinner(
+            f"运行真实全额三仓：4个生命周期方案×2种选择×"
+            f"{int(portfolio_draws)}条路径..."):
+        (portfolio_paths, portfolio_summary, score_vs_random,
+         representative_equity, representative_trades,
+         representative_annual, all_path_year_detail,
+         all_path_year_summary) = v66_run_portfolio_ensemble(
+            early, price_book, open_dates, config, int(portfolio_draws))
+    if portfolio_paths.empty:
+        st.error("成熟事件存在，但全额三仓组合未能生成可执行路径。")
+        return
+
+    early["Calendar_Year"] = early["Signal_Date"].astype(str).str[:4]
+    paired_early_failure = v612_paired_early_failure_summary(portfolio_paths)
+    seed_pairing_audit = v611_seed_pairing_audit(portfolio_paths)
+    score_rank_summary = v68_score_rank_path_summary(portfolio_paths)
+    profit_concentration = v68_profit_concentration_summary(portfolio_paths)
+    representative_stock_profit = v68_representative_stock_profit(
+        representative_trades)
+    actual_selected_grade_audit = v611_actual_selected_grade_audit(
+        representative_trades, portfolio_event_audit)
+    actual_f_slot_audit = v612_actual_f_slot_audit(
+        representative_trades, portfolio_event_audit, open_dates)
+    ordinary_factor_combo = v68_exact_factor_combo_audit(early)
+    ordinary_score_audit = v67_action_score_audit(
+        early, "14日内普通确认_只保留试仓", "普通确认")
+    high_score_audit = v67_action_score_audit(
+        early, "14日内高质量确认_试仓升级", "高质量确认")
+    cross_state_outcomes = timing_outcome_summary(
+        early, ["Cross_Delay_Group", "Future_Cross_State"],
+        "提前买入后按确认速度和确认日状态分组")
+    cross_entry_outcomes = v64_cross_entry_summary(early)
+    calendar = v63_week_calendar(
+        open_dates, signal_start, signal_end, mature)
+    coverage = v63_coverage_summary(calendar)
+
+    recent_start = (
+        pd.Timestamp(latest_market_date) - pd.Timedelta(days=14)
+    ).strftime("%Y%m%d")
+    recent_early = observation[
+        observation["Event_Type"].eq("STRENGTH_3")
+        & observation["Signal_Date"].astype(str).between(
+            recent_start, latest_market_date)].copy()
+    recent_weekly = observation[
+        observation["Event_Type"].eq("WEEKLY_CROSS25")
+        & observation["Signal_Date"].astype(str).between(
+            recent_start, latest_market_date)].copy()
+    if not recent_early.empty:
+        recent_early["Current_Lifecycle_Status"] = v64_live_lifecycle_status(
+            recent_early, latest_market_date)
+    high_priority_weekly = weekly[
+        weekly["Weekly_Momentum_Tier"].eq(
+            "高优先级_红柱扩张且已涨10至30")].copy()
+
+    run_summary = pd.DataFrame([{
+        "程序版本": V63_VERSION,
+        "正式信号开始": signal_start,
+        "历史信号截止": signal_end,
+        "行情观察截止": market_end,
+        "最新市场交易日": latest_market_date,
+        "成熟3%提前事件": len(early),
+        "成熟周线确认事件": len(weekly),
+        "高优先级周线事件": len(high_priority_weekly),
+        "提前事件后来高质量确认": int(
+            early["Future_Cross_State"].eq(V64_CROSS_HIGH).sum()),
+        "14日内高质量确认继续持有资格": int(
+            early["V65_Lifecycle_Action"].eq(
+                "14日内高质量确认_试仓升级").sum()),
+        "14日内普通确认5分继续持有": int((
+            early["V65_Lifecycle_Action"].eq(
+                "14日内普通确认_只保留试仓")
+            & numeric(early, "Timing_Score_221").eq(5.0)).sum()),
+        "14日超时": int((~true_mask(early, "Confirm14_Confirmed")).sum()),
+        "首次买入仓位比例": "100%",
+        "高质量确认是否加仓": False,
+        "迟到确认是否重入": False,
+        "同日入场顺位": "固定原始Top3、不递补",
+        "主排序": "2-2-1降序；完全同分MACD柱较小优先",
+        "早期硬失败检查日": "D3/D5/D7",
+        "早期价格失败阈值%": V612_PRICE_FAILURE_PCT,
+        "早期MACD剩余阈值%": V612_MACD_REMAINING_PCT,
+        "共用随机种子起点": V66_RANDOM_SEED,
+        "公平配对是否全部通过": bool(
+            not seed_pairing_audit.empty
+            and true_mask(seed_pairing_audit, "公平配对通过").all()),
+        "3%提前信号周": early["Signal_Week"].nunique(),
+        "最近14日3%提前信号": len(recent_early),
+        "最近14日周线确认信号": len(recent_weekly),
+        "最新观察池股票": len(live_watch),
+        "组合初始资金": V66_INITIAL_CAPITAL,
+        "最大持股数": V66_MAX_STOCKS,
+        "单股目标投入": V66_FULL_SLOT_CAPITAL,
+        "每组随机路径": int(portfolio_draws),
+        "组合方案数": len(V66_PORTFOLIO_SCHEMES),
+        "组合路径总数": len(portfolio_paths),
+        "组合行情缓存命中": portfolio_cache_hits,
+        "组合行情补下载": recovered_price_files,
+        "处理股票数": len(stocks),
+        "检查点恢复": checkpoint_hits,
+        "行情缓存命中": price_cache_hits,
+        "失败股票": failures,
+    }])
+    definitions = pd.DataFrame([
+        ("提前买入", "周线K15至25；日线MACD质量合格；本轮首次上涨3%；次日开盘"),
+        ("账户规模", "初始30万元；最多3只；每个名额约10万元"),
+        ("首次仓位", "每只一次性使用完整名额；整手买入；剩余零钱留在现金"),
+        ("候选不足", "只有1至2只合格候选时只买1至2只，其余名额保持现金"),
+        ("加仓", "禁止；高质量确认只表示原全额仓位继续持有"),
+        ("确认期限", "买入后14自然日内观察周线K是否上穿25"),
+        ("普通确认", "只有买入时2-2-1恰好5分继续持有；其余下一开盘退出"),
+        ("高质量确认", "红柱扩张且本轮累计上涨10至30%；继续持有，不加仓"),
+        ("已涨超过30", "保护已有全额仓位继续持有；不追买、不加仓"),
+        ("未确认退出", "14日仍未确认，下一可交易开盘退出"),
+        ("迟到确认", "退出后不重入"),
+        ("固定上限", "所有被保留股票持有至初始买入后的第40市场日收盘"),
+        ("基线", "不使用早期硬失败退出，其余规则完全相同"),
+        ("D3/D5/D7", "分别在买入后的第3/5/7市场日收盘检查，下一可交易开盘退出"),
+        ("MACD硬失败", f"柱≤0，或红柱剩余强度≤{V612_MACD_REMAINING_PCT:g}%且保留率<100%"),
+        ("价格硬失败", f"检查日收盘相对买入开盘≤{V612_PRICE_FAILURE_PCT:g}%"),
+        ("早退保护", "检查日前已观察到高质量、超涨确认，或普通确认且原始评分恰好5分"),
+        ("可见性", "早退只读取检查日收盘及此前确认；40日等级不参与交易"),
+        ("主排序", "2-2-1分降序；完全同分时日线MACD柱较小优先"),
+        ("同日Top3", "固定原始顺位前3；高顺位未成交时低顺位不晋级"),
+        ("日内顺序", "开盘退出→当日新候选全额买入；同日释放的名额可以再用"),
+        ("资本核算", "逐日现金、整手股数、持仓市值和交易成本真实复合"),
+        ("公平配对", "相同Path_No跨生命周期方案共用Seed；退出改变后续名额属于真实路径差异"),
+        ("F级目标", "同时审计F占比、F平均持有日、F名额占用日、F净利润与早退召回率"),
+        ("S/A保护", "同时审计早退中S/A比例与全部已买入S/A的误杀率"),
+        ("三股目标", "按实际成交事件验收盈利比例及每三个实际买入中至少两个盈利"),
+        ("牛股依赖", "静态扣除最大和前三盈利股票利润，不虚构释放名额后的反事实交易"),
+        ("缓存", "基础缓存72小时；行情和兼容逐股票检查点不主动过期"),
+    ], columns=["项目", "定义"])
+    cache_policy = pd.DataFrame([
+        ("交易日历", "Streamlit内存", "72小时", "实例重启可能提前消失"),
+        ("股票基础资料", "Streamlit内存", "72小时", "实例重启可能提前消失"),
+        ("申万科技行业成员", "Streamlit内存", "7天", "实例重启可能提前消失"),
+        ("逐股票日线与daily_basic", "应用临时磁盘", "不自动过期", "重新部署可能清空"),
+        ("兼容逐股票事件检查点", "应用临时磁盘", "不自动过期", "V6.12复用相同事件"),
+    ], columns=["对象", "位置", "设定时长", "实际边界"])
+    rejection_audit = pd.DataFrame([
+        {"剔除原因": key, "次数": value}
+        for key, value in sorted(rejects.items())])
+    metadata = pd.DataFrame([{
+        "程序版本": V63_VERSION,
+        "SKDJ_N": EARLY_PRIMARY_N, "SKDJ_M": SKDJ_M,
+        "回测交易日": int(backtest_days), "预热周": WARMUP_WEEKS,
+        "历史信号开始": signal_start, "历史信号截止": signal_end,
+        "行情截止": market_end,
+        "最低股价": float(min_price),
+        "最低流通市值亿元": float(min_mv),
+        "提前涨幅阈值%": V63_STRENGTH_THRESHOLD,
+        "确认期限自然日": 14,
+        "首次买入比例": "1.0000",
+        "买入后加仓": "禁止",
+        "高质量确认": "继续持有原全额仓位",
+        "普通确认": "原始2-2-1恰好5分固定40日",
+        "迟到确认重入": "禁止",
+        "同日入场顺位上限": 3,
+        "顺位递补": "禁止",
+        "主排序": "Score221Desc/DailyMACDHistAsc",
+        "早期失败检查市场日": "3/5/7",
+        "早期价格失败阈值%": V612_PRICE_FAILURE_PCT,
+        "早期MACD剩余阈值%": V612_MACD_REMAINING_PCT,
+        "组合初始资金": V66_INITIAL_CAPITAL,
+        "组合股票名额": V66_MAX_STOCKS,
+        "单股目标投入": V66_FULL_SLOT_CAPITAL,
+        "整手股数": V66_BOARD_LOT,
+        "组合方案数": len(V66_PORTFOLIO_SCHEMES),
+        "每组选择方式路径数": int(portfolio_draws),
+        "共用随机种子起点": V66_RANDOM_SEED,
+        "内存缓存小时": CACHE_TTL_SECONDS / 3600,
+        "Streamlit": streamlit_version,
+    }])
+
+    detail_columns = [
+        "Event_Type", "Strategy_Label", "ts_code", "name", "Signal_Date",
+        "Signal_Week", "SW_L1", "SW_L2", "Raw_Close", "Circ_MV_Billion",
+        "Setup_Weekly_Date", "Signal_K", "Signal_D", "Signal_KD_Spread",
+        "Daily_MACD_State", "Daily_MACD_Red_Age", "Daily_MACD_Hist",
+        "Daily_MACD_Remaining_pct", "Daily_MACD_Retention_pct",
+        "Signal_Rally_From_Red_Start_pct",
+        "Signal_Day_Strength3_Count", "Signal_Week_Cumulative_Strength3_Count",
+        "Trailing5D_Strength3_Count", "Future_Full_Week_Strength3_Count",
+        "Signal_Day_Breadth_Group", "Week_Cumulative_Breadth_Group",
+        "Trailing5D_Breadth_Group", "Future_Full_Week_Breadth_Group",
+        "Timing_K15_20_Pass", "Timing_RedAge3_5_Pass",
+        "Timing_WeeklyK_BelowD_Pass", "Timing_Score_221",
+        "Timing_Three_Factor_Count", "Entry_Date", "Entry_Raw_Open",
+        "Entry_End_Date_40D", "Entry_MFE_Net_pct", "Entry_MAE_Raw_pct",
+        "Entry_Close_Return_Net_pct", "Explosion_Class_40D",
+        "Future_Weekly_Cross25_Date", "Future_Cross_State",
+        "Future_Cross_Daily_MACD_State",
+        "Future_Cross_Rally_From_Red_Start_pct", "Cross_Delay_Group",
+        "V65_Lifecycle_Action", "Confirm14_Confirmed", "Confirm14_Exit_Date",
+        "CrossImmediate_Decision_Date", "CrossImmediate_Exit_Date",
+        "CrossEntry_Date", "CrossEntry_Tradable", "CrossEntry_Has_40D",
+    ]
+    live_columns = [
+        "Event_Type", "Strategy_Label", "ts_code", "name", "Signal_Date",
+        "Signal_Week", "SW_L1", "SW_L2", "Raw_Close", "Circ_MV_Billion",
+        "Setup_Weekly_Date", "Signal_K", "Signal_D", "Signal_KD_Spread",
+        "Daily_MACD_State", "Daily_MACD_Red_Age", "Daily_MACD_Hist",
+        "Daily_MACD_Remaining_pct", "Daily_MACD_Retention_pct",
+        "Signal_Rally_From_Red_Start_pct", "Timing_Score_221",
+        "Timing_Three_Factor_Count", "Future_Cross_State",
+        "Future_Weekly_Cross25_Date", "Current_Lifecycle_Status",
+        "Watch_Next_Strength_Threshold",
+    ]
+    history_weekly_export = weekly[[
+        column for column in detail_columns + ["Weekly_Momentum_Tier"]
+        if column in weekly.columns]].copy()
+    recent_early_export = recent_early[[
+        column for column in live_columns if column in recent_early.columns]].copy()
+    recent_weekly_export = recent_weekly[[
+        column for column in live_columns if column in recent_weekly.columns]].copy()
+    live_watch_export = live_watch[[
+        column for column in live_columns if column in live_watch.columns]].copy()
+
+    files = {
+        "01_run_summary_v6_12.csv": run_summary,
+        "02_experiment_definitions_v6_12.csv": definitions,
+        "03_early_failure_ensemble_summary_v6_12.csv": portfolio_summary,
+        "04_paired_early_failure_comparison_v6_12.csv": paired_early_failure,
+        "05_rule_vs_random_portfolio_v6_12.csv": score_vs_random,
+        "06_all_portfolio_paths_v6_12.csv": portfolio_paths,
+        "07_all_path_year_summary_v6_12.csv": all_path_year_summary,
+        "08_all_path_year_detail_v6_12.csv": all_path_year_detail,
+        "09_representative_path_annual_v6_12.csv": representative_annual,
+        "10_representative_path_equity_v6_12.csv": representative_equity,
+        "11_representative_path_trades_v6_12.csv": representative_trades,
+        "12_actual_f_slot_and_sa_false_exit_audit_v6_12.csv": actual_f_slot_audit,
+        "13_actual_selected_grade_and_win_audit_v6_12.csv": actual_selected_grade_audit,
+        "14_early_failure_event_summary_v6_12.csv": early_failure_event_summary,
+        "15_early_failure_event_detail_v6_12.csv": early_failure_event_detail,
+        "16_rule_rank_1_2_3_path_summary_v6_12.csv": score_rank_summary,
+        "17_profit_concentration_ablation_v6_12.csv": profit_concentration,
+        "18_representative_stock_profit_contribution_v6_12.csv": representative_stock_profit,
+        "19_common_seed_pairing_audit_v6_12.csv": seed_pairing_audit,
+        "20_portfolio_event_audit_v6_12.csv": portfolio_event_audit,
+        "21_ordinary_exact_factor_combination_v6_12.csv": ordinary_factor_combo,
+        "22_ordinary_confirmation_by_exact_score_v6_12.csv": ordinary_score_audit,
+        "23_high_confirmation_by_exact_score_v6_12.csv": high_score_audit,
+        "24_early_outcomes_by_cross_state_v6_12.csv": cross_state_outcomes,
+        "25_fresh_cross_entry_by_state_v6_12.csv": cross_entry_outcomes,
+        "26_weekly_coverage_summary_v6_12.csv": coverage,
+        "27_weekly_signal_calendar_v6_12.csv": calendar,
+        "28_historical_weekly_control_detail_v6_12.csv": history_weekly_export,
+        "29_recent_14d_strength3_candidates_v6_12.csv": recent_early_export,
+        "30_recent_14d_weekly_candidates_v6_12.csv": recent_weekly_export,
+        "31_latest_market_day_watch_pool_v6_12.csv": live_watch_export,
+        "32_cache_policy_v6_12.csv": cache_policy,
+        "33_rejection_audit_v6_12.csv": rejection_audit,
+        "34_metadata_v6_12.csv": metadata,
+        "35_api_errors_v6_12.csv": pd.DataFrame({"错误": API_ERRORS}),
+    }
+    result_zip = make_zip(files)
+    try:
+        atomic_bytes(result_zip, result_path)
+        v63_clear_job_active(request_signature)
+        persisted = True
+    except Exception as exc:
+        persisted = False
+        st.warning(f"结果未能持久保存，但当前页面仍可下载：{exc}")
+
+    st.success(
+        f"完成：成熟3%提前事件{len(early)}个，周线确认对照{len(weekly)}个；"
+        f"已运行{len(portfolio_paths)}条30万元全额三仓路径；"
+        f"14日内高质量确认继续持有资格"
+        f"{int(early['V65_Lifecycle_Action'].eq('14日内高质量确认_试仓升级').sum())}个，"
+        f"普通确认5分继续持有"
+        f"{int((early['V65_Lifecycle_Action'].eq('14日内普通确认_只保留试仓') & numeric(early, 'Timing_Score_221').eq(5.0)).sum())}个；"
+        f"最近14日3%信号{len(recent_early)}个，最新观察池{len(live_watch)}只；"
+        f"结果{'已保存' if persisted else '仅当前页面可下载'}。")
+
+    st.subheader("结论一：全额三仓基线与D3/D5/D7早期硬失败退出")
+    render_plain_table(portfolio_summary, 40)
+    st.caption("这是逐日现金、整手股数、持仓市值和成本复合后的账户结果，不是事件收益平均。")
+    st.subheader("结论二：D3/D5/D7相对无早退基线的逐路径配对")
+    render_plain_table(paired_early_failure, 30)
+    st.caption("重点看收益差分布、最大回撤、资金暴露、高质量确认捕获率和早退数量，而不是只看一条中位路径。")
+    st.subheader("结论三：实际F级占用名额与S/A误杀")
+    render_plain_table(actual_f_slot_audit, 30)
+    st.caption("按各方案中位代表路径的实际成交事件统计；F级平均持有日和名额占用日直接对应资金周转效率。")
+    st.subheader("结论四：D3/D5/D7硬失败条件本身的识别质量")
+    render_plain_table(early_failure_event_summary, 20)
+    st.caption("这是全部成熟事件的独立诊断：触发中F比例衡量精度，清除全部F比例衡量召回，误杀全部S/A比例衡量代价。")
+    st.subheader("结论五：实际买入是否维持S/A/B追求和三股盈利目标")
+    render_plain_table(actual_selected_grade_audit, 30)
+    st.caption("正式验收口径是实际成交事件，而不是候选池平均；同时查看F比例、A/S比例、事件胜率和每三只至少两只盈利。")
+    st.subheader("结论六：固定排序是否优于完全随机")
+    render_plain_table(score_vs_random, 30)
+    st.caption("若规则优于随机比例长期只在50%左右，说明排序并未提供稳定优势。")
+    st.subheader("结论七：实际入场第1/2/3顺位")
+    render_plain_table(score_rank_summary, 40)
+    st.subheader("结论八：剔除头部盈利股票后的静态稳健性")
+    render_plain_table(profit_concentration, 40)
+    st.subheader("结论九：全部路径的逐年稳定性")
+    render_plain_table(all_path_year_summary, 100)
+    with st.expander("中位代表路径逐年表与共用Seed审计", expanded=False):
+        render_plain_table(representative_annual, 80)
+        render_plain_table(seed_pairing_audit, 20)
+    with st.expander("三因子精确组合与确认评分审计", expanded=False):
+        render_plain_table(ordinary_factor_combo, 100)
+        render_plain_table(ordinary_score_audit, 30)
+        render_plain_table(high_score_audit, 30)
+    with st.expander("D3/D5/D7逐事件触发明细", expanded=False):
+        render_plain_table(early_failure_event_detail, 500)
+    st.subheader("确认速度与确认日状态")
+    render_plain_table(cross_state_outcomes, 30)
+    render_plain_table(cross_entry_outcomes, 30)
+    st.subheader("最近14日3%提前候选")
+    recent_sort = [
+        column for column in ["Signal_Date", "Current_Lifecycle_Status",
+                              "Signal_Rally_From_Red_Start_pct"]
+        if column in recent_early_export.columns]
+    if recent_sort:
+        recent_early_export = recent_early_export.sort_values(
+            recent_sort,
+            ascending=[False, True, False][:len(recent_sort)])
+    render_plain_table(recent_early_export, 300)
+    st.subheader(f"最新交易日周线K15至25观察池：{latest_market_date}")
+    watch_sort = [
+        column for column in ["Signal_K", "Signal_KD_Spread"]
+        if column in live_watch_export.columns]
+    if watch_sort:
+        live_watch_export = live_watch_export.sort_values(watch_sort)
+    render_plain_table(live_watch_export, 300)
+    st.subheader("运行摘要与覆盖率")
+    render_plain_table(run_summary, 10)
+    render_plain_table(coverage, 10)
+    st.caption(
+        f"结果ZIP共{len(files)}个CSV；历史成熟事件、组合路径、"
+        "最近候选和最新观察池严格分开。")
+    render_download(result_zip, result_name, f"v612_current_{request_signature}")
 
 
 if __name__ == "__main__":
