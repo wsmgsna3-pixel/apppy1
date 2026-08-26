@@ -1,19 +1,16 @@
 # -*- coding: utf-8 -*-
-"""周线SKDJ参数对齐与日线MACD红柱第2日买点回测 V6.13。
+"""周线SKDJ N6股票池、日线MACD红2与Top5生命周期回测 V6.14。
 
-本版先解决人工图表与程序SKDJ数值不一致的问题：使用用户提供的同花顺
-SKDJ公式和四个历史K/D校准点，对N=2～60、M=2～10逐项扫描并输出误差
-排名。N=9、M=3只作为待验证的主假设，N=6、M=3保留为严格对照；程序
-不会把“常用默认参数”误写成已经校准成功。
+每天使用截至当日收盘可见的未完成周线生成N=6、M=3的SKDJ准备池，再由
+日线MACD第2根红柱确认主买点，下一交易日开盘模拟成交。每天最多选择评分
+前5名并为每个事件提供独立虚拟资金，不运行三仓资金组合；红1和红3只保留
+为相同规则下的影子买点对照。
 
-买点研究把周线SKDJ降为准备区判断，把日线MACD作为执行时钟。新主方案和
-对照方案均在截至信号日收盘可见的动态周线K处于10～25且较上一完整周上升
-时进入观察，并在日线MACD第2根红柱收盘确认、下一交易日开盘全额买入。
-旧N=6、周线K15～25、日线上涨3%确认继续作为冻结基准。三套信号均按30万
-元、最多3只、每只约10万元完整名额进行真实撮合，不试仓、不补仓。
-
-以下保留V6.12及更早版本的函数，最后定义的V6.13 ``main`` 是唯一入口，
-以降低重写历史数据、行业池、缓存和交易成本基础设施带来的回归风险。
+持仓不再固定40日。收盘跌破买入价5%、或跌破买入以来截至上一交易日最高
+价回撤15%的保护线时，于下一可交易日开盘退出；挑战方案在最高收盘达到
++20%后，再保护最高收盘浮盈的一半。以下保留V6.13及更早版本的函数，最后
+定义的V6.14 ``main`` 是唯一入口，以降低重写历史数据、行业池、缓存和交易
+成本基础设施带来的回归风险。
 """
 from __future__ import annotations
 
@@ -14124,8 +14121,1321 @@ def v613_main() -> None:
         result_zip, result_name, f"v613_current_{request_signature}")
 
 
+# ---------------------------------------------------------------------------
+# V6.14 daily N6/red2 Top5 lifecycle monitor.
+#
+# The V6.13 calibration and portfolio code above remains frozen for audit.  The
+# new entry point below reuses its observable partial-week calculation, cache,
+# universe and transaction-cost infrastructure, but deliberately removes the
+# three-slot capital path and fixed-40-day liquidation from the primary test.
+# ---------------------------------------------------------------------------
+
+V614_TITLE = "周线SKDJ N6＋日线MACD红2 Top5生命周期回测 V6.14"
+V614_VERSION = "V6.14-N6-RED2-DAILY-TOP5-LIFECYCLE"
+V614_UI_PATCH = "V6.14-PARTIAL-WEEK-N6-RED123-SHADOW-HARD5-TRAIL15-AHALF"
+V614_RESULT_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_14_results")
+V614_JOB_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_14_jobs")
+V614_CHECKPOINT_DIR = os.path.join(APP_DIR, "weekly_skdj_v6_14_checkpoints")
+V614_EVENT_ENGINE_VERSION = "V6.14-N6-PARTIAL-WEEK-RED123-EVENTS-R1"
+V614_PRIMARY_N = 6
+V614_M = 3
+V614_TOP_N = 5
+V614_MAIN_RED_AGE = 2
+V614_SHADOW_RED_AGES = (1, 2, 3)
+V614_K_MIN = 10.0
+V614_K_MAX = 25.0
+V614_HARD_STOP_PCT = 5.0
+V614_TRAIL_DRAWDOWN_PCT = 15.0
+V614_PROFIT_FLOOR_ACTIVATION_PCT = 20.0
+V614_PROFIT_KEEP_RATIO = 0.50
+V614_EXIT_MODES = (
+    ("Hard5Trail15", "-5%硬止损＋截至上一日最高价回撤15%"),
+    (
+        "Hard5Trail15AHalf",
+        "-5%硬止损＋回撤15%＋收盘达到20%后保护一半最高收盘浮盈",
+    ),
+)
+
+
+def v614_checkpoint_path(signature: str, ts_code: str) -> str:
+    return os.path.join(
+        V614_CHECKPOINT_DIR, signature,
+        f"{str(ts_code).replace('.', '_')}.pkl")
+
+
+def v614_load_checkpoint(
+        signature: str, ts_code: str) -> dict[str, Any] | None:
+    path = v614_checkpoint_path(signature, ts_code)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "rb") as handle:
+            payload = pickle.load(handle)
+        if (not isinstance(payload, dict)
+                or payload.get("signature") != signature
+                or payload.get("ts_code") != str(ts_code)
+                or "events" not in payload or "rejects" not in payload):
+            return None
+        return payload
+    except Exception as exc:
+        record_error(f"V6.14检查点损坏 {ts_code}: {exc}")
+        return None
+
+
+def v614_save_checkpoint(
+        signature: str, ts_code: str, events: list[dict[str, Any]],
+        rejects: dict[str, int]) -> None:
+    atomic_pickle({
+        "signature": signature, "ts_code": str(ts_code),
+        "events": events, "rejects": rejects,
+    }, v614_checkpoint_path(signature, ts_code))
+
+
+def v614_active_job_path(signature: str) -> str:
+    return os.path.join(V614_JOB_DIR, f"{signature}.active")
+
+
+def v614_mark_job_active(signature: str) -> None:
+    atomic_bytes(json.dumps({
+        "signature": signature, "version": V614_VERSION,
+        "updated_at": pd.Timestamp.utcnow().isoformat(),
+    }, ensure_ascii=False).encode("utf-8"), v614_active_job_path(signature))
+
+
+def v614_clear_job_active(signature: str) -> None:
+    path = v614_active_job_path(signature)
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError as exc:
+        record_error(f"V6.14任务标记清除失败: {exc}")
+
+
+def v614_is_job_active(signature: str) -> bool:
+    return os.path.exists(v614_active_job_path(signature))
+
+
+def v614_week_bar_state(
+        signal_date: str,
+        week_last_map: dict[pd.Timestamp, str]) -> tuple[str, str]:
+    period = pd.Timestamp(signal_date).to_period("W-FRI")
+    week_label = period.end_time.normalize()
+    week_last = str(week_last_map.get(week_label, ""))
+    state = "本周已完成" if week_last == signal_date else "本周未完成"
+    return state, week_last
+
+
+def v614_analyze_stock(
+        stock: pd.Series, periods: list[dict[str, str]], daily: pd.DataFrame,
+        cached_basic: pd.DataFrame, storage_path: str,
+        week_last_map: dict[pd.Timestamp, str], open_dates: list[str],
+        open_pos: dict[str, int], config: dict[str, Any], use_cache: bool,
+        api_pause: float) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Create N6 partial-week red1/red2/red3 events using only as-of data."""
+    rejects: dict[str, int] = {}
+    weekly_base = aggregate_complete_weekly(daily, week_last_map)
+    if weekly_base.empty:
+        return [], rejects
+    frame = v613_daily_indicator_frame(daily, weekly_base)
+    dates = frame["trade_date"].astype(str)
+    event_end = str(config.get("event_signal_end", config["market_end"]))
+    formal = dates.between(config["signal_start"], event_end)
+    positive = true_mask(frame, "Daily_MACD_Positive")
+    dynamic_k = numeric(frame, "Dynamic_N6_Weekly_K")
+    dynamic_change = numeric(frame, "Dynamic_N6_Weekly_K_Change")
+    base_mask = (
+        formal & positive
+        & dynamic_k.between(V614_K_MIN, V614_K_MAX, inclusive="both")
+        & dynamic_change.gt(0)
+    )
+    selected_by_age: dict[int, pd.DataFrame] = {}
+    for red_age in V614_SHADOW_RED_AGES:
+        selected = frame[
+            base_mask
+            & numeric(frame, "Daily_MACD_Red_Age").eq(red_age)
+        ].copy().sort_values("trade_date")
+        if not selected.empty:
+            selected = selected.groupby(
+                "Daily_MACD_Cycle", as_index=False, sort=False).first()
+        selected_by_age[int(red_age)] = selected
+
+    latest_date = str(config.get("latest_market_date", config["market_end"]))
+    latest_watch = frame[
+        dates.eq(latest_date)
+        & dynamic_k.between(V614_K_MIN, V614_K_MAX, inclusive="both")
+        & dynamic_change.gt(0)
+    ].copy().tail(1)
+    estimated = sum(len(value) for value in selected_by_age.values()) + len(
+        latest_watch)
+    if estimated == 0:
+        return [], rejects
+
+    code = str(stock["ts_code"])
+    basic = ensure_daily_basic(
+        code, config["data_start"], config["market_end"], daily,
+        cached_basic, storage_path, use_cache, api_pause)
+    if basic.empty:
+        rejects["存在V6.14信号但daily_basic缺失"] = estimated
+        return [], rejects
+
+    rows: list[dict[str, Any]] = []
+    outcome_cache: dict[str, dict[str, Any]] = {}
+    frame_period = pd.to_datetime(
+        frame["trade_date"], format="%Y%m%d").dt.to_period("W-FRI")
+
+    def append_row(
+            signal: pd.Series, red_age: int,
+            is_watch: bool = False) -> None:
+        signal_date = str(signal["trade_date"])
+        membership = membership_on_date(periods, signal_date)
+        snapshot = market_snapshot(basic, signal_date)
+        reason = ""
+        if membership is None:
+            reason = "信号日不在历史科技池"
+        elif not (str(stock["list_date"]) <= signal_date
+                  < str(stock["delist_date"])):
+            reason = "信号日上市状态无效"
+        elif (not math.isfinite(snapshot["Raw_Close"])
+              or snapshot["Raw_Close"] < config["min_price"]):
+            reason = "信号日股价不足"
+        elif (not math.isfinite(snapshot["Circ_MV_Billion"])
+              or snapshot["Circ_MV_Billion"] < config["min_mv"]):
+            reason = "信号日流通市值不足"
+        if reason or membership is None:
+            rejects[reason] = rejects.get(reason, 0) + 1
+            return
+
+        signal_k = finite_num(signal.get("Dynamic_N6_Weekly_K"))
+        signal_d = finite_num(signal.get("Dynamic_N6_Weekly_D"))
+        signal_change = finite_num(
+            signal.get("Dynamic_N6_Weekly_K_Change"))
+        legacy_k = int(
+            math.isfinite(signal_k) and 15.0 <= signal_k <= 20.0)
+        legacy_age = int(3 <= int(red_age) <= 5)
+        legacy_kd = int(
+            math.isfinite(signal_k) and math.isfinite(signal_d)
+            and signal_k < signal_d)
+        week_state, week_last = v614_week_bar_state(
+            signal_date, week_last_map)
+        signal_period = pd.Timestamp(signal_date).to_period("W-FRI")
+        final_week = frame[frame_period.eq(signal_period)].sort_values(
+            "trade_date")
+        completed_available = bool(
+            week_last and week_last <= str(config["latest_market_date"])
+            and not final_week.empty
+            and str(final_week.iloc[-1]["trade_date"]) == week_last)
+        if completed_available:
+            final_row = final_week.iloc[-1]
+            final_k = finite_num(final_row.get("Dynamic_N6_Weekly_K"))
+            final_change = finite_num(
+                final_row.get("Dynamic_N6_Weekly_K_Change"))
+            later_confirmed: Any = bool(
+                math.isfinite(final_k)
+                and V614_K_MIN <= final_k <= V614_K_MAX
+                and math.isfinite(final_change) and final_change > 0)
+        else:
+            final_k = np.nan
+            final_change = np.nan
+            later_confirmed = "尚未完成"
+        row: dict[str, Any] = {
+            "Event_Type": "LIVE_WATCH" if is_watch else "ENTRY_SIGNAL",
+            "Strategy_Key": (
+                "N6_LIVE_WATCH" if is_watch else f"N6_DYNAMIC_RED{red_age}"),
+            "Strategy_Label": (
+                "N6动态周线观察池" if is_watch
+                else f"N6动态周线＋日线MACD红柱第{red_age}日"),
+            "Entry_Red_Age_Hypothesis": int(red_age),
+            "Weekly_SKDJ_N": V614_PRIMARY_N, "SKDJ_M": V614_M,
+            "Weekly_Data_Mode": "截至当日动态周线",
+            "Weekly_Bar_State": week_state,
+            "Week_Last_Trading_Date": week_last,
+            "Later_Week_Close_Confirmed": later_confirmed,
+            "Later_Week_Close_N6_K": final_k,
+            "Later_Week_Close_N6_K_Change": final_change,
+            "Entry_Trigger_Mode": (
+                "仅观察" if is_watch else f"MACD红柱第{red_age}日"),
+            "ts_code": code, "name": str(stock["name"]),
+            "Signal_Date": signal_date,
+            "Signal_Weekday": pd.Timestamp(signal_date).day_name(),
+            "Signal_Week": str(signal_period),
+            "SW_L1": membership["l1"], "SW_L2": membership["l2"],
+            "SW_L3": membership["l3"], **snapshot,
+            "Setup_Weekly_Date": str(
+                signal.get("Dynamic_N6_Prior_Weekly_Date", "")),
+            "Signal_K": signal_k, "Signal_D": signal_d,
+            "Signal_KD_Spread": signal_k - signal_d,
+            "Signal_K_Change_1W": signal_change,
+            "Weekly_K_Approach_Band": v613_k_band(signal_k),
+            **macd_snapshot(signal),
+            "Signal_Rally_From_Red_Start_pct": finite_num(
+                signal.get("Daily_Return_Since_Red_Start_pct")),
+            "Signal_Daily_SKDJ_N6_K": finite_num(
+                signal.get("Daily_SKDJ_N6_K")),
+            "Signal_Daily_SKDJ_N6_D": finite_num(
+                signal.get("Daily_SKDJ_N6_D")),
+            "Signal_Daily_SKDJ_N9_K": finite_num(
+                signal.get("Daily_SKDJ_N9_K")),
+            "Signal_Daily_SKDJ_N9_D": finite_num(
+                signal.get("Daily_SKDJ_N9_D")),
+            "Legacy_Timing_Score_221": (
+                V63_SCORE_K_WEIGHT * legacy_k
+                + V63_SCORE_AGE_WEIGHT * legacy_age
+                + V63_SCORE_KD_WEIGHT * legacy_kd),
+        }
+        if not is_watch:
+            if signal_date not in outcome_cache:
+                outcome_cache[signal_date] = daily_timing_outcomes(
+                    frame, signal_date, code, open_dates, open_pos, config)
+            outcome = outcome_cache[signal_date]
+            row.update({f"Entry_{key}": value for key, value in outcome.items()})
+        rows.append(row)
+
+    for red_age, selected in selected_by_age.items():
+        for _, signal in selected.iterrows():
+            append_row(signal, red_age, False)
+    for _, signal in latest_watch.iterrows():
+        append_row(signal, V614_MAIN_RED_AGE, True)
+    return rows, rejects
+
+
+def v614_rank_daily_events(events: pd.DataFrame) -> pd.DataFrame:
+    """Transparent red-entry ranking; every component is visible at signal close."""
+    if events.empty:
+        return events.copy()
+    work = events.copy()
+    work["V614_K_Band_Score"] = np.select(
+        [
+            numeric(work, "Signal_K").between(10.0, 20.0, inclusive="both"),
+            numeric(work, "Signal_K").gt(20.0)
+            & numeric(work, "Signal_K").le(25.0),
+        ], [40.0, 20.0], default=0.0)
+    group_keys = ["Entry_Red_Age_Hypothesis", "Signal_Date"]
+    work["V614_K_Change_RankPct"] = work.groupby(
+        group_keys, dropna=False)["Signal_K_Change_1W"].rank(
+            pct=True, method="average", na_option="bottom")
+    work["V614_MACD_Retention_RankPct"] = work.groupby(
+        group_keys, dropna=False)["Daily_MACD_Retention_pct"].rank(
+            pct=True, method="average", na_option="bottom")
+    work["V614_K_Change_Score"] = (
+        numeric(work, "V614_K_Change_RankPct").fillna(0.0) * 30.0)
+    work["V614_MACD_Retention_Score"] = (
+        numeric(work, "V614_MACD_Retention_RankPct").fillna(0.0) * 30.0)
+    work["V614_Rank_Score_100"] = (
+        numeric(work, "V614_K_Band_Score")
+        + numeric(work, "V614_K_Change_Score")
+        + numeric(work, "V614_MACD_Retention_Score"))
+    work = work.sort_values(
+        ["Entry_Red_Age_Hypothesis", "Signal_Date",
+         "V614_Rank_Score_100", "Signal_K", "ts_code"],
+        ascending=[True, True, False, True, True]).reset_index(drop=True)
+    work["Daily_Rank"] = work.groupby(
+        group_keys, dropna=False).cumcount() + 1
+    work["Selected_Top5"] = numeric(work, "Daily_Rank").le(V614_TOP_N)
+    work["Pick_ID"] = [
+        f"R{int(age)}:{code}:{signal_date}"
+        for age, code, signal_date in zip(
+            numeric(work, "Entry_Red_Age_Hypothesis").fillna(0),
+            work["ts_code"].astype(str), work["Signal_Date"].astype(str))
+    ]
+    return work
+
+
+def v614_selection_calendar(
+        ranked: pd.DataFrame, open_dates: list[str], start_date: str,
+        end_date: str) -> pd.DataFrame:
+    days = [value for value in open_dates if start_date <= value <= end_date]
+    calendar = pd.DataFrame({"trade_date": days})
+    for red_age in V614_SHADOW_RED_AGES:
+        group = ranked[
+            numeric(ranked, "Entry_Red_Age_Hypothesis").eq(red_age)]
+        raw_counts = group.groupby("Signal_Date").size()
+        selected_counts = group[true_mask(
+            group, "Selected_Top5")].groupby("Signal_Date").size()
+        calendar[f"红{red_age}合格候选"] = calendar["trade_date"].map(
+            raw_counts).fillna(0).astype(int)
+        calendar[f"红{red_age}模拟买入"] = calendar["trade_date"].map(
+            selected_counts).fillna(0).astype(int)
+    calendar["主方案是否空窗"] = calendar["红2模拟买入"].eq(0)
+    calendar["Signal_Week"] = pd.to_datetime(
+        calendar["trade_date"], format="%Y%m%d").dt.to_period(
+            "W-FRI").astype(str)
+    return calendar
+
+
+def v614_dynamic_grade(mfe_net_pct: Any, is_closed: bool) -> str:
+    mfe = finite_num(mfe_net_pct)
+    if math.isfinite(mfe) and mfe >= 30.0:
+        return "S"
+    if math.isfinite(mfe) and mfe >= 20.0:
+        return "A"
+    if math.isfinite(mfe) and mfe >= 10.0:
+        return "B"
+    return "F" if is_closed else "未定级"
+
+
+def v614_simulate_pick(
+        event: dict[str, Any], book: dict[str, Any],
+        open_dates: list[str], config: dict[str, Any],
+        exit_mode: str) -> dict[str, Any]:
+    """Follow one Top5 pick without capital constraints or a fixed horizon."""
+    signal_date = normalize_date(event.get("Signal_Date"))
+    latest_date = normalize_date(config.get("latest_market_date"))
+    entry_date = normalize_date(event.get("Entry_Date"))
+    entry_reason = str(event.get("Entry_Reason", ""))
+    base = {
+        **event,
+        "Exit_Mode_Key": exit_mode,
+        "Exit_Mode": dict(V614_EXIT_MODES).get(exit_mode, exit_mode),
+        "Entry_Status_Reason": entry_reason,
+        "Entry_Execution_Date": entry_date,
+        "Entry_Raw_Open": np.nan,
+        "Entry_Trade_Price": np.nan,
+        "Lifecycle_Status": "",
+        "Decision_Date": "", "Exit_Date": "", "Exit_Reason": "",
+        "Exit_Raw_Open": np.nan, "Exit_Trade_Price": np.nan,
+        "Realized_Return_Net_pct": np.nan,
+        "Current_Return_Net_pct": np.nan,
+        "Current_or_Exit_Return_Net_pct": np.nan,
+        "Hold_Market_Days": np.nan, "Exit_Week": np.nan,
+        "Highest_High_Through_Status": np.nan,
+        "Highest_Close_Through_Status": np.nan,
+        "MFE_Net_pct": np.nan, "MAE_Raw_pct": np.nan,
+        "Decision_Hard_Stop_Line": np.nan,
+        "Decision_Trail15_Line": np.nan,
+        "Decision_AHalf_Profit_Line": np.nan,
+        "Decision_Effective_Line": np.nan,
+        "Next_Day_Hard_Stop_Line": np.nan,
+        "Next_Day_Trail15_Line": np.nan,
+        "Next_Day_AHalf_Profit_Line": np.nan,
+        "Next_Day_Effective_Line": np.nan,
+        "Dynamic_Grade": "未买入",
+    }
+    if not entry_date:
+        next_market = ""
+        if signal_date in open_dates:
+            signal_position = open_dates.index(signal_date)
+            if signal_position + 1 < len(open_dates):
+                next_market = str(open_dates[signal_position + 1])
+        if not next_market or next_market > latest_date:
+            base["Lifecycle_Status"] = "待次日开盘买入"
+        else:
+            base["Lifecycle_Status"] = "未成交"
+        return base
+    if entry_date > latest_date:
+        base["Lifecycle_Status"] = "待次日开盘买入"
+        return base
+
+    raw_entry = finite_num(book.get("open", {}).get(entry_date))
+    if not math.isfinite(raw_entry) or raw_entry <= 0:
+        base["Lifecycle_Status"] = "未成交"
+        base["Entry_Status_Reason"] = (
+            entry_reason or "模拟成交日开盘价缺失")
+        return base
+    buy_factor, sell_factor = _cost_factors(config)
+    buy_slippage = float(config.get("buy_slippage_pct", 0.0)) / 100.0
+    sell_slippage = float(config.get("sell_slippage_pct", 0.0)) / 100.0
+    entry_trade_price = raw_entry * (1.0 + buy_slippage)
+    net_entry = raw_entry * buy_factor
+    hard_line = entry_trade_price * (1.0 - V614_HARD_STOP_PCT / 100.0)
+    base.update({
+        "Entry_Raw_Open": raw_entry,
+        "Entry_Trade_Price": entry_trade_price,
+        "Next_Day_Hard_Stop_Line": hard_line,
+    })
+
+    stock_dates = [
+        str(value) for value in book.get("dates", [])
+        if entry_date <= str(value) <= latest_date]
+    if not stock_dates:
+        base["Lifecycle_Status"] = "未成交"
+        base["Entry_Status_Reason"] = "成交后无个股行情"
+        return base
+    open_pos = {value: position for position, value in enumerate(open_dates)}
+    prior_high = entry_trade_price
+    prior_max_close = entry_trade_price
+    observed_high = entry_trade_price
+    observed_low = entry_trade_price
+    last_close = np.nan
+    last_date = entry_date
+    decision_date = ""
+    decision_reason = ""
+    pending_exit = False
+    exit_date = ""
+    exit_raw_open = np.nan
+    decision_lines: dict[str, float] = {}
+
+    for trade_date in stock_dates:
+        close = finite_num(book.get("close", {}).get(trade_date))
+        high = finite_num(book.get("high", {}).get(trade_date))
+        low = finite_num(book.get("low", {}).get(trade_date))
+        if not math.isfinite(close) or close <= 0:
+            continue
+        trail_line = prior_high * (
+            1.0 - V614_TRAIL_DRAWDOWN_PCT / 100.0)
+        profit_floor = np.nan
+        if (exit_mode == "Hard5Trail15AHalf"
+                and prior_max_close >= entry_trade_price * (
+                    1.0 + V614_PROFIT_FLOOR_ACTIVATION_PCT / 100.0)):
+            profit_floor = (
+                entry_trade_price
+                + V614_PROFIT_KEEP_RATIO
+                * (prior_max_close - entry_trade_price))
+        effective_candidates = [hard_line, trail_line]
+        if math.isfinite(profit_floor):
+            effective_candidates.append(profit_floor)
+        effective_line = max(effective_candidates)
+        triggered = close <= effective_line
+        if triggered:
+            labels = []
+            tolerance = max(abs(effective_line), 1.0) * 1e-10
+            if abs(hard_line - effective_line) <= tolerance:
+                labels.append("收盘跌破买入价5%硬止损")
+            if abs(trail_line - effective_line) <= tolerance:
+                labels.append("收盘跌破截至上一日最高价回撤15%线")
+            if (math.isfinite(profit_floor)
+                    and abs(profit_floor - effective_line) <= tolerance):
+                labels.append("收盘跌破A类半浮盈保护线")
+            decision_date = trade_date
+            decision_reason = "+".join(labels) or "收盘跌破有效退出线"
+            decision_lines = {
+                "Decision_Hard_Stop_Line": hard_line,
+                "Decision_Trail15_Line": trail_line,
+                "Decision_AHalf_Profit_Line": profit_floor,
+                "Decision_Effective_Line": effective_line,
+            }
+
+        # Today's high and close become references only for the next trading
+        # day.  They never raise the line used to judge today's close.
+        if math.isfinite(high) and high > 0:
+            prior_high = max(prior_high, high)
+            observed_high = max(observed_high, high)
+        prior_max_close = max(prior_max_close, close)
+        if math.isfinite(low) and low > 0:
+            observed_low = min(observed_low, low)
+        last_close = close
+        last_date = trade_date
+
+        if triggered:
+            next_date = v613_next_stock_date(book, trade_date)
+            if next_date and next_date <= latest_date:
+                candidate_open = finite_num(book.get("open", {}).get(next_date))
+                if math.isfinite(candidate_open) and candidate_open > 0:
+                    exit_date = next_date
+                    exit_raw_open = candidate_open
+                else:
+                    pending_exit = True
+            else:
+                pending_exit = True
+            break
+
+    next_trail = prior_high * (
+        1.0 - V614_TRAIL_DRAWDOWN_PCT / 100.0)
+    next_floor = np.nan
+    if (exit_mode == "Hard5Trail15AHalf"
+            and prior_max_close >= entry_trade_price * (
+                1.0 + V614_PROFIT_FLOOR_ACTIVATION_PCT / 100.0)):
+        next_floor = (
+            entry_trade_price
+            + V614_PROFIT_KEEP_RATIO
+            * (prior_max_close - entry_trade_price))
+    next_effective = max(
+        [hard_line, next_trail]
+        + ([next_floor] if math.isfinite(next_floor) else []))
+    mfe_net = (observed_high * sell_factor / net_entry - 1.0) * 100.0
+    mae_raw = (observed_low / entry_trade_price - 1.0) * 100.0
+    base.update({
+        **decision_lines,
+        "Decision_Date": decision_date,
+        "Exit_Reason": decision_reason,
+        "Highest_High_Through_Status": prior_high,
+        "Highest_Close_Through_Status": prior_max_close,
+        "MFE_Net_pct": mfe_net,
+        "MAE_Raw_pct": mae_raw,
+        "Next_Day_Hard_Stop_Line": hard_line,
+        "Next_Day_Trail15_Line": next_trail,
+        "Next_Day_AHalf_Profit_Line": next_floor,
+        "Next_Day_Effective_Line": next_effective,
+    })
+    is_closed = bool(exit_date)
+    if is_closed:
+        exit_trade_price = exit_raw_open * (1.0 - sell_slippage)
+        realized = (
+            exit_raw_open * sell_factor / net_entry - 1.0) * 100.0
+        hold_days = (
+            open_pos.get(exit_date, -1) - open_pos.get(entry_date, -1) + 1
+            if entry_date in open_pos and exit_date in open_pos else np.nan)
+        if "硬止损" in decision_reason:
+            status = "已止损"
+        elif "半浮盈" in decision_reason:
+            status = "已利润保护退出"
+        else:
+            status = "已移动保护退出"
+        base.update({
+            "Lifecycle_Status": status,
+            "Exit_Date": exit_date,
+            "Exit_Raw_Open": exit_raw_open,
+            "Exit_Trade_Price": exit_trade_price,
+            "Realized_Return_Net_pct": realized,
+            "Current_or_Exit_Return_Net_pct": realized,
+            "Hold_Market_Days": hold_days,
+            "Exit_Week": (
+                math.ceil(float(hold_days) / 5.0)
+                if math.isfinite(finite_num(hold_days)) else np.nan),
+            "Dynamic_Grade": v614_dynamic_grade(mfe_net, True),
+        })
+    else:
+        current_return = (
+            (last_close * sell_factor / net_entry - 1.0) * 100.0
+            if math.isfinite(last_close) and last_close > 0 else np.nan)
+        hold_days = (
+            open_pos.get(last_date, -1) - open_pos.get(entry_date, -1) + 1
+            if entry_date in open_pos and last_date in open_pos else np.nan)
+        base.update({
+            "Lifecycle_Status": (
+                "待次日开盘卖出" if pending_exit else "持有"),
+            "Current_Return_Net_pct": current_return,
+            "Current_or_Exit_Return_Net_pct": current_return,
+            "Hold_Market_Days": hold_days,
+            "Exit_Week": (
+                math.ceil(float(hold_days) / 5.0)
+                if math.isfinite(finite_num(hold_days)) else np.nan),
+            "Dynamic_Grade": v614_dynamic_grade(mfe_net, False),
+        })
+    return base
+
+
+def v614_run_lifecycles(
+        selected: pd.DataFrame,
+        price_book: dict[str, dict[str, Any]], open_dates: list[str],
+        config: dict[str, Any]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    if selected.empty:
+        return pd.DataFrame()
+    for event in selected.to_dict("records"):
+        code = str(event.get("ts_code", ""))
+        book = price_book.get(code, {})
+        for exit_key, _ in V614_EXIT_MODES:
+            rows.append(v614_simulate_pick(
+                event, book, open_dates, config, exit_key))
+    return pd.DataFrame(rows)
+
+
+def v614_lifecycle_summary(lifecycle: pd.DataFrame) -> pd.DataFrame:
+    if lifecycle.empty:
+        return pd.DataFrame()
+    rows: list[dict[str, Any]] = []
+    cohorts = (("第1名", 1), ("前3名", 3), ("前5名", 5))
+    for exit_key, exit_group in lifecycle.groupby("Exit_Mode_Key"):
+        for red_age, age_group in exit_group.groupby(
+                "Entry_Red_Age_Hypothesis"):
+            for cohort, max_rank in cohorts:
+                group = age_group[numeric(
+                    age_group, "Daily_Rank").le(max_rank)]
+                if group.empty:
+                    continue
+                status = group["Lifecycle_Status"].astype(str)
+                closed = status.str.startswith("已")
+                graded = group["Dynamic_Grade"].astype(str)
+                realized = numeric(
+                    group.loc[closed], "Realized_Return_Net_pct")
+                rows.append({
+                    "Exit_Mode_Key": exit_key,
+                    "退出方案": dict(V614_EXIT_MODES).get(exit_key, exit_key),
+                    "红柱买点": f"红{int(red_age)}",
+                    "排名组": cohort,
+                    "模拟入选": len(group),
+                    "已成交": int(~status.isin([
+                        "待次日开盘买入", "未成交"]).sum()),
+                    "仍持有": int(status.eq("持有").sum()),
+                    "待卖出": int(status.eq("待次日开盘卖出").sum()),
+                    "已退出": int(closed.sum()),
+                    "退出交易盈利比例%": (
+                        realized.gt(0).mean() * 100.0
+                        if len(realized) else np.nan),
+                    "退出收益均值%": realized.mean(),
+                    "退出收益中位%": realized.median(),
+                    "S或A比例%": graded.isin(["S", "A"]).mean() * 100.0,
+                    "F级比例_全部入选%": graded.eq("F").mean() * 100.0,
+                    "未定级比例%": graded.eq("未定级").mean() * 100.0,
+                    "持有日中位": numeric(
+                        group, "Hold_Market_Days").median(),
+                    "最大浮盈中位%": numeric(
+                        group, "MFE_Net_pct").median(),
+                    "最大浮亏中位%": numeric(
+                        group, "MAE_Raw_pct").median(),
+                })
+    return pd.DataFrame(rows)
+
+
+def v614_paired_exit_audit(
+        lifecycle: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if lifecycle.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    identifiers = [
+        "Pick_ID", "ts_code", "name", "Signal_Date",
+        "Entry_Red_Age_Hypothesis", "Daily_Rank"]
+    metrics = [
+        "Lifecycle_Status", "Decision_Date", "Exit_Date", "Exit_Reason",
+        "Realized_Return_Net_pct", "Current_or_Exit_Return_Net_pct",
+        "Hold_Market_Days", "Exit_Week", "Dynamic_Grade",
+        "MFE_Net_pct", "MAE_Raw_pct"]
+    base = lifecycle[lifecycle["Exit_Mode_Key"].eq(
+        "Hard5Trail15")][identifiers + metrics].copy()
+    protected = lifecycle[lifecycle["Exit_Mode_Key"].eq(
+        "Hard5Trail15AHalf")][identifiers + metrics].copy()
+    detail = base.merge(
+        protected, on=identifiers, how="outer",
+        suffixes=("_基础15", "_A半浮盈"))
+    detail["A保护减基础_当前或退出收益百分点"] = (
+        numeric(detail, "Current_or_Exit_Return_Net_pct_A半浮盈")
+        - numeric(detail, "Current_or_Exit_Return_Net_pct_基础15"))
+    detail["A保护更早退出"] = (
+        detail["Exit_Date_A半浮盈"].map(normalize_date).str.len().eq(8)
+        & (
+            ~detail["Exit_Date_基础15"].map(normalize_date).str.len().eq(8)
+            | detail["Exit_Date_A半浮盈"].astype(str).lt(
+                detail["Exit_Date_基础15"].astype(str))))
+    rows: list[dict[str, Any]] = []
+    for red_age, group in detail.groupby(
+            "Entry_Red_Age_Hypothesis", dropna=False):
+        paired_closed = group[
+            group["Exit_Date_基础15"].map(normalize_date).str.len().eq(8)
+            & group["Exit_Date_A半浮盈"].map(normalize_date).str.len().eq(8)]
+        delta = numeric(
+            paired_closed, "A保护减基础_当前或退出收益百分点")
+        rows.append({
+            "红柱买点": f"红{int(red_age)}",
+            "全部配对事件": len(group),
+            "两方案均已退出": len(paired_closed),
+            "A保护更早退出": int(true_mask(group, "A保护更早退出").sum()),
+            "A保护收益更高比例%": (
+                delta.gt(0).mean() * 100.0 if len(delta) else np.nan),
+            "A保护减基础收益均值百分点": delta.mean(),
+            "A保护减基础收益中位百分点": delta.median(),
+        })
+    return pd.DataFrame(rows), detail
+
+
+def v614_exit_week_summary(lifecycle: pd.DataFrame) -> pd.DataFrame:
+    if lifecycle.empty:
+        return pd.DataFrame()
+    closed = lifecycle[
+        lifecycle["Lifecycle_Status"].astype(str).str.startswith("已")].copy()
+    if closed.empty:
+        return pd.DataFrame()
+    rows: list[dict[str, Any]] = []
+    for keys, group in closed.groupby(
+            ["Exit_Mode_Key", "Entry_Red_Age_Hypothesis", "Exit_Week"],
+            dropna=False):
+        exit_key, red_age, week = keys
+        returns = numeric(group, "Realized_Return_Net_pct")
+        rows.append({
+            "退出方案": dict(V614_EXIT_MODES).get(exit_key, exit_key),
+            "红柱买点": f"红{int(red_age)}",
+            "退出周": week, "事件": len(group),
+            "盈利比例%": returns.gt(0).mean() * 100.0,
+            "收益均值%": returns.mean(), "收益中位%": returns.median(),
+            "硬止损退出": group["Lifecycle_Status"].eq("已止损").sum(),
+            "15%移动退出": group["Lifecycle_Status"].eq(
+                "已移动保护退出").sum(),
+            "A半浮盈退出": group["Lifecycle_Status"].eq(
+                "已利润保护退出").sum(),
+        })
+    return pd.DataFrame(rows)
+
+
+def v614_top3_cohort_audit(lifecycle: pd.DataFrame) -> pd.DataFrame:
+    if lifecycle.empty:
+        return pd.DataFrame()
+    work = lifecycle[
+        lifecycle["Exit_Mode_Key"].eq("Hard5Trail15AHalf")
+        & numeric(lifecycle, "Entry_Red_Age_Hypothesis").eq(
+            V614_MAIN_RED_AGE)
+        & numeric(lifecycle, "Daily_Rank").le(3)
+    ].copy()
+    rows: list[dict[str, Any]] = []
+    for signal_date, group in work.groupby("Signal_Date", sort=True):
+        closed = group[
+            group["Lifecycle_Status"].astype(str).str.startswith("已")]
+        returns = numeric(closed, "Realized_Return_Net_pct")
+        rows.append({
+            "Signal_Date": signal_date,
+            "当日前3实际数量": len(group),
+            "已退出数量": len(closed),
+            "仍持有或待处理": len(group) - len(closed),
+            "已退出盈利数量": int(returns.gt(0).sum()),
+            "完整三只且全部退出": bool(len(group) == 3 and len(closed) == 3),
+            "完整三只至少两只盈利": bool(
+                len(group) == 3 and len(closed) == 3
+                and returns.gt(0).sum() >= 2),
+            "三只等权退出收益均值%": (
+                returns.mean() if len(group) == 3 and len(closed) == 3
+                else np.nan),
+        })
+    return pd.DataFrame(rows)
+
+
+def v614_candidate_distribution(calendar: pd.DataFrame) -> pd.DataFrame:
+    if calendar.empty:
+        return pd.DataFrame()
+    counts = numeric(calendar, "红2合格候选").fillna(0)
+    groups = (
+        ("0只", counts.eq(0)),
+        ("1只", counts.eq(1)),
+        ("2至3只", counts.between(2, 3)),
+        ("4至5只", counts.between(4, 5)),
+        ("6至10只", counts.between(6, 10)),
+        ("11至20只", counts.between(11, 20)),
+        ("21至50只", counts.between(21, 50)),
+        ("51只以上", counts.ge(51)),
+    )
+    return pd.DataFrame([{
+        "当日红2候选数量组": label,
+        "交易日数": int(mask.sum()),
+        "交易日占比%": mask.mean() * 100.0,
+        "该组候选总数": int(counts[mask].sum()),
+    } for label, mask in groups])
+
+
+def v614_partial_week_audit(lifecycle: pd.DataFrame) -> pd.DataFrame:
+    if lifecycle.empty:
+        return pd.DataFrame()
+    work = lifecycle[
+        lifecycle["Exit_Mode_Key"].eq("Hard5Trail15AHalf")
+        & numeric(lifecycle, "Entry_Red_Age_Hypothesis").eq(
+            V614_MAIN_RED_AGE)
+    ].copy()
+    rows: list[dict[str, Any]] = []
+    for keys, group in work.groupby(
+            ["Weekly_Bar_State", "Later_Week_Close_Confirmed"],
+            dropna=False):
+        state, confirmed = keys
+        grades = group["Dynamic_Grade"].astype(str)
+        values = numeric(group, "Current_or_Exit_Return_Net_pct")
+        rows.append({
+            "信号周线状态": state,
+            "后来周收盘仍确认": confirmed,
+            "Top5事件": len(group),
+            "S或A比例%": grades.isin(["S", "A"]).mean() * 100.0,
+            "F级比例%": grades.eq("F").mean() * 100.0,
+            "当前或退出盈利比例%": values.gt(0).mean() * 100.0,
+            "当前或退出收益中位%": values.median(),
+        })
+    return pd.DataFrame(rows)
+
+
+def v614_main() -> None:
+    global pro, API_ERRORS
+    st.set_page_config(page_title=V614_TITLE, layout="wide")
+    st.title(V614_TITLE)
+    streamlit_version = str(getattr(st, "__version__", "unknown"))
+    st.caption(f"{V614_UI_PATCH}｜Streamlit {streamlit_version}")
+    with st.expander("V6.14执行口径", expanded=True):
+        st.markdown(f"""
+- **周线池**：每天收盘后，以当周截至当天的开、高、低、收重建未完成周K，使用改良SKDJ N={V614_PRIMARY_N}、M={V614_M}；动态K位于{V614_K_MIN:g}～{V614_K_MAX:g}且高于上一完整周K才进入准备池。周一至周四不使用后来数据，周五收盘自然成为完整周线。
+- **日线买点**：主方案只认MACD第2根红柱；信号在当天收盘确认，下一市场交易日开盘模拟买入，因此最新信号可能显示“待次日开盘买入”。红1和红3只做同规则影子对照，不进入主列表。
+- **每日Top5**：按当天可见的N6位置、N6上升速度和MACD红柱保持率组成透明100分观察排序；每天最多取5只，不足5只按实际数量，0只绝不补弱信号。每个Top5事件使用独立虚拟资金，不运行三仓、不受现金和持仓名额影响。
+- **基础退出**：买入价-5%硬止损与“买入以来、截至上一交易日最高价回撤{V614_TRAIL_DRAWDOWN_PCT:g}%”取较高者；当天收盘跌破，下一可交易日开盘退出。
+- **利润保护挑战**：最高收盘价达到买入价+{V614_PROFIT_FLOOR_ACTIVATION_PCT:g}%后，再加入“保护最高收盘浮盈的{V614_PROFIT_KEEP_RATIO * 100:g}%”；三条线永不下移，仍按收盘确认、下一开盘执行。
+- **没有固定40日**：未触发退出就一直显示持有。S/A/B按持有期间最大净浮盈30%/20%/10%逐级记录；已经退出但未达到B记为F，尚在持有且未达到B记为未定级。
+- **排序说明**：本版排名是可审计的红2专用工作假设，不把它冒充已经成熟的评分模型；输出第1名、前3名、前5名结果，用数据继续验收排序。
+""")
+
+    with st.sidebar:
+        st.header("运行参数")
+        backtest_days = st.number_input(
+            "每日选股回测交易日数", 100, 1000, 500, 50,
+            key="v614_days")
+        min_price = st.number_input(
+            "最低股价（元）", 10.0, 20.0, 10.0, 10.0,
+            format="%.0f", key="v614_min_price")
+        min_mv = st.number_input(
+            "最低流通市值（亿元）", 50.0, 100.0, 50.0, 50.0,
+            format="%.0f", key="v614_min_mv")
+        market_end_date = st.date_input(
+            "回测及每日选股截止（默认今天）", date.today(),
+            key="v614_market_end")
+        pause = st.number_input(
+            "接口间隔(秒)", 0.0, 2.0, 0.12, 0.02,
+            key="v614_pause")
+        use_cache = st.checkbox(
+            "复用行情和72小时基础缓存", True, key="v614_cache")
+        st.divider()
+        commission_pct = st.number_input(
+            "佣金率(%)", 0.0, 0.20, 0.025, 0.005,
+            format="%.3f", key="v614_commission")
+        stamp_duty_pct = st.number_input(
+            "卖出印花税率(%)", 0.0, 0.20, 0.05, 0.01,
+            format="%.3f", key="v614_stamp")
+        transfer_fee_pct = st.number_input(
+            "过户费率(%)", 0.0, 0.05, 0.001, 0.001,
+            format="%.3f", key="v614_transfer")
+        if st.button("清除V6.14结果和运行状态", key="v614_clear"):
+            shutil.rmtree(V614_RESULT_DIR, ignore_errors=True)
+            shutil.rmtree(V614_JOB_DIR, ignore_errors=True)
+            st.success("结果和运行状态已清除；行情缓存与逐股票检查点保留。")
+
+    request_payload = {
+        "version": V614_VERSION, "days": int(backtest_days),
+        "market_end": market_end_date.strftime("%Y%m%d"),
+        "min_price": float(min_price), "min_mv": float(min_mv),
+        "commission": float(commission_pct),
+        "stamp": float(stamp_duty_pct),
+        "transfer": float(transfer_fee_pct),
+        "n": V614_PRIMARY_N, "m": V614_M,
+        "k_band": [V614_K_MIN, V614_K_MAX],
+        "red_ages": list(V614_SHADOW_RED_AGES),
+        "main_red_age": V614_MAIN_RED_AGE, "top_n": V614_TOP_N,
+        "hard_stop": V614_HARD_STOP_PCT,
+        "trail_drawdown": V614_TRAIL_DRAWDOWN_PCT,
+        "profit_activation": V614_PROFIT_FLOOR_ACTIVATION_PCT,
+        "profit_keep": V614_PROFIT_KEEP_RATIO,
+        "exit_modes": [value[0] for value in V614_EXIT_MODES],
+    }
+    request_signature = stable_signature(request_payload)
+    result_path = os.path.join(
+        V614_RESULT_DIR, f"{request_signature}.zip")
+    result_name = (
+        f"weekly_skdj_n6_red2_top5_lifecycle_v6_14_"
+        f"{int(backtest_days)}d_p{int(min_price)}_mv{int(min_mv)}.zip")
+    completed_available = False
+    if os.path.exists(result_path):
+        try:
+            with open(result_path, "rb") as handle:
+                saved_result = handle.read()
+            completed_available = True
+            v614_clear_job_active(request_signature)
+            st.success("发现相同参数的V6.14已完成结果，可直接下载。")
+            render_download(
+                saved_result, result_name,
+                f"v614_saved_{request_signature}")
+        except Exception as exc:
+            st.warning(f"已保存结果读取失败：{exc}")
+
+    secret_token = configured_tushare_token()
+    if secret_token:
+        token = secret_token
+        st.caption("已从Streamlit Secrets读取TUSHARE_TOKEN。")
+    else:
+        token = st.text_input(
+            "Tushare Token", type="password", key="v614_token")
+    job_active = v614_is_job_active(request_signature)
+    left, right = st.columns(2)
+    with left:
+        start_clicked = st.button(
+            "开始/重新运行V6.14", type="primary", key="v614_run")
+    with right:
+        stop_clicked = st.button(
+            "停止自动续跑", disabled=not job_active, key="v614_stop")
+    if stop_clicked:
+        v614_clear_job_active(request_signature)
+        st.success("已停止；逐股票检查点保留。")
+        return
+    if start_clicked:
+        v614_mark_job_active(request_signature)
+        job_active = True
+    if not token:
+        st.info("请输入Token；启动后页面重连会从逐股票检查点续跑。")
+        return
+    if not job_active:
+        st.caption(
+            "点击开始运行。" if not completed_available
+            else "相同参数结果已可下载；如需覆盖请点击重新运行。")
+        return
+
+    API_ERRORS = []
+    ts.set_token(token)
+    pro = ts.pro_api()
+    requested_end = market_end_date.strftime("%Y%m%d")
+    try:
+        probe_start = market_end_date - timedelta(
+            days=int(backtest_days) * 2 + 120)
+        probe_dates = load_trade_calendar(
+            probe_start.strftime("%Y%m%d"), requested_end)
+        signal_start = trailing_signal_start(
+            probe_dates, requested_end, int(backtest_days))
+    except Exception as exc:
+        st.error(f"确定{int(backtest_days)}个交易日窗口失败：{exc}")
+        return
+    data_start = (
+        pd.Timestamp(signal_start).date()
+        - timedelta(weeks=WARMUP_WEEKS, days=7)
+    ).strftime("%Y%m%d")
+    try:
+        with st.spinner("加载交易日历和历史科技池..."):
+            open_dates = load_trade_calendar(data_start, requested_end)
+            extended_end = (
+                market_end_date + timedelta(days=7)).strftime("%Y%m%d")
+            week_last_map = complete_week_last_dates(
+                load_trade_calendar(data_start, extended_end))
+            stock_basic = load_stock_basic()
+            memberships = load_tech_memberships(float(pause))
+    except Exception as exc:
+        st.error(f"基础数据加载失败：{exc}")
+        return
+    eligible_market_dates = [
+        value for value in open_dates if value <= requested_end]
+    if not eligible_market_dates:
+        st.error("截止日前没有可用市场交易日")
+        return
+    latest_market_date = max(eligible_market_dates)
+    open_pos = {value: position for position, value in enumerate(open_dates)}
+    config = {
+        "signal_start": signal_start, "signal_end": latest_market_date,
+        "event_signal_end": latest_market_date,
+        "data_start": data_start, "market_end": latest_market_date,
+        "latest_market_date": latest_market_date,
+        "min_price": float(min_price), "min_mv": float(min_mv),
+        "buy_slippage_pct": 0.20, "sell_slippage_pct": 0.20,
+        "commission_pct": float(commission_pct),
+        "stamp_duty_pct": float(stamp_duty_pct),
+        "transfer_fee_pct": float(transfer_fee_pct),
+    }
+    run_signature = stable_signature({
+        "version": V614_EVENT_ENGINE_VERSION, **config,
+        "n": V614_PRIMARY_N, "m": V614_M,
+        "k_band": [V614_K_MIN, V614_K_MAX],
+        "red_ages": list(V614_SHADOW_RED_AGES),
+    })
+    period_index = build_period_index(memberships)
+    active_codes = {
+        code for code, code_periods in period_index.items()
+        if periods_overlap(code_periods, signal_start, latest_market_date)}
+    stocks = stock_basic[stock_basic["ts_code"].isin(active_codes)].copy()
+    stocks = stocks[
+        ~stocks["list_date"].gt(latest_market_date)
+        & ~stocks["delist_date"].lt(data_start)
+    ].sort_values("ts_code").reset_index(drop=True)
+
+    event_rows: list[dict[str, Any]] = []
+    rejects: dict[str, int] = {}
+    checkpoint_hits = price_cache_hits = failures = 0
+    progress, status = st.progress(0.0), st.empty()
+    last_update = 0.0
+    stopped = False
+    for number, stock in stocks.iterrows():
+        if not v614_is_job_active(request_signature):
+            stopped = True
+            break
+        code = str(stock["ts_code"])
+        checkpoint = (
+            v614_load_checkpoint(run_signature, code)
+            if bool(use_cache) else None)
+        if checkpoint is not None:
+            event_rows.extend(checkpoint["events"])
+            merge_counts(rejects, checkpoint["rejects"])
+            checkpoint_hits += 1
+        else:
+            daily, cached_basic, storage_path, cache_hit = fetch_price(
+                code, data_start, latest_market_date,
+                bool(use_cache), float(pause))
+            price_cache_hits += int(cache_hit)
+            if daily.empty:
+                failures += 1
+            else:
+                try:
+                    rows, stock_rejects = v614_analyze_stock(
+                        stock, period_index.get(code, []), daily,
+                        cached_basic, storage_path, week_last_map,
+                        open_dates, open_pos, config, bool(use_cache),
+                        float(pause))
+                    event_rows.extend(rows)
+                    merge_counts(rejects, stock_rejects)
+                    v614_save_checkpoint(
+                        run_signature, code, rows, stock_rejects)
+                except Exception as exc:
+                    failures += 1
+                    record_error(f"V6.14逐股票分析失败 {code}: {exc}")
+        processed = number + 1
+        now = time.monotonic()
+        if (processed == 1 or now - last_update >= UI_HEARTBEAT_SECONDS
+                or processed == len(stocks)):
+            progress.progress(
+                processed / max(len(stocks), 1),
+                text=f"已处理{processed}/{len(stocks)}只股票，最近{code}")
+            status.caption(
+                f"事件/观察{len(event_rows)}；检查点{checkpoint_hits}；"
+                f"行情缓存{price_cache_hits}；失败{failures}")
+            last_update = now
+    progress.empty()
+    status.empty()
+    if stopped:
+        st.warning("任务已停止，逐股票检查点已保留。")
+        return
+
+    events_all = pd.DataFrame(event_rows)
+    if events_all.empty:
+        signals = pd.DataFrame()
+        live_watch = pd.DataFrame()
+    else:
+        events_all = events_all.sort_values(
+            ["Signal_Date", "Event_Type", "Strategy_Key", "ts_code"]
+        ).reset_index(drop=True)
+        signals = events_all[
+            events_all["Event_Type"].eq("ENTRY_SIGNAL")].copy()
+        live_watch = events_all[
+            events_all["Event_Type"].eq("LIVE_WATCH")].copy()
+    ranked = v614_rank_daily_events(signals)
+    selected = ranked[true_mask(ranked, "Selected_Top5")].copy()
+    calendar = v614_selection_calendar(
+        ranked, open_dates, signal_start, latest_market_date)
+    candidate_distribution = v614_candidate_distribution(calendar)
+
+    price_book: dict[str, dict[str, Any]] = {}
+    book_cache_hits = recovered = 0
+    portfolio_missing: list[str] = []
+    if not selected.empty:
+        with st.spinner("复用本地行情，构建Top5生命周期价格簿..."):
+            price_book, book_cache_hits, portfolio_missing = (
+                v66_load_price_book(
+                    selected, data_start, latest_market_date))
+            still_missing: list[str] = []
+            for code in portfolio_missing:
+                daily, _, _, _ = fetch_price(
+                    code, data_start, latest_market_date, True, float(pause))
+                if daily.empty:
+                    still_missing.append(code)
+                    continue
+                daily = add_daily_macd(normalize_price_frame(daily))
+                dates = daily["trade_date"].astype(str).tolist()
+                price_book[code] = {
+                    "dates": dates,
+                    "open": dict(zip(dates, numeric(daily, "open"))),
+                    "close": dict(zip(dates, numeric(daily, "close"))),
+                    "high": dict(zip(dates, numeric(daily, "high"))),
+                    "low": dict(zip(dates, numeric(daily, "low"))),
+                    "macd_hist": dict(zip(
+                        dates, numeric(daily, "Daily_MACD_Hist"))),
+                    "macd_remaining": dict(zip(
+                        dates, numeric(daily, "Daily_MACD_Remaining_pct"))),
+                    "macd_retention": dict(zip(
+                        dates, numeric(daily, "Daily_MACD_Retention_pct"))),
+                }
+                recovered += 1
+            portfolio_missing = still_missing
+    lifecycle = v614_run_lifecycles(
+        selected, price_book, open_dates, config)
+    lifecycle_summary = v614_lifecycle_summary(lifecycle)
+    paired_summary, paired_detail = v614_paired_exit_audit(lifecycle)
+    exit_week_summary = v614_exit_week_summary(lifecycle)
+    top3_cohort = v614_top3_cohort_audit(lifecycle)
+    partial_week_audit = v614_partial_week_audit(lifecycle)
+
+    main_selected = selected[
+        numeric(selected, "Entry_Red_Age_Hypothesis").eq(
+            V614_MAIN_RED_AGE)].copy()
+    recommended = lifecycle[
+        lifecycle.get("Exit_Mode_Key", pd.Series(dtype=str)).eq(
+            "Hard5Trail15AHalf")
+        & numeric(lifecycle, "Entry_Red_Age_Hypothesis").eq(
+            V614_MAIN_RED_AGE)
+    ].copy() if not lifecycle.empty else pd.DataFrame()
+    latest_top5 = main_selected[
+        main_selected["Signal_Date"].astype(str).eq(
+            latest_market_date)].copy()
+    active_statuses = {
+        "待次日开盘买入", "持有", "待次日开盘卖出"}
+    active = recommended[
+        recommended["Lifecycle_Status"].astype(str).isin(
+            active_statuses)].copy() if not recommended.empty else pd.DataFrame()
+    recent_start = (
+        pd.Timestamp(latest_market_date) - pd.Timedelta(days=30)
+    ).strftime("%Y%m%d")
+    recent_selected = main_selected[
+        main_selected["Signal_Date"].astype(str).between(
+            recent_start, latest_market_date)].copy()
+    recent_exits = recommended[
+        recommended["Exit_Date"].astype(str).between(
+            recent_start, latest_market_date)].copy(
+        ) if not recommended.empty else pd.DataFrame()
+
+    completed_top3 = top3_cohort[true_mask(
+        top3_cohort, "完整三只且全部退出")] if not top3_cohort.empty else pd.DataFrame()
+    top3_two_win_rate = (
+        true_mask(completed_top3, "完整三只至少两只盈利").mean() * 100.0
+        if not completed_top3.empty else np.nan)
+    run_summary = pd.DataFrame([{
+        "程序版本": V614_VERSION,
+        "信号开始": signal_start,
+        "信号及行情截止": latest_market_date,
+        "周线SKDJ参数": f"N={V614_PRIMARY_N},M={V614_M}",
+        "主买点": "日线MACD第2根红柱收盘确认_下一开盘",
+        "主方案全部合格候选": len(ranked[
+            numeric(ranked, "Entry_Red_Age_Hypothesis").eq(2)]),
+        "主方案Top5模拟入选": len(main_selected),
+        "主方案有入选交易日": main_selected["Signal_Date"].nunique(
+            ) if not main_selected.empty else 0,
+        "主方案空窗交易日": int(calendar["红2模拟买入"].eq(0).sum()),
+        "当前持有或待处理": len(active),
+        "最近30日主方案入选": len(recent_selected),
+        "完整同日三只组": len(completed_top3),
+        "同日三只至少两只盈利比例%": top3_two_win_rate,
+        "价格簿缓存命中": book_cache_hits,
+        "价格簿补下载": recovered,
+        "价格簿仍缺失股票": len(portfolio_missing),
+        "处理股票": len(stocks), "检查点恢复": checkpoint_hits,
+        "行情缓存命中": price_cache_hits, "失败股票": failures,
+    }])
+    definitions = pd.DataFrame([
+        ("周线池", "N6/M3；每天以截至当天数据重建未完成周线；K10至25且较上一完整周K上升"),
+        ("主买点", "日线MACD第2根红柱收盘确认；下一市场交易日开盘模拟买入"),
+        ("影子买点", "红1和红3使用相同周线池、排序和退出，仅作对照"),
+        ("每日排名", "K10至20得40分、K20至25得20分；当日K升速分位30分；MACD保持率分位30分"),
+        ("Top5", "每天最多5只；不足按实际数量；零只不补；每个事件使用独立虚拟资金"),
+        ("待买入", "收盘确认信号但下一交易日开盘尚未发生"),
+        ("硬止损", "收盘跌破含滑点买入价5%；下一可交易开盘退出"),
+        ("移动保护", "收盘跌破买入以来截至上一交易日最高价的85%；下一可交易开盘退出"),
+        ("A半浮盈", "截至上一日最高收盘达到买入价120%后，至少保护最高收盘浮盈的一半"),
+        ("实际退出线", "硬止损、15%移动保护、A半浮盈三线取最高；只升不降"),
+        ("持仓期限", "不设固定40日；没有触发退出就持续持有"),
+        ("动态等级", "最大净浮盈≥30/20/10对应S/A/B；已退出且不足10为F；持有不足10为未定级"),
+    ], columns=["项目", "定义"])
+    rejection_audit = pd.DataFrame([
+        {"剔除原因": key, "次数": value}
+        for key, value in sorted(rejects.items())])
+    missing_price_audit = pd.DataFrame({
+        "价格簿缺失股票": portfolio_missing})
+    cache_policy = pd.DataFrame([
+        ("交易日历/基础资料", "Streamlit内存", "72小时"),
+        ("行业成员", "Streamlit内存", "7天"),
+        ("逐股票前复权行情", "应用临时磁盘", "不主动过期"),
+        ("V6.14逐股票事件检查点", "应用临时磁盘", "不主动过期"),
+    ], columns=["对象", "位置", "设定时长"])
+
+    selection_columns = [
+        "Pick_ID", "Entry_Red_Age_Hypothesis", "Signal_Date",
+        "Signal_Weekday", "Daily_Rank", "V614_Rank_Score_100",
+        "V614_K_Band_Score", "V614_K_Change_Score",
+        "V614_MACD_Retention_Score", "ts_code", "name", "SW_L1",
+        "SW_L2", "Weekly_Bar_State", "Week_Last_Trading_Date",
+        "Later_Week_Close_Confirmed", "Signal_K", "Signal_D",
+        "Signal_KD_Spread", "Signal_K_Change_1W",
+        "Daily_MACD_Red_Age", "Daily_MACD_Hist",
+        "Daily_MACD_Retention_pct", "Daily_MACD_Remaining_pct",
+        "Signal_Daily_SKDJ_N6_K", "Signal_Daily_SKDJ_N6_D",
+        "Signal_Daily_SKDJ_N9_K", "Signal_Daily_SKDJ_N9_D",
+        "Raw_Close", "Circ_MV_Billion", "Entry_Tradable",
+        "Entry_Reason", "Entry_Date", "Entry_Raw_Open",
+    ]
+    lifecycle_columns = selection_columns + [
+        "Exit_Mode_Key", "Exit_Mode", "Entry_Execution_Date",
+        "Entry_Trade_Price", "Lifecycle_Status", "Decision_Date",
+        "Exit_Date", "Exit_Reason", "Exit_Raw_Open", "Exit_Trade_Price",
+        "Realized_Return_Net_pct", "Current_Return_Net_pct",
+        "Current_or_Exit_Return_Net_pct", "Hold_Market_Days", "Exit_Week",
+        "Highest_High_Through_Status", "Highest_Close_Through_Status",
+        "MFE_Net_pct", "MAE_Raw_pct", "Dynamic_Grade",
+        "Decision_Hard_Stop_Line", "Decision_Trail15_Line",
+        "Decision_AHalf_Profit_Line", "Decision_Effective_Line",
+        "Next_Day_Hard_Stop_Line", "Next_Day_Trail15_Line",
+        "Next_Day_AHalf_Profit_Line", "Next_Day_Effective_Line",
+    ]
+    selection_export = selected[[
+        column for column in selection_columns if column in selected.columns
+    ]].copy()
+    lifecycle_export = lifecycle[[
+        column for column in lifecycle_columns if column in lifecycle.columns
+    ]].copy()
+    recommended_export = recommended[[
+        column for column in lifecycle_columns if column in recommended.columns
+    ]].copy() if not recommended.empty else pd.DataFrame()
+    active_export = active[[
+        column for column in lifecycle_columns if column in active.columns
+    ]].copy() if not active.empty else pd.DataFrame()
+    recent_exit_export = recent_exits[[
+        column for column in lifecycle_columns if column in recent_exits.columns
+    ]].copy() if not recent_exits.empty else pd.DataFrame()
+    watch_columns = [
+        "Signal_Date", "ts_code", "name", "SW_L1", "SW_L2",
+        "Weekly_Bar_State", "Signal_K", "Signal_D", "Signal_KD_Spread",
+        "Signal_K_Change_1W", "Daily_MACD_State", "Daily_MACD_Red_Age",
+        "Daily_MACD_Hist", "Raw_Close", "Circ_MV_Billion",
+    ]
+    live_watch_export = live_watch[[
+        column for column in watch_columns if column in live_watch.columns
+    ]].copy() if not live_watch.empty else pd.DataFrame()
+    latest_top5_export = latest_top5[[
+        column for column in selection_columns if column in latest_top5.columns
+    ]].copy() if not latest_top5.empty else pd.DataFrame()
+
+    files = {
+        "01_run_summary_v6_14.csv": run_summary,
+        "02_experiment_definitions_v6_14.csv": definitions,
+        "03_daily_candidate_calendar_v6_14.csv": calendar,
+        "04_daily_candidate_count_distribution_v6_14.csv": candidate_distribution,
+        "05_all_red123_ranked_candidates_v6_14.csv": ranked,
+        "06_all_red123_top5_selections_v6_14.csv": selection_export,
+        "07_all_exit_modes_lifecycle_v6_14.csv": lifecycle_export,
+        "08_recommended_red2_lifecycle_v6_14.csv": recommended_export,
+        "09_rank1_top3_top5_lifecycle_summary_v6_14.csv": lifecycle_summary,
+        "10_exit_mode_paired_summary_v6_14.csv": paired_summary,
+        "11_exit_mode_paired_detail_v6_14.csv": paired_detail,
+        "12_exit_week_distribution_v6_14.csv": exit_week_summary,
+        "13_red2_top3_daily_cohort_audit_v6_14.csv": top3_cohort,
+        "14_partial_week_confirmation_audit_v6_14.csv": partial_week_audit,
+        "15_latest_day_red2_top5_v6_14.csv": latest_top5_export,
+        "16_current_open_and_pending_v6_14.csv": active_export,
+        "17_recent_30d_exits_v6_14.csv": recent_exit_export,
+        "18_latest_n6_dynamic_weekly_pool_v6_14.csv": live_watch_export,
+        "19_rejection_audit_v6_14.csv": rejection_audit,
+        "20_missing_price_book_v6_14.csv": missing_price_audit,
+        "21_cache_policy_v6_14.csv": cache_policy,
+        "22_api_errors_v6_14.csv": pd.DataFrame({"错误": API_ERRORS}),
+    }
+    result_zip = make_zip(files)
+    try:
+        atomic_bytes(result_zip, result_path)
+        v614_clear_job_active(request_signature)
+        persisted = True
+    except Exception as exc:
+        persisted = False
+        st.warning(f"结果未能持久保存，但当前页面仍可下载：{exc}")
+
+    st.success(
+        f"完成：N6红2合格候选{len(ranked[numeric(ranked, 'Entry_Red_Age_Hypothesis').eq(2)])}个，"
+        f"每日Top5模拟入选{len(main_selected)}个；"
+        f"当前持有或待处理{len(active)}个；"
+        f"结果{'已保存' if persisted else '仅当前页面可下载'}。")
+    if portfolio_missing:
+        st.warning(
+            f"仍有{len(portfolio_missing)}只入选股票价格簿缺失；"
+            "已在20号文件列出，相关未成交状态不能用于评价退出规则。")
+
+    st.subheader(f"今天的红2 Top5：{latest_market_date}")
+    if latest_top5_export.empty:
+        st.info("今天没有符合周线N6＋日线MACD红2条件的股票，不补弱信号。")
+    else:
+        render_plain_table(latest_top5_export, V614_TOP_N)
+    st.subheader("当前仍持有、待买入或待卖出")
+    render_plain_table(active_export, 500)
+    st.subheader("第1名、前3名、前5名生命周期结果")
+    render_plain_table(lifecycle_summary, 100)
+    st.caption("这是无限虚拟资金的独立选股质量，不是三仓资金收益。")
+    st.subheader("基础15%回撤与A类半浮盈保护的逐事件配对")
+    render_plain_table(paired_summary, 20)
+    st.subheader("红2同日前3质量审计")
+    render_plain_table(top3_cohort, 300)
+    st.caption("只有同日实际入选3只且3只均已退出的日期才进入“至少两只盈利”验收。")
+    st.subheader("未完成周线后来是否在周收盘继续确认")
+    render_plain_table(partial_week_audit, 30)
+    st.subheader("红2每日候选数量分布")
+    render_plain_table(candidate_distribution, 20)
+    with st.expander("最近30日退出与退出周分布", expanded=False):
+        render_plain_table(recent_exit_export, 300)
+        render_plain_table(exit_week_summary, 200)
+    with st.expander("最近交易日N6动态周线观察池", expanded=False):
+        render_plain_table(live_watch_export, 500)
+    st.subheader("运行摘要")
+    render_plain_table(run_summary, 10)
+    st.caption(
+        f"结果ZIP共{len(files)}个CSV；每日候选、Top5、两套退出、"
+        "当前持有和最近退出均分开导出。")
+    render_download(
+        result_zip, result_name, f"v614_current_{request_signature}")
+
+
 def main() -> None:
-    v613_main()
+    v614_main()
 
 
 if __name__ == "__main__":
