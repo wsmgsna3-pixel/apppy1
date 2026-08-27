@@ -1,17 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-周线 SKDJ 双向 ETA10/ETA15 提前买点验证系统 V14.7
+周线 SKDJ 信号后日线状态分类验证系统 V14.8
 ============================================================
 核心约定
 1. 保留原 V14.5 周线 SKDJ：周线 K 上穿 25 且 K>D 为正式信号。
-2. 冻结原 V14.5 正式信号与评分；每周 Top 5 不受 ETA 条件影响。
-3. 同一正式 Top 5 母样本并行验证：正式上穿、下跌 ETA10/15、上升 ETA10/15。
-4. ETA 表示按最近5个交易日动态周线K速度，预计还需多少交易日触及25；
-   首次进入10/15日阈值时登记，下一交易日开盘模拟买入。
+2. 冻结原 V14.5 正式信号与评分；只改变信号后的日线执行选择。
+3. 同一正式候选池并行验证三路径；状态放弃后按原排名递补，最多选满 Top 5。
+4. 所有状态只使用当时已经发生的日线数据；确认路径按确认后的下一交易日开盘买入。
 5. 普通 A 股按 T+1；首周第5个交易日收盘截断；暂不计交易成本。
-6. ETA 对照属于“以后来成为正式 Top 5 为条件”的配对诊断，不冒充独立实盘胜率。
+6. 报告同时计算避免亏损、误杀盈利、接受率、每周买入数与空窗周。
 7. 行情按交易日分片原子保存；历史结果先保存、扫描账本后提交，崩溃可断点续跑。
-8. 下载按钮与回测按钮解耦，页面重跑后仍展示最近一次完整/部分结果。
+8. 持久化“任务运行中”标记；网络重连或页面重跑后自动从断点继续，可手动停止。
 ============================================================
 """
 
@@ -20,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import gc
+import io
 import os
 import pickle
 import re
@@ -27,6 +27,7 @@ import shutil
 import tempfile
 import time
 import warnings
+import zipfile
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -36,15 +37,15 @@ import tushare as ts
 
 warnings.filterwarnings("ignore")
 
-APP_VERSION = "V14.7"
+APP_VERSION = "V14.8"
 MARKET_CACHE_ROOT = "skdj_v14_7_market_cache"
-ETA_BRANCHES = ("正式上穿25", "下跌ETA10", "下跌ETA15", "上升ETA10", "上升ETA15")
+STATE_PATHS = ("原始次日买入", "信号日状态买入", "震荡确认买入")
 
-st.set_page_config(page_title=f"SKDJ {APP_VERSION} ETA验证系统", layout="wide")
-st.title(f"🔬 周线 SKDJ 双向 ETA10/ETA15 提前买点验证系统 ({APP_VERSION})")
+st.set_page_config(page_title=f"SKDJ {APP_VERSION} 日线状态验证系统", layout="wide")
+st.title(f"🔬 周线 SKDJ 信号后日线状态分类验证系统 ({APP_VERSION})")
 st.markdown(
-    "**正式 Top 5 与 V14.5 规则保持独立**；ETA 只改变同一母样本的买入时点。"
-    "下跌组是用户假设，上升组是对照假设，结果由回测决定。"
+    "**正式 Top 5、周线信号和评分保持冻结**；日线状态只决定是否立即买、等待确认或放弃。"
+    "原始路径始终保留，用于衡量避免亏损与误杀利润。"
 )
 
 
@@ -107,6 +108,33 @@ def atomic_write_csv(df: pd.DataFrame, path: str):
     os.close(fd)
     try:
         df.to_csv(tmp_path, index=False, encoding="utf-8-sig")
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def read_json_safe(path: str):
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as file_obj:
+            value = json.load(file_obj)
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+
+
+def atomic_write_json(value, path: str):
+    target_dir = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(target_dir, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=target_dir)
+    os.close(fd)
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as file_obj:
+            json.dump(value, file_obj, ensure_ascii=False, indent=2)
+            file_obj.flush()
+            os.fsync(file_obj.fileno())
         os.replace(tmp_path, path)
     finally:
         if os.path.exists(tmp_path):
@@ -320,7 +348,11 @@ def sync_market_data_incrementally(start_date, end_date, token, whitelist_set):
                 }
                 if _valid_market_partition(payload, trade_date, pool_hash):
                     _atomic_write_pickle(payload, os.path.join(cache_dir, f"{trade_date}.pkl"))
-            bar.progress((idx + 1) / len(missing), text=f"📥 行情同步 {idx + 1}/{len(missing)}：{trade_date}")
+            if (idx + 1) % 10 == 0 or idx == len(missing) - 1:
+                bar.progress(
+                    (idx + 1) / len(missing),
+                    text=f"📥 行情同步 {idx + 1}/{len(missing)}：{trade_date}",
+                )
             time.sleep(0.12)
         bar.empty()
     return valid_dates, cache_dir, pool_hash
@@ -431,222 +463,6 @@ def build_weekly_frame(df_daily: pd.DataFrame) -> pd.DataFrame:
     weekly["ma5_vol"] = weekly["vol"].shift(1).rolling(5).mean()
     weekly["ma20"] = weekly["close"].rolling(20).mean()
     return weekly
-
-
-def build_dynamic_skdj_series(df_daily: pd.DataFrame) -> pd.DataFrame:
-    """逐交易日重建“截至当天”的动态周线K/D，不把未来周内数据泄漏到过去。"""
-    if df_daily is None or df_daily.empty:
-        return pd.DataFrame()
-    frame = df_daily.copy().reset_index()
-    frame["trade_date_str"] = frame["trade_date_str"].astype(str)
-    frame = frame.sort_values("trade_date_str").reset_index(drop=True)
-    frame["dt"] = pd.to_datetime(frame["trade_date_str"])
-    frame["year_week"] = frame["dt"].dt.strftime("%G_%V")
-
-    completed_lows, completed_highs, completed_ks = [], [], []
-    previous_rsv_ewm = np.nan
-    previous_k = np.nan
-    records = []
-    alpha = 0.5  # pandas ewm(span=3, adjust=False)
-
-    for _, week in frame.groupby("year_week", sort=False):
-        week = week.sort_values("trade_date_str")
-        running_high = -np.inf
-        running_low = np.inf
-        week_last_rsv = np.nan
-        week_last_k = np.nan
-        for _, row in week.iterrows():
-            running_high = max(running_high, float(row["high"]))
-            running_low = min(running_low, float(row["low"]))
-            lows = completed_lows[-5:] + [running_low]
-            highs = completed_highs[-5:] + [running_high]
-            raw_rsv = np.nan
-            rsv_ewm = np.nan
-            dynamic_k = np.nan
-            dynamic_d = np.nan
-            if len(lows) == 6:
-                lowv, highv = min(lows), max(highs)
-                raw_rsv = (float(row["close"]) - lowv) / max(highv - lowv, 0.001) * 100.0
-                rsv_ewm = raw_rsv if not np.isfinite(previous_rsv_ewm) else (
-                    alpha * raw_rsv + (1.0 - alpha) * previous_rsv_ewm
-                )
-                dynamic_k = rsv_ewm if not np.isfinite(previous_k) else (
-                    alpha * rsv_ewm + (1.0 - alpha) * previous_k
-                )
-                prior_two = [value for value in completed_ks[-2:] if np.isfinite(value)]
-                if len(prior_two) == 2:
-                    dynamic_d = float(np.mean(prior_two + [dynamic_k]))
-                week_last_rsv = rsv_ewm
-                week_last_k = dynamic_k
-            records.append(
-                {
-                    "trade_date_str": str(row["trade_date_str"]),
-                    "Dynamic_K": dynamic_k,
-                    "Dynamic_D": dynamic_d,
-                    "Close": float(row["close"]),
-                }
-            )
-        completed_lows.append(float(week["low"].min()))
-        completed_highs.append(float(week["high"].max()))
-        completed_ks.append(week_last_k)
-        if np.isfinite(week_last_rsv):
-            previous_rsv_ewm = week_last_rsv
-        if np.isfinite(week_last_k):
-            previous_k = week_last_k
-
-    result = pd.DataFrame(records).set_index("trade_date_str")
-    result["K_Velocity_5D"] = (result["Dynamic_K"] - result["Dynamic_K"].shift(4)) / 4.0
-    result["Direction"] = np.where(
-        (result["Dynamic_K"] > 25.0) & (result["K_Velocity_5D"] < 0), "DOWN",
-        np.where((result["Dynamic_K"] < 25.0) & (result["K_Velocity_5D"] > 0), "UP", "NONE"),
-    )
-    result["ETA_Days"] = np.where(
-        result["Direction"] == "DOWN",
-        (result["Dynamic_K"] - 25.0) / result["K_Velocity_5D"].abs(),
-        np.where(
-            result["Direction"] == "UP",
-            (25.0 - result["Dynamic_K"]) / result["K_Velocity_5D"],
-            np.nan,
-        ),
-    )
-    result.loc[(result["ETA_Days"] < 0) | (result["ETA_Days"] > 120), "ETA_Days"] = np.nan
-    return result
-
-
-def _eta_entered_horizon(dynamic, pos, direction, horizon, tolerance):
-    row = dynamic.iloc[pos]
-    if row.get("Direction") != direction or not np.isfinite(row.get("ETA_Days", np.nan)):
-        return False, ""
-    eta = float(row["ETA_Days"])
-    prev = dynamic.iloc[pos - 1] if pos > 0 else None
-    in_window = abs(eta - float(horizon)) <= float(tolerance)
-    prev_in_window = bool(
-        prev is not None
-        and prev.get("Direction") == direction
-        and np.isfinite(prev.get("ETA_Days", np.nan))
-        and abs(float(prev["ETA_Days"]) - float(horizon)) <= float(tolerance)
-    )
-    if in_window and not prev_in_window:
-        return True, "首次进入容差窗口"
-    if pos <= 0:
-        return False, ""
-    if (
-        prev.get("Direction") == direction
-        and np.isfinite(prev.get("ETA_Days", np.nan))
-        and float(prev["ETA_Days"]) > float(horizon) + float(tolerance)
-        and eta < float(horizon) - float(tolerance)
-    ):
-        return True, "速度突变跨越窗口"
-    return False, ""
-
-
-def find_eta_trigger(dynamic, formal_date, direction, horizon, tolerance=2.0, lookback_days=60):
-    if dynamic is None or dynamic.empty:
-        return None
-    prior = dynamic[dynamic.index < str(formal_date)].tail(int(lookback_days)).copy()
-    if prior.empty:
-        return None
-    hits = []
-    for pos in range(len(prior)):
-        entered, trigger_note = _eta_entered_horizon(prior, pos, direction, horizon, tolerance)
-        if entered:
-            row = prior.iloc[pos]
-            hits.append(
-                {
-                    "Prediction_Date": prior.index[pos],
-                    "Prediction_K": round(float(row["Dynamic_K"]), 4),
-                    "Prediction_D": round(float(row["Dynamic_D"]), 4) if np.isfinite(row["Dynamic_D"]) else np.nan,
-                    "K_Velocity_5D": round(float(row["K_Velocity_5D"]), 4),
-                    "Predicted_ETA_Days": round(float(row["ETA_Days"]), 2),
-                    "ETA_Trigger_Note": trigger_note,
-                    "Signal_Close": float(row["Close"]),
-                }
-            )
-    # 一次正式信号只配对最近一轮靠近25的预测，避免把更早的无关波段错配进来。
-    return hits[-1] if hits else None
-
-
-def build_eta_comparison_events(formal_history, stock_dict, tolerance=2.0, lookback_days=60):
-    if formal_history is None or formal_history.empty:
-        return pd.DataFrame()
-    dynamic_cache = {}
-    rows = []
-    branch_specs = [
-        ("下跌ETA10", "DOWN", 10),
-        ("下跌ETA15", "DOWN", 15),
-        ("上升ETA10", "UP", 10),
-        ("上升ETA15", "UP", 15),
-    ]
-    ordered = formal_history.sort_values(["Signal_Date", "Rank"]).reset_index(drop=True)
-    for _, mother in ordered.iterrows():
-        code = str(mother["ts_code"])
-        parent_id = str(mother["Event_ID"])
-        formal_date = parse_yyyymmdd(mother["Signal_Date"])
-        if code not in dynamic_cache:
-            dynamic_cache[code] = build_dynamic_skdj_series(stock_dict.get(code, pd.DataFrame()))
-
-        baseline = mother.to_dict()
-        baseline.update(
-            {
-                "Parent_Event_ID": parent_id,
-                "Formal_Signal_Date": formal_date,
-                "Entry_Path": "正式上穿25",
-                "Has_ETA_Signal": True,
-                "Prediction_Date": formal_date,
-                "Prediction_K": mother.get("SKDJ_K", np.nan),
-                "Prediction_D": mother.get("SKDJ_D", np.nan),
-                "Predicted_ETA_Days": 0.0,
-                "ETA_Trigger_Note": "原V14.5正式买点",
-                "Lead_Trading_Days": 0,
-                "Event_ID": hashlib.sha1(f"{parent_id}|正式上穿25".encode()).hexdigest()[:20],
-            }
-        )
-        rows.append(baseline)
-
-        dynamic = dynamic_cache[code]
-        dates_before = list(dynamic.index[dynamic.index < formal_date]) if not dynamic.empty else []
-        for branch, direction, horizon in branch_specs:
-            trigger = find_eta_trigger(
-                dynamic, formal_date, direction, horizon,
-                tolerance=float(tolerance), lookback_days=int(lookback_days),
-            )
-            item = mother.to_dict()
-            item.update(
-                {
-                    "Parent_Event_ID": parent_id,
-                    "Formal_Signal_Date": formal_date,
-                    "Entry_Path": branch,
-                    "Signal_Type": branch,
-                    "Event_ID": hashlib.sha1(f"{parent_id}|{branch}".encode()).hexdigest()[:20],
-                    "Has_ETA_Signal": trigger is not None,
-                }
-            )
-            if trigger is None:
-                item.update(
-                    {
-                        "Signal_Date": None,
-                        "Prediction_Date": None,
-                        "Prediction_K": np.nan,
-                        "Prediction_D": np.nan,
-                        "K_Velocity_5D": np.nan,
-                        "Predicted_ETA_Days": np.nan,
-                        "ETA_Trigger_Note": "此前未出现该方向/期限预测",
-                        "Lead_Trading_Days": np.nan,
-                    }
-                )
-            else:
-                prediction_date = str(trigger["Prediction_Date"])
-                lead = sum(prediction_date < date <= formal_date for date in dates_before + [formal_date])
-                item.update(trigger)
-                item.update(
-                    {
-                        "Signal_Date": prediction_date,
-                        "Signal_Raw_Close": np.nan,
-                        "Lead_Trading_Days": int(lead),
-                    }
-                )
-            rows.append(item)
-    return pd.DataFrame(rows)
 
 
 def compute_signal_snapshot(ts_code, end_date, stock_dict):
@@ -832,59 +648,328 @@ def build_candidate_records(date, signal_kind, whitelist_keys, name_map, stock_d
     return deterministic_rank(records)
 
 
-def build_live_eta_candidates(date, branch, whitelist_keys, name_map, stock_dict, basic_indexed,
-                              min_price, min_mv, max_mv, tolerance):
-    specs = {
-        "下跌ETA10": ("DOWN", 10), "下跌ETA15": ("DOWN", 15),
-        "上升ETA10": ("UP", 10), "上升ETA15": ("UP", 15),
+def compute_daily_state(ts_code, end_date, stock_dict, macd_shrink_limit=30.0,
+                        overextension_10d=15.0, overextension_20d=20.0):
+    """只使用end_date及以前的日线，给正式周线信号做可复核状态分类。"""
+    if ts_code not in stock_dict:
+        return {}
+    daily = stock_dict[ts_code][stock_dict[ts_code].index <= str(end_date)].copy()
+    if len(daily) < 30 or str(end_date) not in daily.index:
+        return {}
+    close = pd.to_numeric(daily["close"], errors="coerce")
+    volume = pd.to_numeric(daily["vol"], errors="coerce")
+    ma5 = close.rolling(5).mean()
+    ma10 = close.rolling(10).mean()
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    dif = ema12 - ema26
+    dea = dif.ewm(span=9, adjust=False).mean()
+    hist = 2.0 * (dif - dea)
+
+    last_close = float(close.iloc[-1])
+    last_ma5 = float(ma5.iloc[-1])
+    last_ma10 = float(ma10.iloc[-1])
+    ma5_slope = (last_ma5 / float(ma5.iloc[-4]) - 1.0) * 100 if len(ma5.dropna()) >= 4 else np.nan
+    ret3 = (last_close / float(close.iloc[-4]) - 1.0) * 100
+    ret5 = (last_close / float(close.iloc[-6]) - 1.0) * 100
+    ret10 = (last_close / float(close.iloc[-11]) - 1.0) * 100
+    tail20 = daily.tail(20)
+    rise20 = (last_close / float(tail20["low"].min()) - 1.0) * 100
+    below20_high = (last_close / float(tail20["high"].max()) - 1.0) * 100
+
+    hist_now = float(hist.iloc[-1])
+    hist_prev = float(hist.iloc[-2])
+    hist_three = float(hist.iloc[-3])
+    shrink_pct = (
+        (hist_three - hist_now) / max(abs(hist_three), 1e-9) * 100.0
+        if hist_three > 0 and hist_now < hist_three else 0.0
+    )
+    rapid_shrink = bool(hist_three > 0 and shrink_pct >= float(macd_shrink_limit))
+    macd_growing = bool(hist_now > hist_prev)
+    green_expanding = bool(hist_now < 0 and hist_now < hist_prev)
+    prior_vol = volume.shift(1).tail(5).mean()
+    vol_ratio = float(volume.iloc[-1] / prior_vol) if pd.notna(prior_vol) and prior_vol > 0 else np.nan
+
+    overextended = bool(
+        ret10 >= float(overextension_10d)
+        or (rise20 >= float(overextension_20d) and below20_high >= -3.0)
+    )
+    price_weak = bool(last_close < last_ma5 and ret3 < 0)
+    exhaustion = bool(overextended and (rapid_shrink or price_weak or hist_now < hist_prev))
+    falling = bool(
+        not exhaustion
+        and (
+            (last_close < last_ma5 and ma5_slope < 0 and ret3 < 0)
+            or (rapid_shrink and last_close < last_ma5)
+            or (green_expanding and ret3 < 0)
+        )
+    )
+    healthy = bool(
+        not exhaustion and not falling
+        and last_close >= last_ma5 >= last_ma10
+        and ma5_slope > 0 and ret3 >= 0
+        and hist_now > 0 and not rapid_shrink
+    )
+
+    if exhaustion:
+        state = "上涨衰竭"
+    elif falling:
+        state = "下跌转弱"
+    elif healthy:
+        state = "健康上涨"
+    else:
+        state = "震荡蓄势"
+
+    score = 0
+    score += 2 if last_close >= last_ma5 else -2
+    score += 1 if last_ma5 >= last_ma10 else -1
+    score += 1 if ma5_slope > 0 else -1
+    score += 1 if ret3 >= 0 else -1
+    score += 2 if hist_now > 0 else -2
+    score += 1 if macd_growing else 0
+    score -= 2 if rapid_shrink else 0
+    score -= 2 if green_expanding else 0
+    score -= 2 if exhaustion else 0
+
+    reasons = [
+        f"收盘{'≥' if last_close >= last_ma5 else '<'}MA5",
+        f"MA5斜率{ma5_slope:.2f}%",
+        f"3日{ret3:.2f}%",
+        f"MACD柱{hist_now:.4f}",
+    ]
+    if rapid_shrink:
+        reasons.append(f"MACD三柱缩短{shrink_pct:.1f}%")
+    if overextended:
+        reasons.append("短期涨幅偏大")
+    if green_expanding:
+        reasons.append("绿柱扩大")
+
+    return {
+        "State_AsOf_Date": str(end_date),
+        "Daily_State": state,
+        "State_Score": int(score),
+        "Daily_Close": round(last_close, 4),
+        "Daily_MA5": round(last_ma5, 4),
+        "Daily_MA10": round(last_ma10, 4),
+        "MA5_Slope_3D (%)": round(float(ma5_slope), 2),
+        "Daily_Return_3D (%)": round(float(ret3), 2),
+        "Daily_Return_5D (%)": round(float(ret5), 2),
+        "Daily_Return_10D (%)": round(float(ret10), 2),
+        "Rise_From_20D_Low_State (%)": round(float(rise20), 2),
+        "Below_20D_High_State (%)": round(float(below20_high), 2),
+        "MACD_Hist_Signal": round(hist_now, 6),
+        "MACD_Hist_Prev": round(hist_prev, 6),
+        "MACD_Hist_3Bars_Ago": round(hist_three, 6),
+        "MACD_Shrink_3Bars (%)": round(float(shrink_pct), 2),
+        "MACD_Rapid_Shrink_Signal": rapid_shrink,
+        "MACD_Growing_Signal": macd_growing,
+        "MACD_Green_Expanding": green_expanding,
+        "Daily_Vol_Ratio_State": round(vol_ratio, 2) if np.isfinite(vol_ratio) else np.nan,
+        "Overextended_Flag": overextended,
+        "State_Reason": "；".join(reasons),
     }
-    if branch not in specs:
+
+
+def _confirmation_ready(state):
+    if not state:
+        return False
+    return bool(
+        state.get("Daily_State") == "健康上涨"
+        or (
+            state.get("Daily_State") == "震荡蓄势"
+            and state.get("Daily_Close", -np.inf) >= state.get("Daily_MA5", np.inf)
+            and state.get("Daily_Return_3D (%)", -np.inf) >= 0
+            and state.get("MACD_Hist_Signal", -np.inf) > state.get("MACD_Hist_Prev", np.inf)
+            and not bool(state.get("MACD_Rapid_Shrink_Signal", False))
+            and not bool(state.get("Overextended_Flag", False))
+        )
+    )
+
+
+def find_oscillation_confirmation(event, stock_dict, asof_date, max_wait_days,
+                                  macd_shrink_limit, overextension_10d, overextension_20d):
+    code = str(event["ts_code"])
+    formal_date = parse_yyyymmdd(event.get("Signal_Date"))
+    if not formal_date or code not in stock_dict:
+        return {"Decision_Status": "REJECT", "Decision_Reason": "缺少确认行情"}
+    future_dates = list(
+        stock_dict[code][
+            (stock_dict[code].index > formal_date) & (stock_dict[code].index <= str(asof_date))
+        ].index
+    )
+    observed = future_dates[: int(max_wait_days)]
+    for pos, date in enumerate(observed, start=1):
+        state = compute_daily_state(
+            code, date, stock_dict, macd_shrink_limit, overextension_10d, overextension_20d
+        )
+        if state.get("Daily_State") in {"下跌转弱", "上涨衰竭"}:
+            return {
+                "Decision_Status": "REJECT",
+                "Decision_Reason": f"等待第{pos}日转为{state.get('Daily_State')}",
+                "Confirmation_Days": pos,
+                "Execution_State": state.get("Daily_State"),
+            }
+        if _confirmation_ready(state):
+            result = {
+                "Decision_Status": "BUY",
+                "Decision_Reason": f"震荡后第{pos}日确认转强",
+                "Confirmation_Date": date,
+                "Confirmation_Days": pos,
+                "Execution_State": state.get("Daily_State"),
+                "Signal_Close": float(stock_dict[code].loc[date]["close"]),
+            }
+            result.update({f"Execution_{key}": value for key, value in state.items()})
+            return result
+    if len(future_dates) < int(max_wait_days):
+        return {
+            "Decision_Status": "PENDING",
+            "Decision_Reason": f"已观察{len(future_dates)}/{int(max_wait_days)}日",
+            "Confirmation_Days": len(future_dates),
+            "Execution_State": "等待确认",
+        }
+    return {
+        "Decision_Status": "REJECT",
+        "Decision_Reason": f"{int(max_wait_days)}日内未确认转强",
+        "Confirmation_Days": int(max_wait_days),
+        "Execution_State": "震荡未确认",
+    }
+
+
+def build_state_comparison_events(formal_history, stock_dict, asof_date, max_wait_days=3,
+                                  macd_shrink_limit=30.0, overextension_10d=15.0,
+                                  overextension_20d=20.0, top_n=5):
+    if formal_history is None or formal_history.empty:
         return pd.DataFrame()
-    direction, horizon = specs[branch]
-    records = []
-    for code in whitelist_keys:
-        if code not in stock_dict or str(date) not in stock_dict[code].index:
-            continue
-        market_row = stock_dict[code].loc[str(date)]
-        if isinstance(market_row, pd.DataFrame):
-            market_row = market_row.iloc[-1]
-        raw_close = float(market_row.get("raw_close", market_row["close"]))
-        if raw_close < min_price:
-            continue
-        mv = get_circ_mv_billion(basic_indexed, date, code)
-        if pd.notna(mv) and (mv < min_mv or mv > max_mv):
-            continue
-        dynamic = build_dynamic_skdj_series(stock_dict[code][stock_dict[code].index <= str(date)])
-        if dynamic.empty:
-            continue
-        entered, note = _eta_entered_horizon(dynamic, len(dynamic) - 1, direction, horizon, tolerance)
-        if not entered:
-            continue
-        current = dynamic.iloc[-1]
-        snap = compute_signal_snapshot(code, date, stock_dict)
-        if not snap:
-            continue
-        snap.update(
+    rows = []
+    ordered = formal_history.sort_values(["Signal_Date", "Rank"]).reset_index(drop=True)
+    for _, mother in ordered.iterrows():
+        code = str(mother["ts_code"])
+        parent_id = str(mother["Event_ID"])
+        formal_date = parse_yyyymmdd(mother["Signal_Date"])
+        signal_state = compute_daily_state(
+            code, formal_date, stock_dict, macd_shrink_limit, overextension_10d, overextension_20d
+        )
+        state_name = signal_state.get("Daily_State", "数据不足")
+
+        common = mother.to_dict()
+        common.update(signal_state)
+        common.update(
             {
-                "ts_code": code, "name": name_map.get(code, code),
-                "circ_mv": round(mv, 2) if pd.notna(mv) else np.nan,
-                "MV_Data_Missing": bool(pd.isna(mv)), "Signal_Type": branch,
-                "Entry_Path": branch, "Has_ETA_Signal": True,
-                "Prediction_Date": str(date), "Formal_Signal_Date": None,
-                "Prediction_K": round(float(current["Dynamic_K"]), 4),
-                "Prediction_D": round(float(current["Dynamic_D"]), 4) if np.isfinite(current["Dynamic_D"]) else np.nan,
-                "K_Velocity_5D": round(float(current["K_Velocity_5D"]), 4),
-                "Predicted_ETA_Days": round(float(current["ETA_Days"]), 2),
-                "ETA_Trigger_Note": note,
+                "Parent_Event_ID": parent_id,
+                "Original_Signal_Date": formal_date,
+                "Signal_Daily_State": state_name,
             }
         )
-        records.append(snap)
-    return deterministic_rank(records)
+
+        baseline = common.copy()
+        baseline.update(
+            {
+                "Entry_Path": "原始次日买入",
+                "Has_Entry_Signal": True,
+                "Decision_Status": "BUY",
+                "Decision_Reason": "原始正式信号，不做日线过滤",
+                "Confirmation_Date": formal_date,
+                "Confirmation_Days": 0,
+                "Execution_State": state_name,
+                "Event_ID": hashlib.sha1(f"{parent_id}|原始次日买入".encode()).hexdigest()[:20],
+            }
+        )
+        rows.append(baseline)
+
+        immediate = common.copy()
+        immediate_buy = state_name == "健康上涨"
+        immediate.update(
+            {
+                "Entry_Path": "信号日状态买入",
+                "Has_Entry_Signal": immediate_buy,
+                "Decision_Status": "BUY" if immediate_buy else "REJECT",
+                "Decision_Reason": "信号日健康上涨" if immediate_buy else f"信号日为{state_name}",
+                "Confirmation_Date": formal_date if immediate_buy else None,
+                "Confirmation_Days": 0,
+                "Execution_State": state_name,
+                "Event_ID": hashlib.sha1(f"{parent_id}|信号日状态买入".encode()).hexdigest()[:20],
+            }
+        )
+        if not immediate_buy:
+            immediate["Signal_Date"] = None
+        rows.append(immediate)
+
+        confirmed = common.copy()
+        if state_name == "健康上涨":
+            decision = {
+                "Decision_Status": "BUY", "Decision_Reason": "信号日已健康上涨",
+                "Confirmation_Date": formal_date, "Confirmation_Days": 0,
+                "Execution_State": state_name, "Signal_Close": mother.get("Signal_Close", np.nan),
+            }
+        elif state_name == "震荡蓄势":
+            decision = find_oscillation_confirmation(
+                mother, stock_dict, asof_date, max_wait_days,
+                macd_shrink_limit, overextension_10d, overextension_20d,
+            )
+        else:
+            decision = {
+                "Decision_Status": "REJECT", "Decision_Reason": f"信号日为{state_name}",
+                "Confirmation_Date": None, "Confirmation_Days": 0, "Execution_State": state_name,
+            }
+        confirmed.update(decision)
+        has_signal = decision.get("Decision_Status") == "BUY"
+        confirmed.update(
+            {
+                "Entry_Path": "震荡确认买入",
+                "Has_Entry_Signal": has_signal,
+                "Event_ID": hashlib.sha1(f"{parent_id}|震荡确认买入".encode()).hexdigest()[:20],
+            }
+        )
+        if has_signal:
+            confirmed["Signal_Date"] = decision.get("Confirmation_Date", formal_date)
+            confirmed["Signal_Close"] = decision.get("Signal_Close", mother.get("Signal_Close", np.nan))
+        else:
+            confirmed["Signal_Date"] = None
+        rows.append(confirmed)
+    frame = pd.DataFrame(rows)
+    frame["Classifier_Passed"] = frame["Decision_Status"].eq("BUY")
+    frame["Selected_In_Path"] = False
+    frame["Has_Entry_Signal"] = False
+    frame["Selection_Reason"] = frame["Decision_Reason"]
+    frame["Entry_Check_Status_At_Selection"] = "NOT_CHECKED"
+
+    for (_, path), group in frame.groupby(["Original_Signal_Date", "Entry_Path"], sort=False):
+        eligible = group[group["Classifier_Passed"]].copy()
+        eligible["_selection_date"] = eligible["Signal_Date"].map(parse_yyyymmdd)
+        # 震荡确认按实际信号到达顺序占用名额；同日才按原排名，避免用未来确认结果倒排。
+        eligible = eligible.sort_values(
+            ["_selection_date", "Rank", "Raw_Rank"], na_position="last", kind="mergesort"
+        )
+        selected_count = 0
+        for row_index, candidate in eligible.iterrows():
+            check = entry_check(
+                str(candidate["ts_code"]), parse_yyyymmdd(candidate["Signal_Date"]),
+                candidate.get("Signal_Close", np.nan), stock_dict,
+            )
+            frame.at[row_index, "Entry_Check_Status_At_Selection"] = check.get("Entry_Status", "WAIT_BUY")
+            if check.get("Entry_Status") == "SKIPPED":
+                frame.at[row_index, "Decision_Status"] = "ENTRY_SKIPPED"
+                frame.at[row_index, "Selection_Reason"] = check.get("Entry_Reason", "次日不可买")
+                continue
+            if selected_count >= int(top_n):
+                frame.at[row_index, "Decision_Status"] = "NOT_SELECTED_CAPACITY"
+                frame.at[row_index, "Selection_Reason"] = f"本路径已选满Top {int(top_n)}"
+                continue
+            frame.at[row_index, "Selected_In_Path"] = True
+            frame.at[row_index, "Has_Entry_Signal"] = True
+            frame.at[row_index, "Selection_Reason"] = candidate.get("Decision_Reason", "通过")
+            selected_count += 1
+
+    baseline_ids = set(
+        frame.loc[
+            (frame["Entry_Path"] == "原始次日买入") & frame["Selected_In_Path"],
+            "Parent_Event_ID",
+        ].astype(str)
+    )
+    frame["Baseline_Selected"] = frame["Parent_Event_ID"].astype(str).isin(baseline_ids)
+    return frame
 
 
-# -----------------------------------------------------------------------------
-# 买入检查、T+1 生命周期与 W8/W10/W12 并行结果
-# -----------------------------------------------------------------------------
 def entry_check(ts_code, signal_date, signal_close, stock_dict):
     default = {
         "Entry_Status": "WAIT_BUY",
@@ -1119,7 +1204,8 @@ def simulate_lifecycle(event, stock_dict, asof_date, max_weeks=12):
     observed_days = min(len(future), max_days if forced_exit_pending_reason is None else len(future))
     result["Hold_Days"] = int(observed_days)
     result["Max_Adverse_Excursion (%)"] = round((trough - buy_price) / buy_price * 100, 2)
-    result.update(compute_macd_audit(full, buy_date, asof_date))
+    audit_end_date = exit_data["Exit_Date"] if exit_data is not None else asof_date
+    result.update(compute_macd_audit(full, buy_date, audit_end_date))
 
     # 相同交易路径下的8/10/12周上限反事实结果。
     for weeks in (8, 10, 12):
@@ -1178,12 +1264,10 @@ def simulate_lifecycle(event, stock_dict, asof_date, max_weeks=12):
 
 
 # -----------------------------------------------------------------------------
-# 每日状态：事件登记、回踩识别、所有旧持仓刷新
+# 正式信号母样本：冻结选股结果，执行路径每次可用最新数据重算
 # -----------------------------------------------------------------------------
 SIGNAL_BASE_COLUMNS = [
     "Event_ID", "Signal_Date", "Setup_Week", "Signal_Type", "ts_code", "name",
-    "Entry_Path", "Has_ETA_Signal", "Prediction_Date", "Formal_Signal_Date",
-    "Prediction_K", "Prediction_D", "K_Velocity_5D", "Predicted_ETA_Days", "ETA_Trigger_Note",
     "Raw_Rank", "Rank", "Signal_Close", "Signal_Raw_Close", "Total_Score",
     "SKDJ_K", "SKDJ_D", "Prev_K", "K_Slope", "KD_Gap_Improve", "K_Min_14W",
     "Weeks_Under_25_14W", "Trend_Type", "Weekly_Vol_Ratio", "circ_mv",
@@ -1234,78 +1318,6 @@ def merge_new_events(existing, additions):
     return merged.sort_values(["Signal_Date", "Signal_Type", "Rank"]).reset_index(drop=True)
 
 
-def build_recent_formal_sources(dates, whitelist_keys, name_map, stock_dict, basic_indexed,
-                                min_price, min_mv, max_mv, top_n, config_id):
-    """回补最近若干交易日的Top N正式突破，仅作为首次运行时识别回踩的父信号。"""
-    source_events = []
-    for date in dates:
-        candidates = build_candidate_records(
-            date, "正式上穿25", whitelist_keys, name_map, stock_dict, basic_indexed,
-            min_price, min_mv, max_mv,
-        ).head(int(top_n))
-        if candidates.empty:
-            continue
-        events = candidates_to_events(candidates, "正式上穿25", config_id)
-        events["Signal_Note"] = "最近交易日自动回补，仅用于识别回踩来源"
-        source_events.append(events)
-    return merge_new_events(pd.DataFrame(), source_events)
-
-
-def build_pullback_candidates(signal_history, current_date, stock_dict, name_map, pullback_window):
-    if signal_history.empty:
-        return pd.DataFrame()
-    formal = signal_history[signal_history["Signal_Type"] == "正式上穿25"].copy()
-    if formal.empty:
-        return pd.DataFrame()
-    existing_parents = set(
-        signal_history.loc[signal_history["Signal_Type"] == "回踩止跌", "Parent_Event_ID"].dropna().astype(str)
-    )
-    records = []
-    for _, event in formal.iterrows():
-        parent_id = str(event["Event_ID"])
-        if parent_id in existing_parents:
-            continue
-        code = str(event["ts_code"])
-        signal_date = parse_yyyymmdd(event["Signal_Date"])
-        if not signal_date or code not in stock_dict:
-            continue
-        frame = stock_dict[code]
-        post = frame[(frame.index > signal_date) & (frame.index <= str(current_date))]
-        if len(post) < 2 or len(post) > int(pullback_window):
-            continue
-        snap = compute_signal_snapshot(code, current_date, stock_dict)
-        if not snap or snap["SKDJ_K"] < 25.0 or snap["SKDJ_K"] <= snap["SKDJ_D"]:
-            continue
-        high_since = float(post["high"].max())
-        current = post.iloc[-1]
-        previous = post.iloc[-2]
-        drawdown = (high_since - float(current["close"])) / high_since * 100
-        prior_vol = post["vol"].shift(1).tail(5).mean()
-        pullback_vol_ratio = float(current["vol"] / prior_vol) if pd.notna(prior_vol) and prior_vol > 0 else np.nan
-        stopped_falling = float(current["close"]) >= float(previous["close"])
-        shrinking = pd.isna(pullback_vol_ratio) or pullback_vol_ratio <= 1.0
-        if not (3.0 <= drawdown <= 10.0 and stopped_falling and shrinking):
-            continue
-        snap.update(
-            {
-                "ts_code": code,
-                "name": name_map.get(code, event.get("name", code)),
-                "circ_mv": event.get("circ_mv", np.nan),
-                "Signal_Type": "回踩止跌",
-                "Signal_Close": float(current["close"]),
-                "Signal_Raw_Close": float(current.get("raw_close", current["close"])),
-                "Signal_Date": str(current_date),
-                "Setup_Week": pd.to_datetime(str(current_date)).strftime("%G_%V"),
-                "Parent_Event_ID": parent_id,
-                "Pullback_Drawdown (%)": round(drawdown, 2),
-                "Pullback_Days": int(len(post)),
-                "Signal_Note": f"突破后第{len(post)}日，距峰值回撤{drawdown:.1f}%",
-            }
-        )
-        records.append(snap)
-    return deterministic_rank(records)
-
-
 def refresh_all_positions(signal_history, stock_dict, asof_date):
     if signal_history.empty:
         return pd.DataFrame()
@@ -1322,19 +1334,23 @@ def refresh_all_positions(signal_history, stock_dict, asof_date):
     return pd.DataFrame(rows)
 
 
-def refresh_eta_positions(comparison_events, stock_dict, asof_date):
+def refresh_state_positions(comparison_events, stock_dict, asof_date):
     if comparison_events is None or comparison_events.empty:
         return pd.DataFrame()
     rows = []
-    progress = st.progress(0, text="🔄 重算五条买入路径...")
+    progress = st.progress(0, text="🔄 重算三条日线执行路径...")
     for idx, (_, event) in enumerate(comparison_events.iterrows()):
         combined = event.to_dict()
-        if not bool(event.get("Has_ETA_Signal", False)):
+        has_signal = str(event.get("Has_Entry_Signal", False)).lower() in {"true", "1", "yes"}
+        decision = str(event.get("Decision_Status", "REJECT"))
+        if not has_signal:
             lifecycle = {f"Return_W{w} (%)": np.nan for w in range(1, 13)}
+            status = "PENDING_CONFIRMATION" if decision == "PENDING" else "REJECTED"
             lifecycle.update(
                 {
-                    "Status": "NO_SIGNAL", "Entry_Status": "NO_SIGNAL",
-                    "Entry_Reason": "该母样本此前未出现此ETA预测", "Exit_Reason": "无ETA信号",
+                    "Status": status, "Entry_Status": status,
+                    "Entry_Reason": event.get("Decision_Reason", "日线状态未通过"),
+                    "Exit_Reason": "等待确认" if decision == "PENDING" else "日线状态放弃",
                     "Buy_Date": None, "Buy_Price": np.nan, "Gap_pct": np.nan,
                     "Exit_Date": None, "Exit_Price": np.nan, "Final_Return (%)": np.nan,
                     "Hold_Days": 0, "Followup_Days": 0, "Current_Return (%)": np.nan,
@@ -1349,47 +1365,52 @@ def refresh_eta_positions(comparison_events, stock_dict, asof_date):
         if (idx + 1) % 20 == 0 or idx == len(comparison_events) - 1:
             progress.progress(
                 (idx + 1) / len(comparison_events),
-                text=f"🔄 五路径更新 {idx + 1}/{len(comparison_events)}",
+                text=f"🔄 三路径更新 {idx + 1}/{len(comparison_events)}",
             )
     progress.empty()
     return pd.DataFrame(rows)
-
-
 # -----------------------------------------------------------------------------
 # 报告：正确区分本周有记录、周初存活、周末存活与固定队列收益
 # -----------------------------------------------------------------------------
-def display_eta_validation_report(position_df):
+def _true_mask(series):
+    return series.fillna(False).astype(str).str.lower().isin(["true", "1", "yes"])
+
+
+def display_state_validation_report(position_df):
     if position_df.empty or "Entry_Path" not in position_df.columns:
         return
-    st.header("🧭 双向 ETA10/ETA15 配对验证")
-    st.warning(
-        "四个ETA组均以‘后来进入正式Top 5’为母样本，因此用于回答同一股票能否提前买，"
-        "不等于全市场独立ETA策略的实盘胜率。未出现ETA信号的母样本仍计入覆盖率。"
+    st.header("🧭 信号后日线状态三路径验证")
+    st.caption(
+        "所有分类只使用正式信号日及以前的数据；震荡确认只在确认日收盘后登记，并按下一交易日开盘成交。"
     )
     total_mothers = position_df["Parent_Event_ID"].astype(str).nunique()
+    all_weeks = sorted(position_df["Original_Signal_Date"].map(parse_yyyymmdd).dropna().unique())
     rows = []
-    for branch in ETA_BRANCHES:
-        group = position_df[position_df["Entry_Path"] == branch].copy()
-        has_signal = (
-            group["Has_ETA_Signal"].fillna(False).astype(str).str.lower().isin(["true", "1", "yes"])
-            if "Has_ETA_Signal" in group else pd.Series(False, index=group.index)
-        )
+    for path in STATE_PATHS:
+        group = position_df[position_df["Entry_Path"] == path].copy()
+        has_signal = _true_mask(group["Has_Entry_Signal"])
         signaled = group[has_signal]
-        executable = signaled[~signaled["Status"].isin(["SKIPPED", "NO_SIGNAL", "WAIT_BUY"])]
+        executable = signaled[~signaled["Status"].isin(["SKIPPED", "WAIT_BUY"])]
         closed = executable[executable["Status"] == "CLOSED"].copy()
         final_ret = pd.to_numeric(closed.get("Final_Return (%)"), errors="coerce").dropna()
         w1 = pd.to_numeric(executable.get("Return_W1 (%)"), errors="coerce").dropna()
         mae = pd.to_numeric(executable.get("Max_Adverse_Excursion (%)"), errors="coerce").dropna()
-        lead = pd.to_numeric(signaled.get("Lead_Trading_Days"), errors="coerce").dropna()
-        stop_mask = closed.get("Exit_Reason", pd.Series("", index=closed.index)).astype(str).str.contains("破-10%")
+        wait = pd.to_numeric(signaled.get("Confirmation_Days"), errors="coerce").dropna()
+        per_week = (
+            signaled.assign(_week=signaled["Original_Signal_Date"].map(parse_yyyymmdd))
+            .groupby("_week").size().reindex(all_weeks, fill_value=0)
+        )
         rows.append(
             {
-                "买入路径": branch,
-                "母样本": total_mothers,
-                "出现预测": int(has_signal.sum()),
-                "预测覆盖率": has_signal.mean() * 100 if len(group) else np.nan,
-                "平均提前交易日": lead.mean() if len(lead) else np.nan,
-                "可执行样本": len(executable),
+                "执行路径": path,
+                "正式候选池": total_mothers,
+                "通过分类": int(has_signal.sum()),
+                "接受率": has_signal.mean() * 100 if len(group) else np.nan,
+                "平均等待日": wait.mean() if len(wait) else np.nan,
+                "平均每周买入": per_week.mean() if len(per_week) else np.nan,
+                "选满TopN周": int((per_week >= int(MAX_TOP_N)).sum()) if len(per_week) else 0,
+                "空窗周": int((per_week == 0).sum()) if len(per_week) else 0,
+                "W1样本": len(w1),
                 "W1均益": w1.mean() if len(w1) else np.nan,
                 "W1胜率": (w1 > 0).mean() * 100 if len(w1) else np.nan,
                 "已结束": len(final_ret),
@@ -1397,49 +1418,103 @@ def display_eta_validation_report(position_df):
                 "最终中位数": final_ret.median() if len(final_ret) else np.nan,
                 "最终胜率": (final_ret > 0).mean() * 100 if len(final_ret) else np.nan,
                 "平均最大不利回撤": mae.mean() if len(mae) else np.nan,
-                "最差盘中回撤": mae.min() if len(mae) else np.nan,
-                "-10%止损率": stop_mask.mean() * 100 if len(closed) else np.nan,
+                "-10%止损率": (
+                    closed["Exit_Reason"].astype(str).str.contains("破-10%").mean() * 100
+                    if len(closed) else np.nan
+                ),
             }
         )
     summary = pd.DataFrame(rows)
-    pct_cols = ["预测覆盖率", "W1均益", "W1胜率", "最终均益", "最终中位数", "最终胜率", "平均最大不利回撤", "最差盘中回撤", "-10%止损率"]
-    st.dataframe(summary.style.format({col: "{:.2f}%" for col in pct_cols}, na_rep="—"), width="stretch")
+    pct_cols = [
+        "接受率", "W1均益", "W1胜率", "最终均益", "最终中位数", "最终胜率",
+        "平均最大不利回撤", "-10%止损率",
+    ]
+    formats = {column: "{:.2f}%" for column in pct_cols}
+    formats.update({"平均等待日": "{:.2f}", "平均每周买入": "{:.2f}"})
+    st.dataframe(summary.style.format(formats, na_rep="—"), width="stretch")
 
-    closed = position_df[position_df["Status"] == "CLOSED"].copy()
-    if not closed.empty:
-        closed["Final_Return (%)"] = pd.to_numeric(closed["Final_Return (%)"], errors="coerce")
-        pivot = closed.pivot_table(index="Parent_Event_ID", columns="Entry_Path", values="Final_Return (%)", aggfunc="first")
-        if "正式上穿25" in pivot.columns:
-            paired_rows = []
-            for branch in ETA_BRANCHES[1:]:
-                pair = pivot[["正式上穿25", branch]].dropna() if branch in pivot.columns else pd.DataFrame()
-                delta = pair[branch] - pair["正式上穿25"] if not pair.empty else pd.Series(dtype=float)
-                paired_rows.append(
-                    {
-                        "提前路径": branch,
-                        "双方均结束样本": len(pair),
-                        "相对原买点平均改善": delta.mean() if len(delta) else np.nan,
-                        "相对原买点中位改善": delta.median() if len(delta) else np.nan,
-                        "收益优于原买点比例": (delta > 0).mean() * 100 if len(delta) else np.nan,
-                    }
-                )
-            st.subheader("同一股票相对正式买点的收益差")
-            st.dataframe(
-                pd.DataFrame(paired_rows).style.format(
-                    {"相对原买点平均改善": "{:.2f}%", "相对原买点中位改善": "{:.2f}%", "收益优于原买点比例": "{:.1f}%"},
-                    na_rep="—",
-                ), width="stretch",
-            )
+    baseline = position_df[
+        (position_df["Entry_Path"] == "原始次日买入")
+        & _true_mask(position_df["Selected_In_Path"])
+    ].copy()
+    baseline["Final_Return (%)"] = pd.to_numeric(baseline["Final_Return (%)"], errors="coerce")
+    baseline["Return_W1 (%)"] = pd.to_numeric(baseline["Return_W1 (%)"], errors="coerce")
+    state_rows = []
+    for state, group in baseline.groupby("Signal_Daily_State", dropna=False):
+        final_ret = group.loc[group["Status"] == "CLOSED", "Final_Return (%)"].dropna()
+        w1 = group["Return_W1 (%)"].dropna()
+        mae = pd.to_numeric(group["Max_Adverse_Excursion (%)"], errors="coerce").dropna()
+        state_rows.append(
+            {
+                "信号日日线状态": state,
+                "母样本": len(group),
+                "W1样本": len(w1),
+                "W1均益": w1.mean() if len(w1) else np.nan,
+                "W1胜率": (w1 > 0).mean() * 100 if len(w1) else np.nan,
+                "已结束": len(final_ret),
+                "最终均益": final_ret.mean() if len(final_ret) else np.nan,
+                "最终中位数": final_ret.median() if len(final_ret) else np.nan,
+                "最终胜率": (final_ret > 0).mean() * 100 if len(final_ret) else np.nan,
+                "平均最大不利回撤": mae.mean() if len(mae) else np.nan,
+            }
+        )
+    st.subheader("信号日状态本身的历史辨别力")
+    st.dataframe(
+        pd.DataFrame(state_rows).style.format(
+            {
+                "W1均益": "{:.2f}%", "W1胜率": "{:.1f}%", "最终均益": "{:.2f}%",
+                "最终中位数": "{:.2f}%", "最终胜率": "{:.1f}%", "平均最大不利回撤": "{:.2f}%",
+            },
+            na_rep="—",
+        ),
+        width="stretch",
+    )
 
-        if "MACD_Rapid_Shrink" in closed.columns:
-            audit = (
-                closed.groupby(["Entry_Path", "MACD_Rapid_Shrink"], observed=False)["Final_Return (%)"]
-                .agg([("样本数", "count"), ("最终均益", "mean"), ("最终胜率", lambda x: (x > 0).mean() * 100)])
-                .reset_index()
-            )
-            st.subheader("日线MACD红柱快速缩短审计（只观察，不参与退出）")
-            st.caption("快速缩短定义：单日缩短≥30%，或三日内缩短≥50%；后续可根据回测再决定是否写入卖出规则。")
-            st.dataframe(audit.style.format({"最终均益": "{:.2f}%", "最终胜率": "{:.1f}%"}), width="stretch")
+    closed_baseline = baseline[baseline["Status"] == "CLOSED"].set_index("Parent_Event_ID")
+    selection_rows = []
+    for path in STATE_PATHS[1:]:
+        path_rows = position_df[position_df["Entry_Path"] == path].set_index("Parent_Event_ID")
+        common_ids = closed_baseline.index.intersection(path_rows.index)
+        audit = path_rows.loc[common_ids].copy()
+        base_ret = closed_baseline.loc[common_ids, "Final_Return (%)"]
+        rejected = ~_true_mask(audit["Has_Entry_Signal"])
+        rejected_ret = base_ret[rejected]
+        avoided_losers = rejected_ret[rejected_ret <= 0]
+        missed_winners = rejected_ret[rejected_ret > 0]
+        path_closed = audit[audit["Status"] == "CLOSED"]
+        paired_ids = closed_baseline.index.intersection(path_closed.index)
+        delta = (
+            pd.to_numeric(path_closed.loc[paired_ids, "Final_Return (%)"], errors="coerce")
+            - pd.to_numeric(closed_baseline.loc[paired_ids, "Final_Return (%)"], errors="coerce")
+        ).dropna()
+        selection_rows.append(
+            {
+                "分类路径": path,
+                "可判断基准样本": len(common_ids),
+                "放弃样本": len(rejected_ret),
+                "放弃中亏损股": len(avoided_losers),
+                "放弃准确率": len(avoided_losers) / len(rejected_ret) * 100 if len(rejected_ret) else np.nan,
+                "避免亏损合计": -avoided_losers.sum(),
+                "误杀盈利股": len(missed_winners),
+                "错失利润合计": missed_winners.sum(),
+                "净筛选价值": -rejected_ret.sum(),
+                "双方均结束": len(delta),
+                "买点平均改善": delta.mean() if len(delta) else np.nan,
+                "买点优于基准比例": (delta > 0).mean() * 100 if len(delta) else np.nan,
+            }
+        )
+    st.subheader("避免亏损与误杀利润")
+    st.caption("“净筛选价值”＝被放弃亏损的绝对值－被放弃盈利股的利润；正数才说明过滤总体有价值。")
+    st.dataframe(
+        pd.DataFrame(selection_rows).style.format(
+            {
+                "放弃准确率": "{:.1f}%", "避免亏损合计": "{:.2f}%", "错失利润合计": "{:.2f}%",
+                "净筛选价值": "{:.2f}%", "买点平均改善": "{:.2f}%", "买点优于基准比例": "{:.1f}%",
+            },
+            na_rep="—",
+        ),
+        width="stretch",
+    )
 
 
 def display_lifecycle_report(position_df, title, recent_trade_dates=None):
@@ -1448,7 +1523,9 @@ def display_lifecycle_report(position_df, title, recent_trade_dates=None):
         st.info("暂无可分析记录。")
         return
 
-    valid = position_df[~position_df["Status"].isin(["SKIPPED", "NO_SIGNAL"])].copy()
+    valid = position_df[
+        ~position_df["Status"].isin(["SKIPPED", "NO_SIGNAL", "REJECTED", "PENDING_CONFIRMATION"])
+    ].copy()
     completed = valid[valid["Status"] == "CLOSED"].copy()
     if "Final_Return (%)" in completed.columns:
         completed["Final_Return (%)"] = pd.to_numeric(completed["Final_Return (%)"], errors="coerce")
@@ -1527,7 +1604,7 @@ def display_lifecycle_report(position_df, title, recent_trade_dates=None):
     if not completed.empty:
         st.subheader("🏆 排名与买点路径")
         rank_stats = (
-            completed.groupby(["Signal_Type", "Rank"], observed=False)
+            completed.groupby(["Entry_Path", "Rank"], observed=False)
             .agg(
                 样本数=("Final_Return (%)", "count"),
                 胜率=("Final_Return (%)", lambda x: (x > 0).mean() * 100),
@@ -1564,7 +1641,7 @@ def display_lifecycle_report(position_df, title, recent_trade_dates=None):
     detail = valid.copy()
     if recent_trade_dates:
         recent_set = {str(date) for date in recent_trade_dates}
-        active_mask = detail["Status"].isin(["WAIT_BUY", "HOLDING"])
+        active_mask = detail["Status"].isin(["WAIT_BUY", "HOLDING", "PENDING_CONFIRMATION"])
         recent_mask = pd.Series(False, index=detail.index)
         for date_col in ("Signal_Date", "Buy_Date", "Exit_Date"):
             if date_col in detail.columns:
@@ -1575,8 +1652,10 @@ def display_lifecycle_report(position_df, title, recent_trade_dates=None):
     else:
         st.subheader("📋 最新状态")
     display_cols = [
-        "Formal_Signal_Date", "Signal_Date", "Entry_Path", "Signal_Type", "Rank", "name", "ts_code", "Total_Score",
-        "Prediction_K", "K_Velocity_5D", "Predicted_ETA_Days", "Lead_Trading_Days",
+        "Original_Signal_Date", "Signal_Date", "Entry_Path", "Rank", "name", "ts_code", "Total_Score",
+        "Signal_Daily_State", "Execution_State", "Decision_Status", "Decision_Reason", "Confirmation_Days",
+        "Daily_Return_3D (%)", "Daily_Return_10D (%)", "MA5_Slope_3D (%)",
+        "MACD_Hist_Signal", "MACD_Shrink_3Bars (%)", "Overextended_Flag", "State_Reason",
         "Pre_Return_10D", "Days_Since_20D_Low", "Timing_Flag", "Status",
         "Buy_Date", "Buy_Price", "Gap_pct", "Hold_Days",
         "Current_Week", "Current_Return (%)", "Peak_Return (%)", "Max_Adverse_Excursion (%)", "Drawdown_From_Peak (%)",
@@ -1600,12 +1679,23 @@ def display_lifecycle_report(position_df, title, recent_trade_dates=None):
 # -----------------------------------------------------------------------------
 with st.sidebar:
     st.header("⚙️ 运行配置")
-    RUN_MODE = st.radio("运行模式", ["每日ETA状态更新", "历史五路径回测"], index=1)
+    RUN_MODE = st.radio("运行模式", ["每日状态更新", "历史状态分类回测"], index=1)
     end_date = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("历史回测交易日数", value=250, min_value=30, step=30)
-    MAX_TOP_N = st.number_input("每类信号最多跟踪数", value=5, min_value=1, max_value=20, step=1)
-    ETA_TOLERANCE = st.number_input("ETA允许误差(交易日)", value=2.0, min_value=0.5, max_value=5.0, step=0.5)
-    ETA_LOOKBACK = st.number_input("正式信号前ETA搜索天数", value=60, min_value=20, max_value=120, step=10)
+    MAX_TOP_N = st.number_input("每周正式母样本数", value=5, min_value=1, max_value=20, step=1)
+    MAX_WAIT_DAYS = st.number_input("震荡最长确认天数", value=3, min_value=1, max_value=5, step=1)
+
+    st.markdown("---")
+    st.subheader("📐 日线状态参数")
+    MACD_SHRINK_LIMIT = st.number_input(
+        "MACD三柱快速缩短阈值(%)", value=30.0, min_value=10.0, max_value=80.0, step=5.0
+    )
+    OVEREXTENSION_10D = st.number_input(
+        "10日涨幅偏大阈值(%)", value=15.0, min_value=5.0, max_value=40.0, step=1.0
+    )
+    OVEREXTENSION_20D = st.number_input(
+        "距20日低点涨幅阈值(%)", value=20.0, min_value=10.0, max_value=60.0, step=2.0
+    )
 
     st.markdown("---")
     st.subheader("💰 股票池")
@@ -1614,40 +1704,65 @@ with st.sidebar:
     MIN_MV = c1.number_input("最小流通市值(亿)", value=50.0, min_value=0.0)
     MAX_MV = c2.number_input("最大流通市值(亿)", value=1000.0, min_value=0.0)
 
-    config_id = make_config_id(MIN_PRICE, MIN_MV, MAX_MV, MAX_TOP_N, ETA_LOOKBACK)
-    config_id += f"_tol{str(ETA_TOLERANCE).replace('.', '_')}"
-    DAILY_SIGNAL_FILE = f"skdj_v14_7_daily_signal_history_{config_id}.csv"
-    DAILY_POSITION_FILE = f"skdj_v14_7_daily_position_state_{config_id}.csv"
-    FORMAL_HISTORY_FILE = f"skdj_v14_7_formal_mothers_{config_id}.csv"
-    HISTORY_FILE = f"skdj_v14_7_eta_comparison_{config_id}.csv"
-    HISTORY_LEDGER_FILE = f"skdj_v14_7_scanned_dates_{config_id}.csv"
-
     st.markdown("---")
+    st.subheader("🔁 自动回测")
+    AUTO_RESUME = st.checkbox("网络重连后自动续跑", value=True)
+    HISTORY_BATCH_WEEKS = st.number_input(
+        "每批扫描周数", value=5, min_value=1, max_value=20, step=1,
+        help="每批原子保存后自动进入下一批，缩短单次页面连接时间。",
+    )
+
+    config_seed = (
+        f"{MAX_WAIT_DAYS}|{MACD_SHRINK_LIMIT:.1f}|{OVEREXTENSION_10D:.1f}|"
+        f"{OVEREXTENSION_20D:.1f}"
+    )
+    config_id = make_config_id(MIN_PRICE, MIN_MV, MAX_MV, MAX_TOP_N, MAX_WAIT_DAYS)
+    config_id += "_" + hashlib.sha1(config_seed.encode("utf-8")).hexdigest()[:8]
+    DAILY_MOTHER_FILE = f"skdj_v14_8_daily_mothers_{config_id}.csv"
+    DAILY_POSITION_FILE = f"skdj_v14_8_daily_state_{config_id}.csv"
+    FORMAL_HISTORY_FILE = f"skdj_v14_8_formal_mothers_{config_id}.csv"
+    HISTORY_FILE = f"skdj_v14_8_state_comparison_{config_id}.csv"
+    HISTORY_LEDGER_FILE = f"skdj_v14_8_scanned_dates_{config_id}.csv"
+    RUN_TASK_FILE = f"skdj_v14_8_running_task_{config_id}.json"
+
+    task_snapshot = read_json_safe(RUN_TASK_FILE)
+    if task_snapshot:
+        st.caption(
+            f"任务状态：{task_snapshot.get('state', '未知')}｜"
+            f"已完成周次：{task_snapshot.get('completed_weeks', 0)}"
+        )
+    stop_auto = st.button("⏹️ 停止自动续跑")
+    if stop_auto and os.path.exists(RUN_TASK_FILE):
+        os.remove(RUN_TASK_FILE)
+        st.success("已停止自动续跑；已保存的行情、母样本和周次不会删除。")
+
     if st.button("🗑️ 清空行情缓存"):
         if os.path.isdir(MARKET_CACHE_ROOT):
             shutil.rmtree(MARKET_CACHE_ROOT)
         st.cache_data.clear()
         st.success("行情缓存已清理。")
-    if st.button("🗑️ 清空V14.7本配置结果"):
-        for path in (DAILY_SIGNAL_FILE, DAILY_POSITION_FILE):
+    if st.button("🗑️ 清空V14.8本配置结果"):
+        for path in (
+            DAILY_MOTHER_FILE, DAILY_POSITION_FILE, FORMAL_HISTORY_FILE,
+            HISTORY_FILE, HISTORY_LEDGER_FILE, RUN_TASK_FILE,
+        ):
             if os.path.exists(path):
                 os.remove(path)
-        for path in (FORMAL_HISTORY_FILE, HISTORY_FILE, HISTORY_LEDGER_FILE):
-            if os.path.exists(path):
-                os.remove(path)
-        st.success("当前参数对应的信号、回测和断点账本已清理；行情分片仍保留。")
+        st.success("当前参数对应的结果和任务标记已清理；分片行情仍保留。")
 
     try:
         secret_token = st.secrets.get("TUSHARE_TOKEN", "") if hasattr(st, "secrets") else ""
     except Exception:
         secret_token = ""
     TOKEN_INPUT = st.text_input("🔑 Tushare Token", value=secret_token, type="password")
+    if AUTO_RESUME and not secret_token:
+        st.caption("若页面形成新会话，自动续跑需要在Secrets中配置TUSHARE_TOKEN。")
 
 token_clean = clean_token_str(TOKEN_INPUT)
 
 
 # -----------------------------------------------------------------------------
-# V14.7 主流程：轻量下载范围、断点扫描、五路径对照
+# V14.8 主流程：持久化任务标记、小批次续跑、日线状态三路径
 # -----------------------------------------------------------------------------
 def prepare_runtime_market(token_value, analysis_end, backtest_days, whitelist_keys):
     pro = ts.pro_api(token_value)
@@ -1662,7 +1777,7 @@ def prepare_runtime_market(token_value, analysis_end, backtest_days, whitelist_k
     open_days_all = cal[cal["is_open"] == 1].sort_values("cal_date")["cal_date"].astype(str).tolist()
     available = [date for date in open_days_all if date <= end_str]
     if len(available) < 120:
-        raise RuntimeError("可用交易日不足120天，无法稳定计算20周均线与ETA。")
+        raise RuntimeError("可用交易日不足120天，无法稳定计算20周均线与日线状态。")
     required_count = min(len(available), int(backtest_days) + warmup_trade_days)
     fetch_start = available[-required_count]
     fetch_end = min(end_str, datetime.now().strftime("%Y%m%d"))
@@ -1676,66 +1791,127 @@ def prepare_runtime_market(token_value, analysis_end, backtest_days, whitelist_k
     return stock_dict, basic_indexed, open_days_all, available, data_date
 
 
-run_clicked = st.button("🚀 运行V14.7验证", type="primary")
+def start_task(mode, analysis_end, backtest_days):
+    task = {
+        "version": APP_VERSION,
+        "config_id": config_id,
+        "mode": mode,
+        "end_date": analysis_end.strftime("%Y%m%d"),
+        "backtest_days": int(backtest_days),
+        "state": "RUNNING",
+        "error_count": 0,
+        "completed_weeks": 0,
+        "started_at": datetime.now().isoformat(timespec="seconds"),
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    atomic_write_json(task, RUN_TASK_FILE)
+    return task
+
+
+def complete_task():
+    if os.path.exists(RUN_TASK_FILE):
+        os.remove(RUN_TASK_FILE)
+
+
+def build_all_download_zip(result, mothers, ledger):
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "skdj_v14_8_state_validation_export.csv",
+            result.to_csv(index=False).encode("utf-8-sig"),
+        )
+        archive.writestr(
+            "skdj_v14_8_formal_mothers.csv",
+            mothers.to_csv(index=False).encode("utf-8-sig"),
+        )
+        archive.writestr(
+            "skdj_v14_8_scanned_dates.csv",
+            ledger.to_csv(index=False).encode("utf-8-sig"),
+        )
+    return buffer.getvalue()
+
+
+run_clicked = st.button("🚀 运行V14.8状态分类验证", type="primary")
+task = read_json_safe(RUN_TASK_FILE)
+auto_resume = bool(
+    AUTO_RESUME
+    and task
+    and task.get("state") == "RUNNING"
+    and task.get("config_id") == config_id
+    and task.get("mode") == RUN_MODE
+)
 if run_clicked:
-    valid_token, token_message = verify_token_connection(token_clean)
-    if not valid_token:
-        st.error(f"❌ Token预检失败：{token_message}")
+    task = start_task(RUN_MODE, end_date, BACKTEST_DAYS)
+    auto_resume = False
+
+should_run = bool(run_clicked or auto_resume)
+if task and task.get("state") == "PAUSED_ERROR" and not run_clicked:
+    st.warning("自动续跑连续失败3次后已暂停。网络恢复后点击运行，会从现有断点继续。")
+if auto_resume:
+    st.info("检测到未完成任务，正在自动从最近断点续跑。")
+
+if should_run:
+    if not token_clean:
+        st.error("任务断点仍在，但当前会话没有Token。请填写Token；建议在Secrets配置TUSHARE_TOKEN。")
     else:
         try:
+            valid_token, token_message = verify_token_connection(token_clean)
+            if not valid_token:
+                raise RuntimeError(f"Token预检失败：{token_message}")
+
+            task = read_json_safe(RUN_TASK_FILE) or start_task(RUN_MODE, end_date, BACKTEST_DAYS)
+            effective_end = datetime.strptime(task.get("end_date"), "%Y%m%d").date()
+            effective_days = int(task.get("backtest_days", BACKTEST_DAYS))
+
             ts.set_token(token_clean)
-            with st.spinner("构建冻结股票池并检查断点..."):
+            with st.spinner("构建冻结股票池并读取断点..."):
                 whitelist, name_map = load_custom_tech_whitelist(token_clean)
                 whitelist_keys = tuple(sorted(whitelist))
             if not whitelist_keys:
                 raise RuntimeError("未获取到股票池，请检查Token权限或网络。")
-            st.info(f"股票池 {len(whitelist_keys)} 只；ETA不会改变正式Top {int(MAX_TOP_N)}的入选数量。")
+            st.info(f"股票池 {len(whitelist_keys)} 只；周线信号、原评分和正式Top {int(MAX_TOP_N)}保持不变。")
 
             stock_dict, basic_indexed, open_days_all, available_cal_days, data_date = prepare_runtime_market(
-                token_clean, end_date, int(BACKTEST_DAYS), whitelist_keys
+                token_clean, effective_end, effective_days, whitelist_keys
             )
-            if data_date < end_date.strftime("%Y%m%d"):
+            if data_date < effective_end.strftime("%Y%m%d"):
                 st.warning(f"截止日行情尚未完整发布，本次使用最新可用日线：{data_date}。")
             else:
                 st.success(f"行情已更新至：{data_date}")
 
-            if RUN_MODE == "每日ETA状态更新":
-                existing = read_csv_safe(DAILY_SIGNAL_FILE)
-                frames = []
-                formal = build_candidate_records(
+            if RUN_MODE == "每日状态更新":
+                mothers = read_csv_safe(DAILY_MOTHER_FILE)
+                formal_all = build_candidate_records(
                     data_date, "正式上穿25", whitelist_keys, name_map, stock_dict, basic_indexed,
                     MIN_PRICE, MIN_MV, MAX_MV,
-                ).head(int(MAX_TOP_N)).copy()
-                if not formal.empty:
-                    formal["Entry_Path"] = "正式上穿25"
-                    formal["Has_ETA_Signal"] = True
-                    formal["Prediction_Date"] = data_date
-                    formal["Formal_Signal_Date"] = data_date
-                    frames.append(candidates_to_events(formal, "正式上穿25", config_id))
+                )
+                if not formal_all.empty:
+                    formal_all = formal_all.copy()
+                    formal_all["Rank"] = np.arange(1, len(formal_all) + 1)
+                    events = candidates_to_events(formal_all, "正式上穿25", config_id)
+                    mothers = merge_new_events(mothers, [events])
+                    atomic_write_csv(mothers, DAILY_MOTHER_FILE)
 
-                live_tables = {"正式上穿25": formal}
-                for branch in ETA_BRANCHES[1:]:
-                    eta_frame = build_live_eta_candidates(
-                        data_date, branch, whitelist_keys, name_map, stock_dict, basic_indexed,
-                        MIN_PRICE, MIN_MV, MAX_MV, ETA_TOLERANCE,
-                    ).head(int(MAX_TOP_N)).copy()
-                    live_tables[branch] = eta_frame
-                    if not eta_frame.empty:
-                        frames.append(candidates_to_events(eta_frame, branch, config_id))
-
-                signals = merge_new_events(existing, frames)
-                atomic_write_csv(signals, DAILY_SIGNAL_FILE)
-                positions = refresh_all_positions(signals, stock_dict, data_date)
+                comparison = build_state_comparison_events(
+                    mothers, stock_dict, data_date, int(MAX_WAIT_DAYS),
+                    float(MACD_SHRINK_LIMIT), float(OVEREXTENSION_10D), float(OVEREXTENSION_20D),
+                    int(MAX_TOP_N),
+                )
+                positions = refresh_state_positions(comparison, stock_dict, data_date)
                 atomic_write_csv(positions, DAILY_POSITION_FILE)
-                counts = "｜".join(f"{name} {len(frame)}只" for name, frame in live_tables.items())
-                st.success(f"今日首次进入阈值：{counts}")
+                complete_task()
+                state_counts = (
+                    positions[positions["Entry_Path"] == "原始次日买入"]["Signal_Daily_State"]
+                    .value_counts().to_dict()
+                )
+                st.success(f"每日状态更新完成：{state_counts}")
 
             else:
                 cal_df = pd.DataFrame({"cal_date": open_days_all})
                 cal_df["dt"] = pd.to_datetime(cal_df["cal_date"])
                 cal_df["year_week"] = cal_df["dt"].dt.strftime("%G_%V")
                 completed_week_ends = set(cal_df.groupby("year_week")["cal_date"].max().tolist())
-                recent_days = available_cal_days[-int(BACKTEST_DAYS):]
+                recent_days = available_cal_days[-int(effective_days):]
                 scan_dates = [date for date in recent_days if date in completed_week_ends and date < data_date]
 
                 ledger = read_csv_safe(HISTORY_LEDGER_FILE)
@@ -1747,9 +1923,34 @@ if run_clicked:
                 )
                 mothers = read_csv_safe(FORMAL_HISTORY_FILE)
                 new_scan_dates = [date for date in scan_dates if date not in processed]
-                if new_scan_dates:
-                    bar = st.progress(0, text="扫描冻结的V14.5正式Top 5...")
-                    for idx, date in enumerate(new_scan_dates):
+                batch_dates = new_scan_dates[: int(HISTORY_BATCH_WEEKS)]
+
+                if batch_dates:
+                    bar = st.progress(0, text="分批扫描冻结的V14.5正式Top 5...")
+                    for idx, date in enumerate(batch_dates):
+                        coverage_count = sum(
+                            1 for frame in stock_dict.values() if not frame.empty and str(date) in frame.index
+                        )
+                        coverage_rate = coverage_count / max(len(stock_dict), 1)
+                        if coverage_rate < 0.60:
+                            ledger_row = pd.DataFrame(
+                                [{
+                                    "Trade_Date": date, "Raw_Signal_Count": np.nan,
+                                    "Selected_Count": np.nan, "Missing_To_TopN": np.nan,
+                                    "Market_Coverage_Count": coverage_count,
+                                    "Market_Coverage_Rate": round(coverage_rate * 100, 2),
+                                    "Scan_Status": "SKIPPED_INCOMPLETE",
+                                    "Config_ID": config_id,
+                                }]
+                            )
+                            ledger = pd.concat([ledger, ledger_row], ignore_index=True)
+                            ledger = ledger.drop_duplicates(["Trade_Date", "Config_ID"], keep="last")
+                            atomic_write_csv(ledger, HISTORY_LEDGER_FILE)
+                            bar.progress(
+                                (idx + 1) / len(batch_dates),
+                                text=f"本批 {idx + 1}/{len(batch_dates)}：{date}行情不完整，已跳过",
+                            )
+                            continue
                         formal_all = build_candidate_records(
                             date, "正式上穿25", whitelist_keys, name_map, stock_dict, basic_indexed,
                             MIN_PRICE, MIN_MV, MAX_MV,
@@ -1762,90 +1963,158 @@ if run_clicked:
                             selected.append(candidate.to_dict())
                             if len(selected) >= int(MAX_TOP_N):
                                 break
-                        if selected:
-                            selected_df = pd.DataFrame(selected)
-                            selected_df["Rank"] = np.arange(1, len(selected_df) + 1)
-                            events = candidates_to_events(selected_df, "正式上穿25", config_id)
+                        if not formal_all.empty:
+                            formal_store = formal_all.copy()
+                            formal_store["Rank"] = np.arange(1, len(formal_store) + 1)
+                            events = candidates_to_events(formal_store, "正式上穿25", config_id)
                             mothers = merge_new_events(mothers, [events])
-                            # 先提交结果；若随后崩溃，日期尚未入账，重跑会按Event_ID安全去重。
                             atomic_write_csv(mothers, FORMAL_HISTORY_FILE)
 
                         ledger_row = pd.DataFrame(
                             [{
                                 "Trade_Date": date, "Raw_Signal_Count": len(formal_all),
-                                "Selected_Count": len(selected), "Missing_To_TopN": max(0, int(MAX_TOP_N) - len(selected)),
+                                "Selected_Count": len(selected),
+                                "Stored_Candidate_Count": len(formal_all),
+                                "Missing_To_TopN": max(0, int(MAX_TOP_N) - len(selected)),
+                                "Market_Coverage_Count": coverage_count,
+                                "Market_Coverage_Rate": round(coverage_rate * 100, 2),
+                                "Scan_Status": "COMPLETED",
                                 "Config_ID": config_id,
                             }]
                         )
                         ledger = pd.concat([ledger, ledger_row], ignore_index=True)
                         ledger = ledger.drop_duplicates(["Trade_Date", "Config_ID"], keep="last")
-                        # 日期账本最后提交，消除“已标记完成但结果尚未保存”的永久漏周。
                         atomic_write_csv(ledger, HISTORY_LEDGER_FILE)
                         bar.progress(
-                            (idx + 1) / len(new_scan_dates),
-                            text=f"断点扫描 {idx + 1}/{len(new_scan_dates)}：{date}（选出{len(selected)}只）",
+                            (idx + 1) / len(batch_dates),
+                            text=f"本批 {idx + 1}/{len(batch_dates)}：{date}（选出{len(selected)}只）",
                         )
                     bar.empty()
 
-                if mothers.empty:
-                    st.warning("本区间没有正式上穿母样本；ETA没有作为硬过滤条件。")
-                else:
-                    comparison_events = build_eta_comparison_events(
-                        mothers, stock_dict, tolerance=float(ETA_TOLERANCE), lookback_days=int(ETA_LOOKBACK)
+                    remaining = len(new_scan_dates) - len(batch_dates)
+                    task.update(
+                        {
+                            "state": "RUNNING", "error_count": 0,
+                            "completed_weeks": len(ledger),
+                            "remaining_weeks": max(0, remaining),
+                            "updated_at": datetime.now().isoformat(timespec="seconds"),
+                        }
                     )
-                    result = refresh_eta_positions(comparison_events, stock_dict, data_date)
-                    atomic_write_csv(result, HISTORY_FILE)
-                    st.success(
-                        f"已保存 {mothers['Event_ID'].nunique()} 个正式母样本、{len(result)} 条五路径记录。"
-                        "下载或刷新页面不会清空结果。"
-                    )
+                    atomic_write_json(task, RUN_TASK_FILE)
+                    if remaining > 0 and AUTO_RESUME:
+                        st.info(f"本批已原子保存，剩余{remaining}个周次，页面将自动继续。")
+                        time.sleep(0.8)
+                        st.rerun()
+                    elif remaining > 0:
+                        st.warning(f"本批已保存，剩余{remaining}个周次；再次点击运行可续跑。")
+
+                processed_after = (
+                    set(ledger["Trade_Date"].map(parse_yyyymmdd).dropna())
+                    if not ledger.empty and "Trade_Date" in ledger.columns else set()
+                )
+                remaining_dates = [date for date in scan_dates if date not in processed_after]
+                if not remaining_dates:
+                    if mothers.empty:
+                        st.warning("本区间没有正式上穿母样本；日线分类没有参与周线母样本筛选。")
+                        complete_task()
+                    else:
+                        comparison = build_state_comparison_events(
+                            mothers, stock_dict, data_date, int(MAX_WAIT_DAYS),
+                            float(MACD_SHRINK_LIMIT), float(OVEREXTENSION_10D), float(OVEREXTENSION_20D),
+                            int(MAX_TOP_N),
+                        )
+                        result = refresh_state_positions(comparison, stock_dict, data_date)
+                        atomic_write_csv(result, HISTORY_FILE)
+                        complete_task()
+                        st.success(
+                            f"已保存{mothers['Event_ID'].nunique()}个正式母样本、{len(result)}条三路径记录。"
+                            "下载或页面重跑不会清空结果。"
+                        )
         except Exception as exc:
-            st.error("本次运行中断。已完成的单日行情分片和已提交周次会保留，下次直接续跑。")
+            current_task = read_json_safe(RUN_TASK_FILE)
+            failures = int(current_task.get("error_count", 0)) + 1
+            current_task.update(
+                {
+                    "state": "PAUSED_ERROR" if failures >= 3 else "RUNNING",
+                    "error_count": failures,
+                    "last_error": str(exc)[:500],
+                    "updated_at": datetime.now().isoformat(timespec="seconds"),
+                }
+            )
+            atomic_write_json(current_task, RUN_TASK_FILE)
+            st.error("本次连接或运行中断；已完成分片和周次均已保存。")
             st.exception(exc)
+            if AUTO_RESUME and failures < 3:
+                st.info(f"自动重试 {failures}/3，将从断点继续。")
+                time.sleep(2.0)
+                st.rerun()
 
 
-# 报告和下载始终从最后一次原子保存的文件加载，不依赖本次按钮状态。
-if RUN_MODE == "历史五路径回测":
+# 报告与下载始终从磁盘加载，和运行按钮、自动重跑状态完全解耦。
+if RUN_MODE == "历史状态分类回测":
     saved_ledger = read_csv_safe(HISTORY_LEDGER_FILE)
+    saved_mothers = read_csv_safe(FORMAL_HISTORY_FILE)
     if not saved_ledger.empty:
         st.subheader("📦 正式Top 5选出数量审计")
-        short = saved_ledger[pd.to_numeric(saved_ledger.get("Selected_Count"), errors="coerce") < int(MAX_TOP_N)]
-        c1, c2, c3 = st.columns(3)
-        c1.metric("已扫描完整周", len(saved_ledger))
-        c2.metric(f"选满Top {int(MAX_TOP_N)}周", len(saved_ledger) - len(short))
-        c3.metric("不足周数", len(short))
+        scan_status = saved_ledger.get(
+            "Scan_Status", pd.Series("COMPLETED", index=saved_ledger.index)
+        ).fillna("COMPLETED")
+        complete_ledger = saved_ledger[scan_status == "COMPLETED"]
+        skipped_ledger = saved_ledger[scan_status == "SKIPPED_INCOMPLETE"]
+        selected_count = pd.to_numeric(complete_ledger.get("Selected_Count"), errors="coerce")
+        short = complete_ledger[selected_count < int(MAX_TOP_N)]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("已扫描完整周", len(complete_ledger))
+        c2.metric(f"选满Top {int(MAX_TOP_N)}周", len(complete_ledger) - len(short))
+        c3.metric("正式信号不足周", len(short))
+        c4.metric("行情不完整跳过", len(skipped_ledger))
         if not short.empty:
-            st.caption("不足来自正式信号总数或次日不可成交，不是ETA过滤；明细保留Raw_Signal_Count。")
+            st.caption("不足来自正式信号总数或次日不可成交；日线状态分类没有减少母样本。")
             st.dataframe(short.sort_values("Trade_Date"), width="stretch")
+        if not skipped_ledger.empty:
+            st.warning("下列周次因行情覆盖不足被跳过，没有被错误记成零信号。")
+            st.dataframe(skipped_ledger.sort_values("Trade_Date"), width="stretch")
+
     saved_result = read_csv_safe(HISTORY_FILE)
     if not saved_result.empty:
         st.markdown("---")
-        st.caption("以下报告来自磁盘中最近一次成功原子保存的结果；点击下载触发页面重跑后仍会保留。")
-        display_eta_validation_report(saved_result)
-        display_lifecycle_report(saved_result, "📈 五路径生命周期明细")
+        st.caption("以下报告来自最近一次成功原子保存的结果；下载触发页面重跑后仍会保留。")
+        display_state_validation_report(saved_result)
+        display_lifecycle_report(saved_result, "📈 三路径生命周期明细")
         st.download_button(
-            "📥 下载V14.7五路径回测数据",
-            saved_result.to_csv(index=False).encode("utf-8-sig"),
-            file_name="skdj_v14_7_eta_validation_export.csv",
-            mime="text/csv",
-            key="download_v147_history",
+            "📥 一键下载V14.8全部回测数据",
+            build_all_download_zip(saved_result, saved_mothers, saved_ledger),
+            file_name="skdj_v14_8_all_backtest_data.zip",
+            mime="application/zip",
+            key="download_v148_all",
         )
-    elif os.path.exists(FORMAL_HISTORY_FILE):
-        mothers_partial = read_csv_safe(FORMAL_HISTORY_FILE)
-        st.info(f"已保存 {len(mothers_partial)} 条正式母样本，五路径结果尚未完成；再次点击运行会从此断点继续。")
+        st.download_button(
+            "📥 仅下载三路径流水CSV",
+            saved_result.to_csv(index=False).encode("utf-8-sig"),
+            file_name="skdj_v14_8_state_validation_export.csv",
+            mime="text/csv",
+            key="download_v148_history",
+        )
+    elif not saved_mothers.empty:
+        st.info(f"已保存{len(saved_mothers)}条正式母样本；自动任务会继续生成三路径结果。")
 else:
     saved_daily = read_csv_safe(DAILY_POSITION_FILE)
     if not saved_daily.empty:
         st.markdown("---")
         recent_dates = sorted(
-            {date for col in ("Signal_Date", "Buy_Date", "Exit_Date") if col in saved_daily.columns
-             for date in saved_daily[col].map(parse_yyyymmdd).dropna()}
+            {
+                date
+                for column in ("Original_Signal_Date", "Signal_Date", "Buy_Date", "Exit_Date")
+                if column in saved_daily.columns
+                for date in saved_daily[column].map(parse_yyyymmdd).dropna()
+            }
         )[-5:]
-        display_lifecycle_report(saved_daily, "📡 最近5个交易日ETA状态", recent_trade_dates=recent_dates)
+        display_state_validation_report(saved_daily)
+        display_lifecycle_report(saved_daily, "📡 最近5个交易日状态", recent_trade_dates=recent_dates)
         st.download_button(
-            "📥 下载V14.7每日ETA状态",
+            "📥 下载V14.8每日状态",
             saved_daily.to_csv(index=False).encode("utf-8-sig"),
-            file_name="skdj_v14_7_daily_eta_state.csv",
+            file_name="skdj_v14_8_daily_state.csv",
             mime="text/csv",
-            key="download_v147_daily",
+            key="download_v148_daily",
         )
