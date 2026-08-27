@@ -1517,6 +1517,27 @@ def display_state_validation_report(position_df):
     )
 
 
+def prepare_lifecycle_detail_view(detail, display_cols):
+    """按现有字段稳定排序，再截取展示列；兼容旧版或不同路径CSV。"""
+    available_display_cols = [col for col in display_cols if col in detail.columns]
+    sort_preferences = [
+        ("Original_Signal_Date", False),
+        ("Signal_Date", False),
+        ("Entry_Path", True),
+        ("Rank", True),
+    ]
+    sort_cols = [col for col, _ in sort_preferences if col in detail.columns]
+    ascending = [direction for col, direction in sort_preferences if col in detail.columns]
+    if sort_cols:
+        detail = detail.sort_values(
+            sort_cols,
+            ascending=ascending,
+            na_position="last",
+            kind="mergesort",
+        )
+    return detail[available_display_cols]
+
+
 def display_lifecycle_report(position_df, title, recent_trade_dates=None):
     st.header(title)
     if position_df.empty:
@@ -1662,14 +1683,11 @@ def display_lifecycle_report(position_df, title, recent_trade_dates=None):
         "MACD_Rapid_Shrink", "MACD_Rapid_Shrink_Date",
         "Stop_Stage", "Stop_Level", "Exit_Date", "Exit_Reason", "Final_Return (%)",
     ]
-    display_cols = [col for col in display_cols if col in detail.columns]
     if detail.empty:
         st.info("最近5个交易日没有新状态，且当前没有未结束持仓。")
     else:
         st.dataframe(
-            detail[display_cols].sort_values(
-                ["Signal_Date", "Signal_Type", "Rank"], ascending=[False, True, True]
-            ),
+            prepare_lifecycle_detail_view(detail, display_cols),
             width="stretch",
         )
 
