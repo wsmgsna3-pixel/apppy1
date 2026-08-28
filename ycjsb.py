@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-周线 SKDJ 信号后日线MACD确认验证系统 V14.10
+周线 SKDJ 买入后日线MACD持有确认系统 V14.11
 ============================================================
 核心约定
 1. 保留原 V14.5 周线 SKDJ：周线 K 上穿 25 且 K>D 为正式信号。
 2. 先冻结原始可成交 Top 5；所有日线路径只研究这五只，拒绝后保持空缺，不再低排名递补。
-3. 并行验证原始买入、信号日健康过滤、MACD一日确认、MACD二日确认和买后风控五条路径。
-4. 所有判断只使用当日收盘前已经发生的数据；触发后统一在下一交易日开盘执行。
+3. 并行验证原始买入、信号日健康过滤、买后1日确认持有、买后2日确认持有和买后快速缩短风控五条路径。
+4. 持有确认路径与原策略同时买入；只使用已收盘的日线MACD，未确认时在下一交易日开盘退出。
 5. 普通 A 股按 T+1；首周第5个交易日收盘截断；暂不计交易成本。
-6. 红柱重新扩张与绿柱翻红分别打标签；报告计算过滤得失、买点延迟、误杀利润与空窗周。
+6. 第1日路径要求买入日红柱扩张或绿柱翻红；第2日路径要求买入后两日连续扩张。
 7. 行情按交易日分片原子保存；历史结果先保存、扫描账本后提交，崩溃可断点续跑。
 8. 持久化“任务运行中”标记；网络重连或页面重跑后自动从断点继续，可手动停止。
 ============================================================
@@ -37,21 +37,21 @@ import tushare as ts
 
 warnings.filterwarnings("ignore")
 
-APP_VERSION = "V14.10"
+APP_VERSION = "V14.11"
 MARKET_CACHE_ROOT = "skdj_v14_7_market_cache"
 STATE_PATHS = (
     "原始次日买入",
     "信号日健康买入",
-    "MACD一日确认买入",
-    "MACD二日确认买入",
-    "买后MACD风控",
+    "买后1日确认持有",
+    "买后2日确认持有",
+    "买后MACD快速缩短风控",
 )
 
-st.set_page_config(page_title=f"SKDJ {APP_VERSION} 日线MACD确认系统", layout="wide")
-st.title(f"🔬 周线 SKDJ 信号后日线MACD确认验证系统 ({APP_VERSION})")
+st.set_page_config(page_title=f"SKDJ {APP_VERSION} 买后MACD持有确认", layout="wide")
+st.title(f"🔬 周线 SKDJ 买入后日线MACD持有确认系统 ({APP_VERSION})")
 st.markdown(
     "**正式 Top 5、周线信号和评分保持冻结**；日线路径不得用第6名以后递补。"
-    "原始路径始终保留，用于衡量一日确认、二日确认、静态过滤和买后风控的真实增减。"
+    "两条持有确认路径都在原买点买入，用日线MACD决定继续持有还是T+1退出。"
 )
 
 
@@ -776,89 +776,7 @@ def compute_daily_state(ts_code, end_date, stock_dict, macd_shrink_limit=30.0,
     }
 
 
-def find_macd_confirmations(event, stock_dict, asof_date, max_wait_days,
-                            macd_shrink_limit, overextension_10d, overextension_20d):
-    """一次扫描同时返回MACD一日与二日确认；所有判断仅使用当日及以前数据。"""
-    code = str(event["ts_code"])
-    formal_date = parse_yyyymmdd(event.get("Signal_Date"))
-    if not formal_date or code not in stock_dict:
-        missing = {"Decision_Status": "REJECT", "Decision_Reason": "缺少MACD确认行情"}
-        return {1: missing.copy(), 2: missing.copy()}
-    future_dates = list(
-        stock_dict[code][
-            (stock_dict[code].index > formal_date) & (stock_dict[code].index <= str(asof_date))
-        ].index
-    )
-    observed = future_dates[: int(max_wait_days)]
-    decisions = {1: None, 2: None}
-    previous_expand = False
-    previous_cross = False
-
-    for pos, date in enumerate(observed, start=1):
-        state = compute_daily_state(
-            code, date, stock_dict, macd_shrink_limit, overextension_10d, overextension_20d
-        )
-        hist_now = float(state.get("MACD_Hist_Signal", np.nan))
-        hist_prev = float(state.get("MACD_Hist_Prev", np.nan))
-        red_expand = bool(
-            np.isfinite(hist_now) and np.isfinite(hist_prev)
-            and hist_now > 0 and hist_now > hist_prev
-        )
-        green_to_red = bool(red_expand and hist_prev <= 0)
-
-        def confirmation_payload(confirm_bars, confirm_type):
-            result = {
-                "Decision_Status": "BUY",
-                "Decision_Reason": f"信号后第{pos}日收盘确认{confirm_type}",
-                "Confirmation_Date": date,
-                "Confirmation_Days": pos,
-                "Execution_State": state.get("Daily_State"),
-                "Signal_Close": float(stock_dict[code].loc[date]["close"]),
-                "MACD_Confirm_Type": confirm_type,
-                "MACD_Confirm_Bars": int(confirm_bars),
-                "MACD_Confirm_Hist": round(hist_now, 6),
-                "MACD_Confirm_Prev_Hist": round(hist_prev, 6),
-            }
-            result.update({f"Execution_{key}": value for key, value in state.items()})
-            return result
-
-        if red_expand and decisions[1] is None:
-            one_type = "绿柱翻红1日" if green_to_red else "红柱扩张1日"
-            decisions[1] = confirmation_payload(1, one_type)
-
-        if red_expand and previous_expand and decisions[2] is None:
-            two_type = "绿柱翻红后扩张2日" if previous_cross else "红柱连续扩张2日"
-            decisions[2] = confirmation_payload(2, two_type)
-
-        previous_expand = red_expand
-        previous_cross = green_to_red
-
-    for confirm_bars in (1, 2):
-        if decisions[confirm_bars] is not None:
-            continue
-        if len(future_dates) < int(max_wait_days):
-            decisions[confirm_bars] = {
-                "Decision_Status": "PENDING",
-                "Decision_Reason": (
-                    f"已观察{len(future_dates)}/{int(max_wait_days)}日，"
-                    f"尚未形成MACD连续{confirm_bars}日确认"
-                ),
-                "Confirmation_Days": len(future_dates),
-                "Execution_State": "等待MACD确认",
-                "MACD_Confirm_Bars": int(confirm_bars),
-            }
-        else:
-            decisions[confirm_bars] = {
-                "Decision_Status": "REJECT",
-                "Decision_Reason": f"信号后{int(max_wait_days)}日内未形成MACD连续{confirm_bars}日确认",
-                "Confirmation_Days": int(max_wait_days),
-                "Execution_State": "MACD确认期满",
-                "MACD_Confirm_Bars": int(confirm_bars),
-            }
-    return decisions
-
-
-def build_state_comparison_events(formal_history, stock_dict, asof_date, max_wait_days=10,
+def build_state_comparison_events(formal_history, stock_dict, asof_date,
                                   macd_shrink_limit=30.0, overextension_10d=15.0,
                                   overextension_20d=20.0, top_n=5,
                                   macd_exit_window_days=5, macd_exit_one_day_pct=30.0,
@@ -939,34 +857,34 @@ def build_state_comparison_events(formal_history, stock_dict, asof_date, max_wai
             immediate["Signal_Date"] = None
         rows.append(immediate)
 
-        macd_decisions = find_macd_confirmations(
-            mother, stock_dict, asof_date, max_wait_days,
-            macd_shrink_limit, overextension_10d, overextension_20d,
-        )
-        for confirm_bars, path_name in ((1, "MACD一日确认买入"), (2, "MACD二日确认买入")):
-            confirmed = common.copy()
-            decision = macd_decisions[confirm_bars]
-            confirmed.update(decision)
-            has_signal = decision.get("Decision_Status") == "BUY"
-            confirmed.update(
+        for confirm_days, path_name in (
+            (1, "买后1日确认持有"),
+            (2, "买后2日确认持有"),
+        ):
+            hold_confirm = common.copy()
+            hold_confirm.update(
                 {
                     "Entry_Path": path_name,
-                    "Has_Entry_Signal": has_signal,
-                    "Lifecycle_Mode": "STANDARD",
+                    "Has_Entry_Signal": True,
+                    "Decision_Status": "BUY",
+                    "Decision_Reason": (
+                        f"原始买点买入；买后{confirm_days}日MACD"
+                        f"{'\u7ea2\u67f1\u6269\u5f20' if confirm_days == 1 else '\u8fde\u7eed\u7ea2\u67f1\u6269\u5f20'}才继续持有"
+                    ),
+                    "Confirmation_Date": None,
+                    "Confirmation_Days": int(confirm_days),
+                    "Execution_State": state_name,
+                    "Lifecycle_Mode": f"MACD_HOLD_CONFIRM_{confirm_days}D",
+                    "Hold_Confirm_Required_Days": int(confirm_days),
                     "Event_ID": hashlib.sha1(f"{parent_id}|{path_name}".encode()).hexdigest()[:20],
                 }
             )
-            if has_signal:
-                confirmed["Signal_Date"] = decision.get("Confirmation_Date")
-                confirmed["Signal_Close"] = decision.get("Signal_Close", np.nan)
-            else:
-                confirmed["Signal_Date"] = None
-            rows.append(confirmed)
+            rows.append(hold_confirm)
 
         macd_exit = common.copy()
         macd_exit.update(
             {
-                "Entry_Path": "买后MACD风控",
+                "Entry_Path": "买后MACD快速缩短风控",
                 "Has_Entry_Signal": True,
                 "Decision_Status": "BUY",
                 "Decision_Reason": "原始买点；前5日MACD快速缩短则下一交易日退出",
@@ -977,7 +895,7 @@ def build_state_comparison_events(formal_history, stock_dict, asof_date, max_wai
                 "MACD_Exit_Window_Days": int(macd_exit_window_days),
                 "MACD_Exit_OneDay_Pct": float(macd_exit_one_day_pct),
                 "MACD_Exit_ThreeDay_Pct": float(macd_exit_three_day_pct),
-                "Event_ID": hashlib.sha1(f"{parent_id}|买后MACD风控".encode()).hexdigest()[:20],
+                "Event_ID": hashlib.sha1(f"{parent_id}|买后MACD快速缩短风控".encode()).hexdigest()[:20],
             }
         )
         rows.append(macd_exit)
@@ -1201,6 +1119,15 @@ def simulate_lifecycle(event, stock_dict, asof_date, max_weeks=12):
             "MACD_Exit_Trigger_Days": np.nan,
             "MACD_Exit_Trigger_Type": None,
             "MACD_Exit_Executed": False,
+            "Hold_Confirm_Required_Days": np.nan,
+            "Hold_Confirm_Status": "NOT_APPLICABLE",
+            "Hold_Confirm_Check_Date": None,
+            "Hold_Confirm_Observed_Days": 0,
+            "Hold_Confirm_Day1": np.nan,
+            "Hold_Confirm_Day2": np.nan,
+            "Hold_Confirm_Type": None,
+            "Hold_Confirm_Failed_Date": None,
+            "Hold_Confirm_Exit_Executed": False,
         }
     )
     if not signal_date or ts_code not in stock_dict or not np.isfinite(signal_close):
@@ -1226,6 +1153,19 @@ def simulate_lifecycle(event, stock_dict, asof_date, max_weeks=12):
     result.update(Status="HOLDING", Exit_Reason="持仓中", Stop_Stage="基础-10%止损")
     lifecycle_mode = str(event.get("Lifecycle_Mode", "STANDARD"))
     macd_exit_enabled = lifecycle_mode == "MACD_EARLY_EXIT"
+    hold_confirm_days = 0
+    if lifecycle_mode == "MACD_HOLD_CONFIRM_1D":
+        hold_confirm_days = 1
+    elif lifecycle_mode == "MACD_HOLD_CONFIRM_2D":
+        hold_confirm_days = 2
+    hold_confirm_enabled = hold_confirm_days in (1, 2)
+    if hold_confirm_enabled:
+        result.update(
+            {
+                "Hold_Confirm_Required_Days": int(hold_confirm_days),
+                "Hold_Confirm_Status": "PENDING",
+            }
+        )
 
     def event_number(name, default):
         try:
@@ -1237,10 +1177,11 @@ def simulate_lifecycle(event, stock_dict, asof_date, max_weeks=12):
     macd_exit_window = int(event_number("MACD_Exit_Window_Days", 5))
     macd_one_day_pct = event_number("MACD_Exit_OneDay_Pct", 30.0)
     macd_three_day_pct = event_number("MACD_Exit_ThreeDay_Pct", 50.0)
-    if macd_exit_enabled:
+    if macd_exit_enabled or hold_confirm_enabled:
         hist_full = macd_histogram(full[full.index <= str(asof_date)]["close"])
         post_hist = hist_full[hist_full.index >= buy_date].dropna()
     else:
+        hist_full = pd.Series(dtype=float)
         post_hist = pd.Series(dtype=float)
     peak = buy_price
     trough = buy_price
@@ -1248,6 +1189,24 @@ def simulate_lifecycle(event, stock_dict, asof_date, max_weeks=12):
     exit_data = None
     max_days = int(max_weeks) * 5
     forced_exit_pending_reason = None
+    hold_confirm_flags = []
+
+    def macd_red_expansion_on(date):
+        """只使用date当日及以前的MACD柱。
+
+        当日柱已翻红且长于前一日才确认；绿柱只是缩短、但尚未翻红不算通过。
+        """
+        if date not in hist_full.index:
+            return False, None
+        position = hist_full.index.get_loc(date)
+        if not isinstance(position, (int, np.integer)) or position <= 0:
+            return False, None
+        current = float(hist_full.iloc[int(position)])
+        previous = float(hist_full.iloc[int(position) - 1])
+        passed = bool(np.isfinite(current) and np.isfinite(previous) and current > 0 and current > previous)
+        if not passed:
+            return False, None
+        return True, ("绿柱翻红" if previous <= 0 else "红柱扩张")
 
     for idx in range(len(future)):
         row = future.iloc[idx]
@@ -1263,16 +1222,15 @@ def simulate_lifecycle(event, stock_dict, asof_date, max_weeks=12):
             if is_one_price_limit_down(row, ts_code):
                 continue
             pending_reason = forced_exit_pending_reason
-            executed_reason = (
-                pending_reason
-                if str(pending_reason).startswith("MACD前")
-                else f"{pending_reason}(流动性顺延)"
-            )
+            is_macd_rule = str(pending_reason).startswith(("MACD前", "买后MACD"))
+            executed_reason = pending_reason if is_macd_rule else f"{pending_reason}(流动性顺延)"
             exit_data = _exit_payload(
                 executed_reason, date, open_p, buy_price, day_count
             )
             if str(pending_reason).startswith("MACD前"):
                 result["MACD_Exit_Executed"] = True
+            if str(pending_reason).startswith("买后MACD"):
+                result["Hold_Confirm_Exit_Executed"] = True
             result[f"Return_W{min(12, (day_count - 1) // 5 + 1)} (%)"] = exit_data["Final_Return (%)"]
             break
 
@@ -1324,6 +1282,43 @@ def simulate_lifecycle(event, stock_dict, asof_date, max_weeks=12):
             week_no = day_count // 5
             result[f"Return_W{week_no} (%)"] = round((close_p - buy_price) / buy_price * 100, 2)
 
+        # 买入日已经是周线信号后的下一交易日。收盘后确认，失败时下一交易日开盘退出。
+        if hold_confirm_enabled and day_count <= hold_confirm_days:
+            confirmed_today, confirm_type = macd_red_expansion_on(date)
+            hold_confirm_flags.append(bool(confirmed_today))
+            result["Hold_Confirm_Observed_Days"] = int(day_count)
+            result[f"Hold_Confirm_Day{day_count}"] = bool(confirmed_today)
+            if day_count == hold_confirm_days:
+                result["Hold_Confirm_Check_Date"] = date
+                all_confirmed = len(hold_confirm_flags) == hold_confirm_days and all(hold_confirm_flags)
+                if all_confirmed:
+                    first_type = macd_red_expansion_on(future.index[0])[1]
+                    if hold_confirm_days == 1:
+                        final_type = f"{confirm_type}1日"
+                    elif first_type == "绿柱翻红":
+                        final_type = "绿柱翻红后连续扩张2日"
+                    else:
+                        final_type = "红柱连续扩张2日"
+                    result.update(
+                        {
+                            "Hold_Confirm_Status": "CONFIRMED",
+                            "Hold_Confirm_Type": final_type,
+                            "Confirmation_Date": date,
+                            "Confirmation_Days": int(hold_confirm_days),
+                        }
+                    )
+                else:
+                    result.update(
+                        {
+                            "Hold_Confirm_Status": "FAILED",
+                            "Hold_Confirm_Type": f"买后{hold_confirm_days}日未形成连续红柱扩张",
+                            "Hold_Confirm_Failed_Date": date,
+                            "Confirmation_Date": date,
+                            "Confirmation_Days": int(hold_confirm_days),
+                        }
+                    )
+                    forced_exit_pending_reason = f"买后MACD{hold_confirm_days}日持有确认失败退出"
+
         # 收盘后才能确认MACD柱缩短；最早在下一交易日开盘退出，严格遵守T+1。
         if macd_exit_enabled and day_count <= macd_exit_window and forced_exit_pending_reason is None:
             hist_position = post_hist.index.get_loc(date) if date in post_hist.index else None
@@ -1368,6 +1363,14 @@ def simulate_lifecycle(event, stock_dict, asof_date, max_weeks=12):
             result[col] = round((price - buy_price) / buy_price * 100, 2)
 
     if exit_data is not None:
+        if hold_confirm_enabled and result.get("Hold_Confirm_Status") == "PENDING":
+            result.update(
+                {
+                    "Hold_Confirm_Status": "INTERRUPTED",
+                    "Hold_Confirm_Check_Date": exit_data.get("Exit_Date"),
+                    "Hold_Confirm_Type": "完成确认前触发其他退出",
+                }
+            )
         result.update(exit_data)
         final_peak_return = (peak - buy_price) / buy_price * 100
         result["Peak_Return (%)"] = round(final_peak_return, 2)
@@ -1531,9 +1534,10 @@ def _true_mask(series):
 def display_state_validation_report(position_df):
     if position_df.empty or "Entry_Path" not in position_df.columns:
         return
-    st.header("🧭 信号后日线MACD五路径验证")
+    st.header("🧭 买入后日线MACD持有确认验证")
     st.caption(
-        "先冻结原始可成交Top N，其他路径不允许低排名递补；所有确认和退出均在当日收盘后登记，下一交易日开盘执行。"
+        "先冻结原始可成交Top N；两条持有确认路径与原路径同时买入，"
+        "买入后用已收盘的日线MACD决定继续持有或在下一交易日开盘退出。"
     )
     total_mothers = position_df["Parent_Event_ID"].astype(str).nunique()
     all_weeks = sorted(position_df["Original_Signal_Date"].map(parse_yyyymmdd).dropna().unique())
@@ -1549,11 +1553,13 @@ def display_state_validation_report(position_df):
         mature = selected[(followup >= 60) & h12_values.notna()].copy()
         h12 = pd.to_numeric(mature.get("Horizon_12W_Return (%)"), errors="coerce").dropna()
         mae = pd.to_numeric(mature.get("Max_Adverse_Excursion (%)"), errors="coerce").dropna()
-        wait = pd.to_numeric(selected.get("Confirmation_Days"), errors="coerce").dropna()
         per_week = (
             selected.assign(_week=selected["Original_Signal_Date"].map(parse_yyyymmdd))
             .groupby("_week").size().reindex(all_weeks, fill_value=0)
         )
+        hold_status = mature.get("Hold_Confirm_Status", pd.Series("NOT_APPLICABLE", index=mature.index)).astype(str)
+        confirmed_count = int(hold_status.eq("CONFIRMED").sum())
+        decided_count = int(hold_status.isin(["CONFIRMED", "FAILED"]).sum())
         rows.append(
             {
                 "执行路径": path,
@@ -1561,7 +1567,6 @@ def display_state_validation_report(position_df):
                 "冻结TopN": frozen_count,
                 "实际买入": len(selected),
                 "接受率": len(selected) / frozen_count * 100 if frozen_count else np.nan,
-                "平均等待日": wait.mean() if len(wait) else np.nan,
                 "平均每周买入": per_week.mean() if len(per_week) else np.nan,
                 "选满TopN周": int((per_week >= int(MAX_TOP_N)).sum()) if len(per_week) else 0,
                 "空窗周": int((per_week == 0).sum()) if len(per_week) else 0,
@@ -1577,7 +1582,12 @@ def display_state_validation_report(position_df):
                     mature["Exit_Reason"].astype(str).str.contains("破-10%").mean() * 100
                     if len(mature) else np.nan
                 ),
-                "MACD风控退出": int(_true_mask(mature.get(
+                "买后确认率": confirmed_count / decided_count * 100 if decided_count else np.nan,
+                "确认失败退出": int(_true_mask(mature.get(
+                    "Hold_Confirm_Exit_Executed", pd.Series(False, index=mature.index)
+                )).sum()),
+                "确认前其他退出": int(hold_status.eq("INTERRUPTED").sum()),
+                "快速缩短退出": int(_true_mask(mature.get(
                     "MACD_Exit_Executed", pd.Series(False, index=mature.index)
                 )).sum()),
             }
@@ -1585,10 +1595,10 @@ def display_state_validation_report(position_df):
     summary = pd.DataFrame(rows)
     pct_cols = [
         "接受率", "W1均益", "W1胜率", "W12均益", "W12中位数", "W12胜率",
-        "平均最大不利回撤", "-10%止损率",
+        "平均最大不利回撤", "-10%止损率", "买后确认率",
     ]
     formats = {column: "{:.2f}%" for column in pct_cols}
-    formats.update({"平均等待日": "{:.2f}", "平均每周买入": "{:.2f}"})
+    formats.update({"平均每周买入": "{:.2f}"})
     st.dataframe(summary.style.format(formats, na_rep="—"), width="stretch")
 
     baseline = position_df[
@@ -1636,19 +1646,18 @@ def display_state_validation_report(position_df):
     )
 
     mature_baseline = mature_baseline.set_index("Parent_Event_ID")
-    selection_rows = []
-    for path in ("信号日健康买入", "MACD一日确认买入", "MACD二日确认买入"):
-        path_rows = position_df[position_df["Entry_Path"] == path].set_index("Parent_Event_ID")
-        common_ids = mature_baseline.index.intersection(path_rows.index)
-        audit = path_rows.loc[common_ids].copy()
-        base_ret = mature_baseline.loc[common_ids, "Horizon_12W_Return (%)"]
-        rejected = ~_true_mask(audit["Selected_In_Path"])
-        rejected_ret = base_ret[rejected]
-        avoided_losers = rejected_ret[rejected_ret <= 0]
-        missed_winners = rejected_ret[rejected_ret > 0]
-        selection_rows.append(
-            {
-                "分类路径": path,
+
+    # 信号日健康路径是唯一真正的买前过滤，单独显示避免亏损与误杀。
+    health = position_df[position_df["Entry_Path"] == "信号日健康买入"].set_index("Parent_Event_ID")
+    common_ids = mature_baseline.index.intersection(health.index)
+    rejected = ~_true_mask(health.loc[common_ids, "Selected_In_Path"])
+    rejected_ret = mature_baseline.loc[common_ids, "Horizon_12W_Return (%)"][rejected]
+    avoided_losers = rejected_ret[rejected_ret <= 0]
+    missed_winners = rejected_ret[rejected_ret > 0]
+    st.subheader("信号日健康过滤的取舍")
+    st.dataframe(
+        pd.DataFrame(
+            [{
                 "可判断基准样本": len(common_ids),
                 "放弃样本": len(rejected_ret),
                 "放弃中亏损股": len(avoided_losers),
@@ -1657,15 +1666,11 @@ def display_state_validation_report(position_df):
                 "误杀盈利股": len(missed_winners),
                 "错失利润合计": missed_winners.sum(),
                 "净筛选价值": -rejected_ret.sum(),
-            }
-        )
-    st.subheader("避免亏损与误杀利润")
-    st.caption("“净筛选价值”＝被放弃亏损的绝对值－被放弃盈利股的利润；正数才说明过滤总体有价值。")
-    st.dataframe(
-        pd.DataFrame(selection_rows).style.format(
+            }]
+        ).style.format(
             {
-                "放弃准确率": "{:.1f}%", "避免亏损合计": "{:.2f}%", "错失利润合计": "{:.2f}%",
-                "净筛选价值": "{:.2f}%",
+                "放弃准确率": "{:.1f}%", "避免亏损合计": "{:.2f}%",
+                "错失利润合计": "{:.2f}%", "净筛选价值": "{:.2f}%",
             },
             na_rep="—",
         ),
@@ -1673,7 +1678,7 @@ def display_state_validation_report(position_df):
     )
 
     execution_rows = []
-    for path in ("MACD一日确认买入", "MACD二日确认买入", "买后MACD风控"):
+    for path in ("买后1日确认持有", "买后2日确认持有", "买后MACD快速缩短风控"):
         path_rows = position_df[
             (position_df["Entry_Path"] == path) & _true_mask(position_df["Selected_In_Path"])
         ].copy()
@@ -1689,8 +1694,16 @@ def display_state_validation_report(position_df):
         base_ret = mature_baseline.loc[paired_ids, "Horizon_12W_Return (%)"]
         path_ret = path_rows.loc[paired_ids, "Horizon_12W_Return (%)"]
         delta = (path_ret - base_ret).dropna()
-        paired_base_buy = mature_baseline.loc[paired_ids, "Buy_Price"]
-        paired_path_buy = path_rows.loc[paired_ids, "Buy_Price"]
+        base_mae = pd.to_numeric(
+            mature_baseline.loc[paired_ids, "Max_Adverse_Excursion (%)"], errors="coerce"
+        )
+        path_mae = pd.to_numeric(
+            path_rows.loc[paired_ids, "Max_Adverse_Excursion (%)"], errors="coerce"
+        )
+        hold_status = path_rows.loc[paired_ids].get(
+            "Hold_Confirm_Status", pd.Series("NOT_APPLICABLE", index=paired_ids)
+        ).astype(str)
+        decided = hold_status.isin(["CONFIRMED", "FAILED"])
         execution_rows.append(
             {
                 "执行路径": path,
@@ -1700,20 +1713,24 @@ def display_state_validation_report(position_df):
                 "平均改善": delta.mean() if len(delta) else np.nan,
                 "优于基准比例": (delta > 0).mean() * 100 if len(delta) else np.nan,
                 "差于基准比例": (delta < 0).mean() * 100 if len(delta) else np.nan,
-                "平均等待日": pd.to_numeric(
-                    path_rows.loc[paired_ids, "Confirmation_Days"], errors="coerce"
-                ).mean() if len(paired_ids) else np.nan,
-                "买得更高比例": (paired_path_buy > paired_base_buy).mean() * 100 if len(paired_ids) else np.nan,
-                "买得更低比例": (paired_path_buy < paired_base_buy).mean() * 100 if len(paired_ids) else np.nan,
+                "胜率变化": (
+                    (path_ret.loc[delta.index] > 0).mean() - (base_ret.loc[delta.index] > 0).mean()
+                ) * 100 if len(delta) else np.nan,
+                "平均回撤改善": path_mae.mean() - base_mae.mean() if len(paired_ids) else np.nan,
+                "买后确认率": hold_status.eq("CONFIRMED").sum() / decided.sum() * 100 if decided.sum() else np.nan,
+                "确认失败退出": int(_true_mask(path_rows.loc[paired_ids].get(
+                    "Hold_Confirm_Exit_Executed", pd.Series(False, index=paired_ids)
+                )).sum()),
+                "确认前其他退出": int(hold_status.eq("INTERRUPTED").sum()),
             }
         )
-    st.subheader("动态执行相对同一只股票原买点的变化")
+    st.subheader("买后确认相对同一只股票原路径的真实变化")
     st.dataframe(
         pd.DataFrame(execution_rows).style.format(
             {
                 "基准均益": "{:.2f}%", "路径均益": "{:.2f}%", "平均改善": "{:.2f}%",
-                "优于基准比例": "{:.1f}%", "差于基准比例": "{:.1f}%", "平均等待日": "{:.2f}",
-                "买得更高比例": "{:.1f}%", "买得更低比例": "{:.1f}%",
+                "优于基准比例": "{:.1f}%", "差于基准比例": "{:.1f}%",
+                "胜率变化": "{:+.2f}%", "平均回撤改善": "{:+.2f}%", "买后确认率": "{:.1f}%",
             },
             na_rep="—",
         ),
@@ -1721,8 +1738,8 @@ def display_state_validation_report(position_df):
     )
 
     confirmation_rows = []
-    if "MACD_Confirm_Type" in position_df.columns:
-        for path in ("MACD一日确认买入", "MACD二日确认买入"):
+    if "Hold_Confirm_Status" in position_df.columns:
+        for path in ("买后1日确认持有", "买后2日确认持有"):
             path_rows = position_df[
                 (position_df["Entry_Path"] == path) & _true_mask(position_df["Selected_In_Path"])
             ].copy()
@@ -1733,28 +1750,35 @@ def display_state_validation_report(position_df):
             path_rows = path_rows[
                 (path_rows["Followup_Days"] >= 60) & path_rows["Horizon_12W_Return (%)"].notna()
             ]
-            for confirm_type, group in path_rows.groupby("MACD_Confirm_Type", dropna=False):
+            for (status, confirm_type), group in path_rows.groupby(
+                ["Hold_Confirm_Status", "Hold_Confirm_Type"], dropna=False
+            ):
                 returns = group["Horizon_12W_Return (%)"].dropna()
                 mae = pd.to_numeric(group["Max_Adverse_Excursion (%)"], errors="coerce").dropna()
+                group_ids = group["Parent_Event_ID"].astype(str)
+                common = mature_baseline.index.intersection(group_ids)
+                base_returns = mature_baseline.loc[common, "Horizon_12W_Return (%)"].dropna()
                 confirmation_rows.append(
                     {
                         "确认路径": path,
-                        "MACD确认类型": confirm_type,
+                        "确认结果": status,
+                        "MACD类型": confirm_type,
                         "成熟样本": len(returns),
-                        "平均等待日": pd.to_numeric(group["Confirmation_Days"], errors="coerce").mean(),
-                        "W12均益": returns.mean() if len(returns) else np.nan,
-                        "W12中位数": returns.median() if len(returns) else np.nan,
-                        "W12胜率": (returns > 0).mean() * 100 if len(returns) else np.nan,
+                        "原路径均益": base_returns.mean() if len(base_returns) else np.nan,
+                        "确认路径均益": returns.mean() if len(returns) else np.nan,
+                        "确认路径中位数": returns.median() if len(returns) else np.nan,
+                        "确认路径胜率": (returns > 0).mean() * 100 if len(returns) else np.nan,
                         "平均最大不利回撤": mae.mean() if len(mae) else np.nan,
                     }
                 )
     if confirmation_rows:
-        st.subheader("红柱扩张与绿柱翻红分组")
+        st.subheader("买后MACD确认成功与失败分组")
         st.dataframe(
             pd.DataFrame(confirmation_rows).style.format(
                 {
-                    "平均等待日": "{:.2f}", "W12均益": "{:.2f}%", "W12中位数": "{:.2f}%",
-                    "W12胜率": "{:.1f}%", "平均最大不利回撤": "{:.2f}%",
+                    "原路径均益": "{:.2f}%", "确认路径均益": "{:.2f}%",
+                    "确认路径中位数": "{:.2f}%", "确认路径胜率": "{:.1f}%",
+                    "平均最大不利回撤": "{:.2f}%",
                 },
                 na_rep="—",
             ),
@@ -1921,8 +1945,10 @@ def display_lifecycle_report(position_df, title, recent_trade_dates=None):
         "Original_Signal_Date", "Signal_Date", "Entry_Path", "Rank", "name", "ts_code", "Total_Score",
         "Lifecycle_Mode", "Baseline_Selected", "Selected_In_Path",
         "Signal_Daily_State", "Execution_State", "Decision_Status", "Decision_Reason",
-        "Confirmation_Date", "Confirmation_Days", "MACD_Confirm_Type", "MACD_Confirm_Bars",
-        "MACD_Confirm_Hist", "MACD_Confirm_Prev_Hist",
+        "Confirmation_Date", "Confirmation_Days", "Hold_Confirm_Required_Days",
+        "Hold_Confirm_Status", "Hold_Confirm_Check_Date", "Hold_Confirm_Observed_Days",
+        "Hold_Confirm_Day1", "Hold_Confirm_Day2", "Hold_Confirm_Type",
+        "Hold_Confirm_Failed_Date", "Hold_Confirm_Exit_Executed",
         "Daily_Return_3D (%)", "Daily_Return_10D (%)", "MA5_Slope_3D (%)",
         "MACD_Hist_Signal", "MACD_Shrink_3Bars (%)", "Overextended_Flag", "State_Reason",
         "Pre_Return_10D", "Days_Since_20D_Low", "Timing_Flag", "Status",
@@ -1946,14 +1972,11 @@ def display_lifecycle_report(position_df, title, recent_trade_dates=None):
 # -----------------------------------------------------------------------------
 with st.sidebar:
     st.header("⚙️ 运行配置")
-    RUN_MODE = st.radio("运行模式", ["每日状态更新", "历史MACD路径回测"], index=1)
+    RUN_MODE = st.radio("运行模式", ["每日状态更新", "历史买后确认回测"], index=1)
     end_date = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("历史回测交易日数", value=250, min_value=30, step=30)
     MAX_TOP_N = st.number_input("每周正式母样本数", value=5, min_value=1, max_value=20, step=1)
-    MAX_CONFIRM_DAYS = st.number_input(
-        "MACD确认最长观察天数", value=10, min_value=2, max_value=20, step=1,
-        help="一日或二日扩张在收盘后确认，下一交易日开盘买入；期满未确认则放弃。",
-    )
+    st.caption("持有确认固定对照：买入后1日扩张，以及买入后2日连续扩张。")
 
     st.markdown("---")
     st.subheader("📐 日线状态参数")
@@ -1961,7 +1984,7 @@ with st.sidebar:
         "MACD三柱快速缩短阈值(%)", value=30.0, min_value=10.0, max_value=80.0, step=5.0
     )
     MACD_EXIT_WINDOW_DAYS = st.number_input(
-        "买后MACD风控窗口(交易日)", value=5, min_value=2, max_value=10, step=1
+        "买后MACD快速缩短风控窗口(交易日)", value=5, min_value=2, max_value=10, step=1
     )
     MACD_EXIT_ONE_DAY_PCT = st.number_input(
         "MACD单日快速缩短退出阈值(%)", value=30.0, min_value=10.0, max_value=90.0, step=5.0
@@ -1992,19 +2015,19 @@ with st.sidebar:
     )
 
     config_seed = (
-        f"confirm={MAX_CONFIRM_DAYS}|state_shrink={MACD_SHRINK_LIMIT:.1f}|"
+        f"hold_confirm=1-2|state_shrink={MACD_SHRINK_LIMIT:.1f}|"
         f"exit_window={MACD_EXIT_WINDOW_DAYS}|exit1={MACD_EXIT_ONE_DAY_PCT:.1f}|"
         f"exit3={MACD_EXIT_THREE_DAY_PCT:.1f}|over10={OVEREXTENSION_10D:.1f}|"
         f"over20={OVEREXTENSION_20D:.1f}"
     )
-    config_id = make_config_id(MIN_PRICE, MIN_MV, MAX_MV, MAX_TOP_N, MAX_CONFIRM_DAYS)
+    config_id = make_config_id(MIN_PRICE, MIN_MV, MAX_MV, MAX_TOP_N)
     config_id += "_" + hashlib.sha1(config_seed.encode("utf-8")).hexdigest()[:8]
-    DAILY_MOTHER_FILE = f"skdj_v14_10_daily_mothers_{config_id}.csv"
-    DAILY_POSITION_FILE = f"skdj_v14_10_daily_paths_{config_id}.csv"
-    FORMAL_HISTORY_FILE = f"skdj_v14_10_formal_mothers_{config_id}.csv"
-    HISTORY_FILE = f"skdj_v14_10_path_comparison_{config_id}.csv"
-    HISTORY_LEDGER_FILE = f"skdj_v14_10_scanned_dates_{config_id}.csv"
-    RUN_TASK_FILE = f"skdj_v14_10_running_task_{config_id}.json"
+    DAILY_MOTHER_FILE = f"skdj_v14_11_daily_mothers_{config_id}.csv"
+    DAILY_POSITION_FILE = f"skdj_v14_11_daily_paths_{config_id}.csv"
+    FORMAL_HISTORY_FILE = f"skdj_v14_11_formal_mothers_{config_id}.csv"
+    HISTORY_FILE = f"skdj_v14_11_path_comparison_{config_id}.csv"
+    HISTORY_LEDGER_FILE = f"skdj_v14_11_scanned_dates_{config_id}.csv"
+    RUN_TASK_FILE = f"skdj_v14_11_running_task_{config_id}.json"
 
     task_snapshot = read_json_safe(RUN_TASK_FILE)
     if task_snapshot:
@@ -2022,7 +2045,7 @@ with st.sidebar:
             shutil.rmtree(MARKET_CACHE_ROOT)
         st.cache_data.clear()
         st.success("行情缓存已清理。")
-    if st.button("🗑️ 清空V14.10本配置结果"):
+    if st.button("🗑️ 清空V14.11本配置结果"):
         for path in (
             DAILY_MOTHER_FILE, DAILY_POSITION_FILE, FORMAL_HISTORY_FILE,
             HISTORY_FILE, HISTORY_LEDGER_FILE, RUN_TASK_FILE,
@@ -2043,7 +2066,7 @@ token_clean = clean_token_str(TOKEN_INPUT)
 
 
 # -----------------------------------------------------------------------------
-# V14.10 主流程：持久化任务标记、小批次续跑、冻结Top N后的五路径验证
+# V14.11 主流程：持久化任务标记、小批次续跑、冻结Top N后的买后确认验证
 # -----------------------------------------------------------------------------
 def prepare_runtime_market(token_value, analysis_end, backtest_days, whitelist_keys):
     pro = ts.pro_api(token_value)
@@ -2098,21 +2121,21 @@ def build_all_download_zip(result, mothers, ledger):
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr(
-            "skdj_v14_10_path_validation_export.csv",
+            "skdj_v14_11_hold_confirmation_export.csv",
             result.to_csv(index=False).encode("utf-8-sig"),
         )
         archive.writestr(
-            "skdj_v14_10_formal_mothers.csv",
+            "skdj_v14_11_formal_mothers.csv",
             mothers.to_csv(index=False).encode("utf-8-sig"),
         )
         archive.writestr(
-            "skdj_v14_10_scanned_dates.csv",
+            "skdj_v14_11_scanned_dates.csv",
             ledger.to_csv(index=False).encode("utf-8-sig"),
         )
     return buffer.getvalue()
 
 
-run_clicked = st.button("🚀 运行V14.10 MACD确认验证", type="primary")
+run_clicked = st.button("🚀 运行V14.11 买后MACD持有确认", type="primary")
 task = read_json_safe(RUN_TASK_FILE)
 auto_resume = bool(
     AUTO_RESUME
@@ -2174,7 +2197,7 @@ if should_run:
                     atomic_write_csv(mothers, DAILY_MOTHER_FILE)
 
                 comparison = build_state_comparison_events(
-                    mothers, stock_dict, data_date, int(MAX_CONFIRM_DAYS),
+                    mothers, stock_dict, data_date,
                     float(MACD_SHRINK_LIMIT), float(OVEREXTENSION_10D), float(OVEREXTENSION_20D),
                     int(MAX_TOP_N),
                     int(MACD_EXIT_WINDOW_DAYS), float(MACD_EXIT_ONE_DAY_PCT),
@@ -2302,7 +2325,7 @@ if should_run:
                         complete_task()
                     else:
                         comparison = build_state_comparison_events(
-                            mothers, stock_dict, data_date, int(MAX_CONFIRM_DAYS),
+                            mothers, stock_dict, data_date,
                             float(MACD_SHRINK_LIMIT), float(OVEREXTENSION_10D), float(OVEREXTENSION_20D),
                             int(MAX_TOP_N),
                             int(MACD_EXIT_WINDOW_DAYS), float(MACD_EXIT_ONE_DAY_PCT),
@@ -2336,7 +2359,7 @@ if should_run:
 
 
 # 报告与下载始终从磁盘加载，和运行按钮、自动重跑状态完全解耦。
-if RUN_MODE == "历史MACD路径回测":
+if RUN_MODE == "历史买后确认回测":
     saved_ledger = read_csv_safe(HISTORY_LEDGER_FILE)
     saved_mothers = read_csv_safe(FORMAL_HISTORY_FILE)
     if not saved_ledger.empty:
@@ -2367,18 +2390,18 @@ if RUN_MODE == "历史MACD路径回测":
         display_state_validation_report(saved_result)
         display_lifecycle_report(saved_result, "📈 五路径生命周期明细")
         st.download_button(
-            "📥 一键下载V14.10全部回测数据",
+            "📥 一键下载V14.11全部回测数据",
             build_all_download_zip(saved_result, saved_mothers, saved_ledger),
-            file_name="skdj_v14_10_all_backtest_data.zip",
+            file_name="skdj_v14_11_all_backtest_data.zip",
             mime="application/zip",
-            key="download_v1410_all",
+            key="download_v1411_all",
         )
         st.download_button(
             "📥 仅下载五路径流水CSV",
             saved_result.to_csv(index=False).encode("utf-8-sig"),
-            file_name="skdj_v14_10_path_validation_export.csv",
+            file_name="skdj_v14_11_hold_confirmation_export.csv",
             mime="text/csv",
-            key="download_v1410_history",
+            key="download_v1411_history",
         )
     elif not saved_mothers.empty:
         st.info(f"已保存{len(saved_mothers)}条正式母样本；自动任务会继续生成五路径结果。")
@@ -2397,9 +2420,9 @@ else:
         display_state_validation_report(saved_daily)
         display_lifecycle_report(saved_daily, "📡 最近5个交易日状态", recent_trade_dates=recent_dates)
         st.download_button(
-            "📥 下载V14.10每日状态",
+            "📥 下载V14.11每日状态",
             saved_daily.to_csv(index=False).encode("utf-8-sig"),
-            file_name="skdj_v14_10_daily_paths.csv",
+            file_name="skdj_v14_11_daily_paths.csv",
             mime="text/csv",
-            key="download_v1410_daily",
+            key="download_v1411_daily",
         )
