@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-周线 SKDJ 买入后日线MACD持有确认系统 V14.11
+周线 SKDJ 三因子评分排序验证系统 V14.12
 ============================================================
 核心约定
 1. 保留原 V14.5 周线 SKDJ：周线 K 上穿 25 且 K>D 为正式信号。
-2. 先冻结原始可成交 Top 5；所有日线路径只研究这五只，拒绝后保持空缺，不再低排名递补。
-3. 并行验证原始买入、信号日健康过滤、买后1日确认持有、买后2日确认持有和买后快速缩短风控五条路径。
-4. 持有确认路径与原策略同时买入；只使用已收盘的日线MACD，未确认时在下一交易日开盘退出。
+2. 每周先冻结可成交的原评分 Top 10，三条路径共享同一母样本，不因日线条件减少候选数量。
+3. 新评分保留原总分中的 MA20 分，只新增信号日日线状态与信号前10日涨幅调整分，调整幅度封顶±20分。
+4. 并行验证 Top10 全样本、原评分 Top 5、新评分 Top 5；所有路径使用完全相同的下一日开盘和生命周期。
 5. 普通 A 股按 T+1；首周第5个交易日收盘截断；暂不计交易成本。
-6. 第1日路径要求买入日红柱扩张或绿柱翻红；第2日路径要求买入后两日连续扩张。
+6. 同时保存原排名、新排名、升降名次、三项评分明细，以及新旧 Top 5 的晋级与降级股票。
 7. 行情按交易日分片原子保存；历史结果先保存、扫描账本后提交，崩溃可断点续跑。
 8. 持久化“任务运行中”标记；网络重连或页面重跑后自动从断点继续，可手动停止。
 ============================================================
@@ -37,21 +37,19 @@ import tushare as ts
 
 warnings.filterwarnings("ignore")
 
-APP_VERSION = "V14.11"
+APP_VERSION = "V14.12"
 MARKET_CACHE_ROOT = "skdj_v14_7_market_cache"
 STATE_PATHS = (
-    "原始次日买入",
-    "信号日健康买入",
-    "买后1日确认持有",
-    "买后2日确认持有",
-    "买后MACD快速缩短风控",
+    "Top10全样本",
+    "原评分Top5",
+    "新评分Top5",
 )
 
-st.set_page_config(page_title=f"SKDJ {APP_VERSION} 买后MACD持有确认", layout="wide")
-st.title(f"🔬 周线 SKDJ 买入后日线MACD持有确认系统 ({APP_VERSION})")
+st.set_page_config(page_title=f"SKDJ {APP_VERSION} 三因子评分验证", layout="wide")
+st.title(f"🔬 周线 SKDJ 三因子评分排序验证系统 ({APP_VERSION})")
 st.markdown(
-    "**正式 Top 5、周线信号和评分保持冻结**；日线路径不得用第6名以后递补。"
-    "两条持有确认路径都在原买点买入，用日线MACD决定继续持有还是T+1退出。"
+    "**周线正式信号与原评分完全冻结**；每周先保存可成交原评分Top 10，"
+    "再从相同母样本比较原评分Top 5与三因子新评分Top 5。"
 )
 
 
@@ -776,7 +774,7 @@ def compute_daily_state(ts_code, end_date, stock_dict, macd_shrink_limit=30.0,
     }
 
 
-def build_state_comparison_events(formal_history, stock_dict, asof_date,
+def build_legacy_state_comparison_events(formal_history, stock_dict, asof_date,
                                   macd_shrink_limit=30.0, overextension_10d=15.0,
                                   overextension_20d=20.0, top_n=5,
                                   macd_exit_window_days=5, macd_exit_one_day_pct=30.0,
@@ -961,6 +959,162 @@ def build_state_comparison_events(formal_history, stock_dict, asof_date,
         frame.at[row_index, "Has_Entry_Signal"] = True
         frame.at[row_index, "Selection_Reason"] = candidate.get("Decision_Reason", "通过")
     return frame
+
+
+def timing_score_components(mother, state_name):
+    """计算V14.12新增时机分；MA20已在原Trend_Score中，不重复加分。"""
+    state_adjust = {
+        "健康上涨": 10.0,
+        "震荡蓄势": 2.0,
+        "下跌转弱": -8.0,
+        "上涨衰竭": -12.0,
+    }.get(str(state_name), 0.0)
+
+    pre10 = pd.to_numeric(
+        pd.Series([mother.get("Pre_Return_10D", np.nan)]), errors="coerce"
+    ).iloc[0]
+    if pd.isna(pre10):
+        pre10_adjust, pre10_bucket = 0.0, "数据不足"
+    elif pre10 < 0.0:
+        pre10_adjust, pre10_bucket = -12.0, "<0%"
+    elif pre10 < 5.0:
+        pre10_adjust, pre10_bucket = 3.0, "0%～5%"
+    elif pre10 < 15.0:
+        pre10_adjust, pre10_bucket = 10.0, "5%～15%"
+    elif pre10 < 20.0:
+        pre10_adjust, pre10_bucket = -8.0, "15%～20%"
+    elif pre10 < 25.0:
+        pre10_adjust, pre10_bucket = 0.0, "20%～25%"
+    else:
+        pre10_adjust, pre10_bucket = -8.0, "≥25%"
+
+    raw_adjust = state_adjust + pre10_adjust
+    timing_adjust = float(np.clip(raw_adjust, -20.0, 20.0))
+    original_score = pd.to_numeric(
+        pd.Series([mother.get("Total_Score", 0.0)]), errors="coerce"
+    ).fillna(0.0).iloc[0]
+    trend_score = pd.to_numeric(
+        pd.Series([mother.get("Trend_Score", 0.0)]), errors="coerce"
+    ).fillna(0.0).iloc[0]
+    return {
+        "Original_Total_Score": round(float(original_score), 1),
+        "MA20_Score_In_Base": round(float(trend_score), 1),
+        "Daily_State_Adjust": round(state_adjust, 1),
+        "Pre10_Bucket": pre10_bucket,
+        "Pre10_Adjust": round(pre10_adjust, 1),
+        "Timing_Adjust_Raw": round(raw_adjust, 1),
+        "Timing_Adjust": round(timing_adjust, 1),
+        "New_Total_Score": round(float(original_score) + timing_adjust, 1),
+    }
+
+
+def build_state_comparison_events(formal_history, stock_dict, asof_date,
+                                  macd_shrink_limit=30.0, overextension_10d=15.0,
+                                  overextension_20d=20.0, top_n=5,
+                                  research_top_n=10, *unused_args):
+    """冻结相同可成交Top10，生成Top10、原Top5和新Top5三条可比路径。"""
+    if formal_history is None or formal_history.empty:
+        return pd.DataFrame()
+
+    ordered = formal_history.copy()
+    for col in ("Rank", "Raw_Rank", "Total_Score"):
+        if col in ordered.columns:
+            ordered[col] = pd.to_numeric(ordered[col], errors="coerce")
+    ordered["Signal_Date"] = ordered["Signal_Date"].map(parse_yyyymmdd)
+    ordered = ordered.dropna(subset=["Signal_Date"]).sort_values(
+        ["Signal_Date", "Rank", "Raw_Rank", "ts_code"], kind="mergesort"
+    )
+
+    mothers = []
+    for signal_date, week_group in ordered.groupby("Signal_Date", sort=False):
+        executable_rank = 0
+        for _, candidate in week_group.iterrows():
+            check = entry_check(
+                str(candidate["ts_code"]), signal_date,
+                candidate.get("Signal_Close", np.nan), stock_dict,
+            )
+            if check.get("Entry_Status") == "SKIPPED":
+                continue
+            executable_rank += 1
+            code = str(candidate["ts_code"])
+            parent_id = str(candidate["Event_ID"])
+            signal_state = compute_daily_state(
+                code, signal_date, stock_dict,
+                macd_shrink_limit, overextension_10d, overextension_20d,
+            )
+            state_name = signal_state.get("Daily_State", "数据不足")
+            common = candidate.to_dict()
+            common.update(signal_state)
+            common.update(timing_score_components(candidate, state_name))
+            common.update(
+                {
+                    "Parent_Event_ID": parent_id,
+                    "Original_Signal_Date": signal_date,
+                    "Signal_Daily_State": state_name,
+                    "Original_Score_Rank": int(executable_rank),
+                    "Entry_Check_Status_At_Selection": check.get("Entry_Status", "WAIT_BUY"),
+                }
+            )
+            mothers.append(common)
+            if executable_rank >= int(research_top_n):
+                break
+
+    if not mothers:
+        return pd.DataFrame()
+
+    frozen = pd.DataFrame(mothers)
+    frozen["New_Score_Rank"] = np.nan
+    for _, indices in frozen.groupby("Original_Signal_Date", sort=False).groups.items():
+        group = frozen.loc[indices].sort_values(
+            ["New_Total_Score", "Total_Score", "Original_Score_Rank", "ts_code"],
+            ascending=[False, False, True, True], kind="mergesort",
+        )
+        frozen.loc[group.index, "New_Score_Rank"] = np.arange(1, len(group) + 1)
+    frozen["New_Score_Rank"] = frozen["New_Score_Rank"].astype(int)
+    frozen["Rank_Change"] = frozen["Original_Score_Rank"] - frozen["New_Score_Rank"]
+    frozen["Baseline_Selected"] = frozen["Original_Score_Rank"] <= int(top_n)
+    frozen["New_Score_Selected"] = frozen["New_Score_Rank"] <= int(top_n)
+    frozen["Selection_Change"] = np.select(
+        [
+            frozen["Baseline_Selected"] & frozen["New_Score_Selected"],
+            ~frozen["Baseline_Selected"] & frozen["New_Score_Selected"],
+            frozen["Baseline_Selected"] & ~frozen["New_Score_Selected"],
+        ],
+        ["两种评分都入选", "新评分晋级", "新评分降级"],
+        default="两种评分都未入选",
+    )
+
+    rows = []
+    path_specs = (
+        ("Top10全样本", "Original_Score_Rank", lambda row: True),
+        ("原评分Top5", "Original_Score_Rank", lambda row: bool(row["Baseline_Selected"])),
+        ("新评分Top5", "New_Score_Rank", lambda row: bool(row["New_Score_Selected"])),
+    )
+    for _, mother in frozen.iterrows():
+        parent_id = str(mother["Parent_Event_ID"])
+        for path_name, rank_col, selector in path_specs:
+            selected = bool(selector(mother))
+            path_rank = int(mother[rank_col])
+            row = mother.to_dict()
+            row.update(
+                {
+                    "Entry_Path": path_name,
+                    "Path_Rank": path_rank,
+                    "Has_Entry_Signal": selected,
+                    "Classifier_Passed": selected,
+                    "Selected_In_Path": selected,
+                    "Decision_Status": "BUY" if selected else "NOT_SELECTED_CAPACITY",
+                    "Decision_Reason": f"{path_name}第{path_rank}名" if selected else f"未进入{path_name}",
+                    "Selection_Reason": f"{path_name}第{path_rank}名" if selected else f"未进入{path_name}",
+                    "Confirmation_Date": mother["Original_Signal_Date"],
+                    "Confirmation_Days": 0,
+                    "Execution_State": mother.get("Signal_Daily_State", "数据不足"),
+                    "Lifecycle_Mode": "STANDARD",
+                    "Event_ID": hashlib.sha1(f"{parent_id}|{path_name}".encode()).hexdigest()[:20],
+                }
+            )
+            rows.append(row)
+    return pd.DataFrame(rows)
 
 
 def entry_check(ts_code, signal_date, signal_close, stock_dict):
@@ -1491,7 +1645,8 @@ def refresh_state_positions(comparison_events, stock_dict, asof_date):
     if comparison_events is None or comparison_events.empty:
         return pd.DataFrame()
     rows = []
-    progress = st.progress(0, text="🔄 重算五条日线执行路径...")
+    lifecycle_cache = {}
+    progress = st.progress(0, text="🔄 重算Top10与新旧评分路径...")
     for idx, (_, event) in enumerate(comparison_events.iterrows()):
         combined = event.to_dict()
         has_signal = str(event.get("Has_Entry_Signal", False)).lower() in {"true", "1", "yes"}
@@ -1514,13 +1669,18 @@ def refresh_state_positions(comparison_events, stock_dict, asof_date):
                 }
             )
         else:
-            lifecycle = simulate_lifecycle(event, stock_dict, asof_date, max_weeks=12)
+            cache_key = str(event.get("Parent_Event_ID", event.get("Event_ID", idx)))
+            if cache_key not in lifecycle_cache:
+                lifecycle_cache[cache_key] = simulate_lifecycle(
+                    event, stock_dict, asof_date, max_weeks=12
+                )
+            lifecycle = lifecycle_cache[cache_key].copy()
         combined.update(lifecycle)
         rows.append(combined)
         if (idx + 1) % 20 == 0 or idx == len(comparison_events) - 1:
             progress.progress(
                 (idx + 1) / len(comparison_events),
-                text=f"🔄 五路径更新 {idx + 1}/{len(comparison_events)}",
+                text=f"🔄 评分路径更新 {idx + 1}/{len(comparison_events)}",
             )
     progress.empty()
     return pd.DataFrame(rows)
@@ -1531,7 +1691,7 @@ def _true_mask(series):
     return series.fillna(False).astype(str).str.lower().isin(["true", "1", "yes"])
 
 
-def display_state_validation_report(position_df):
+def display_legacy_state_validation_report(position_df):
     if position_df.empty or "Entry_Path" not in position_df.columns:
         return
     st.header("🧭 买入后日线MACD持有确认验证")
@@ -1786,6 +1946,164 @@ def display_state_validation_report(position_df):
         )
 
 
+def display_state_validation_report(position_df):
+    if position_df.empty or "Entry_Path" not in position_df.columns:
+        return
+    st.header("🧭 三因子新旧评分排序验证")
+    st.caption(
+        "三条路径共享同一批可成交原评分Top10和同一生命周期。"
+        "新评分只改变排序，不改变周线信号、买入日期、止损止盈或候选数量。"
+    )
+
+    all_weeks = sorted(
+        position_df.get("Original_Signal_Date", pd.Series(dtype=object))
+        .map(parse_yyyymmdd).dropna().unique()
+    )
+    summary_rows = []
+    for path in STATE_PATHS:
+        group = position_df[position_df["Entry_Path"] == path].copy()
+        selected = group[_true_mask(group.get(
+            "Selected_In_Path", pd.Series(False, index=group.index)
+        ))].copy()
+        followup = pd.to_numeric(selected.get("Followup_Days"), errors="coerce").fillna(0)
+        w1_values = pd.to_numeric(selected.get("Return_W1 (%)"), errors="coerce")
+        w1 = w1_values[(followup >= 5) & w1_values.notna()]
+        h12_values = pd.to_numeric(selected.get("Horizon_12W_Return (%)"), errors="coerce")
+        mature = selected[(followup >= 60) & h12_values.notna()].copy()
+        h12 = pd.to_numeric(mature.get("Horizon_12W_Return (%)"), errors="coerce").dropna()
+        mae = pd.to_numeric(mature.get("Max_Adverse_Excursion (%)"), errors="coerce").dropna()
+        per_week = (
+            selected.assign(_week=selected["Original_Signal_Date"].map(parse_yyyymmdd))
+            .groupby("_week").size().reindex(all_weeks, fill_value=0)
+        )
+        expected = int(RESEARCH_TOP_N) if path == "Top10全样本" else int(MAX_TOP_N)
+        summary_rows.append(
+            {
+                "评分路径": path,
+                "实际研究股票": len(selected),
+                "平均每周": per_week.mean() if len(per_week) else np.nan,
+                "选满目标周": int((per_week >= expected).sum()) if len(per_week) else 0,
+                "空窗周": int((per_week == 0).sum()) if len(per_week) else 0,
+                "W1样本": len(w1),
+                "W1均益": w1.mean() if len(w1) else np.nan,
+                "W1胜率": (w1 > 0).mean() * 100 if len(w1) else np.nan,
+                "W12成熟样本": len(h12),
+                "W12均益": h12.mean() if len(h12) else np.nan,
+                "W12中位数": h12.median() if len(h12) else np.nan,
+                "W12胜率": (h12 > 0).mean() * 100 if len(h12) else np.nan,
+                "平均最大不利回撤": mae.mean() if len(mae) else np.nan,
+                "-10%止损率": (
+                    mature.get("Exit_Reason", pd.Series("", index=mature.index))
+                    .astype(str).str.contains("破-10%").mean() * 100
+                    if len(mature) else np.nan
+                ),
+            }
+        )
+    summary = pd.DataFrame(summary_rows)
+    st.dataframe(
+        summary.style.format(
+            {
+                "平均每周": "{:.2f}", "W1均益": "{:.2f}%", "W1胜率": "{:.1f}%",
+                "W12均益": "{:.2f}%", "W12中位数": "{:.2f}%", "W12胜率": "{:.1f}%",
+                "平均最大不利回撤": "{:.2f}%", "-10%止损率": "{:.1f}%",
+            }, na_rep="—"
+        ),
+        width="stretch",
+    )
+
+    top10 = position_df[
+        (position_df["Entry_Path"] == "Top10全样本")
+        & _true_mask(position_df.get("Selected_In_Path", pd.Series(False, index=position_df.index)))
+    ].copy()
+    if top10.empty:
+        return
+    top10["Followup_Days"] = pd.to_numeric(top10.get("Followup_Days"), errors="coerce")
+    top10["Horizon_12W_Return (%)"] = pd.to_numeric(
+        top10.get("Horizon_12W_Return (%)"), errors="coerce"
+    )
+    mature = top10[
+        (top10["Followup_Days"] >= 60) & top10["Horizon_12W_Return (%)"].notna()
+    ].copy()
+    if mature.empty:
+        st.info("Top10母样本尚未形成60个交易日成熟队列，排名收益表将在后续自动出现。")
+        return
+
+    st.subheader("原排名与新排名逐名表现")
+    rank_rows = []
+    for label, rank_col in (("原评分", "Original_Score_Rank"), ("新评分", "New_Score_Rank")):
+        if rank_col not in mature.columns:
+            continue
+        for rank, group in mature.groupby(rank_col, dropna=False):
+            values = group["Horizon_12W_Return (%)"].dropna()
+            rank_rows.append(
+                {
+                    "评分系统": label, "名次": int(rank), "成熟样本": len(values),
+                    "平均收益": values.mean(), "中位数": values.median(),
+                    "胜率": (values > 0).mean() * 100,
+                    "平均MAE": pd.to_numeric(
+                        group.get("Max_Adverse_Excursion (%)"), errors="coerce"
+                    ).mean(),
+                }
+            )
+    st.dataframe(
+        pd.DataFrame(rank_rows).sort_values(["评分系统", "名次"]).style.format(
+            {"平均收益": "{:.2f}%", "中位数": "{:.2f}%", "胜率": "{:.1f}%", "平均MAE": "{:.2f}%"},
+            na_rep="—",
+        ),
+        width="stretch",
+    )
+
+    if "Selection_Change" in mature.columns:
+        st.subheader("新评分晋级与降级是否正确")
+        change_rows = []
+        for change, group in mature.groupby("Selection_Change", dropna=False):
+            values = group["Horizon_12W_Return (%)"].dropna()
+            change_rows.append(
+                {
+                    "排名变化": change, "成熟样本": len(values),
+                    "平均收益": values.mean(), "中位数": values.median(),
+                    "胜率": (values > 0).mean() * 100,
+                    "平均原排名": pd.to_numeric(group.get("Original_Score_Rank"), errors="coerce").mean(),
+                    "平均新排名": pd.to_numeric(group.get("New_Score_Rank"), errors="coerce").mean(),
+                }
+            )
+        st.dataframe(
+            pd.DataFrame(change_rows).style.format(
+                {
+                    "平均收益": "{:.2f}%", "中位数": "{:.2f}%", "胜率": "{:.1f}%",
+                    "平均原排名": "{:.2f}", "平均新排名": "{:.2f}",
+                }, na_rep="—"
+            ),
+            width="stretch",
+        )
+
+    st.subheader("三项评分因子的独立历史辨别力")
+    factor_rows = []
+    factor_specs = (
+        ("MA20位置", "Trend_Type"),
+        ("信号日日线状态", "Signal_Daily_State"),
+        ("信号前10日涨幅", "Pre10_Bucket"),
+    )
+    for factor, column in factor_specs:
+        if column not in mature.columns:
+            continue
+        for value, group in mature.groupby(column, dropna=False):
+            returns = group["Horizon_12W_Return (%)"].dropna()
+            factor_rows.append(
+                {
+                    "评分因子": factor, "分组": value, "成熟样本": len(returns),
+                    "平均收益": returns.mean(), "中位数": returns.median(),
+                    "胜率": (returns > 0).mean() * 100,
+                }
+            )
+    st.dataframe(
+        pd.DataFrame(factor_rows).style.format(
+            {"平均收益": "{:.2f}%", "中位数": "{:.2f}%", "胜率": "{:.1f}%"}, na_rep="—"
+        ),
+        width="stretch",
+    )
+
+
 def prepare_lifecycle_detail_view(detail, display_cols):
     """按现有字段稳定排序，再截取展示列；兼容旧版或不同路径CSV。"""
     available_display_cols = [col for col in display_cols if col in detail.columns]
@@ -1793,6 +2111,7 @@ def prepare_lifecycle_detail_view(detail, display_cols):
         ("Original_Signal_Date", False),
         ("Signal_Date", False),
         ("Entry_Path", True),
+        ("Path_Rank", True),
         ("Rank", True),
     ]
     sort_cols = [col for col, _ in sort_preferences if col in detail.columns]
@@ -1893,8 +2212,9 @@ def display_lifecycle_report(position_df, title, recent_trade_dates=None):
 
     if not completed.empty:
         st.subheader("🏆 排名与买点路径")
+        rank_column = "Path_Rank" if "Path_Rank" in completed.columns else "Rank"
         rank_stats = (
-            completed.groupby(["Entry_Path", "Rank"], observed=False)
+            completed.groupby(["Entry_Path", rank_column], observed=False)
             .agg(
                 样本数=("Final_Return (%)", "count"),
                 胜率=("Final_Return (%)", lambda x: (x > 0).mean() * 100),
@@ -1942,7 +2262,10 @@ def display_lifecycle_report(position_df, title, recent_trade_dates=None):
     else:
         st.subheader("📋 最新状态")
     display_cols = [
-        "Original_Signal_Date", "Signal_Date", "Entry_Path", "Rank", "name", "ts_code", "Total_Score",
+        "Original_Signal_Date", "Signal_Date", "Entry_Path", "Path_Rank",
+        "Original_Score_Rank", "New_Score_Rank", "Rank_Change", "Selection_Change",
+        "name", "ts_code", "Total_Score", "Timing_Adjust", "New_Total_Score",
+        "MA20_Score_In_Base", "Daily_State_Adjust", "Pre10_Bucket", "Pre10_Adjust",
         "Lifecycle_Mode", "Baseline_Selected", "Selected_In_Path",
         "Signal_Daily_State", "Execution_State", "Decision_Status", "Decision_Reason",
         "Confirmation_Date", "Confirmation_Days", "Hold_Confirm_Required_Days",
@@ -1972,25 +2295,21 @@ def display_lifecycle_report(position_df, title, recent_trade_dates=None):
 # -----------------------------------------------------------------------------
 with st.sidebar:
     st.header("⚙️ 运行配置")
-    RUN_MODE = st.radio("运行模式", ["每日状态更新", "历史买后确认回测"], index=1)
+    RUN_MODE = st.radio("运行模式", ["每日评分更新", "历史评分排序回测"], index=1)
     end_date = st.date_input("分析截止日期", value=datetime.now().date())
     BACKTEST_DAYS = st.number_input("历史回测交易日数", value=250, min_value=30, step=30)
-    MAX_TOP_N = st.number_input("每周正式母样本数", value=5, min_value=1, max_value=20, step=1)
-    st.caption("持有确认固定对照：买入后1日扩张，以及买入后2日连续扩张。")
+    RESEARCH_TOP_N = st.number_input(
+        "每周评分研究母样本数", value=10, min_value=6, max_value=20, step=1
+    )
+    MAX_TOP_N = st.number_input(
+        "每套评分最终入选数", value=5, min_value=1, max_value=int(RESEARCH_TOP_N), step=1
+    )
+    st.caption("默认冻结原评分可成交Top10，再分别比较原评分Top5与新评分Top5。")
 
     st.markdown("---")
     st.subheader("📐 日线状态参数")
     MACD_SHRINK_LIMIT = st.number_input(
         "MACD三柱快速缩短阈值(%)", value=30.0, min_value=10.0, max_value=80.0, step=5.0
-    )
-    MACD_EXIT_WINDOW_DAYS = st.number_input(
-        "买后MACD快速缩短风控窗口(交易日)", value=5, min_value=2, max_value=10, step=1
-    )
-    MACD_EXIT_ONE_DAY_PCT = st.number_input(
-        "MACD单日快速缩短退出阈值(%)", value=30.0, min_value=10.0, max_value=90.0, step=5.0
-    )
-    MACD_EXIT_THREE_DAY_PCT = st.number_input(
-        "MACD三日累计缩短退出阈值(%)", value=50.0, min_value=20.0, max_value=100.0, step=5.0
     )
     OVEREXTENSION_10D = st.number_input(
         "10日涨幅偏大阈值(%)", value=15.0, min_value=5.0, max_value=40.0, step=1.0
@@ -2015,19 +2334,19 @@ with st.sidebar:
     )
 
     config_seed = (
-        f"hold_confirm=1-2|state_shrink={MACD_SHRINK_LIMIT:.1f}|"
-        f"exit_window={MACD_EXIT_WINDOW_DAYS}|exit1={MACD_EXIT_ONE_DAY_PCT:.1f}|"
-        f"exit3={MACD_EXIT_THREE_DAY_PCT:.1f}|over10={OVEREXTENSION_10D:.1f}|"
+        f"score_v1|research={int(RESEARCH_TOP_N)}|select={int(MAX_TOP_N)}|"
+        f"state=10,2,-8,-12|pre10=-12,3,10,-8,0,-8|cap=20|"
+        f"state_shrink={MACD_SHRINK_LIMIT:.1f}|over10={OVEREXTENSION_10D:.1f}|"
         f"over20={OVEREXTENSION_20D:.1f}"
     )
-    config_id = make_config_id(MIN_PRICE, MIN_MV, MAX_MV, MAX_TOP_N)
+    config_id = make_config_id(MIN_PRICE, MIN_MV, MAX_MV, RESEARCH_TOP_N)
     config_id += "_" + hashlib.sha1(config_seed.encode("utf-8")).hexdigest()[:8]
-    DAILY_MOTHER_FILE = f"skdj_v14_11_daily_mothers_{config_id}.csv"
-    DAILY_POSITION_FILE = f"skdj_v14_11_daily_paths_{config_id}.csv"
-    FORMAL_HISTORY_FILE = f"skdj_v14_11_formal_mothers_{config_id}.csv"
-    HISTORY_FILE = f"skdj_v14_11_path_comparison_{config_id}.csv"
-    HISTORY_LEDGER_FILE = f"skdj_v14_11_scanned_dates_{config_id}.csv"
-    RUN_TASK_FILE = f"skdj_v14_11_running_task_{config_id}.json"
+    DAILY_MOTHER_FILE = f"skdj_v14_12_daily_mothers_{config_id}.csv"
+    DAILY_POSITION_FILE = f"skdj_v14_12_daily_scores_{config_id}.csv"
+    FORMAL_HISTORY_FILE = f"skdj_v14_12_formal_mothers_{config_id}.csv"
+    HISTORY_FILE = f"skdj_v14_12_score_comparison_{config_id}.csv"
+    HISTORY_LEDGER_FILE = f"skdj_v14_12_scanned_dates_{config_id}.csv"
+    RUN_TASK_FILE = f"skdj_v14_12_running_task_{config_id}.json"
 
     task_snapshot = read_json_safe(RUN_TASK_FILE)
     if task_snapshot:
@@ -2045,7 +2364,7 @@ with st.sidebar:
             shutil.rmtree(MARKET_CACHE_ROOT)
         st.cache_data.clear()
         st.success("行情缓存已清理。")
-    if st.button("🗑️ 清空V14.11本配置结果"):
+    if st.button("🗑️ 清空V14.12本配置结果"):
         for path in (
             DAILY_MOTHER_FILE, DAILY_POSITION_FILE, FORMAL_HISTORY_FILE,
             HISTORY_FILE, HISTORY_LEDGER_FILE, RUN_TASK_FILE,
@@ -2066,7 +2385,7 @@ token_clean = clean_token_str(TOKEN_INPUT)
 
 
 # -----------------------------------------------------------------------------
-# V14.11 主流程：持久化任务标记、小批次续跑、冻结Top N后的买后确认验证
+# V14.12 主流程：持久化任务标记、小批次续跑、冻结Top10后的评分排序验证
 # -----------------------------------------------------------------------------
 def prepare_runtime_market(token_value, analysis_end, backtest_days, whitelist_keys):
     pro = ts.pro_api(token_value)
@@ -2121,21 +2440,21 @@ def build_all_download_zip(result, mothers, ledger):
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr(
-            "skdj_v14_11_hold_confirmation_export.csv",
+            "skdj_v14_12_score_validation_export.csv",
             result.to_csv(index=False).encode("utf-8-sig"),
         )
         archive.writestr(
-            "skdj_v14_11_formal_mothers.csv",
+            "skdj_v14_12_formal_mothers.csv",
             mothers.to_csv(index=False).encode("utf-8-sig"),
         )
         archive.writestr(
-            "skdj_v14_11_scanned_dates.csv",
+            "skdj_v14_12_scanned_dates.csv",
             ledger.to_csv(index=False).encode("utf-8-sig"),
         )
     return buffer.getvalue()
 
 
-run_clicked = st.button("🚀 运行V14.11 买后MACD持有确认", type="primary")
+run_clicked = st.button("🚀 运行V14.12 三因子评分排序验证", type="primary")
 task = read_json_safe(RUN_TASK_FILE)
 auto_resume = bool(
     AUTO_RESUME
@@ -2173,7 +2492,10 @@ if should_run:
                 whitelist_keys = tuple(sorted(whitelist))
             if not whitelist_keys:
                 raise RuntimeError("未获取到股票池，请检查Token权限或网络。")
-            st.info(f"股票池 {len(whitelist_keys)} 只；周线信号、原评分和正式Top {int(MAX_TOP_N)}保持不变。")
+            st.info(
+                f"股票池 {len(whitelist_keys)} 只；每周冻结可成交原评分Top {int(RESEARCH_TOP_N)}，"
+                f"比较原评分与新评分各自Top {int(MAX_TOP_N)}。"
+            )
 
             stock_dict, basic_indexed, open_days_all, available_cal_days, data_date = prepare_runtime_market(
                 token_clean, effective_end, effective_days, whitelist_keys
@@ -2183,7 +2505,7 @@ if should_run:
             else:
                 st.success(f"行情已更新至：{data_date}")
 
-            if RUN_MODE == "每日状态更新":
+            if RUN_MODE == "每日评分更新":
                 mothers = read_csv_safe(DAILY_MOTHER_FILE)
                 formal_all = build_candidate_records(
                     data_date, "正式上穿25", whitelist_keys, name_map, stock_dict, basic_indexed,
@@ -2199,18 +2521,17 @@ if should_run:
                 comparison = build_state_comparison_events(
                     mothers, stock_dict, data_date,
                     float(MACD_SHRINK_LIMIT), float(OVEREXTENSION_10D), float(OVEREXTENSION_20D),
-                    int(MAX_TOP_N),
-                    int(MACD_EXIT_WINDOW_DAYS), float(MACD_EXIT_ONE_DAY_PCT),
-                    float(MACD_EXIT_THREE_DAY_PCT),
+                    int(MAX_TOP_N), int(RESEARCH_TOP_N),
                 )
                 positions = refresh_state_positions(comparison, stock_dict, data_date)
                 atomic_write_csv(positions, DAILY_POSITION_FILE)
                 complete_task()
-                state_counts = (
-                    positions[positions["Entry_Path"] == "原始次日买入"]["Signal_Daily_State"]
+                selection_counts = (
+                    positions[positions["Entry_Path"] == "Top10全样本"]["Selection_Change"]
                     .value_counts().to_dict()
+                    if not positions.empty and "Selection_Change" in positions.columns else {}
                 )
-                st.success(f"每日状态更新完成：{state_counts}")
+                st.success(f"每日评分更新完成：{selection_counts}")
 
             else:
                 cal_df = pd.DataFrame({"cal_date": open_days_all})
@@ -2232,7 +2553,7 @@ if should_run:
                 batch_dates = new_scan_dates[: int(HISTORY_BATCH_WEEKS)]
 
                 if batch_dates:
-                    bar = st.progress(0, text="分批扫描冻结的V14.5正式Top 5...")
+                    bar = st.progress(0, text=f"分批扫描可成交原评分Top {int(RESEARCH_TOP_N)}...")
                     for idx, date in enumerate(batch_dates):
                         coverage_count = sum(
                             1 for frame in stock_dict.values() if not frame.empty and str(date) in frame.index
@@ -2267,7 +2588,7 @@ if should_run:
                             if check["Entry_Status"] == "SKIPPED":
                                 continue
                             selected.append(candidate.to_dict())
-                            if len(selected) >= int(MAX_TOP_N):
+                            if len(selected) >= int(RESEARCH_TOP_N):
                                 break
                         if not formal_all.empty:
                             formal_store = formal_all.copy()
@@ -2281,7 +2602,7 @@ if should_run:
                                 "Trade_Date": date, "Raw_Signal_Count": len(formal_all),
                                 "Selected_Count": len(selected),
                                 "Stored_Candidate_Count": len(formal_all),
-                                "Missing_To_TopN": max(0, int(MAX_TOP_N) - len(selected)),
+                                "Missing_To_TopN": max(0, int(RESEARCH_TOP_N) - len(selected)),
                                 "Market_Coverage_Count": coverage_count,
                                 "Market_Coverage_Rate": round(coverage_rate * 100, 2),
                                 "Scan_Status": "COMPLETED",
@@ -2327,15 +2648,13 @@ if should_run:
                         comparison = build_state_comparison_events(
                             mothers, stock_dict, data_date,
                             float(MACD_SHRINK_LIMIT), float(OVEREXTENSION_10D), float(OVEREXTENSION_20D),
-                            int(MAX_TOP_N),
-                            int(MACD_EXIT_WINDOW_DAYS), float(MACD_EXIT_ONE_DAY_PCT),
-                            float(MACD_EXIT_THREE_DAY_PCT),
+                            int(MAX_TOP_N), int(RESEARCH_TOP_N),
                         )
                         result = refresh_state_positions(comparison, stock_dict, data_date)
                         atomic_write_csv(result, HISTORY_FILE)
                         complete_task()
                         st.success(
-                            f"已保存{mothers['Event_ID'].nunique()}个正式母样本、{len(result)}条五路径记录。"
+                            f"已保存{mothers['Event_ID'].nunique()}个正式信号、{len(result)}条三路径评分记录。"
                             "下载或页面重跑不会清空结果。"
                         )
         except Exception as exc:
@@ -2359,25 +2678,25 @@ if should_run:
 
 
 # 报告与下载始终从磁盘加载，和运行按钮、自动重跑状态完全解耦。
-if RUN_MODE == "历史买后确认回测":
+if RUN_MODE == "历史评分排序回测":
     saved_ledger = read_csv_safe(HISTORY_LEDGER_FILE)
     saved_mothers = read_csv_safe(FORMAL_HISTORY_FILE)
     if not saved_ledger.empty:
-        st.subheader("📦 正式Top 5选出数量审计")
+        st.subheader(f"📦 可成交原评分Top {int(RESEARCH_TOP_N)}母样本数量审计")
         scan_status = saved_ledger.get(
             "Scan_Status", pd.Series("COMPLETED", index=saved_ledger.index)
         ).fillna("COMPLETED")
         complete_ledger = saved_ledger[scan_status == "COMPLETED"]
         skipped_ledger = saved_ledger[scan_status == "SKIPPED_INCOMPLETE"]
         selected_count = pd.to_numeric(complete_ledger.get("Selected_Count"), errors="coerce")
-        short = complete_ledger[selected_count < int(MAX_TOP_N)]
+        short = complete_ledger[selected_count < int(RESEARCH_TOP_N)]
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("已扫描完整周", len(complete_ledger))
-        c2.metric(f"选满Top {int(MAX_TOP_N)}周", len(complete_ledger) - len(short))
+        c2.metric(f"选满Top {int(RESEARCH_TOP_N)}周", len(complete_ledger) - len(short))
         c3.metric("正式信号不足周", len(short))
         c4.metric("行情不完整跳过", len(skipped_ledger))
         if not short.empty:
-            st.caption("不足来自正式信号总数或次日不可成交；日线路径只在冻结Top N内部研究，不改变母样本。")
+            st.caption("不足来自正式信号总数或次日不可成交；新评分不会制造或删除周线正式信号。")
             st.dataframe(short.sort_values("Trade_Date"), width="stretch")
         if not skipped_ledger.empty:
             st.warning("下列周次因行情覆盖不足被跳过，没有被错误记成零信号。")
@@ -2388,23 +2707,27 @@ if RUN_MODE == "历史买后确认回测":
         st.markdown("---")
         st.caption("以下报告来自最近一次成功原子保存的结果；下载触发页面重跑后仍会保留。")
         display_state_validation_report(saved_result)
-        display_lifecycle_report(saved_result, "📈 五路径生命周期明细")
+        top10_detail = saved_result[
+            (saved_result.get("Entry_Path") == "Top10全样本")
+            & _true_mask(saved_result.get("Selected_In_Path", pd.Series(False, index=saved_result.index)))
+        ].copy()
+        display_lifecycle_report(top10_detail, "📈 Top10全样本生命周期与评分明细")
         st.download_button(
-            "📥 一键下载V14.11全部回测数据",
+            "📥 一键下载V14.12全部回测数据",
             build_all_download_zip(saved_result, saved_mothers, saved_ledger),
-            file_name="skdj_v14_11_all_backtest_data.zip",
+            file_name="skdj_v14_12_all_backtest_data.zip",
             mime="application/zip",
-            key="download_v1411_all",
+            key="download_v1412_all",
         )
         st.download_button(
-            "📥 仅下载五路径流水CSV",
+            "📥 仅下载三路径评分流水CSV",
             saved_result.to_csv(index=False).encode("utf-8-sig"),
-            file_name="skdj_v14_11_hold_confirmation_export.csv",
+            file_name="skdj_v14_12_score_validation_export.csv",
             mime="text/csv",
-            key="download_v1411_history",
+            key="download_v1412_history",
         )
     elif not saved_mothers.empty:
-        st.info(f"已保存{len(saved_mothers)}条正式母样本；自动任务会继续生成五路径结果。")
+        st.info(f"已保存{len(saved_mothers)}条正式信号；自动任务会继续生成评分比较结果。")
 else:
     saved_daily = read_csv_safe(DAILY_POSITION_FILE)
     if not saved_daily.empty:
@@ -2418,11 +2741,15 @@ else:
             }
         )[-5:]
         display_state_validation_report(saved_daily)
-        display_lifecycle_report(saved_daily, "📡 最近5个交易日状态", recent_trade_dates=recent_dates)
+        top10_daily = saved_daily[
+            (saved_daily.get("Entry_Path") == "Top10全样本")
+            & _true_mask(saved_daily.get("Selected_In_Path", pd.Series(False, index=saved_daily.index)))
+        ].copy()
+        display_lifecycle_report(top10_daily, "📡 最近5个交易日评分状态", recent_trade_dates=recent_dates)
         st.download_button(
-            "📥 下载V14.11每日状态",
+            "📥 下载V14.12每日评分状态",
             saved_daily.to_csv(index=False).encode("utf-8-sig"),
-            file_name="skdj_v14_11_daily_paths.csv",
+            file_name="skdj_v14_12_daily_scores.csv",
             mime="text/csv",
-            key="download_v1411_daily",
+            key="download_v1412_daily",
         )
