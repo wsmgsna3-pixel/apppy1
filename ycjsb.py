@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-周线 SKDJ 翻转打分系统 (V14.5-S1 稳定修复版)
+周线 SKDJ 翻转打分系统 (V14.5 终极实盘版)
 ------------------------------------------------
-1. 周线SKDJ信号、原评分权重、Top N、买入条件和生命周期与V14.5完全一致。
-2. 行情改为按交易日原子分片保存，单日损坏不会毁掉全部两小时缓存。
-3. 历史结果、扫描账本和任务状态均原子保存；网络重连后可从周次断点续跑。
-4. 下载和报告始终从磁盘结果加载，页面重跑不会回到无结果初始状态。
+1. 【消除警告】：全面适配 Streamlit 最新版接口规范，将 use_container_width 替换为 width='stretch'。
+2. 【真·周末锁定】：回测模式下，系统强制向未来探测15天日历，仅允许真正的周末（周五）数据进入历史库。
+3. 【双模引擎】：追溯天数设为 1 时，激活“盘中极速选股”模式，秒级出票，不写入数据库，不追踪未来。
+4. 【优选截断】：保留 Top N 控制阀，过滤杂波。
 ------------------------------------------------
 """
 
@@ -19,15 +19,15 @@ import time
 import os
 import re
 import pickle
-import json
-import hashlib
+import gzip
 import tempfile
 import shutil
 import gc
+from contextlib import contextmanager
 
 try:
     import fcntl
-except ImportError:  # Windows 本地运行时使用后备锁；Streamlit Cloud 为 Linux
+except ImportError:
     fcntl = None
 
 warnings.filterwarnings("ignore")
@@ -35,19 +35,16 @@ warnings.filterwarnings("ignore")
 # ---------------------------
 # 全局持久化缓存配置
 # ---------------------------
-APP_VERSION = "V14.5-S1"
-CHECKPOINT_FILE = "skdj_v14_5_stable_history.csv"
-SCAN_LEDGER_FILE = "skdj_v14_5_stable_scanned_dates.csv"
-RUN_TASK_FILE = "skdj_v14_5_stable_running_task.json"
-RUN_LOCK_FILE = "skdj_v14_5_stable_running.lock"
-MARKET_CACHE_ROOT = "skdj_v14_5_stable_market_cache"
+CHECKPOINT_FILE = "skdj_v14_analysis_checkpoint.csv"
+MARKET_CACHE_FILE = "skdj_market_data_master.pkl"
+MARKET_CACHE_DIR = "skdj_market_data_daily_cache"
 
 # ---------------------------
 # 页面基础配置
 # ---------------------------
-st.set_page_config(page_title="SKDJ V14.5-S1 稳定修复版", layout="wide")
-st.title("🔬 周线 SKDJ 底部脱离系统 (V14.5-S1 稳定修复版)")
-st.markdown("🔒 **策略与V14.5保持一致；本版只修复缓存、断点续跑、下载和页面崩溃问题**")
+st.set_page_config(page_title="SKDJ V14.5 终极系统", layout="wide")
+st.title("🔬 周线 SKDJ 底部脱离系统 (V14.5 终极实盘版)")
+st.markdown("🔒 **天数=1为极速选股，>1为历史回测 · 纯净剥离 · 全面兼容新版UI**")
 
 # ---------------------------
 # Token 清洗与安全请求模块
@@ -84,179 +81,80 @@ def safe_tushare_call(func, max_retries=3, sleep_time=0.8, **kwargs):
     return pd.DataFrame()
 
 
-def parse_yyyymmdd(value):
-    if value is None or (isinstance(value, float) and np.isnan(value)):
-        return None
-    text = re.sub(r"\.0$", "", str(value)).replace("-", "")
-    return text if re.fullmatch(r"\d{8}", text) else None
-
-
-def atomic_write_csv(df, path):
-    """完整写入临时文件后原子替换，杜绝断线留下半行CSV。"""
-    target_dir = os.path.dirname(os.path.abspath(path)) or "."
+def _atomic_replace_bytes(write_callback, target_path):
+    target_dir = os.path.dirname(os.path.abspath(target_path)) or "."
     os.makedirs(target_dir, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=target_dir)
+    fd, temp_path = tempfile.mkstemp(
+        prefix=os.path.basename(target_path) + ".", suffix=".tmp", dir=target_dir
+    )
     os.close(fd)
     try:
-        df.to_csv(tmp_path, index=False, encoding="utf-8-sig")
-        with open(tmp_path, "rb") as file_obj:
-            os.fsync(file_obj.fileno())
-        if os.path.exists(path):
-            try:
-                shutil.copy2(path, path + ".bak")
-            except OSError:
-                pass
-        elif os.path.exists(path + ".bak"):
-            os.remove(path + ".bak")
-        os.replace(tmp_path, path)
+        write_callback(temp_path)
+        os.replace(temp_path, target_path)
     finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
 
-def read_csv_safe(path):
-    if not os.path.exists(path):
+def _atomic_write_csv(dataframe, target_path):
+    def writer(temp_path):
+        dataframe.to_csv(temp_path, index=False, encoding="utf-8-sig")
+        with open(temp_path, "rb") as file_obj:
+            os.fsync(file_obj.fileno())
+
+    if os.path.exists(target_path):
+        try:
+            shutil.copy2(target_path, target_path + ".bak")
+        except OSError:
+            pass
+    _atomic_replace_bytes(writer, target_path)
+
+
+def _read_csv_safely(target_path):
+    if not os.path.exists(target_path):
         return pd.DataFrame()
-    for candidate in (path, path + ".bak"):
+    for candidate in (target_path, target_path + ".bak"):
         if not os.path.exists(candidate):
             continue
         try:
             return pd.read_csv(candidate, encoding="utf-8-sig", low_memory=False)
-        except (pd.errors.EmptyDataError, pd.errors.ParserError, UnicodeDecodeError, OSError):
+        except (OSError, UnicodeDecodeError, pd.errors.EmptyDataError, pd.errors.ParserError):
             continue
     return pd.DataFrame()
 
 
-def atomic_write_json(value, path):
-    target_dir = os.path.dirname(os.path.abspath(path)) or "."
-    os.makedirs(target_dir, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=target_dir)
-    os.close(fd)
+@contextmanager
+def _checkpoint_lock():
+    """只锁定数秒钟的结果提交，不锁下载、计算或页面会话。"""
+    lock_path = CHECKPOINT_FILE + ".lock"
+    handle = open(lock_path, "a+", encoding="utf-8")
     try:
-        with open(tmp_path, "w", encoding="utf-8") as file_obj:
-            json.dump(value, file_obj, ensure_ascii=False, indent=2)
-            file_obj.flush()
-            os.fsync(file_obj.fileno())
-        if os.path.exists(path):
-            try:
-                shutil.copy2(path, path + ".bak")
-            except OSError:
-                pass
-        elif os.path.exists(path + ".bak"):
-            os.remove(path + ".bak")
-        os.replace(tmp_path, path)
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
     finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
 
 
-def read_json_safe(path):
-    if not os.path.exists(path):
-        return {}
-    for candidate in (path, path + ".bak"):
-        if not os.path.exists(candidate):
-            continue
-        try:
-            with open(candidate, "r", encoding="utf-8") as file_obj:
-                value = json.load(file_obj)
-            if isinstance(value, dict):
-                return value
-        except (OSError, ValueError, json.JSONDecodeError):
-            continue
-    return {}
-
-
-def remove_with_backup(path):
-    for candidate in (path, path + ".bak"):
-        try:
-            if os.path.exists(candidate):
-                os.remove(candidate)
-        except OSError:
-            pass
-
-
-def append_checkpoint_atomic(new_rows):
-    existing = read_csv_safe(CHECKPOINT_FILE)
-    combined = pd.concat([existing, new_rows], ignore_index=True, sort=False) if not existing.empty else new_rows.copy()
-    if "Trade_Date" in combined.columns:
-        combined["Trade_Date"] = combined["Trade_Date"].map(parse_yyyymmdd)
-    keys = [col for col in ("Config_ID", "Trade_Date", "ts_code") if col in combined.columns]
-    if keys:
-        combined = combined.drop_duplicates(keys, keep="last")
-    sort_cols = [col for col in ("Trade_Date", "Rank") if col in combined.columns]
-    if sort_cols:
-        combined = combined.sort_values(sort_cols, kind="mergesort")
-    atomic_write_csv(combined.reset_index(drop=True), CHECKPOINT_FILE)
-
-
-def mark_scan_complete(trade_date, raw_signal_count, selected_count, config_id):
-    ledger = read_csv_safe(SCAN_LEDGER_FILE)
-    row = pd.DataFrame([{
-        "Trade_Date": str(trade_date),
-        "Raw_Signal_Count": int(raw_signal_count),
-        "Selected_Count": int(selected_count),
-        "Scan_Status": "COMPLETED",
-        "Config_ID": config_id,
-        "Updated_At": datetime.now().isoformat(timespec="seconds"),
-    }])
-    ledger = pd.concat([ledger, row], ignore_index=True, sort=False) if not ledger.empty else row
-    ledger["Trade_Date"] = ledger["Trade_Date"].map(parse_yyyymmdd)
-    ledger = ledger.drop_duplicates(["Trade_Date", "Config_ID"], keep="last")
-    atomic_write_csv(ledger.sort_values("Trade_Date").reset_index(drop=True), SCAN_LEDGER_FILE)
-
-
-_RUN_LOCK_HANDLE = None
-
-
-def acquire_run_lock(stale_seconds=600):
-    """防止双击或两个页面会话同时写同一缓存；进程终止时系统自动释放锁。"""
-    global _RUN_LOCK_HANDLE
-    if fcntl is not None:
-        try:
-            lock_handle = open(RUN_LOCK_FILE, "a+", encoding="utf-8")
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            lock_handle.seek(0)
-            lock_handle.truncate()
-            lock_handle.write(str(time.time()))
-            lock_handle.flush()
-            _RUN_LOCK_HANDLE = lock_handle
-            return True
-        except (OSError, BlockingIOError):
-            try:
-                lock_handle.close()
-            except Exception:
-                pass
-            return False
-
-    if os.path.exists(RUN_LOCK_FILE):
-        try:
-            if time.time() - os.path.getmtime(RUN_LOCK_FILE) > stale_seconds:
-                os.remove(RUN_LOCK_FILE)
-        except OSError:
-            pass
-    try:
-        fd = os.open(RUN_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.write(fd, str(time.time()).encode("utf-8"))
-        os.close(fd)
-        return True
-    except FileExistsError:
-        return False
-
-
-def release_run_lock():
-    global _RUN_LOCK_HANDLE
-    try:
-        if _RUN_LOCK_HANDLE is not None:
-            if fcntl is not None:
-                fcntl.flock(_RUN_LOCK_HANDLE.fileno(), fcntl.LOCK_UN)
-            _RUN_LOCK_HANDLE.close()
-            _RUN_LOCK_HANDLE = None
-            # flock 锁文件保留在磁盘；真正的锁随文件句柄关闭而释放。
-            return
-        if fcntl is None and os.path.exists(RUN_LOCK_FILE):
-            os.remove(RUN_LOCK_FILE)
-    except OSError:
-        pass
+def _append_checkpoint_safely(new_rows):
+    with _checkpoint_lock():
+        existing = _read_csv_safely(CHECKPOINT_FILE)
+        combined = (
+            pd.concat([existing, new_rows], ignore_index=True, sort=False)
+            if not existing.empty else new_rows.copy()
+        )
+        if "Trade_Date" in combined.columns:
+            combined["Trade_Date"] = (
+                combined["Trade_Date"].astype(str).str.replace(r"\.0$", "", regex=True)
+            )
+        if {"Trade_Date", "ts_code"}.issubset(combined.columns):
+            combined = combined.drop_duplicates(["Trade_Date", "ts_code"], keep="last")
+        sort_columns = [col for col in ("Trade_Date", "Rank") if col in combined.columns]
+        if sort_columns:
+            combined = combined.sort_values(sort_columns, kind="mergesort")
+        _atomic_write_csv(combined.reset_index(drop=True), CHECKPOINT_FILE)
 
 # ---------------------------
 # 科技白名单池构建
@@ -319,196 +217,197 @@ def load_custom_tech_whitelist(token):
     return whitelist_set, name_map
 
 # ---------------------------
-# 稳定版行情缓存：每个交易日独立原子分片
+# 增量下载引擎
 # ---------------------------
-def _pool_cache_dir(whitelist_set):
-    pool_hash = hashlib.sha1("|".join(sorted(whitelist_set)).encode("utf-8")).hexdigest()[:12]
-    cache_dir = os.path.join(MARKET_CACHE_ROOT, pool_hash)
-    os.makedirs(cache_dir, exist_ok=True)
-    return cache_dir, pool_hash
+def _market_partition_path(trade_date):
+    os.makedirs(MARKET_CACHE_DIR, exist_ok=True)
+    return os.path.join(MARKET_CACHE_DIR, f"{trade_date}.pkl.gz")
 
 
-def _valid_market_partition(payload, trade_date, pool_hash):
+def _market_partition_exists(trade_date):
+    try:
+        return os.path.getsize(_market_partition_path(trade_date)) >= 100
+    except OSError:
+        return False
+
+
+def _valid_market_partition(payload, trade_date):
     if not isinstance(payload, dict):
         return False
-    if payload.get("version") != 1 or payload.get("trade_date") != str(trade_date):
-        return False
-    if payload.get("pool_hash") != pool_hash:
+    if payload.get("version") != 1 or str(payload.get("trade_date")) != str(trade_date):
         return False
     daily = payload.get("daily")
     adj = payload.get("adj")
     basic = payload.get("daily_basic")
-    if not isinstance(daily, pd.DataFrame) or not isinstance(adj, pd.DataFrame):
-        return False
-    if not isinstance(basic, pd.DataFrame):
-        return False
-    if int(payload.get("raw_daily_count", 0)) < 1000 or int(payload.get("raw_adj_count", 0)) < 1000:
+    if not all(isinstance(frame, pd.DataFrame) for frame in (daily, adj, basic)):
         return False
     required_daily = {"ts_code", "trade_date", "open", "high", "low", "close", "vol"}
-    return (
-        not daily.empty and not adj.empty
-        and required_daily.issubset(daily.columns)
-        and {"ts_code", "trade_date", "adj_factor"}.issubset(adj.columns)
-    )
+    required_adj = {"ts_code", "trade_date", "adj_factor"}
+    if daily.empty or adj.empty:
+        return False
+    if not required_daily.issubset(daily.columns) or not required_adj.issubset(adj.columns):
+        return False
+    # 防止Tushare网络波动只返回一小部分股票，却被永久当成完整缓存。
+    if int(payload.get("daily_count", 0)) < 1000:
+        return False
+    if int(payload.get("adj_count", 0)) < 1000:
+        return False
+    return True
 
 
-def _atomic_write_pickle(payload, path):
-    target_dir = os.path.dirname(os.path.abspath(path)) or "."
-    os.makedirs(target_dir, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=target_dir)
-    os.close(fd)
-    try:
-        with open(tmp_path, "wb") as file_obj:
-            pickle.dump(payload, file_obj, protocol=pickle.HIGHEST_PROTOCOL)
-            file_obj.flush()
-            os.fsync(file_obj.fileno())
-        os.replace(tmp_path, path)
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-
-
-def _read_market_partition(path, trade_date, pool_hash):
-    if not os.path.exists(path):
+def _read_market_partition(trade_date):
+    partition_path = _market_partition_path(trade_date)
+    if not os.path.exists(partition_path):
         return None
     try:
-        with open(path, "rb") as file_obj:
+        with gzip.open(partition_path, "rb") as file_obj:
             payload = pickle.load(file_obj)
-        return payload if _valid_market_partition(payload, trade_date, pool_hash) else None
-    except (OSError, EOFError, pickle.UnpicklingError, AttributeError, ValueError):
+        if _valid_market_partition(payload, trade_date):
+            return payload
+        try:
+            os.remove(partition_path)
+        except OSError:
+            pass
         return None
+    except (OSError, EOFError, pickle.UnpicklingError, AttributeError, ValueError):
+        try:
+            os.remove(partition_path)
+        except OSError:
+            pass
+        return None
+
+
+def _write_market_partition(payload, trade_date):
+    partition_path = _market_partition_path(trade_date)
+
+    def writer(temp_path):
+        with gzip.open(temp_path, "wb", compresslevel=3) as file_obj:
+            pickle.dump(payload, file_obj, protocol=pickle.HIGHEST_PROTOCOL)
+        with open(temp_path, "rb") as file_obj:
+            os.fsync(file_obj.fileno())
+
+    _atomic_replace_bytes(writer, partition_path)
 
 
 def sync_market_data_incrementally(start_date, end_date, token, whitelist_set):
-    """单日下载完成即提交；进程中断后只补未完成日期。"""
     token_c = clean_token_str(token)
     ts.set_token(token_c)
     pro = ts.pro_api(token_c)
-    cal_raw = safe_tushare_call(
-        pro.trade_cal, exchange="SSE", start_date=start_date, end_date=end_date
-    )
-    if cal_raw.empty:
-        return [], "", ""
+    
+    cal_raw = safe_tushare_call(pro.trade_cal, exchange='SSE', start_date=start_date, end_date=end_date)
+    if cal_raw.empty: return []
+        
+    cal_open = cal_raw[cal_raw['is_open'] == 1].sort_values('cal_date', ascending=True)
+    all_dates = cal_open['cal_date'].tolist()
+    
     today_str = datetime.now().strftime("%Y%m%d")
-    valid_dates = (
-        cal_raw[(cal_raw["is_open"] == 1) & (cal_raw["cal_date"].astype(str) <= today_str)]
-        .sort_values("cal_date")["cal_date"].astype(str).tolist()
-    )
-    cache_dir, pool_hash = _pool_cache_dir(whitelist_set)
+    valid_dates = [d for d in all_dates if d <= today_str]
+    
     missing_dates = [
-        trade_date for trade_date in valid_dates
-        if _read_market_partition(
-            os.path.join(cache_dir, f"{trade_date}.pkl"), trade_date, pool_hash
-        ) is None
+        d for d in valid_dates
+        if not _market_partition_exists(d)
     ]
+    
     if missing_dates:
-        bar = st.progress(0, text=f"📥 从断点补充 {len(missing_dates)} 个交易日行情...")
-        failed_dates = []
-        for idx, trade_date in enumerate(missing_dates):
-            daily_all = safe_tushare_call(pro.daily, max_retries=3, sleep_time=0.8, trade_date=trade_date)
-            adj_all = safe_tushare_call(pro.adj_factor, max_retries=3, sleep_time=0.8, trade_date=trade_date)
-            basic_all = safe_tushare_call(
-                pro.daily_basic, max_retries=3, sleep_time=0.8,
-                trade_date=trade_date, fields="ts_code,trade_date,circ_mv",
-            )
-            daily = daily_all[daily_all["ts_code"].isin(whitelist_set)].copy() if not daily_all.empty else pd.DataFrame()
-            adj = adj_all[adj_all["ts_code"].isin(whitelist_set)].copy() if not adj_all.empty else pd.DataFrame()
-            basic = basic_all[basic_all["ts_code"].isin(whitelist_set)].copy() if not basic_all.empty else pd.DataFrame()
-            payload = {
-                "version": 1,
-                "trade_date": trade_date,
-                "pool_hash": pool_hash,
-                "raw_daily_count": int(len(daily_all)),
-                "raw_adj_count": int(len(adj_all)),
-                "daily": daily,
-                "adj": adj,
-                "daily_basic": basic,
-            }
-            if _valid_market_partition(payload, trade_date, pool_hash):
-                _atomic_write_pickle(payload, os.path.join(cache_dir, f"{trade_date}.pkl"))
-            else:
-                failed_dates.append(trade_date)
-            if (idx + 1) % 5 == 0 or idx == len(missing_dates) - 1:
-                bar.progress(
-                    (idx + 1) / len(missing_dates),
-                    text=f"📥 行情同步 {idx + 1}/{len(missing_dates)}：{trade_date}",
-                )
-            time.sleep(0.12)
-        bar.empty()
-        if failed_dates:
-            st.warning(
-                f"有 {len(failed_dates)} 个交易日行情暂未返回；成功日期已保存，"
-                "本次继续使用完整分片，下次运行只补缺失日期。"
-            )
-    return valid_dates, cache_dir, pool_hash
+        my_bar = st.progress(0, text=f"📥 检测到 {len(missing_dates)} 天增量行情需要同步...")
+        for i, d in enumerate(missing_dates):
+            df_d = safe_tushare_call(pro.daily, max_retries=3, sleep_time=0.8, trade_date=d)
+            df_a = safe_tushare_call(pro.adj_factor, max_retries=3, sleep_time=0.8, trade_date=d)
+            df_b = safe_tushare_call(pro.daily_basic, max_retries=3, sleep_time=0.8, trade_date=d, fields='ts_code,trade_date,circ_mv')
 
+            if not df_d.empty and not df_a.empty:
+                payload = {
+                    "version": 1,
+                    "trade_date": d,
+                    "daily_count": len(df_d),
+                    "adj_count": len(df_a),
+                    "daily": df_d,
+                    "adj": df_a,
+                    "daily_basic": df_b if not df_b.empty else pd.DataFrame(),
+                }
+                if _valid_market_partition(payload, d):
+                    _write_market_partition(payload, d)
 
-@st.cache_resource(ttl=3600 * 12, show_spinner=False)
-def _build_market_index_from_partitions(valid_dates_key, cache_dir, pool_hash, whitelist_key, cache_stamp):
+            if (i + 1) % 5 == 0 or i == len(missing_dates) - 1:
+                my_bar.progress((i+1)/len(missing_dates), text=f"📥 行情同步中: {i+1}/{len(missing_dates)}")
+            time.sleep(0.25)
+        my_bar.empty()
+    return valid_dates
+
+# ---------------------------
+# 极速轻量化内存索引引擎
+# ---------------------------
+@st.cache_resource(ttl=3600*12, show_spinner=False)
+def _build_market_index(valid_dates, whitelist_keys, cache_stamp):
     del cache_stamp
-    whitelist_set = set(whitelist_key)
-    daily_parts, adj_parts, basic_parts = [], [], []
-    for trade_date in valid_dates_key:
-        payload = _read_market_partition(
-            os.path.join(cache_dir, f"{trade_date}.pkl"), trade_date, pool_hash
-        )
-        if payload is None:
-            continue
-        daily_parts.append(payload["daily"])
-        adj_parts.append(payload["adj"])
-        if not payload["daily_basic"].empty:
-            basic_parts.append(payload["daily_basic"])
-    daily_raw = pd.concat(daily_parts, ignore_index=True) if daily_parts else pd.DataFrame()
-    adj_raw = pd.concat(adj_parts, ignore_index=True) if adj_parts else pd.DataFrame()
-    basic_raw = pd.concat(basic_parts, ignore_index=True) if basic_parts else pd.DataFrame()
-    if daily_raw.empty or adj_raw.empty:
-        return {}, pd.DataFrame()
+    whitelist_set = set(whitelist_keys)
+    with st.spinner("正在构建全样本前复权索引..."):
+        daily_list, adj_list, basic_list = [], [], []
+        for trade_date in valid_dates:
+            payload = _read_market_partition(trade_date)
+            if payload is None:
+                continue
+            df_d = payload['daily']
+            df_a = payload['adj']
+            df_b = payload['daily_basic']
+            if whitelist_set:
+                df_d = df_d[df_d['ts_code'].isin(whitelist_set)]
+                df_a = df_a[df_a['ts_code'].isin(whitelist_set)]
+                if not df_b.empty:
+                    df_b = df_b[df_b['ts_code'].isin(whitelist_set)]
+            if not df_d.empty and not df_a.empty:
+                daily_list.append(df_d)
+                adj_list.append(df_a)
+                if not df_b.empty:
+                    basic_list.append(df_b)
 
-    merged_all = daily_raw.merge(
-        adj_raw[["ts_code", "trade_date", "adj_factor"]],
-        on=["ts_code", "trade_date"], how="inner",
-    )
-    merged_all["trade_date_str"] = merged_all["trade_date"].astype(str)
-    merged_all = merged_all.drop_duplicates(["ts_code", "trade_date_str"], keep="last")
-    merged_all = merged_all.sort_values(["ts_code", "trade_date_str"])
-    del daily_raw, adj_raw, daily_parts, adj_parts
-    gc.collect()
+        daily_raw = pd.concat(daily_list, ignore_index=True) if daily_list else pd.DataFrame()
+        adj_raw = pd.concat(adj_list, ignore_index=True) if adj_list else pd.DataFrame()
+        basic_raw = pd.concat(basic_list, ignore_index=True) if basic_list else pd.DataFrame()
 
-    stock_qfq_dict = {}
-    for ts_code, group in merged_all.groupby("ts_code"):
-        df_g = group.copy()
-        latest_adj = df_g["adj_factor"].iloc[-1]
-        if latest_adj > 0:
-            for col in ["open", "high", "low", "close", "pre_close"]:
-                if col in df_g.columns:
-                    df_g[col] = df_g[col] * df_g["adj_factor"] / latest_adj
-        df_g = df_g.set_index("trade_date_str")
-        stock_qfq_dict[ts_code] = df_g
-    if not basic_raw.empty:
-        basic_raw["trade_date"] = basic_raw["trade_date"].astype(str)
-        basic_indexed = basic_raw.drop_duplicates(
-            subset=["ts_code", "trade_date"]
-        ).set_index(["trade_date", "ts_code"])
-    else:
-        basic_indexed = pd.DataFrame()
+        if daily_raw.empty or adj_raw.empty: return {}, pd.DataFrame()
+
+        merged_all = daily_raw.merge(adj_raw[['ts_code', 'trade_date', 'adj_factor']], on=['ts_code', 'trade_date'], how='inner')
+        merged_all['trade_date_str'] = merged_all['trade_date'].astype(str)
+        merged_all = merged_all.drop_duplicates(['ts_code', 'trade_date_str'], keep='last')
+        merged_all = merged_all.sort_values(['ts_code', 'trade_date_str'])
+        del daily_raw, adj_raw, daily_list, adj_list
+        gc.collect()
+
+        stock_qfq_dict = {}
+        for ts_code, group in merged_all.groupby('ts_code'):
+            df_g = group.copy()
+            latest_adj = df_g['adj_factor'].iloc[-1]
+            if latest_adj > 0:
+                for col in ['open', 'high', 'low', 'close', 'pre_close']:
+                    if col in df_g.columns:
+                        df_g[col] = df_g[col] * df_g['adj_factor'] / latest_adj
+            df_g = df_g.set_index('trade_date_str')
+            stock_qfq_dict[ts_code] = df_g
+        del merged_all
+        gc.collect()
+            
+        if not basic_raw.empty:
+            basic_raw['trade_date'] = basic_raw['trade_date'].astype(str)
+            basic_indexed = basic_raw.drop_duplicates(subset=['ts_code', 'trade_date']).set_index(['trade_date', 'ts_code'])
+        else:
+            basic_indexed = pd.DataFrame()
+
     return stock_qfq_dict, basic_indexed
 
 
-def load_optimized_market_data(start_date, end_date, token, whitelist_keys):
-    whitelist_set = set(whitelist_keys)
-    valid_dates, cache_dir, pool_hash = sync_market_data_incrementally(
-        start_date, end_date, token, whitelist_set
-    )
+def load_optimized_market_data(start_date, end_date, token, _whitelist_keys):
+    token_c = clean_token_str(token)
+    whitelist_set = set(_whitelist_keys)
+    valid_dates = sync_market_data_incrementally(start_date, end_date, token_c, whitelist_set)
     if not valid_dates:
         return {}, pd.DataFrame()
-    partition_paths = [os.path.join(cache_dir, f"{date}.pkl") for date in valid_dates]
-    stamp = (
-        len([path for path in partition_paths if os.path.exists(path)]),
-        max((os.path.getmtime(path) for path in partition_paths if os.path.exists(path)), default=0),
+    valid_paths = [_market_partition_path(date) for date in valid_dates]
+    cache_stamp = (
+        sum(os.path.exists(path) for path in valid_paths),
+        max((os.path.getmtime(path) for path in valid_paths if os.path.exists(path)), default=0),
     )
-    return _build_market_index_from_partitions(
-        tuple(valid_dates), cache_dir, pool_hash, tuple(sorted(whitelist_set)), stamp
-    )
+    return _build_market_index(tuple(valid_dates), tuple(sorted(whitelist_set)), cache_stamp)
 
 # ---------------------------
 # 🚀 核心引擎：翻转打分模型（通用于选股与回测）
@@ -745,551 +644,301 @@ def repair_checkpoint_df(df_in):
     return df_out
 
 # ---------------------------
-# 稳定任务与原版扫描封装
-# ---------------------------
-WEEKS_PER_BATCH = 4
-
-
-def make_config_id(top_n, min_price, min_mv, max_mv):
-    payload = {
-        "strategy": "V14.5-original",
-        "top_n": int(top_n),
-        "min_price": float(min_price),
-        "min_mv": float(min_mv),
-        "max_mv": float(max_mv),
-    }
-    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
-
-
-def save_task(task):
-    task = dict(task)
-    task["Updated_At"] = datetime.now().isoformat(timespec="seconds")
-    atomic_write_json(task, RUN_TASK_FILE)
-
-
-def completed_scan_dates(config_id):
-    completed = set()
-    ledger = read_csv_safe(SCAN_LEDGER_FILE)
-    if not ledger.empty and {"Trade_Date", "Config_ID", "Scan_Status"}.issubset(ledger.columns):
-        match = ledger[
-            (ledger["Config_ID"].astype(str) == str(config_id))
-            & (ledger["Scan_Status"].astype(str) == "COMPLETED")
-        ]
-        completed.update(filter(None, (parse_yyyymmdd(v) for v in match["Trade_Date"])))
-
-    # 若进程恰好在“结果写入”与“账本写入”之间退出，结果文件本身也可恢复断点。
-    history = read_csv_safe(CHECKPOINT_FILE)
-    if not history.empty and "Trade_Date" in history.columns:
-        if "Config_ID" in history.columns:
-            history = history[history["Config_ID"].astype(str) == str(config_id)]
-        completed.update(filter(None, (parse_yyyymmdd(v) for v in history["Trade_Date"])))
-    return completed
-
-
-def scan_one_date_original(
-    date, whitelist_keys, basic_name_map, stock_qfq_dict, basic_indexed,
-    min_price, min_mv, max_mv, top_n, is_picking_mode,
-):
-    """V14.5 原扫描循环的函数化封装；条件、字段、排序与交易规则不变。"""
-    records = []
-    for ts_code in whitelist_keys:
-        if ts_code not in stock_qfq_dict:
-            continue
-        df_stock = stock_qfq_dict[ts_code]
-        if date not in df_stock.index:
-            continue
-
-        row_latest = df_stock.loc[date]
-        if isinstance(row_latest, pd.DataFrame):
-            row_latest = row_latest.iloc[-1]
-
-        curr_close = row_latest["close"]
-        if curr_close < min_price:
-            continue
-
-        circ_mv_billion = np.nan
-        if not basic_indexed.empty and (date, ts_code) in basic_indexed.index:
-            circ_mv_billion = basic_indexed.loc[(date, ts_code)]["circ_mv"] / 10000.0
-
-        if pd.notna(circ_mv_billion):
-            if circ_mv_billion < min_mv or circ_mv_billion > max_mv:
-                continue
-
-        ind = compute_breakout_signal(ts_code, date, stock_qfq_dict)
-        if not ind or not ind.get("is_buy_signal"):
-            continue
-
-        stock_name = basic_name_map.get(ts_code, ts_code)
-        record_dict = {
-            "ts_code": ts_code, "name": stock_name, "Signal_Close": ind["signal_close"],
-            "SKDJ_K": ind["k"], "SKDJ_D": ind["d"],
-            "D_Min(10W)": ind["recent_k_min"], "Weeks_Under": ind["weeks_under_25"],
-            "Trend_Type": ind["trend_type"], "vol_ratio": ind["vol_ratio"],
-            "circ_mv": round(circ_mv_billion, 2) if pd.notna(circ_mv_billion) else np.nan,
-            "Total_Score": ind["Total_Score"],
-        }
-        if not is_picking_mode:
-            future_returns = track_future_performance(
-                ts_code, date, ind["signal_close"], stock_qfq_dict, hold_weeks=12
-            )
-            record_dict.update(future_returns)
-        records.append(record_dict)
-
-    if not records:
-        return pd.DataFrame(), 0
-    selected = (
-        pd.DataFrame(records)
-        .sort_values("Total_Score", ascending=False)
-        .head(int(top_n))
-    )
-    selected.insert(0, "Rank", range(1, len(selected) + 1))
-    selected["Trade_Date"] = date
-    return selected, len(records)
-
-
-def build_run_dates(pro, backtest_days, end_date, is_picking_mode, config_id):
-    lookback_days = max(int(backtest_days) * 3, 900)
-    end_dt = datetime.strptime(end_date, "%Y%m%d")
-    start_cal = (end_dt - timedelta(days=lookback_days)).strftime("%Y%m%d")
-    end_cal_extended = (end_dt + timedelta(days=15)).strftime("%Y%m%d")
-    cal_raw = safe_tushare_call(
-        pro.trade_cal, exchange="SSE", start_date=start_cal, end_date=end_cal_extended
-    )
-    if cal_raw.empty:
-        raise RuntimeError("无法获取交易日历。")
-    cal_open = cal_raw[cal_raw["is_open"] == 1].sort_values("cal_date")
-    all_trade_days = cal_open["cal_date"].astype(str).tolist()
-    trade_days_list = [date for date in all_trade_days if date <= end_date]
-    if not trade_days_list:
-        raise RuntimeError("未获取到有效交易日。")
-    if is_picking_mode:
-        return [trade_days_list[-1]], [trade_days_list[-1]]
-
-    td_df = pd.DataFrame({"cal_date": all_trade_days})
-    td_df["dt"] = pd.to_datetime(td_df["cal_date"])
-    td_df["year_week"] = td_df["dt"].dt.strftime("%G_%V")
-    valid_scan_dates = set(td_df.groupby("year_week")["cal_date"].max().tolist())
-    requested = sorted(
-        date for date in trade_days_list[-int(backtest_days):]
-        if date in valid_scan_dates
-    )
-    processed = completed_scan_dates(config_id)
-    return requested, [date for date in requested if date not in processed]
-
-
-# ---------------------------
 # UI 控制流与输入侧边栏
 # ---------------------------
 with st.sidebar:
     st.header("⚙️ 模式与分析配置")
-    st.info(
-        "💡 **双模引擎说明**：\n将追溯天数设为 **1**，触发【盘中极速选股】(不保存)；"
-        "设为 **>1**，触发【历史回测】。历史任务每完成一周即保存，可在中断后自动续跑。"
-    )
-
-    BACKTEST_DAYS = st.number_input(
-        "追溯交易天数 (设为1为极速选股)", value=1, step=30, min_value=1,
-        key="v145_backtest_days",
-    )
-    MAX_TOP_N = st.number_input(
-        "每周最多展示股票数 (Top N)", value=5, min_value=1, max_value=50, step=1,
-        key="v145_top_n",
-    )
-    backtest_date_end = st.date_input(
-        "分析截止日期", value=datetime.now().date(), key="v145_end_date"
-    )
-
+    
+    st.info("💡 **双模引擎说明**：\n将追溯天数设为 **1**，触发【盘中极速选股】(不保存)；设为 **>1**，触发【历史回测】。系统已锁定回测模式仅在周末生效，防止污染。")
+    
+    BACKTEST_DAYS = st.number_input("追溯交易天数 (设为1为极速选股)", value=1, step=30, min_value=1)
+    MAX_TOP_N = st.number_input("每周最多展示股票数 (Top N)", value=5, min_value=1, max_value=50, step=1)
+    backtest_date_end = st.date_input("分析截止日期", value=datetime.now().date())
+    
     st.markdown("---")
-    clear_market_clicked = st.button("🗑️ 清空行情缓存", key="clear_market")
-    clear_history_clicked = st.button("🗑️ 清除历史回测记录", key="clear_history")
-
+    if st.button("🗑️ 清空行情缓存"):
+        if os.path.isdir(MARKET_CACHE_DIR): shutil.rmtree(MARKET_CACHE_DIR)
+        for cache_path in (MARKET_CACHE_FILE, MARKET_CACHE_FILE + ".tmp"):
+            if os.path.exists(cache_path): os.remove(cache_path)
+        st.cache_data.clear()
+        st.cache_resource.clear()
+        st.success("底层行情缓存已清理！")
+            
+    if st.button("🗑️ 清除历史回测记录"):
+        for result_path in (CHECKPOINT_FILE, CHECKPOINT_FILE + ".bak"):
+            if os.path.exists(result_path): os.remove(result_path)
+        st.success("历史记录已清理！")
+            
     st.markdown("---")
     st.subheader("💰 护城河底座")
-    MIN_PRICE = st.number_input("最低股价 (元)", value=10.0, key="v145_min_price")
+    MIN_PRICE = st.number_input("最低股价 (元)", value=10.0) 
     col1, col2 = st.columns(2)
-    MIN_MV = col1.number_input("最小市值(亿)", value=50.0, key="v145_min_mv")
-    MAX_MV = col2.number_input("最大市值(亿)", value=1000.0, key="v145_max_mv")
-
+    MIN_MV = col1.number_input("最小市值(亿)", value=50.0) 
+    MAX_MV = col2.number_input("最大市值(亿)", value=1000.0)
+    
     st.markdown("---")
-    try:
-        secret_token = st.secrets.get("TUSHARE_TOKEN", "")
-    except Exception:
-        secret_token = ""
-    TS_TOKEN_INPUT = st.text_input(
-        "🔑 Tushare Token", value=secret_token, type="password", key="v145_token"
-    )
-
-if clear_market_clicked:
-    if acquire_run_lock():
-        try:
-            if os.path.isdir(MARKET_CACHE_ROOT):
-                shutil.rmtree(MARKET_CACHE_ROOT)
-            st.cache_data.clear()
-            st.cache_resource.clear()
-            st.success("底层行情缓存已清理！")
-        finally:
-            release_run_lock()
-    else:
-        st.warning("回测正在使用行情缓存，请先停止或等待当前批次结束。")
-
-if clear_history_clicked:
-    if acquire_run_lock():
-        try:
-            for file_path in (CHECKPOINT_FILE, SCAN_LEDGER_FILE, RUN_TASK_FILE):
-                remove_with_backup(file_path)
-            st.success("历史记录和断点任务已清理！")
-        finally:
-            release_run_lock()
-    else:
-        st.warning("回测正在写入结果，请先等待当前批次结束。")
+    secret_token = st.secrets.get("TUSHARE_TOKEN", "") if hasattr(st, "secrets") else ""
+    TS_TOKEN_INPUT = st.text_input("🔑 Tushare Token", value=secret_token, type="password")
 
 token_clean = clean_token_str(TS_TOKEN_INPUT)
-is_picking_mode = int(BACKTEST_DAYS) == 1
-current_config_id = make_config_id(MAX_TOP_N, MIN_PRICE, MIN_MV, MAX_MV)
-task_before = read_json_safe(RUN_TASK_FILE)
+is_picking_mode = (int(BACKTEST_DAYS) == 1)
 
-if task_before.get("State") in {"RUNNING", "PAUSED_ERROR"}:
-    done_count = int(task_before.get("Completed_Weeks", 0))
-    total_count = int(task_before.get("Total_Weeks", 0))
-    state_text = "运行中" if task_before.get("State") == "RUNNING" else "已暂停"
-    st.info(f"🔄 检测到断点回测：{state_text}，已完成 {done_count}/{total_count} 周。")
+# ---------------------------
+# 主流程：启动引擎
+# ---------------------------
+btn_label = "🚀 启动盘中极速选股 (天数=1)" if is_picking_mode else "🚀 启动历史回测分析 (天数>1)"
 
-retry_clicked = False
-stop_clicked = False
-if task_before.get("State") == "PAUSED_ERROR":
-    retry_clicked = st.button("▶️ 从断点继续", key="resume_backtest")
-if task_before.get("State") in {"RUNNING", "PAUSED_ERROR"}:
-    stop_clicked = st.button("⏹️ 停止断点回测", key="stop_backtest")
-
-if stop_clicked:
-    stopped_task = read_json_safe(RUN_TASK_FILE)
-    stopped_task["State"] = "STOPPED"
-    save_task(stopped_task)
-    st.warning("断点任务已停止；已完成的行情和周结果仍保留。")
-
-if retry_clicked:
-    task_before["State"] = "RUNNING"
-    task_before["Error_Count"] = 0
-    task_before.pop("Last_Error", None)
-    save_task(task_before)
-
-btn_label = (
-    "🚀 启动盘中极速选股 (天数=1)"
-    if is_picking_mode else "🚀 启动历史回测分析 (天数>1)"
-)
-start_clicked = st.button(btn_label, key="start_v145")
-
-if start_clicked:
+if st.button(btn_label):
     is_valid, msg = verify_token_connection(token_clean)
     if not is_valid:
         st.error(f"❌ **Token 预检拦截**：{msg}")
     else:
-        # 新任务只保留一个大型内存索引，避免多次回测把旧索引叠加到内存中。
-        st.cache_resource.clear()
-    if is_valid and not is_picking_mode:
-        new_task = {
-            "State": "RUNNING",
-            "Config_ID": current_config_id,
-            "Params": {
-                "Backtest_Days": int(BACKTEST_DAYS),
-                "Top_N": int(MAX_TOP_N),
-                "End_Date": backtest_date_end.strftime("%Y%m%d"),
-                "Min_Price": float(MIN_PRICE),
-                "Min_MV": float(MIN_MV),
-                "Max_MV": float(MAX_MV),
-            },
-            "Completed_Weeks": 0,
-            "Total_Weeks": 0,
-            "Error_Count": 0,
-        }
-        save_task(new_task)
-
-
-# ---------------------------
-# 主流程：原策略 + 可恢复的工程执行层
-# ---------------------------
-active_task = read_json_safe(RUN_TASK_FILE)
-run_history = active_task.get("State") == "RUNNING" and not stop_clicked
-run_picking = start_clicked and is_picking_mode
-rerun_needed = False
-
-if run_history or run_picking:
-    if not token_clean:
-        if run_history:
-            active_task["State"] = "PAUSED_ERROR"
-            active_task["Last_Error"] = "Token为空；请填写Token后点击从断点继续。"
-            save_task(active_task)
-        st.error("❌ Token为空，回测断点已保留。")
-    elif not acquire_run_lock():
-        st.info("另一个页面会话正在执行同一回测，本页面不会重复启动。")
-    else:
         try:
-            if run_history:
-                params = active_task["Params"]
-                run_backtest_days = int(params["Backtest_Days"])
-                run_top_n = int(params["Top_N"])
-                run_end_date = str(params["End_Date"])
-                run_min_price = float(params["Min_Price"])
-                run_min_mv = float(params["Min_MV"])
-                run_max_mv = float(params["Max_MV"])
-                run_config_id = str(active_task["Config_ID"])
-            else:
-                run_backtest_days = 1
-                run_top_n = int(MAX_TOP_N)
-                run_end_date = backtest_date_end.strftime("%Y%m%d")
-                run_min_price = float(MIN_PRICE)
-                run_min_mv = float(MIN_MV)
-                run_max_mv = float(MAX_MV)
-                run_config_id = current_config_id
-
+            # 每次新任务先释放上一轮大型内存索引，避免连续回测叠加占用内存。
+            st.cache_resource.clear()
             ts.set_token(token_clean)
             pro = ts.pro_api(token_clean)
+            
             with st.spinner("正在精准筛选科技池白名单标的..."):
                 whitelist_set, basic_name_map = load_custom_tech_whitelist(token_clean)
                 whitelist_keys = tuple(sorted(whitelist_set))
+                
             if not whitelist_keys:
-                raise RuntimeError("未能获取到科技白名单股票，请检查Token积分或网络。")
-            st.info(f"💡 成功锁定科技白名单股票池：共 **{len(whitelist_keys)}** 只标的。")
-
-            requested_dates, pending_dates = build_run_dates(
-                pro, run_backtest_days, run_end_date, run_picking, run_config_id
-            )
-            if run_history:
-                active_task["Total_Weeks"] = len(requested_dates)
-                active_task["Completed_Weeks"] = len(requested_dates) - len(pending_dates)
-                save_task(active_task)
-
-            if not pending_dates:
-                if run_history:
-                    remove_with_backup(RUN_TASK_FILE)
-                    st.success("🎉 指定区间回测数据已全部跑完！")
-                else:
-                    st.warning("⚠️ 未获取到可扫描日期。")
+                st.error("❌ 未能获取到科技白名单股票，请检查 Token 积分或网络。")
             else:
-                batch_dates = pending_dates if run_picking else pending_dates[:WEEKS_PER_BATCH]
-                fetch_start = (
-                    datetime.strptime(min(requested_dates), "%Y%m%d") - timedelta(days=300)
-                ).strftime("%Y%m%d")
-                fetch_end = (
-                    datetime.strptime(max(requested_dates), "%Y%m%d") + timedelta(days=200)
-                ).strftime("%Y%m%d")
-                stock_qfq_dict, basic_indexed = load_optimized_market_data(
-                    fetch_start, fetch_end, token_clean, whitelist_keys
-                )
-                if not stock_qfq_dict:
-                    raise RuntimeError("未能加载到完整行情数据；已下载部分仍保留在断点缓存中。")
-
-                bar = st.progress(0, text="执行 V14.5 原版数据扫描...")
-                stopped_during_batch = False
-                for idx, date in enumerate(batch_dates):
-                    if run_history and read_json_safe(RUN_TASK_FILE).get("State") == "STOPPED":
-                        stopped_during_batch = True
-                        break
-                    if not any(date in stock_data.index for stock_data in stock_qfq_dict.values()):
-                        raise RuntimeError(
-                            f"扫描日 {date} 的完整行情尚未取得；断点已保留，下次只补该日数据。"
-                        )
-                    selected, raw_count = scan_one_date_original(
-                        date, whitelist_keys, basic_name_map, stock_qfq_dict, basic_indexed,
-                        run_min_price, run_min_mv, run_max_mv, run_top_n, run_picking,
-                    )
-                    if run_picking:
-                        if not selected.empty:
-                            st.subheader(f"🎯 盘中极速选股结果 [{date}] - Top {run_top_n}")
-                            try:
-                                st.dataframe(
-                                    selected.style.background_gradient(
-                                        subset=["Total_Score"], cmap="YlOrRd"
-                                    ),
-                                    width="stretch",
-                                )
-                            except Exception:
-                                st.dataframe(selected, width="stretch")
+                st.info(f"💡 成功锁定科技白名单股票池：共 **{len(whitelist_keys)}** 只标的。")
+                
+                # 🌟 修复关键点：强制系统多看 15 天的日历，确保准确识别未来的周末
+                lookback_days = max(int(BACKTEST_DAYS) * 3, 900) 
+                start_cal = (datetime.strptime(backtest_date_end.strftime("%Y%m%d"), "%Y%m%d") - timedelta(days=lookback_days)).strftime("%Y%m%d")
+                end_cal_extended = (datetime.strptime(backtest_date_end.strftime("%Y%m%d"), "%Y%m%d") + timedelta(days=15)).strftime("%Y%m%d")
+                
+                cal_raw = safe_tushare_call(pro.trade_cal, exchange='SSE', start_date=start_cal, end_date=end_cal_extended)
+                if cal_raw.empty:
+                    st.error("❌ 无法获取交易日历。")
+                else:
+                    cal_open = cal_raw[cal_raw['is_open'] == 1].sort_values('cal_date', ascending=True)
+                    all_trade_days = cal_open['cal_date'].tolist()
+                    
+                    # 过滤出小于等于我们所选截止日期的真实可交易日列表
+                    end_str = backtest_date_end.strftime("%Y%m%d")
+                    trade_days_list = [d for d in all_trade_days if d <= end_str]
+                    
+                    if not trade_days_list:
+                        st.error("❌ 未获取到有效交易日。")
+                    else:
+                        td_df = pd.DataFrame({'cal_date': all_trade_days})
+                        td_df['dt'] = pd.to_datetime(td_df['cal_date'])
+                        td_df['year_week'] = td_df['dt'].dt.strftime('%G_%V')
+                        
+                        # 🌟 核心模式分流与周末防线
+                        if is_picking_mode:
+                            dates_to_run = [trade_days_list[-1]] 
                         else:
-                            st.info(f"[{date}] 未发现符合V14.5原条件的股票。")
-                    else:
-                        if not selected.empty:
-                            selected["Config_ID"] = run_config_id
-                            append_checkpoint_atomic(selected)
-                        mark_scan_complete(date, raw_count, len(selected), run_config_id)
-                        active_task["Completed_Weeks"] = (
-                            int(active_task.get("Completed_Weeks", 0)) + 1
-                        )
-                        active_task["Error_Count"] = 0
-                        active_task["Last_Date"] = date
-                        save_task(active_task)
-                    bar.progress(
-                        (idx + 1) / len(batch_dates),
-                        text=f"扫描中: {date} (捕获 {raw_count} 只目标)",
-                    )
-                bar.empty()
-
-                if run_picking:
-                    st.success("🎉 今日极速选股完成！(当前为选股模式，数据未写入历史回测库)")
-                elif stopped_during_batch:
-                    st.warning("断点任务已停止；本批已完成的周结果仍已安全保存。")
-                else:
-                    remaining = len(pending_dates) - len(batch_dates)
-                    if remaining > 0:
-                        st.success(f"✅ 本批完成 {len(batch_dates)} 周，剩余 {remaining} 周将自动续跑。")
-                        rerun_needed = True
-                    else:
-                        remove_with_backup(RUN_TASK_FILE)
-                        st.success("🎉 回测数据更新完毕！请查看下方报告。")
-        except Exception as error:
-            if run_history:
-                latest_task = read_json_safe(RUN_TASK_FILE) or active_task
-                error_count = int(latest_task.get("Error_Count", 0)) + 1
-                latest_task["Error_Count"] = error_count
-                latest_task["Last_Error"] = str(error)
-                if error_count < 3:
-                    latest_task["State"] = "RUNNING"
-                    rerun_needed = True
-                    st.warning(f"⚠️ 临时异常，已保留断点，将自动重试 ({error_count}/3)：{error}")
-                else:
-                    latest_task["State"] = "PAUSED_ERROR"
-                    st.error(f"❌ 连续3次失败，任务已安全暂停：{error}")
-                save_task(latest_task)
-            else:
-                st.error(f"❌ **运行异常拦截**：{error}")
-        finally:
-            release_run_lock()
-
-if rerun_needed:
-    time.sleep(0.8)
-    st.rerun()
-
+                            # 找出所有包含在完整日历里的“真正的一周最后一天”
+                            valid_scan_dates = set(td_df.groupby('year_week')['cal_date'].max().tolist())
+                            
+                            processed_dates = set()
+                            if os.path.exists(CHECKPOINT_FILE):
+                                try:
+                                    existing_df = _read_csv_safely(CHECKPOINT_FILE)
+                                    existing_df['Trade_Date'] = existing_df['Trade_Date'].astype(str)
+                                    processed_dates = set(existing_df['Trade_Date'].unique())
+                                except Exception: pass
+                            recent_trade_days = trade_days_list[-int(BACKTEST_DAYS):]
+                            
+                            # 只有这一天既在最近回测范围内，又是真正的周末，且没被处理过，才允许进入回测
+                            dates_to_run = [d for d in recent_trade_days if d not in processed_dates and d in valid_scan_dates]
+                            dates_to_run.sort()
+                        
+                        if not dates_to_run and not is_picking_mode:
+                            st.success("🎉 指定区间回测数据已全部跑完！(如果您选择了周中日期，系统已自动跳过以保护数据纯洁性)")
+                        elif dates_to_run:
+                            fetch_start = (datetime.strptime(min(dates_to_run), "%Y%m%d") - timedelta(days=300)).strftime("%Y%m%d")
+                            fetch_end = (datetime.strptime(max(dates_to_run), "%Y%m%d") + timedelta(days=200)).strftime("%Y%m%d")
+                            
+                            stock_qfq_dict, basic_indexed = load_optimized_market_data(fetch_start, fetch_end, token_clean, whitelist_keys)
+                            
+                            if not stock_qfq_dict:
+                                st.warning("⚠️ 未能加载到行情数据，请重试。")
+                            else:
+                                bar = st.progress(0, text="执行 V14.5 数据扫描...")
+                                
+                                for i, date in enumerate(dates_to_run):
+                                    records = []
+                                    for ts_code in whitelist_keys:
+                                        if ts_code not in stock_qfq_dict: continue
+                                        df_stock = stock_qfq_dict[ts_code]
+                                        if date not in df_stock.index: continue
+                                            
+                                        row_latest = df_stock.loc[date]
+                                        if isinstance(row_latest, pd.DataFrame): row_latest = row_latest.iloc[-1]
+                                            
+                                        curr_close = row_latest['close']
+                                        if curr_close < MIN_PRICE: continue
+                                            
+                                        circ_mv_billion = np.nan
+                                        if not basic_indexed.empty and (date, ts_code) in basic_indexed.index:
+                                            circ_mv_billion = basic_indexed.loc[(date, ts_code)]['circ_mv'] / 10000.0
+                                        
+                                        if pd.notna(circ_mv_billion):
+                                            if circ_mv_billion < MIN_MV or circ_mv_billion > MAX_MV: continue
+                                        
+                                        ind = compute_breakout_signal(ts_code, date, stock_qfq_dict)
+                                        if not ind or not ind.get('is_buy_signal'): continue
+                                            
+                                        stock_name = basic_name_map.get(ts_code, ts_code)
+                                        record_dict = {
+                                            'ts_code': ts_code, 'name': stock_name, 'Signal_Close': ind['signal_close'], 
+                                            'SKDJ_K': ind['k'], 'SKDJ_D': ind['d'], 
+                                            'D_Min(10W)': ind['recent_k_min'], 'Weeks_Under': ind['weeks_under_25'],
+                                            'Trend_Type': ind['trend_type'], 'vol_ratio': ind['vol_ratio'],
+                                            'circ_mv': round(circ_mv_billion, 2) if pd.notna(circ_mv_billion) else np.nan, 
+                                            'Total_Score': ind['Total_Score']
+                                        }
+                                        
+                                        if not is_picking_mode:
+                                            future_returns = track_future_performance(ts_code, date, ind['signal_close'], stock_qfq_dict, hold_weeks=12)
+                                            record_dict.update(future_returns)
+                                            
+                                        records.append(record_dict)
+                                            
+                                    if records:
+                                        fdf = pd.DataFrame(records).sort_values('Total_Score', ascending=False).head(int(MAX_TOP_N))
+                                        fdf.insert(0, 'Rank', range(1, len(fdf) + 1))
+                                        fdf['Trade_Date'] = date
+                                        
+                                        if is_picking_mode:
+                                            st.subheader(f"🎯 盘中极速选股结果 [{date}] - Top {MAX_TOP_N}")
+                                            try:
+                                                st.dataframe(fdf.style.background_gradient(subset=['Total_Score'], cmap='YlOrRd'), width='stretch')
+                                            except Exception:
+                                                st.dataframe(fdf, width='stretch')
+                                        else:
+                                            _append_checkpoint_safely(fdf)
+                                        
+                                    bar.progress((i+1)/len(dates_to_run), text=f"扫描中: {date} (捕获 {len(records)} 只目标)")
+                                    
+                                bar.empty()
+                                if is_picking_mode:
+                                    st.success("🎉 今日极速选股完成！(当前为选股模式，数据未写入历史回测库)")
+                                else:
+                                    st.success("🎉 回测数据更新完毕！请查看下方报告。")
+                                    
+        except Exception as e:
+            st.error(f"❌ **运行异常拦截**：{str(e)}")
 
 # ---------------------------
-# 全景分析展示区：每次页面重跑均从安全文件恢复
+# 全景分析展示区 (仅在有历史记录时展示)
 # ---------------------------
-raw_res = read_csv_safe(CHECKPOINT_FILE)
-if not raw_res.empty:
+if os.path.exists(CHECKPOINT_FILE) and not is_picking_mode:
     st.markdown("---")
     try:
-        raw_res["Trade_Date"] = raw_res["Trade_Date"].map(parse_yyyymmdd)
-        raw_res = raw_res.dropna(subset=["Trade_Date"])
-
-        # 默认展示当前参数；若页面刷新回默认选股模式，则展示最近一次已保存配置。
-        report_config_id = current_config_id
-        if "Config_ID" in raw_res.columns:
-            matching = raw_res[raw_res["Config_ID"].astype(str) == report_config_id]
-            if matching.empty:
-                report_config_id = str(raw_res["Config_ID"].dropna().astype(str).iloc[-1])
-            raw_res = raw_res[raw_res["Config_ID"].astype(str) == report_config_id].copy()
-
+        raw_res = _read_csv_safely(CHECKPOINT_FILE)
+        if raw_res.empty:
+            raise pd.errors.EmptyDataError
+        raw_res['Trade_Date'] = raw_res['Trade_Date'].astype(str)
+        
         repaired_res = repair_checkpoint_df(raw_res)
-        if "Exit_Reason" not in repaired_res.columns:
-            repaired_res["Exit_Reason"] = "持仓中"
-        valid_signals = repaired_res[
-            ~repaired_res["Exit_Reason"].astype(str).str.contains("剔除", na=False)
-        ].copy()
-
+        valid_signals = repaired_res[~repaired_res['Exit_Reason'].astype(str).str.contains('剔除', na=False)].copy()
+        
         st.header("📈 V14.5 历史回测全景分析报告")
+        
         if not valid_signals.empty:
-            comp_trades = valid_signals[valid_signals["Exit_Reason"] != "持仓中"].copy()
+            comp_trades = valid_signals[valid_signals['Exit_Reason'] != '持仓中'].copy()
             total_executed = len(comp_trades)
-
-            if total_executed > 0 and "Final_Return (%)" in comp_trades.columns:
-                comp_trades["Final_Return (%)"] = pd.to_numeric(
-                    comp_trades["Final_Return (%)"], errors="coerce"
-                ).fillna(0)
-                win_count = (comp_trades["Final_Return (%)"] > 0).sum()
-                global_win_rate = win_count / total_executed * 100.0
-                global_mean_ret = comp_trades["Final_Return (%)"].mean()
-
+            
+            if total_executed > 0:
+                comp_trades['Final_Return (%)'] = pd.to_numeric(comp_trades['Final_Return (%)'], errors='coerce').fillna(0)
+                win_count = (comp_trades['Final_Return (%)'] > 0).sum()
+                global_win_rate = (win_count / total_executed) * 100.0
+                global_mean_ret = comp_trades['Final_Return (%)'].mean()
+                
                 col_m1, col_m2, col_m3 = st.columns(3)
                 col_m1.metric("优选截断总笔数", f"{total_executed} 笔")
                 col_m2.metric("无干预绝对胜率", f"{global_win_rate:.1f}%", f"{win_count}胜")
                 col_m3.metric("全样本平均单笔收益", f"{global_mean_ret:.2f}%")
-
+                
                 st.subheader("🗓️ 周度胜率分布 (强制有序排列 W1 - W12)")
-                week_columns = st.columns(4) + st.columns(4) + st.columns(4)
-                for week in range(1, 13):
-                    column_name = f"Return_W{week} (%)"
-                    if column_name not in valid_signals.columns:
-                        continue
-                    numeric_week = pd.to_numeric(valid_signals[column_name], errors="coerce")
-                    valid_week = numeric_week.dropna()
-                    with week_columns[week - 1]:
-                        if not valid_week.empty:
-                            avg = valid_week.mean()
-                            win = (valid_week > 0).mean() * 100
-                            st.metric(
-                                f"W{week} 均益/胜率 (存活{len(valid_week)}只)",
-                                f"{avg:.2f}% / {win:.1f}%",
-                            )
-
-                required_rank_cols = {
-                    "Rank", "Total_Score", "SKDJ_K", "Weeks_Under",
-                    "Final_Return (%)", "Exit_Reason",
-                }
-                if required_rank_cols.issubset(comp_trades.columns):
-                    st.markdown("### 🏆 评分层级横向对比验证 (Top N)")
-                    rank_stats = comp_trades.groupby("Rank", observed=False).agg(
-                        样本数=("Final_Return (%)", "count"),
-                        平均分=("Total_Score", "mean"),
-                        平均K值=("SKDJ_K", "mean"),
-                        均水下周数=("Weeks_Under", "mean"),
-                        胜率=("Final_Return (%)", lambda values: (values > 0).mean() * 100),
-                        均益=("Final_Return (%)", "mean"),
-                        止损率=("Exit_Reason", lambda values: values.str.contains("破-10%").mean() * 100),
-                        超级大牛=("Exit_Reason", lambda values: values.str.contains("移动止盈").mean() * 100),
-                    ).reset_index().head(10)
-                    rank_stats["胜率"] = rank_stats["胜率"].map("{:.1f}%".format)
-                    rank_stats["均益"] = rank_stats["均益"].map("{:.2f}%".format)
-                    rank_stats["止损率"] = rank_stats["止损率"].map("{:.1f}%".format)
-                    rank_stats["超级大牛"] = rank_stats["超级大牛"].map("{:.1f}%".format)
-                    rank_stats["均水下周数"] = rank_stats["均水下周数"].map("{:.1f}".format)
-                    try:
-                        st.dataframe(
-                            rank_stats.style.background_gradient(subset=["平均分"], cmap="YlOrRd"),
-                            width="stretch",
-                        )
-                    except Exception:
-                        st.dataframe(rank_stats, width="stretch")
+                cols_row1 = st.columns(4)
+                cols_row2 = st.columns(4)
+                cols_row3 = st.columns(4)
+                
+                for w in range(1, 13):
+                    col_name = f'Return_W{w} (%)'
+                    if col_name in valid_signals.columns:
+                        valid = valid_signals.dropna(subset=[col_name]) 
+                        if w <= 4: target_col = cols_row1[w - 1]
+                        elif w <= 8: target_col = cols_row2[w - 5]
+                        else: target_col = cols_row3[w - 9]
+                            
+                        with target_col:
+                            if not valid.empty:
+                                avg = valid[col_name].mean()
+                                win = (valid[col_name] > 0).mean() * 100
+                                st.metric(f"W{w} 均益/胜率 (存活{len(valid)}只)", f"{avg:.2f}% / {win:.1f}%")
+                                
+                st.markdown("### 🏆 评分层级横向对比验证 (Top N)")
+                rank_stats = comp_trades.groupby('Rank', observed=False).agg(
+                    样本数=('Final_Return (%)', 'count'),
+                    平均分=('Total_Score', 'mean'),
+                    平均K值=('SKDJ_K', 'mean'),
+                    均水下周数=('Weeks_Under', 'mean'),
+                    胜率=('Final_Return (%)', lambda x: (x > 0).mean() * 100),
+                    均益=('Final_Return (%)', 'mean'),
+                    止损率=('Exit_Reason', lambda x: x.str.contains('破-10%').mean() * 100),
+                    超级大牛=('Exit_Reason', lambda x: x.str.contains('移动止盈').mean() * 100)
+                ).reset_index().head(10)
+                
+                rank_stats['胜率'] = rank_stats['胜率'].map('{:.1f}%'.format)
+                rank_stats['均益'] = rank_stats['均益'].map('{:.2f}%'.format)
+                rank_stats['止损率'] = rank_stats['止损率'].map('{:.1f}%'.format)
+                rank_stats['超级大牛'] = rank_stats['超级大牛'].map('{:.1f}%'.format)
+                rank_stats['均水下周数'] = rank_stats['均水下周数'].map('{:.1f}'.format)
+                try:
+                    st.dataframe(rank_stats.style.background_gradient(subset=['平均分'], cmap='YlOrRd'), width='stretch')
+                except Exception:
+                    st.dataframe(rank_stats, width='stretch')
 
             st.subheader("📋 历史回测交割流水单")
-            display_columns = [
-                "Trade_Date", "name", "ts_code", "Rank", "Total_Score", "SKDJ_K",
-                "D_Min(10W)", "Weeks_Under", "Signal_Close", "Buy_Price", "Exit_Date",
-                "Hold_Days", "Exit_Reason", "Final_Return (%)",
+            disp_cols = [
+                'Trade_Date', 'name', 'ts_code', 'Rank', 'Total_Score', 'SKDJ_K', 'D_Min(10W)', 'Weeks_Under',
+                'Signal_Close', 'Buy_Price', 'Exit_Date', 'Hold_Days', 'Exit_Reason', 'Final_Return (%)'
             ]
-            final_display = [column for column in display_columns if column in valid_signals.columns]
-            display_frame = valid_signals[final_display].copy()
-            sort_columns = [column for column in ("Trade_Date", "Rank") if column in display_frame.columns]
-            if sort_columns:
-                ascending = [False if column == "Trade_Date" else True for column in sort_columns]
-                display_frame = display_frame.sort_values(sort_columns, ascending=ascending)
-
-            def color_exit_reason(value):
-                if isinstance(value, str):
-                    if "截断" in value: return "color: white; background-color: #8B4513"
-                    if "认栽" in value: return "color: white; background-color: darkred"
-                    if "保本" in value: return "color: white; background-color: darkgoldenrod"
-                    if "移动止盈" in value: return "color: white; background-color: darkgreen"
-                    if "期满" in value: return "color: blue"
-                return ""
-
+            final_disp = [c for c in disp_cols if c in valid_signals.columns]
+            
+            def color_exit_reason(val):
+                if isinstance(val, str):
+                    if '截断' in val: return 'color: white; background-color: #8B4513'
+                    elif '认栽' in val: return 'color: white; background-color: darkred'
+                    elif '保本' in val: return 'color: white; background-color: darkgoldenrod'
+                    elif '移动止盈' in val: return 'color: white; background-color: darkgreen'
+                    elif '期满' in val: return 'color: blue'
+                return ''
+                
             try:
-                styled_port = display_frame.style
-                if "Exit_Reason" in display_frame.columns:
-                    styled_port = styled_port.map(color_exit_reason, subset=["Exit_Reason"])
-                st.dataframe(styled_port, width="stretch")
+                styled_port = valid_signals[final_disp].sort_values(['Trade_Date', 'Rank'], ascending=[False, True]).style
+                if 'Exit_Reason' in valid_signals.columns:
+                    styled_port = styled_port.map(color_exit_reason, subset=['Exit_Reason'])
+                st.dataframe(styled_port, width='stretch')
             except Exception:
-                st.dataframe(display_frame, width="stretch")
-
-            export_frame = valid_signals.drop(columns=["Config_ID"], errors="ignore")
-            csv_data = export_frame.to_csv(index=False).encode("utf-8-sig")
+                fallback_port = valid_signals[final_disp]
+                if {'Trade_Date', 'Rank'}.issubset(fallback_port.columns):
+                    fallback_port = fallback_port.sort_values(['Trade_Date', 'Rank'], ascending=[False, True])
+                st.dataframe(fallback_port, width='stretch')
+                
+            csv_data = valid_signals.to_csv(index=False).encode('utf-8-sig')
             st.download_button(
-                label="📥 导出回测流水单 (CSV)",
-                data=csv_data,
-                file_name="skdj_v14_5_history_export.csv",
+                label="📥 导出回测流水单 (CSV)", 
+                data=csv_data, 
+                file_name="skdj_v14_5_history_export.csv", 
                 mime="text/csv",
-                key="download_v145_history",
+                on_click="ignore",
+                key="download_v14_5_history"
             )
         else:
             st.info("🕒 未发现符合条件的样本。")
+    except pd.errors.EmptyDataError:
+        st.info("🕒 当前暂无满足条件的回测记录。")
     except Exception as report_error:
-        st.error(f"回测结果文件暂时无法展示，但已保存数据不会被删除：{report_error}")
+        st.warning(f"回测数据已保留，但报告暂时无法显示：{report_error}")
