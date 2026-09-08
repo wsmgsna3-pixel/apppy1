@@ -28,6 +28,9 @@ import numpy as np
 import pandas as pd
 
 VERSION = "T1.0-FROZEN-20260908"
+DOWNLOAD_REVISION = "DL4"
+DOWNLOAD_WORKERS = 4
+API_MIN_INTERVAL = 0.36
 CACHE_SCHEMA = "t1_data_v1"
 CORE = {"电子", "计算机", "通信", "国防军工"}
 EXTENDED = {"机械设备", "电力设备", "医药生物", "汽车", "基础化工", "有色金属"}
@@ -102,23 +105,41 @@ class DataClient:
         self.root = Path(root) / CACHE_SCHEMA
         self.progress = progress
         self.lock = threading.Lock()
-        self.next_call = 0.0
+        self.rate_states = {}
+
+    def rate_state(self, endpoint):
+        # 分接口限速：日线等待时不阻塞市值、复权因子、涨跌停价请求。
+        with self.lock:
+            if endpoint not in self.rate_states:
+                self.rate_states[endpoint] = {"lock": threading.Lock(), "next_call": 0.0,
+                                              "interval": API_MIN_INTERVAL}
+            return self.rate_states[endpoint]
 
     def query(self, endpoint, **kwargs):
         error = None
+        state = self.rate_state(endpoint)
         for attempt in range(3):
-            with self.lock:
-                wait = max(0.0, self.next_call - time.monotonic())
+            with state["lock"]:
+                wait = max(0.0, state["next_call"] - time.monotonic())
                 if wait:
                     time.sleep(wait)
-                self.next_call = time.monotonic() + 0.36
+                state["next_call"] = time.monotonic() + state["interval"]
             try:
                 result = self.pro.query(endpoint, **kwargs)
                 return result if isinstance(result, pd.DataFrame) else pd.DataFrame()
             except Exception as exc:
                 error = exc
+                message = str(exc).lower()
+                # 频次报错常附带“权限详情”，必须先识别限流，不能误报Token无效。
+                if any(word in message for word in ("每分钟", "频次", "rate limit", "too many requests", "429")):
+                    with state["lock"]:
+                        state["interval"] = min(2.0, state["interval"] * 2)
+                        state["next_call"] = max(state["next_call"], time.monotonic() + 60.0)
+                    if attempt == 2:
+                        raise RuntimeError(f"{endpoint} 频次限制，退避重试仍失败；已缓存数据保留") from None
+                    continue
                 # 权限/Token问题不反复消耗额度，也不在界面输出可能包含凭据的异常全文。
-                if any(word in str(exc).lower() for word in ("token", "权限", "积分")):
+                if any(word in message for word in ("token", "权限", "积分")):
                     raise RuntimeError(f"{endpoint} 接口认证或积分权限不足") from None
                 time.sleep(0.6 * (attempt + 1))
         raise RuntimeError(f"{endpoint} 三次请求失败（{type(error).__name__}）")
@@ -277,14 +298,14 @@ class DataClient:
             return merged, issues
 
         parts, issues = [], []
-        with ThreadPoolExecutor(max_workers=2) as executor:
+        with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as executor:
             pending = {executor.submit(fetch, ds(day)): day for day in calendar}
             for n, future in enumerate(as_completed(pending), 1):
                 frame, errors = future.result()
                 if not frame.empty:
                     parts.append(frame)
                 issues.extend(errors)
-                self.progress(f"行情下载/读取 {n}/{len(calendar)} 日；问题记录 {len(issues)}；成功数据已缓存")
+                self.progress(f"{DOWNLOAD_WORKERS}路并发下载/读取 {n}/{len(calendar)} 日；问题记录 {len(issues)}；成功数据已缓存")
         if not parts:
             raise RuntimeError("没有可用行情；成功端点缓存保留，可重新运行补齐")
         data = pd.concat(parts, ignore_index=True)
@@ -815,7 +836,8 @@ def run_research(token, cache_root, cfg, progress):
     stress, _, _, _ = portfolio(events, market, calendar, cfg, detail=False, cost_mult=2.0)
     stress_summary = pd.DataFrame([{"情景": "基准费用", "总收益%": (nav.equity.iloc[-1] / cfg.capital - 1) * 100},
                                   {"情景": "买卖综合费用翻倍（滑点不变）", "总收益%": (stress.equity.iloc[-1] / cfg.capital - 1) * 100}])
-    manifest = {"version": VERSION, "created_at": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(),
+    manifest = {"version": VERSION, "download_revision": DOWNLOAD_REVISION, "download_workers": DOWNLOAD_WORKERS,
+                "created_at": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(),
                 "config": asdict(cfg), "rules": RULES, "pool_mode": mode, "warnings": warnings,
                 "universe_size": len(basic), "actual_account_start": nav.date.min(), "actual_account_end": nav.date.max(),
                 "data_start": history_start, "data_end": data_end, "data_issues": len(issues),
@@ -1028,7 +1050,7 @@ def main():
     import streamlit as st
     st.set_page_config(page_title="科技波段 T1.0", layout="wide")
     st.title("科技波段 T1.0 · 独立研发第一版")
-    st.write("整理突破 / 回调再启动 · 统一排序和退出 · 30万元三仓 · 持仓上限8周")
+    st.write("整理突破 / 回调再启动 · 统一排序和退出 · 30万元三仓 · 持仓上限8周 · 四路并发下载")
     try:
         default_token = str(st.secrets.get("TUSHARE_TOKEN", st.secrets.get("tushare_token", "")))
     except Exception:
@@ -1042,7 +1064,7 @@ def main():
         min_mv = st.number_input("最低流通市值（亿元）", value=50.0, min_value=0.0, step=10.0)
         max_mv = st.number_input("最高流通市值（亿元）", value=1000.0, min_value=1.0, step=100.0)
         cache_root = st.text_input("数据缓存目录", value="tech_swing_cache")
-        st.caption("日线、每日市值、复权因子和涨跌停价首次下载较多。缓存长期保留；托管服务重启能否保留取决于磁盘。")
+        st.caption("四路并发下载，分接口限速；遇到频次限制自动退避重试。沿用已有缓存，只下载缺失端点；托管服务重启能否保留取决于磁盘。")
         st.caption("科技范围固定：电子、计算机、通信、国防军工，以及自动化/新能源设备/医疗器械等指定细分。明细随结果导出。")
         run = st.button("运行冻结规则回测", type="primary", use_container_width=True)
     with st.expander("第一版规则与数据边界"):
