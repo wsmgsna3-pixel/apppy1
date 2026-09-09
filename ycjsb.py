@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""科技波段研究 T1.1 退出诊断 — streamlit run app.py
+"""科技波段研究 T1.2 独立买点验证 — streamlit run app.py
 
 单文件；依赖 pandas、numpy、streamlit、tushare。python app.py --self-test 可离线验算。
 策略阈值不是回测寻优结果。历史统计不构成策略有效或实盘合格证明。
@@ -27,7 +27,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
-VERSION = "T1.1-EXIT-DIAGNOSTIC-20260909"
+VERSION = "T1.2-ENTRY-EDGE-20260909"
 BASELINE_VERSION = "T1.0-FROZEN-20260908"
 EXIT_SCHEMES = {"none": "不提前退出（满8自然周）", "initial": "仅初始保护", "full": "T1.0完整退出"}
 DOWNLOAD_REVISION = "DL4"
@@ -49,8 +49,7 @@ RULES = {
     "止损": "初始保护价=max(信号日前10日最低价,买入成交价×92%)；收盘跌破→次日开盘卖出",
     "跟踪": "每日收盘将保护价提高至max(原保护价,买入后最高收盘价−3×当日ATR14)，次日生效",
     "期限": "买入满8个自然周的首个交易日开盘退出；跌停/停牌可延迟并计入超期",
-    "费用": "买入综合费用0.10%、卖出0.20%，每笔最低5元；另每边滑点0.10%；为保守统一假设",
-    "仓位": "30万元起、最多3只；每个新仓目标为上日账户权益的1/3；不强制卖旧换新",
+    "费用": "买入比例费用0.10%、卖出0.20%；另每边滑点0.10%；独立收益不模拟最低收费",
     "价格": "筛池/成交限制用不复权价；形态/收益用原价×当日复权因子",
     "公司行动": "按复权总收益折算持仓，近似红利再投资；不是逐笔派息送转税费账本",
     "周指标": "仅观察；MACD(12,26,9)；SKDJ=RSV9→EMA3→EMA3(K)→MA3(D)；周中只合成截至当日",
@@ -64,10 +63,6 @@ class Config:
     min_price: float = 10.0
     min_mv: float = 50.0
     max_mv: float = 1000.0
-    capital: float = 300000.0
-    slots: int = 3
-    random_runs: int = 100
-    seed: int = 20260908
 
 
 def stamp(x):
@@ -415,7 +410,7 @@ def build_features(data, basic, member, calendar, cfg, progress=lambda text: Non
         g["ts_code"] = code
         g["name"] = base.loc[code, "name"]
         stocks[code] = g[["open", "ao", "ac", "ah", "al", "vol", "adj_factor", "up_limit", "down_limit",
-                          "atr", "mark", "last_quote"]].copy()
+                          "atr", "mark", "last_quote", "structure", "eligible", "ret20"]].copy()
         cols = ["ts_code", "name", "source", "close", "ac", "structure", "atr", "ret20", "contraction",
                 "risk_distance", "circ_mv", "turnover_rate", "weekly_state", "weekly_k", "weekly_d", "weekly_macd"]
         select = g.loc[g.signal, cols].copy()
@@ -467,7 +462,7 @@ def execution_price(row, side):
 
 
 def path_for_signal(signal, g, calendar, exit_scheme="full"):
-    """独立事件；同一退出轨迹复用于无限资金审计及三仓账户。"""
+    """独立事件；不设资金总额、仓位数量或复投。"""
     if exit_scheme not in EXIT_SCHEMES:
         raise ValueError("未知退出方案")
     out = signal.copy()
@@ -630,97 +625,10 @@ def exit_diagnostics(event_sets, stocks, calendar, progress=lambda text: None):
     return {"exit_diagnostic": pd.DataFrame(summaries), "exit_pairs": details, "matched_rank": pd.DataFrame(rank_rows)}
 
 
-def prepare_market(stocks):
-    return {code: {"mark": g.mark.to_numpy(), "last_quote": g.last_quote.to_numpy()}
-            for code, g in stocks.items()}
 
 
-def portfolio(events, market, calendar, cfg, random_seed=None, detail=True, cost_mult=1.0):
-    """买单优先级在信号日确定；不因看到次日无法成交而改买候补。"""
-    rng = np.random.default_rng(random_seed) if random_seed is not None else None
-    schedule = {}
-    for event in events.to_dict("records"):
-        signal_idx = calendar.get_indexer([event["date"]])[0]
-        schedule.setdefault(signal_idx + 1, []).append(event)
-    start, end = stamp(cfg.start), stamp(cfg.end)
-    cash, prior_equity = cfg.capital, cfg.capital
-    positions, ledger, curve, skipped = {}, [], [], []
-    for i, day in enumerate(calendar):
-        if day < start or day > end:
-            continue
-        # 开盘先执行已排队的卖单；8周到期同样是已知安排。
-        for code, pos in list(positions.items()):
-            event = pos["event"]
-            if event["sell_idx"] == i:
-                amount = pos["units"] * event["sell_price"]
-                proceeds = amount - max(5.0, amount * 0.002 * cost_mult)
-                cash += proceeds
-                if detail:
-                    ledger.append({"event_id": event["event_id"], "ts_code": code, "name": event["name"],
-                        "source": event["source"], "rank": event["rank"], "buy_date": event["buy_date"],
-                        "sell_date": day, "invested": pos["invested"], "proceeds": proceeds,
-                        "pnl": proceeds - pos["invested"], "net_pct": 100 * (proceeds / pos["invested"] - 1),
-                        "reason": event["reason"], "delayed_days": event["delayed_days"]})
-                del positions[code]
-        candidates = [e for e in schedule.get(i, []) if e["ts_code"] not in positions]
-        candidates.sort(key=lambda e: (e["rank"], e["ts_code"]))
-        if rng is not None:
-            rng.shuffle(candidates)
-        # 每个空位只分配一个买单；失败保留现金，不用未来可成交状态筛选候选。
-        chosen = candidates[:cfg.slots - len(positions)]
-        for event in chosen:
-            if event["entry_status"] != "已成交":
-                if detail:
-                    skipped.append({"date": day, "event_id": event["event_id"], "reason": event["entry_status"]})
-                continue
-            target = min(cash, prior_equity / cfg.slots)
-            raw_price = event["raw_buy"]
-            code = event["ts_code"]
-            # 科创板最低200股、超过部分1股；其他沪深A股整手100股。
-            if code.startswith("68"):
-                quantity = int(max(0, target - 5) / (raw_price * (1 + 0.001 * cost_mult)))
-                quantity = quantity if quantity >= 200 else 0
-            else:
-                quantity = int(max(0, target - 5) / (raw_price * (1 + 0.001 * cost_mult)) / 100) * 100
-            if quantity <= 0:
-                if detail:
-                    skipped.append({"date": day, "event_id": event["event_id"], "reason": "资金不足最小申报量"})
-                continue
-            amount = quantity * raw_price
-            invested = amount + max(5.0, amount * 0.001 * cost_mult)
-            cash -= invested
-            assert cash >= -1e-6, "账户现金不能为负"
-            positions[code] = {"event": event, "units": quantity / event["factor"],
-                               "invested": invested, "quantity": quantity}
-        exposure, stale, overdue = 0.0, 0, 0
-        for code, pos in positions.items():
-            quote = market[code]["mark"][i]
-            exposure += pos["units"] * quote
-            last = pd.Timestamp(market[code]["last_quote"][i])
-            stale += int((day - last).days > 7)
-            overdue += int(day >= pos["event"]["deadline"])
-        equity = cash + exposure
-        curve.append({"date": day, "equity": equity, "cash": cash, "positions": len(positions),
-                      "exposure_pct": exposure / equity * 100 if equity else 0.0,
-                      "stale_positions": stale, "overdue_positions": overdue})
-        prior_equity = equity
-    nav = pd.DataFrame(curve)
-    open_rows = []
-    if detail and len(nav):
-        final_i = calendar.get_indexer([nav.date.iloc[-1]])[0]
-        for code, pos in positions.items():
-            event = pos["event"]
-            value = pos["units"] * market[code]["mark"][final_i]
-            open_rows.append({"ts_code": code, "name": event["name"], "event_id": event["event_id"],
-                              "buy_date": event["buy_date"], "invested": pos["invested"],
-                              "market_value": value, "unrealized_pnl": value - pos["invested"],
-                              "deadline": event["deadline"]})
-    return nav, pd.DataFrame(ledger), pd.DataFrame(open_rows), pd.DataFrame(skipped)
 
 
-def max_drawdown(values, initial):
-    a = np.r_[initial, np.asarray(values, dtype=float)]
-    return float(np.min(a / np.maximum.accumulate(a) - 1) * 100)
 
 
 def longest_true(values):
@@ -731,66 +639,8 @@ def longest_true(values):
     return longest
 
 
-def weekly_coverage(signals, events, nav, cov, calendar, cfg, issues):
-    dates = calendar[(calendar >= stamp(cfg.start)) & (calendar <= stamp(cfg.end))]
-    daily = pd.DataFrame(index=dates)
-    daily["new_signals"] = signals.groupby("date").size().reindex(dates, fill_value=0)
-    completed = events[events.entry_status == "已成交"]
-    # 对应信号周可成交的新事件，不把已有持仓算成新信号。
-    daily["executable_events"] = completed.groupby("date").size().reindex(dates, fill_value=0)
-    daily["pool_count"] = cov.pool_count.reindex(dates, fill_value=0)
-    daily["positions"] = nav.set_index("date").positions.reindex(dates, fill_value=0)
-    daily["missing"] = 0
-    if not issues.empty:
-        problem_days = pd.to_datetime(issues.date.unique())
-        daily.loc[daily.index.isin(problem_days), "missing"] = 1
-    daily["week"] = daily.index.to_period("W-SUN")
-    weekly = daily.groupby("week").agg(first_date=("new_signals", lambda x: x.index.min()),
-        last_date=("new_signals", lambda x: x.index.max()), trading_days=("new_signals", "size"),
-        new_signals=("new_signals", "sum"), executable_events=("executable_events", "sum"),
-        max_positions=("positions", "max"), mean_positions=("positions", "mean"),
-        min_pool=("pool_count", "min"), missing_days=("missing", "sum")).reset_index()
-    if not signals.empty:
-        unique = signals.groupby(signals.date.dt.to_period("W-SUN")).ts_code.nunique()
-        weekly["unique_stocks"] = weekly.week.map(unique).fillna(0).astype(int)
-    else:
-        weekly["unique_stocks"] = 0
-    weekly["year"] = weekly.first_date.dt.year
-    weekly["no_new_signal"] = weekly.new_signals.eq(0)
-    weekly["no_executable_signal"] = weekly.executable_events.eq(0)
-    weekly["fully_flat"] = weekly.max_positions.eq(0)
-    weekly["week"] = weekly.week.astype(str)
-    return weekly
 
 
-def annual_report(nav, trades, weekly, cfg, issues, pool_mode):
-    result, prior = [], cfg.capital
-    for year, group in nav.groupby(nav.date.dt.year, sort=True):
-        w = weekly[weekly.year == year]
-        t = trades[pd.to_datetime(trades.sell_date).dt.year == year] if not trades.empty else trades
-        start_full = stamp(cfg.start) <= pd.Timestamp(year=int(year), month=1, day=1)
-        end_full = stamp(cfg.end) >= pd.Timestamp(year=int(year), month=12, day=31)
-        complete_year = start_full and end_full and latest_ready_day() >= pd.Timestamp(year=int(year), month=12, day=31)
-        # 任何缺失都可能影响后续信号、去重或持仓；保守地不给该次运行任何年度通过结论。
-        integrity = issues.empty and "历史行业区间" in pool_mode
-        gap_count = int(w.no_new_signal.sum())
-        verdict = "覆盖通过，盈利能力仍须验证" if gap_count <= 5 else "覆盖未达标"
-        if not complete_year:
-            verdict = "部分年度，不判全年达标"
-        elif not integrity or (group.stale_positions > 0).any():
-            verdict = "数据/股票池受限，不判通过"
-        pnl = t.pnl if not t.empty else pd.Series(dtype=float)
-        result.append({"年度": int(year), "账户收益%": (group.equity.iloc[-1] / prior - 1) * 100,
-            "年内最大回撤%": max_drawdown(group.equity, prior), "已平仓笔数": len(t),
-            "胜率%": (pnl > 0).mean() * 100 if len(t) else np.nan,
-            "盈亏比": (pnl[pnl > 0].mean() / abs(pnl[pnl < 0].mean())) if (pnl < 0).any() else np.nan,
-            "无新信号周": gap_count, "无可成交信号周": int(w.no_executable_signal.sum()),
-            "最长连续无新信号周": longest_true(w.no_new_signal), "整周空仓": int(w.fully_flat.sum()),
-            "只有1只新股的周": int(w.unique_stocks.eq(1).sum()), "至少3只新股的周": int(w.unique_stocks.ge(3).sum()),
-            "平均资金使用率%": group.exposure_pct.mean(), "陈旧估值日": int(group.stale_positions.gt(0).sum()),
-            "超8周持仓日": int(group.overdue_positions.gt(0).sum()), "判定": verdict})
-        prior = group.equity.iloc[-1]
-    return pd.DataFrame(result)
 
 
 def signal_reports(events):
@@ -815,46 +665,8 @@ def signal_reports(events):
     return pd.DataFrame(rows)
 
 
-def concentration_report(trades):
-    if trades.empty:
-        return pd.DataFrame()
-    grouped = trades.groupby("ts_code").pnl.sum().sort_values(ascending=False)
-    total = grouped.sum()
-    return pd.DataFrame([{"项目": f"剔除最大盈利{k}只股票", "原已实现净利润": total,
-        "剔除利润": grouped.head(k).clip(lower=0).sum(),
-        "剩余已实现净利润": total - grouped.head(k).clip(lower=0).sum(),
-        "说明": "已实现损益归因，非删除股票后重跑账户"} for k in (1, 3)])
 
 
-def random_audit(events, market, calendar, cfg, actual_nav, progress=lambda text: None):
-    rows = []
-    for n in range(cfg.random_runs):
-        nav, _, _, _ = portfolio(events, market, calendar, cfg, random_seed=cfg.seed + n, detail=False)
-        if not nav.empty:
-            prior = cfg.capital
-            for year, group in nav.groupby(nav.date.dt.year):
-                rows.append({"seed": cfg.seed + n, "year": str(year),
-                             "return_pct": (group.equity.iloc[-1] / prior - 1) * 100,
-                             "drawdown_pct": max_drawdown(group.equity, prior)})
-                prior = group.equity.iloc[-1]
-            rows.append({"seed": cfg.seed + n, "year": "全部", "return_pct": (prior / cfg.capital - 1) * 100,
-                         "drawdown_pct": max_drawdown(nav.equity, cfg.capital)})
-        if (n + 1) % 10 == 0:
-            progress(f"同日候选随机三仓对照 {n + 1}/{cfg.random_runs}")
-    raw = pd.DataFrame(rows)
-    summary = []
-    if not raw.empty:
-        actuals, prior = {}, cfg.capital
-        for year, group in actual_nav.groupby(actual_nav.date.dt.year):
-            actuals[str(year)] = (group.equity.iloc[-1] / prior - 1) * 100
-            prior = group.equity.iloc[-1]
-        actuals["全部"] = (prior / cfg.capital - 1) * 100
-        for year, group in raw.groupby("year"):
-            actual = actuals[year]
-            summary.append({"年度": year, "排序账户收益%": actual, "随机中位收益%": group.return_pct.median(),
-                            "随机10分位%": group.return_pct.quantile(0.1), "随机90分位%": group.return_pct.quantile(0.9),
-                            "超过随机比例%": (group.return_pct < actual).mean() * 100, "模拟次数": len(group)})
-    return pd.DataFrame(summary), raw
 
 
 def observer_report(events):
@@ -873,117 +685,8 @@ def observer_report(events):
     return pd.DataFrame(rows)
 
 
-def make_zip(tables, manifest):
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for name, frame in tables.items():
-            archive.writestr(name + ".csv", frame.to_csv(index=False).encode("utf-8-sig"))
-        archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2, default=str))
-        archive.writestr("规则与口径.txt", "\n".join(f"{key}：{value}" for key, value in RULES.items()) +
-            "\nT1.1新增退出诊断，不修改T1.0买点/排序/去重/成交门槛。\n"
-            "exit_diagnostic按同一买点、同一买价、同一成熟观察窗口配对；A/B/A+B互斥。\n"
-            "固定观察为5/10/20/40交易日收盘估值，预扣退出成本，不代表该收盘可以成交。\n"
-            "三种可执行方案均保留8自然周到期及停牌/涨跌停限制；none无提前保护，initial保护价固定，full为原完整规则。\n"
-            "只有固定观察没有8自然周到期截断；它是价格路径参照，不是第四个实盘方案。\n"
-            "最高浮盈/最大浮亏为窗口内相对买价的原始高低幅度，未扣成本；不是可以同时实现的交易收益。\n"
-            "配对样本排除未成熟和路径不完整事件，计数单列；旧signal_groups保留原口径用于复核。\n"
-            "三仓方案各自重跑，后续成交股票可以不同，账户差值不能全归因于同一笔交易的退出。\n"
-            "matched_rank按同日同来源成熟样本比较，排名仍是全候选原排名，不在来源内重新排名。\n"
-            "\n分组收益保留提前止损交易；未成熟/目标日缺行情不按0收益填充。\n"
-            "账户收益含未平仓市值；胜率仅已平仓；独立事件观察收益与账户收益不可混用。\n"
-            "跨年周按该周首个纳入观察的交易日归属；仅完整自然年判断五周覆盖目标。\n"
-            "固定收益观察W1/2/4/8指5/10/20/40交易日；策略最长持仓为8个自然周。\n"
-            "缺数据继续运行，但相关结果不认定通过。退市/长期停牌末价估值可能高估权益。\n"
-            "当前ST名称只用于显示；主板5%限制用于保守过滤，创业/科创历史风险警示未完整重建。\n"
-            "同日全体候选随机排序并按空仓位下单；不能预知次日是否成交再挑股票。\n"
-            "100次随机是探索性参照，不是统计显著性或实盘资格证明。")
-    return buffer.getvalue()
 
 
-def run_research(token, cache_root, cfg, progress):
-    client = DataClient(token, cache_root, progress)
-    basic, member, mode, warnings = client.universe()
-    ready = latest_ready_day()
-    effective_end = min(stamp(cfg.end), ready)
-    if effective_end < stamp(cfg.start):
-        raise RuntimeError("截至可用行情日尚未进入指定回测区间")
-    # 未来观察数据只用于事后审计，不参与日期内信号；账户仍截于用户指定结束日。
-    history_start = ds(stamp(cfg.start) - pd.Timedelta(days=450))
-    data_end = ds(min(ready, effective_end + pd.Timedelta(days=85)))
-    calendar = client.calendar(history_start, data_end)
-    progress(f"科技历史候选共 {len(basic)} 只；准备 {len(calendar)} 个交易日")
-    data, issues = client.download(calendar, set(basic.ts_code))
-    # 行哈希排序使指纹不受并行下载完成顺序影响，避免复制整张行情大表排序。
-    row_hashes = pd.util.hash_pandas_object(data, index=False).to_numpy(copy=True)
-    row_hashes.sort()
-    data_hash = hashlib.sha256(row_hashes.tobytes()).hexdigest()
-    del row_hashes
-    stocks, signals, cov = build_features(data, basic, member, calendar, cfg, progress)
-    del data
-    gc.collect()
-    events = build_events(signals, stocks, calendar, progress)
-    event_sets = {"full": events}
-    for scheme in ("none", "initial"):
-        event_sets[scheme] = build_events(signals, stocks, calendar, progress, exit_scheme=scheme)
-    diagnostic_tables = exit_diagnostics(event_sets, stocks, calendar, progress)
-    market = prepare_market(stocks)
-    nav, trades, open_positions, skipped = portfolio(events, market, calendar, cfg)
-    if nav.empty:
-        raise RuntimeError("所选区间没有交易日")
-    weeks = weekly_coverage(signals, events, nav, cov, calendar, cfg, issues)
-    years = annual_report(nav, trades, weeks, cfg, issues, mode)
-    variant_years, variant_totals = [], []
-    for scheme in ("none", "initial", "full"):
-        if scheme == "full":
-            vn, vt, vo, vs, vy = nav, trades, open_positions, skipped, years.copy()
-        else:
-            vn, vt, vo, vs = portfolio(event_sets[scheme], market, calendar, cfg)
-            vw = weekly_coverage(signals, event_sets[scheme], vn, cov, calendar, cfg, issues)
-            vy = annual_report(vn, vt, vw, cfg, issues, mode)
-        if warnings:
-            vy["判定"] = "股票池受限，不判通过"
-        vy.insert(0, "退出方案", EXIT_SCHEMES[scheme])
-        variant_years.append(vy)
-        variant_totals.append({"退出方案": EXIT_SCHEMES[scheme], "期末权益": vn.equity.iloc[-1],
-            "总收益%": (vn.equity.iloc[-1]/cfg.capital-1)*100,
-            "全程最大回撤%": max_drawdown(vn.equity,cfg.capital), "已平仓笔数": len(vt),
-            "胜率%": vt.pnl.gt(0).mean()*100 if len(vt) else np.nan,
-            "平均资金使用率%": vn.exposure_pct.mean()})
-        if scheme != "full":
-            diagnostic_tables.update({f"{scheme}_events": event_sets[scheme], f"{scheme}_equity": vn,
-                f"{scheme}_trades": vt, f"{scheme}_open_positions": vo, f"{scheme}_orders_skipped": vs})
-    diagnostic_tables["exit_portfolio_annual"] = pd.concat(variant_years, ignore_index=True)
-    diagnostic_tables["exit_portfolio_total"] = pd.DataFrame(variant_totals)
-    random_summary, random_raw = random_audit(events, market, calendar, cfg, nav, progress)
-    stress, _, _, _ = portfolio(events, market, calendar, cfg, detail=False, cost_mult=2.0)
-    stress_summary = pd.DataFrame([{"情景": "基准费用", "总收益%": (nav.equity.iloc[-1] / cfg.capital - 1) * 100},
-                                  {"情景": "买卖综合费用翻倍（滑点不变）", "总收益%": (stress.equity.iloc[-1] / cfg.capital - 1) * 100}])
-    manifest = {"version": VERSION, "baseline_version": BASELINE_VERSION, "exit_schemes": EXIT_SCHEMES,
-                "diagnostic_pairing": "同一买点同一成交价；5/10/20/40交易日已成熟且路径完整样本；来源互斥",
-                "download_revision": DOWNLOAD_REVISION, "download_workers": DOWNLOAD_WORKERS,
-                "created_at": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(),
-                "config": asdict(cfg), "rules": RULES, "pool_mode": mode, "warnings": warnings,
-                "universe_size": len(basic), "actual_account_start": nav.date.min(), "actual_account_end": nav.date.max(),
-                "data_start": history_start, "data_end": data_end, "data_issues": len(issues),
-                "pool_hash": hashlib.sha256(member.to_csv(index=False).encode()).hexdigest(),
-                "data_hash": data_hash,
-                "limitations": ["复权总收益近似公司行动，非逐笔税费账本", "历史行业为供应商区间，未经独立完整性核验",
-                                "科创/创业历史ST未完整重建", "日线不能还原开盘排队，涨跌停开盘保守不成交",
-                                "没有实盘合格自动结论；历史已多次观察，须冻结后前向验证"]}
-    if warnings:
-        years["判定"] = "股票池受限，不判通过"
-    tables = {"annual": years, "weekly_coverage": weeks, "equity": nav, "trades": trades,
-              "open_positions": open_positions, "orders_skipped": skipped, "signals": signals,
-              "all_events": events, "signal_groups": signal_reports(events), "random_summary": random_summary,
-              "random_runs": random_raw, "concentration": concentration_report(trades),
-              "observers": observer_report(events), "cost_stress": stress_summary, "data_issues": issues,
-              "industry_intervals": member, "universe": basic, "daily_pool": cov.reset_index()}
-    tables.update(diagnostic_tables)
-    zipped = make_zip(tables, manifest)
-    run_id = hashlib.sha256(json.dumps(asdict(cfg), sort_keys=True).encode()).hexdigest()[:12]
-    result_path = Path(cache_root) / "results" / f"{VERSION}_{run_id}.zip"
-    atomic_bytes(zipped, result_path)
-    return tables, manifest, zipped, str(result_path)
 
 
 def latest_ready_day():
@@ -992,290 +695,391 @@ def latest_ready_day():
     return pd.Timestamp(now.date() - timedelta(days=1 if now.hour < 18 else 0))
 
 
-def show_results(st, tables, manifest, zipped):
-    cfg = manifest["config"]
-    nav = tables["equity"]
-    st.subheader(f"{manifest['version']} · {str(manifest['actual_account_start'])[:10]} 至 {str(manifest['actual_account_end'])[:10]}")
-    st.caption("当前展示的是上次完成结果；修改侧栏后需重新运行才会更新。")
-    st.caption("顶部账户与逐年成绩沿用T1.0完整退出作为基准；新增三方案对照见“退出诊断”。")
-    metrics = st.columns(4)
-    metrics[0].metric("账户总收益", f"{(nav.equity.iloc[-1] / cfg['capital'] - 1) * 100:.2f}%")
-    metrics[1].metric("最大回撤", f"{max_drawdown(nav.equity, cfg['capital']):.2f}%")
-    metrics[2].metric("独立新信号", len(tables["signals"]))
-    metrics[3].metric("已平仓交易", len(tables["trades"]))
-    st.info("这是冻结规则的研究版。空窗目标、排序优势、风险承受能力分别评估，不自动给出实盘合格结论。")
-    if manifest["warnings"] or manifest["data_issues"]:
-        st.warning("数据存在限制，本轮不能认定通过：" + "；".join(manifest["warnings"]) +
-                   f"；缺失/异常记录 {manifest['data_issues']} 条。成功数据已缓存，下次运行补缺。")
-    st.caption("股票池：" + manifest["pool_mode"] + "。公司行动按复权总收益近似；账户权益含未平仓市值。")
-    st.download_button("下载完整回测结果（ZIP）", zipped,
-        file_name=f"tech_swing_T1_1_{cfg['start']}_{cfg['end']}.zip", mime="application/zip")
-    tabs = st.tabs(["逐年成绩", "覆盖与空窗", "买点与排名", "随机对照", "交易与持仓", "数据与规则", "退出诊断"])
+def fixed_pool_outcomes(stocks, signals, calendar, progress=lambda text: None):
+    """同一信号日的全部时点合格科技股；先确定抽样母体，再计算未来结果。"""
+    dates = pd.DatetimeIndex(signals.date.unique())
+    parts = []
+    for n, (code, g) in enumerate(stocks.items(), 1):
+        eligible = (g.eligible & g.atr.notna() & g.structure.gt(0) & g.ret20.notna()
+                    & g.index.isin(dates))
+        idx = np.flatnonzero(eligible.to_numpy())
+        if not len(idx):
+            continue
+        # 入场门槛与正式信号一致，仅去除A/B形态和评分要求。
+        next_open, next_ao = g.open.shift(-1), g.ao.shift(-1)
+        next_up, next_down = g.up_limit.shift(-1), g.down_limit.shift(-1)
+        valid = (next_open.notna() & next_ao.notna() & next_up.notna() & next_down.notna()
+                 & g.vol.shift(-1).gt(0) & next_open.gt(0))
+        gap = next_ao.gt(g.ac*1.05)
+        broken = next_ao.le(g.structure)
+        limited = next_open.ge(next_up-.005)
+        filled = valid & ~gap & ~broken & ~limited
+        status = np.select([~valid, limited, gap, broken],
+            ["缺报价/停牌，取消", "开盘涨停，取消", "高开超过5%，取消", "跌破形态低点，取消"], default="已成交")
+        status = pd.Series(status, index=g.index)
+        status.iloc[-1] = "区间末待成交"
+        buy_price = np.minimum(next_open*1.001, next_up)*g.adj_factor.shift(-1)
+        part = pd.DataFrame({"date": g.index[idx], "ts_code": code, "entry_status": status.iloc[idx].to_numpy(),
+                             "filled": filled.iloc[idx].to_numpy(), "buy_price": buy_price.iloc[idx].to_numpy()})
+        for week in (1, 2, 4, 8):
+            # 信号日i，买入日i+1，第5*w个持有交易日为i+5*w。
+            mature = idx + week*5 < len(calendar)
+            target_close = g.ac.shift(-week*5).iloc[idx].to_numpy()
+            returns = (target_close*.999*.998/(buy_price.iloc[idx].to_numpy()*1.001)-1)*100
+            # 随机选择发生于信号日；不因次日无法成交换一只股票，取消单收益为0。
+            returns = np.where(part.filled, returns, 0.0)
+            returns = np.where(mature, returns, np.nan)
+            part[f"W{week}_mature"] = mature
+            part[f"W{week}_net_pct"] = returns
+        parts.append(part)
+        if n % 50 == 0:
+            progress(f"全池等概率入场参照 {n}/{len(stocks)} 只；固定5/10/20/40交易日观察")
+    columns = ["date", "ts_code", "entry_status", "filled", "buy_price"]
+    for week in (1,2,4,8):
+        columns += [f"W{week}_mature", f"W{week}_net_pct"]
+    return (pd.concat(parts, ignore_index=True).sort_values(["date", "ts_code"]).reset_index(drop=True)
+            if parts else pd.DataFrame(columns=columns))
+
+
+def group_masks(frame):
+    for year in ["全部"] + sorted(frame.date.dt.year.unique().tolist()):
+        yearly = frame if year == "全部" else frame[frame.date.dt.year == year]
+        for source in ("全部", "A", "B", "A+B"):
+            part = yearly if source == "全部" else yearly[yearly.source == source]
+            for ranking in ("全部", "第一名", "前三名"):
+                subset = part if ranking == "全部" else part[part['rank'] <= (1 if ranking == "第一名" else 3)]
+                yield str(year), source, ranking, subset
+
+
+def entry_edge_reports(signals, pool):
+    """完整日期严格配对；未知未来值不填0、不凭已知结果换股。"""
+    if signals.empty:
+        return {name:pd.DataFrame() for name in ("entry_outcomes","entry_summary","pool_daily_reference","edge_daily","edge_summary")}
+    extra = pool.drop(columns=["buy_price"])
+    outcomes = signals.merge(extra, on=["date", "ts_code"], how="left", validate="one_to_one")
+    if outcomes.entry_status.isna().any():
+        raise RuntimeError("部分正式信号不在同日对照母体，停止比较")
+    pool_rows=[]
+    for week in (1,2,4,8):
+        val, mat = f"W{week}_net_pct", f"W{week}_mature"
+        for day, g in pool.groupby('date',sort=True):
+            mature=bool(g[mat].all()); unknown=int(g[val].isna().sum()) if mature else 0
+            pool_rows.append({"date":day,"week":week,"pool_size":len(g),"filled":int(g.filled.sum()),
+                "mature":mature,"unknown":unknown,"complete":mature and unknown==0,
+                "known_subset_mean_pct":g[val].mean(),
+                "uniform_expected_pct":g[val].mean() if mature and unknown==0 else np.nan})
+    pool_daily=pd.DataFrame(pool_rows)
+    summaries, comparisons, daily_rows=[],[],[]
+    for year,source,ranking,subset in group_masks(outcomes):
+        for week in (1,2,4,8):
+            val,mat=f"W{week}_net_pct",f"W{week}_mature"
+            mature=subset[subset[mat]]
+            known=mature[val].dropna(); executed=mature.loc[mature.filled,val].dropna()
+            summaries.append({"年度":year,"来源":source,"排名":ranking,"观察交易日":week*5,
+                "发单事件数":len(subset),"可成交数":int(subset.filled.sum()),"未成熟数":int((~subset[mat]).sum()),
+                "成熟但收益未知数":int(mature[val].isna().sum()),"已知结果数":len(known),
+                "每次发单均收益%":known.mean(),"每次发单中位数%":known.median(),
+                "实际成交均收益%":executed.mean(),"实际成交中位数%":executed.median(),
+                "实际成交胜率%":executed.gt(0).mean()*100 if len(executed) else np.nan,
+                "实际成交10分位收益%":executed.quantile(.1) if len(executed) else np.nan})
+            ref=pool_daily[pool_daily.week==week].set_index('date')
+            paired=[]; immature=0; incomplete=0
+            for day,g in subset.groupby('date',sort=True):
+                r=ref.loc[day]
+                if not r.mature:
+                    immature+=1;continue
+                if not r.complete or g[val].isna().any():
+                    incomplete+=1;continue
+                selected=g[val].mean(); benchmark=r.uniform_expected_pct
+                item={"年度":year,"来源":source,"排名":ranking,"date":day,"观察交易日":week*5,
+                    "信号数量":len(g),"同日母体数量":r.pool_size,"信号每次发单均收益%":selected,
+                    "同池等概率入场期望收益%":benchmark,"超额收益_百分点":selected-benchmark}
+                paired.append(item)
+                # 日明细只存真实年份，避免与“全部”分组重复。
+                if year!="全部":daily_rows.append(item)
+            p=pd.DataFrame(paired)
+            comparisons.append({"年度":year,"来源":source,"排名":ranking,"观察交易日":week*5,
+                "信号日期数":subset.date.nunique(),"未成熟日期":immature,"不完整日期":incomplete,
+                "严格配对日期":len(p),
+                "日期覆盖率%":len(p)/subset.date.nunique()*100 if subset.date.nunique() else np.nan,
+                "信号日均收益%":p['信号每次发单均收益%'].mean() if len(p) else np.nan,
+                "同池等概率日均收益%":p['同池等概率入场期望收益%'].mean() if len(p) else np.nan,
+                "日均超额收益_百分点":p['超额收益_百分点'].mean() if len(p) else np.nan,
+                "超额收益中位数_百分点":p['超额收益_百分点'].median() if len(p) else np.nan,
+                "胜出日期比例%":p['超额收益_百分点'].gt(0).mean()*100 if len(p) else np.nan,
+                "解释":"仅描述完整日期，无显著性/实盘通过结论"})
+    return {"entry_outcomes":outcomes,"entry_summary":pd.DataFrame(summaries),
+            "pool_daily_reference":pool_daily,"edge_daily":pd.DataFrame(daily_rows),"edge_summary":pd.DataFrame(comparisons)}
+
+
+def signal_coverage(signals, events, cov, calendar, cfg, issues):
+    dates=calendar[(calendar>=stamp(cfg.start))&(calendar<=stamp(cfg.end))]
+    daily=pd.DataFrame(index=dates)
+    daily['new_signals']=signals.groupby('date').size().reindex(dates,fill_value=0)
+    filled=events[events.entry_status=='已成交']
+    daily['executable_events']=filled.groupby('date').size().reindex(dates,fill_value=0)
+    daily['pool_count']=cov.pool_count.reindex(dates,fill_value=0)
+    daily['missing']=daily.index.isin(pd.to_datetime(issues.date.unique())) if len(issues) else False
+    daily['week']=dates.to_period('W-SUN')
+    weekly=daily.groupby('week').agg(first_date=('new_signals',lambda s:s.index.min()),
+        last_date=('new_signals',lambda s:s.index.max()),new_signals=('new_signals','sum'),
+        executable_events=('executable_events','sum'),min_pool=('pool_count','min'),missing_days=('missing','sum')).reset_index()
+    unique=signals.groupby(signals.date.dt.to_period('W-SUN')).ts_code.nunique()
+    weekly['unique_stocks']=weekly.week.map(unique).fillna(0).astype(int)
+    weekly['year']=weekly.first_date.dt.year
+    weekly['no_new_signal']=weekly.new_signals.eq(0)
+    weekly['no_executable_signal']=weekly.executable_events.eq(0)
+    annual=[]
+    for year,w in weekly.groupby('year'):
+        full=(stamp(cfg.start)<=pd.Timestamp(year=int(year),month=1,day=1)
+              and stamp(cfg.end)>=pd.Timestamp(year=int(year),month=12,day=31)
+              and latest_ready_day()>=pd.Timestamp(year=int(year),month=12,day=31))
+        annual.append({"年度":year,"观察周数":len(w),"新信号数":w.new_signals.sum(),
+            "无新信号周":int(w.no_new_signal.sum()),"无可成交信号周":int(w.no_executable_signal.sum()),
+            "最长连续无新信号周":longest_true(w.no_new_signal),"仅1只新股周":int(w.unique_stocks.eq(1).sum()),
+            "覆盖目标":"部分年度" if not full else ('数据受限' if len(issues) else ('达到五周目标' if w.no_new_signal.sum()<=5 else '未达到五周目标'))})
+    weekly['week']=weekly.week.astype(str)
+    return weekly,pd.DataFrame(annual)
+
+
+STUDY_NOTES = """T1.2 独立买点验证
+所有买点各自观察，不设总资金、持有股票数量限制，也不计算复投净值。
+主结果采用固定5/10/20/40交易日观察，信号日i之后第一个交易日买入，目标日为i+5*w。
+买点、评分、去重、技术指标和成交过滤沿用T1.0。评分仅作观察分组，不限制纳入事件。
+科技池对照使用同日历史行业、价格、市值和指标数据准备条件，去除A/B形态要求。
+随机入场参照计算全池等概率选一只股票的收益期望，不需要随机抽样，也不存在抽样种子挑选。
+股票池允许包含当天触发买点的股票，不以未来结果选取对照。对照只在正式信号出现的日期计算。
+入场同为次日开盘并计入成本，高开超过5%、开盘涨停、跌破此前10日低点或缺报价时取消；不补选。
+每次发单收益：成交则记观察收益，取消则为0；但所有事件必须观察期届满才纳入。
+实际成交收益另列，不能与包含取消单的发单收益混用。收益未知不填0，不当作失败或盈利。
+固定窗口末收盘为估值参考，预扣卖出成本；不保证当时能成交。
+日线复权价格近似分红再投资。按比例收取费用，不模拟成交金额相关的最低收费。
+edge_summary先在每个日期平均信号，再与同日全池等概率期望比较，对日期等权。
+严格配对只使用同日母体和信号收益都已知的成熟日期；其余日期单列排除计数。
+排除日期可能造成样本偏差，不能将完整子样本直接推广到全部年份或全部交易日。
+pool_daily_reference的known_subset_mean_pct仅描述结果已知部分，不是母体完整期望；完整期望缺失时不配对。
+退出诊断继续保留，仅为同事件比较；不提前退出/初始保护/完整退出都保留8自然周到期限制。
+观察窗口40交易日与8自然周不同，不提前退出方案可能先到期；固定窗口参考不提前截断。
+最高浮盈/最大浮亏仅为事后路径极值，不代表可实现收益。
+来源A、B、A+B互斥；第一名、前三名仍是原始全候选排名，不能解释为新买入限制。
+事件和日期收益相关，重叠窗口不是独立样本；不提供未经检验的显著性或实盘通过判定。
+不重用先前会话的计算结果；沿用逐日行情缓存。股票池和原始数据指纹随本轮导出。
+"""
+
+
+def make_zip(tables,manifest):
+    buffer=io.BytesIO()
+    with zipfile.ZipFile(buffer,'w',compression=zipfile.ZIP_DEFLATED) as z:
+        for name,frame in tables.items():
+            z.writestr(name+'.csv',frame.to_csv(index=False).encode('utf-8-sig'))
+        z.writestr('manifest.json',json.dumps(manifest,ensure_ascii=False,indent=2,default=str))
+        z.writestr('规则与口径.txt',STUDY_NOTES+'\n'+'\n'.join(f'{k}：{v}' for k,v in RULES.items()))
+    return buffer.getvalue()
+
+
+def run_research(token,cache_root,cfg,progress):
+    client=DataClient(token,cache_root,progress)
+    basic,member,mode,pool_warnings=client.universe()
+    ready=latest_ready_day();effective_end=min(stamp(cfg.end),ready)
+    if effective_end<stamp(cfg.start):raise RuntimeError('尚未进入指定观察区间')
+    history_start=ds(stamp(cfg.start)-pd.Timedelta(days=450))
+    data_end=ds(min(ready,effective_end+pd.Timedelta(days=85)))
+    calendar=client.calendar(history_start,data_end)
+    study_dates=calendar[(calendar>=stamp(cfg.start))&(calendar<=effective_end)]
+    if not len(study_dates):raise RuntimeError('所选区间没有交易日')
+    progress(f'科技候选共{len(basic)}只，读取{len(calendar)}个交易日')
+    data,issues=client.download(calendar,set(basic.ts_code))
+    hashes=pd.util.hash_pandas_object(data,index=False).to_numpy(copy=True);hashes.sort()
+    data_hash=hashlib.sha256(hashes.tobytes()).hexdigest();del hashes
+    stocks,signals,cov=build_features(data,basic,member,calendar,cfg,progress)
+    del data;gc.collect()
+    pool=fixed_pool_outcomes(stocks,signals,calendar,progress)
+    tables=entry_edge_reports(signals,pool)
+    event_sets={s:build_events(signals,stocks,calendar,progress,exit_scheme=s) for s in EXIT_SCHEMES}
+    events=event_sets['full']
+    tables.update(exit_diagnostics(event_sets,stocks,calendar,progress))
+    weeks,years=signal_coverage(signals,events,cov,calendar,cfg,issues)
+    if pool_warnings or '历史行业区间' not in mode:years['覆盖目标']='股票池受限'
+    # 验证固定窗口模块与旧事件模块的入场完全一致。
+    if not signals.empty:
+        check=tables['entry_outcomes'].set_index('event_id').filled
+        expected=events.set_index('event_id').entry_status.eq('已成交')
+        if not check.reindex(expected.index).equals(expected.rename('filled')):
+            raise RuntimeError('固定窗口与退出审计的成交状态不一致')
+    manifest={'version':VERSION,'baseline_version':BASELINE_VERSION,'config':asdict(cfg),'rules':RULES,
+        'study_mode':'全部独立事件，不配置资金与仓位','control':'同日全池等概率入场期望，完整日期严格配对',
+        'download_revision':DOWNLOAD_REVISION,'download_workers':DOWNLOAD_WORKERS,'exit_schemes':EXIT_SCHEMES,
+        'created_at':datetime.now(ZoneInfo('Asia/Shanghai')).isoformat(),'pool_mode':mode,'warnings':pool_warnings,
+        'data_issues':len(issues),'universe_size':len(basic),'actual_signal_start':study_dates.min(),
+        'actual_signal_end':study_dates.max(),'data_start':history_start,'data_end':data_end,'data_hash':data_hash,
+        'pool_hash':hashlib.sha256(member.to_csv(index=False).encode()).hexdigest(),
+        'limitations':['历史行业供应商记录未经独立核验','创业/科创历史风险警示未完全重建',
+                       '复权总收益和按比例费用估算','完整日期子样本可能存在选择偏差','历史已多次观察，不作为未见样本证明']}
+    tables.update({'signals':signals,'all_events':events,'none_events':event_sets['none'],
+        'initial_events':event_sets['initial'],'weekly_coverage':weeks,'annual_coverage':years,
+        'signal_groups':signal_reports(events),'observers':observer_report(events),'data_issues':issues,
+        'universe':basic,'industry_intervals':member,'daily_pool':cov.reset_index(),'pool_entry_outcomes':pool})
+    zipped=make_zip(tables,manifest)
+    run_id=hashlib.sha256(json.dumps(asdict(cfg),sort_keys=True).encode()).hexdigest()[:12]
+    path=Path(cache_root)/'results'/f'{VERSION}_{run_id}.zip';atomic_bytes(zipped,path)
+    return tables,manifest,zipped,str(path)
+
+
+def filtered_table(st,frame,key):
+    if frame.empty:
+        st.info('此分组暂无可计算结果。');return
+    cols=st.columns(3)
+    y=cols[0].selectbox('年度',['全部']+sorted(x for x in frame['年度'].unique() if x!='全部'),key=key+'_year')
+    source=cols[1].selectbox('互斥来源',['全部','A','B','A+B'],key=key+'_source')
+    rank=cols[2].selectbox('观察排名',['全部','第一名','前三名'],key=key+'_rank')
+    st.dataframe(frame[(frame['年度']==y)&(frame['来源']==source)&(frame['排名']==rank)],use_container_width=True,hide_index=True)
+
+
+def show_results(st,tables,manifest,zipped):
+    st.subheader(f"{manifest['version']} · 独立买点验证")
+    st.caption('显示上次完成结果；修改设置后需重新运行。')
+    events=tables['all_events'];metrics=st.columns(3)
+    metrics[0].metric('独立新信号',len(tables['signals']))
+    metrics[1].metric('可成交事件',int(events.entry_status.eq('已成交').sum()))
+    metrics[2].metric('科技候选股票数',manifest['universe_size'])
+    st.info('所有买点独立观察。先检查扣费后收益，再检查相对同日科技池的收益差；目前不自动判定策略有效。')
+    if manifest['warnings'] or manifest['data_issues']:
+        st.warning('数据受限：'+'；'.join(manifest['warnings'])+f"；异常记录{manifest['data_issues']}条")
+    cfg=manifest['config']
+    st.download_button('下载完整研究结果（ZIP）',zipped,file_name=f"tech_swing_T1_2_{cfg['start']}_{cfg['end']}.zip",mime='application/zip')
+    tabs=st.tabs(['独立买点收益','同池入场对照','覆盖与信号','退出诊断','数据与规则'])
     with tabs[0]:
-        st.dataframe(tables["annual"], use_container_width=True, hide_index=True)
-        st.line_chart(nav.set_index("date")[["equity"]])
-        st.dataframe(tables["concentration"], use_container_width=True, hide_index=True)
-        st.dataframe(tables["cost_stress"], use_container_width=True, hide_index=True)
+        st.caption('固定5/10/20/40交易日收盘估值；已扣比例费用和滑点。取消单的发单收益为0，实际成交收益另列。未成熟和未知不填0。')
+        filtered_table(st,tables['entry_summary'],'entry')
     with tabs[1]:
-        st.caption("空窗=该交易周没有去重后的新信号。已有持仓不冲抵空窗；跨年周按首个观察交易日归属。")
-        st.dataframe(tables["weekly_coverage"], use_container_width=True, hide_index=True)
+        st.caption('随机参照为同日全池等概率选股的期望，无需抽样。只配对已成熟且全池结果完整的日期，请同时查看排除日期数量。')
+        filtered_table(st,tables['edge_summary'],'edge')
+        st.caption('同日平均后对日期等权，不将重叠事件当成独立统计样本；正超额也不等于绝对盈利。')
     with tabs[2]:
-        st.caption("W1/2/4/8=5/10/20/40交易日观察。提前退出交易保留收益；未成熟和缺行情显示未知。独立事件按无限资金计算。")
-        st.dataframe(tables["signal_groups"], use_container_width=True, hide_index=True)
-        st.dataframe(tables["observers"], use_container_width=True, hide_index=True)
-        st.dataframe(tables["signals"].tail(200), use_container_width=True, hide_index=True)
+        st.dataframe(tables['annual_coverage'],use_container_width=True,hide_index=True)
+        st.dataframe(tables['weekly_coverage'],use_container_width=True,hide_index=True)
+        st.dataframe(tables['signals'].tail(200),use_container_width=True,hide_index=True)
     with tabs[3]:
-        st.caption("100次同日候选随机排序，沿用相同资金、空位、退出、费用和成交限制。不是统计显著性结论。")
-        st.dataframe(tables["random_summary"], use_container_width=True, hide_index=True)
+        st.caption('保持同一批买点：固定价格观察、仅8自然周到期、初始保护、原完整退出。路径极值仅作事后诊断。')
+        filtered_table(st,tables['exit_diagnostic'],'exit')
+        st.dataframe(tables['matched_rank'],use_container_width=True,hide_index=True)
     with tabs[4]:
-        st.write("期末仍持有")
-        st.dataframe(tables["open_positions"], use_container_width=True, hide_index=True)
-        st.write("已平仓")
-        st.dataframe(tables["trades"], use_container_width=True, hide_index=True)
-        st.write("取消或未成交的账户买单")
-        st.dataframe(tables["orders_skipped"], use_container_width=True, hide_index=True)
-    with tabs[5]:
-        st.dataframe(pd.DataFrame(RULES.items(), columns=["项目", "冻结规则"]), use_container_width=True, hide_index=True)
-        st.dataframe(tables["data_issues"], use_container_width=True, hide_index=True)
+        st.text(STUDY_NOTES)
+        st.dataframe(tables['data_issues'],use_container_width=True,hide_index=True)
         st.json(manifest)
-    with tabs[6]:
-        if "exit_diagnostic" not in tables:
-            st.info("当前显示旧版结果，请重新运行生成退出诊断。")
-        else:
-            st.write("三种退出方式的三仓账户结果")
-            st.caption("每种方式独立重跑账户，空位释放时间不同，后续买入股票也会不同。原完整退出是对照基准。")
-            st.dataframe(tables["exit_portfolio_total"], use_container_width=True, hide_index=True)
-            st.dataframe(tables["exit_portfolio_annual"], use_container_width=True, hide_index=True)
-            st.write("同一批买点配对：固定观察、仅到期、初始保护、完整退出")
-            st.caption("固定观察是价格路径参照；只比较已成熟且路径完整的相同事件。最高浮盈不等于可实现利润。")
-            report = tables["exit_diagnostic"]
-            if not report.empty:
-                cols = st.columns(3)
-                year = cols[0].selectbox("诊断年度", ["全部"] + sorted(x for x in report['年度'].unique() if x != "全部"))
-                source = cols[1].selectbox("互斥信号来源", ["全部", "A", "B", "A+B"])
-                rank = cols[2].selectbox("原信号排名", ["全部", "前三名", "第一名"])
-                view = report[(report['年度']==year)&(report['来源']==source)&(report['排名']==rank)]
-                st.dataframe(view, use_container_width=True, hide_index=True)
-            st.write("同日排名对照")
-            st.caption("逐日比较前N名与同日全体，再对日期等权平均；同日样本少时差异可能为零。不是独立验证或显著性检验。")
-            st.dataframe(tables["matched_rank"], use_container_width=True, hide_index=True)
-
-
-def self_test():
-    """独立的合成行情边界测试；不下载真实行情，也不宣称策略收益。"""
-    import unittest
-
-    class EngineTests(unittest.TestCase):
-        def setUp(self):
-            self.cal = pd.bdate_range("2022-01-03", periods=100)
-            self.g = pd.DataFrame(index=self.cal)
-            for col in ("open", "close", "ao", "ac", "mark"):
-                self.g[col] = 20.0
-            self.g["high"], self.g["low"] = 20.5, 19.5
-            self.g["ah"], self.g["al"] = 20.5, 19.5
-            self.g["vol"] = 10000.0
-            self.g["adj_factor"] = 1.0
-            self.g["up_limit"], self.g["down_limit"] = 22.0, 18.0
-            self.g["atr"] = 1.0
-            self.g["last_quote"] = self.cal
-            self.signal = {"date": self.cal[0], "ts_code": "600001.SH", "name": "合成股票", "source": "A",
-                "rank": 1, "ac": 20.0, "structure": 18.5, "event_id": "test", "score": 100.0}
-
-        def test_next_day_and_time_cap(self):
-            event = path_for_signal(self.signal, self.g, self.cal)
-            self.assertEqual(event["buy_idx"], 1)
-            self.assertEqual(event["sell_date"], self.cal[1] + pd.Timedelta(weeks=8))
-            self.assertLess(event["net_return"], 0)  # 平价交易仍然支付费用与滑点
-
-        def test_t_plus_one_and_failed_trades_preserved(self):
-            self.g.loc[self.cal[1], ["close", "ac"]] = 17.5
-            event = path_for_signal(self.signal, self.g, self.cal)
-            self.assertEqual(event["sell_idx"], 2)  # 买入当日不能卖出
-            self.assertAlmostEqual(event["W8_net_pct"], event["net_return"])
-            self.assertEqual(event["W8_status"], "已退出，资金保持现金")
-
-        def test_limit_down_delays_exit(self):
-            self.g.loc[self.cal[1], ["close", "ac"]] = 17.5
-            self.g.loc[self.cal[2], ["open", "ao"]] = 18.0
-            event = path_for_signal(self.signal, self.g, self.cal)
-            self.assertEqual(event["sell_idx"], 3)
-            self.assertEqual(event["delayed_days"], 1)
-
-        def test_missing_quote_does_not_compress_time(self):
-            self.g.loc[self.cal[2:10], ["open", "ao", "ac", "close"]] = np.nan
-            event = path_for_signal(self.signal, self.g, self.cal)
-            self.assertEqual(event["sell_date"], self.cal[1] + pd.Timedelta(weeks=8))
-            self.assertTrue(np.isnan(event["W1_net_pct"]))
-
-        def test_no_hindsight_replacement(self):
-            events, market = [], {}
-            for k in range(4):
-                signal = dict(self.signal, ts_code=f"60000{k}.SH", event_id=str(k), rank=k+1)
-                g = self.g.copy()
-                if k == 0:
-                    g.loc[self.cal[1], ["open", "ao"]] = 22.0
-                events.append(path_for_signal(signal, g, self.cal))
-                market[signal["ts_code"]] = {"mark": g.mark.to_numpy(), "last_quote": g.last_quote.to_numpy()}
-            cfg = Config(start=ds(self.cal[0]), end=ds(self.cal[10]))
-            nav, _, positions, skipped = portfolio(pd.DataFrame(events), market, self.cal, cfg)
-            self.assertEqual(nav.positions.max(), 2)
-            self.assertNotIn("600003.SH", positions.ts_code.tolist())
-            self.assertEqual(len(skipped), 1)
-            self.assertTrue(nav.cash.ge(0).all())
-
-        def test_unmatured_is_unknown(self):
-            event = path_for_signal(self.signal, self.g.iloc[:4], self.cal[:4])
-            self.assertTrue(np.isnan(event["W8_net_pct"]))
-            self.assertEqual(event["sell_idx"], -1)
-
-        def test_account_conservation(self):
-            event = path_for_signal(self.signal, self.g, self.cal)
-            cfg = Config(start=ds(self.cal[0]), end=ds(self.cal[-1]))
-            market = prepare_market({"600001.SH": self.g})
-            nav, trades, positions, _ = portfolio(pd.DataFrame([event]), market, self.cal, cfg)
-            self.assertTrue(positions.empty)
-            self.assertAlmostEqual(nav.equity.iloc[-1], cfg.capital + trades.pnl.sum())
-            self.assertTrue((nav.positions <= 3).all())
-
-        def test_three_exit_schemes_and_pairing(self):
-            g = self.g.copy()
-            g.loc[self.cal[2], ["ac", "close", "ah", "high"]] = 27.0
-            g.loc[self.cal[3:5], ["ac", "close", "ao", "open"]] = 23.0
-            g.loc[self.cal[3:5], "up_limit"] = 30.0
-            g.loc[self.cal[6:8], ["ac", "close", "ao", "open"]] = 17.0
-            g.loc[self.cal[6:8], "down_limit"] = 15.0
-            event_sets = {s: pd.DataFrame([path_for_signal(self.signal,g,self.cal,s)]) for s in EXIT_SCHEMES}
-            self.assertEqual(event_sets['full'].sell_idx.iloc[0], 4)
-            self.assertEqual(event_sets['initial'].sell_idx.iloc[0], 7)
-            self.assertEqual(event_sets['none'].reason.iloc[0], '满8周')
-            report = exit_diagnostics(event_sets, {self.signal['ts_code']:g}, self.cal)
-            pairs = report['exit_pairs']
-            self.assertTrue(pairs.paired.all())
-            self.assertGreater(pairs.loc[pairs.week==2,'full_net_pct'].iloc[0], pairs.loc[pairs.week==2,'initial_net_pct'].iloc[0])
-            # 固定观察始终按目标日股价计算，不把提前退出收益当成股票后续表现。
-            expected=(g.ac.iloc[10]*.999*.998/(event_sets['full'].buy_price.iloc[0]*1.001)-1)*100
-            self.assertAlmostEqual(pairs.loc[pairs.week==2,'fixed_net_pct'].iloc[0],expected)
-            short_cal = self.cal[:9]
-            short = {s:pd.DataFrame([path_for_signal(self.signal,g.iloc[:9],short_cal,s)]) for s in EXIT_SCHEMES}
-            rows=exit_diagnostics(short,{self.signal['ts_code']:g.iloc[:9]},short_cal)['exit_pairs']
-            self.assertFalse(rows.loc[rows.week==2,'paired'].iloc[0])
-            self.assertFalse(rows.loc[rows.week==2,'mature'].iloc[0])
-            # 路径内任一行情缺失，单列为不完整，不混入最高浮盈/最大浮亏配对。
-            missing=g.copy(); missing.loc[self.cal[3],'ah']=np.nan
-            rows=exit_diagnostics(event_sets,{self.signal['ts_code']:missing},self.cal)['exit_pairs']
-            self.assertFalse(rows.paired.any())
-
-        def test_split_is_not_loss(self):
-            baseline = path_for_signal(self.signal, self.g, self.cal)
-            g = self.g.copy()
-            after = self.cal >= self.cal[10]
-            g.loc[after, ["open", "close", "high", "low", "up_limit", "down_limit"]] /= 2
-            g.loc[after, "adj_factor"] = 2.0
-            split = path_for_signal(self.signal, g, self.cal)
-            self.assertAlmostEqual(split["net_return"], baseline["net_return"])
-
-        def test_weekly_prefix_invariance(self):
-            g = self.g.copy()
-            g["ac"] = 20 + np.sin(np.arange(len(g))/4) + np.arange(len(g)) * .03
-            g["ah"], g["al"] = g.ac + .5, g.ac - .5
-            full = weekly_observers(g)
-            prefix = weekly_observers(g.iloc[:73])
-            pd.testing.assert_frame_equal(full.iloc[:73], prefix)
-
-        def test_feature_and_rank_prefix_invariance(self):
-            rng = np.random.default_rng(17)
-            cal = pd.bdate_range("2020-01-01", periods=350)
-            frames, basics, members = [], [], []
-            for k in range(5):
-                code = f"60000{k}.SH"
-                close = 20 * np.exp(np.cumsum(rng.normal(.002, .014, len(cal))))
-                frames.append(pd.DataFrame({"date": cal, "ts_code": code, "open": close*.999, "close": close,
-                    "high": close*1.006, "low": close*.994, "pre_close": np.r_[close[0], close[:-1]],
-                    "vol": 10000., "amount": 20000., "circ_mv": 2000000., "turnover_rate": 1.,
-                    "adj_factor": 1., "up_limit": close*1.1, "down_limit": close*.9}))
-                basics.append({"ts_code": code, "name": code, "list_date": "20100101", "delist_date": None})
-                members.append({"ts_code": code, "in_date": pd.Timestamp("2010-01-01"), "out_date": pd.NaT})
-            data, basic, member = pd.concat(frames), pd.DataFrame(basics), pd.DataFrame(members)
-            cfg = Config(start=ds(cal[80]), end=ds(cal[-1]), random_runs=3)
-            stocks, signals, cov = build_features(data, basic, member, cal, cfg)
-            cut = cal[231]
-            _, partial, _ = build_features(data[data.date <= cut], basic, member, cal[:232], cfg)
-            self.assertGreater(len(signals), 0)
-            pd.testing.assert_frame_equal(signals[signals.date <= cut].reset_index(drop=True), partial)
-            events = build_events(signals, stocks, cal)
-            market = prepare_market(stocks)
-            nav, trades, opened, skipped = portfolio(events, market, cal, cfg)
-            issues = pd.DataFrame(columns=["date", "endpoint", "problem"])
-            weeks = weekly_coverage(signals, events, nav, cov, cal, cfg, issues)
-            years = annual_report(nav, trades, weeks, cfg, issues, "历史行业区间")
-            summary, raw = random_audit(events, market, cal, cfg, nav)
-            self.assertEqual(raw.seed.nunique(), 3)
-            self.assertGreater(len(signal_reports(events)), 0)
-            self.assertFalse(summary.empty)
-            zipped = make_zip({"annual": years, "events": events}, {"synthetic": True})
-            self.assertTrue(zipfile.is_zipfile(io.BytesIO(zipped)))
-
-    suite = unittest.defaultTestLoader.loadTestsFromTestCase(EngineTests)
-    result = unittest.TextTestRunner(verbosity=2).run(suite)
-    if not result.wasSuccessful():
-        raise SystemExit(1)
 
 
 def main():
     import streamlit as st
-    st.set_page_config(page_title="科技波段 T1.1 退出诊断", layout="wide")
-    st.title("科技波段 T1.1 · 退出诊断版")
-    st.write("整理突破 / 回调再启动 · 统一排序和退出 · 30万元三仓 · 持仓上限8周 · 四路并发下载")
-    try:
-        default_token = str(st.secrets.get("TUSHARE_TOKEN", st.secrets.get("tushare_token", "")))
-    except Exception:
-        default_token = ""
-    default_token = os.environ.get("TUSHARE_TOKEN", default_token)
+    st.set_page_config(page_title='科技波段 T1.2 独立买点验证',layout='wide')
+    st.title('科技波段 T1.2 · 独立买点验证')
+    st.write('全信号独立观察 · 同日科技池入场对照 · 四路并发下载')
+    try:token_default=str(st.secrets.get('TUSHARE_TOKEN',st.secrets.get('tushare_token','')))
+    except Exception:token_default=''
     with st.sidebar:
-        token = st.text_input("Tushare Token", value=default_token, type="password")
-        start = st.date_input("回测开始", value=date(2022, 1, 1))
-        end = st.date_input("回测结束", value=latest_ready_day().date())
-        price = st.number_input("最低股价（高于，元）", value=10.0, min_value=0.0, step=1.0)
-        min_mv = st.number_input("最低流通市值（亿元）", value=50.0, min_value=0.0, step=10.0)
-        max_mv = st.number_input("最高流通市值（亿元）", value=1000.0, min_value=1.0, step=100.0)
-        cache_root = st.text_input("数据缓存目录", value="tech_swing_cache")
-        st.caption("四路并发下载，分接口限速；遇到频次限制自动退避重试。沿用已有缓存，只下载缺失端点；托管服务重启能否保留取决于磁盘。")
-        st.caption("科技范围固定：电子、计算机、通信、国防军工，以及自动化/新能源设备/医疗器械等指定细分。明细随结果导出。")
-        run = st.button("运行冻结规则回测", type="primary", use_container_width=True)
-    with st.expander("冻结规则与数据边界"):
-        st.dataframe(pd.DataFrame(RULES.items(), columns=["项目", "规则"]), use_container_width=True, hide_index=True)
-        st.write("缺行情跳过，未知收益不填零；按原交易日历推进持仓年龄。历史行业权限不足会显示快照池限制。")
-        st.write("不承诺每年五周空窗；结果直接报告达标与否。参数未依据本次真实回测优化。")
-        st.write("T1.1冻结原买点和排名，新增同事件退出配对与三方案三仓回测。无提前保护方案仅用于诊断。")
+        token=st.text_input('Tushare Token',value=os.environ.get('TUSHARE_TOKEN',token_default),type='password')
+        start=st.date_input('信号开始',value=date(2022,1,1))
+        end=st.date_input('信号结束',value=latest_ready_day().date())
+        price=st.number_input('最低股价（高于，元）',value=10.,min_value=0.,step=1.)
+        low=st.number_input('最低流通市值（亿元）',value=50.,min_value=0.,step=10.)
+        high=st.number_input('最高流通市值（亿元）',value=1000.,min_value=1.,step=100.)
+        cache_root=st.text_input('数据缓存目录',value='tech_swing_cache')
+        st.caption('沿用已有行情缓存，四路并发补缺。买点和评分冻结，排名仅作观察。')
+        run=st.button('运行独立买点研究',type='primary',use_container_width=True)
+    with st.expander('冻结规则与研究口径'):
+        st.dataframe(pd.DataFrame(RULES.items(),columns=['项目','规则']),use_container_width=True,hide_index=True)
+        st.text(STUDY_NOTES)
     if run:
-        if not token.strip():
-            st.error("请输入Tushare Token，或在 secrets 中设置 TUSHARE_TOKEN。")
-        elif start > end or min_mv >= max_mv or not cache_root.strip():
-            st.error("请检查起止日期、市值上下限和缓存目录。")
+        if not token.strip():st.error('请输入Token，或设置TUSHARE_TOKEN。')
+        elif start>end or low>=high or not cache_root.strip():st.error('请检查日期、市值上下限和缓存目录。')
         else:
-            progress_box = st.empty()
-            last_update = [0.0]
+            box=st.empty();last=[0.]
             def progress(message):
-                if time.monotonic() - last_update[0] > 0.25:
-                    progress_box.info(message)
-                    last_update[0] = time.monotonic()
-            cfg = Config(start=ds(start), end=ds(end), min_price=price, min_mv=min_mv, max_mv=max_mv)
+                if time.monotonic()-last[0]>.25:box.info(message);last[0]=time.monotonic()
+            cfg=Config(start=ds(start),end=ds(end),min_price=price,min_mv=low,max_mv=high)
             try:
-                result = run_research(token, cache_root.strip(), cfg, progress)
-                st.session_state["t1_result"] = result
-                progress_box.success("回测完成。结果保留在当前会话，点击下载不会重新下载行情或重跑回测。")
+                st.session_state['t12_result']=run_research(token,cache_root.strip(),cfg,progress)
+                box.success('研究完成，结果已保留，可下载明细。')
             except Exception as exc:
-                progress_box.error("运行未完成：" + str(exc).replace(token, "[隐藏]")[:500])
-                st.info("已成功下载的数据已逐端点保存。修复权限或网络后重新运行即可补缺。")
-    if "t1_result" in st.session_state:
-        tables, manifest, zipped, _ = st.session_state["t1_result"]
-        show_results(st, tables, manifest, zipped)
-    else:
-        st.info("首次建议直接测试2022年至最近完整交易日，逐年查看结果。这里尚无真实行情回测结论。")
+                box.error('运行未完成：'+str(exc).replace(token,'[隐藏]')[:500])
+                st.info('已下载成功的数据保留，修复后继续补缺。')
+    if 't12_result' in st.session_state:
+        tables,manifest,zipped,_=st.session_state['t12_result'];show_results(st,tables,manifest,zipped)
+    else:st.info('建议先使用与上轮相同的日期区间，核对信号数量后再分析收益和同池对照。')
 
 
-if __name__ == "__main__":
-    if "--self-test" in sys.argv:
-        self_test()
-    else:
-        main()
+def self_test():
+    import unittest
+    class EventTests(unittest.TestCase):
+        def setUp(self):
+            self.cal=pd.bdate_range('2022-01-03',periods=90)
+            self.g=pd.DataFrame(index=self.cal)
+            for col in ('open','ao','ac','mark'):self.g[col]=20.
+            self.g['ah']=20.5;self.g['al']=19.5;self.g['vol']=1000.
+            self.g['adj_factor']=1.;self.g['up_limit']=22.;self.g['down_limit']=18.
+            self.g['atr']=1.;self.g['structure']=18.5;self.g['ret20']=0.;self.g['eligible']=True
+            self.signal={'date':self.cal[0],'ts_code':'600001.SH','name':'合成股票','ac':20.,
+                'structure':18.5,'rank':1,'source':'A','event_id':'test'}
+
+        def test_fixed_dates_and_fees(self):
+            signals=pd.DataFrame([self.signal]);pool=fixed_pool_outcomes({'600001.SH':self.g},signals,self.cal)
+            expected=(20*.999*.998/(20*1.001*1.001)-1)*100
+            self.assertAlmostEqual(pool.W1_net_pct.iloc[0],expected)
+            self.g.loc[self.cal[5],'ac']=25.
+            pool=fixed_pool_outcomes({'600001.SH':self.g},signals,self.cal)
+            self.assertAlmostEqual(pool.W1_net_pct.iloc[0],(25*.999*.998/(20*1.001*1.001)-1)*100)
+
+        def test_cancel_no_replacement_and_unknown(self):
+            g=self.g.copy();g.loc[self.cal[1],['open','ao']]=22.
+            signals=pd.DataFrame([self.signal]);pool=fixed_pool_outcomes({'600001.SH':g},signals,self.cal)
+            self.assertFalse(pool.filled.iloc[0]);self.assertEqual(pool.W8_net_pct.iloc[0],0.)
+            g=self.g.copy();g.loc[self.cal[40],'ac']=np.nan
+            pool=fixed_pool_outcomes({'600001.SH':g},signals,self.cal)
+            self.assertTrue(np.isnan(pool.W8_net_pct.iloc[0]))
+            reports=entry_edge_reports(signals,pool)
+            row=reports['edge_summary'].query("年度=='全部' and 来源=='全部' and 排名=='全部' and 观察交易日==40").iloc[0]
+            self.assertEqual(row['不完整日期'],1);self.assertEqual(row['严格配对日期'],0)
+
+        def test_future_pool_membership_not_used(self):
+            g=self.g.copy();g['eligible']=False;g.loc[self.cal[10]:,'eligible']=True
+            signals=pd.DataFrame([self.signal]);pool=fixed_pool_outcomes({'600001.SH':self.g,'600002.SH':g},signals,self.cal)
+            self.assertEqual(pool.ts_code.tolist(),['600001.SH'])
+
+        def test_uniform_reference_hand_calculation(self):
+            signals=pd.DataFrame([self.signal]);other=self.g.copy();other.loc[self.cal[5],'ac']=24.
+            pool=fixed_pool_outcomes({'600001.SH':self.g,'600002.SH':other},signals,self.cal)
+            r=entry_edge_reports(signals,pool)
+            daily=r['pool_daily_reference'].query('week==1').iloc[0]
+            self.assertAlmostEqual(daily.uniform_expected_pct,pool.W1_net_pct.mean())
+            edge=r['edge_summary'].query("年度=='全部' and 来源=='全部' and 排名=='全部' and 观察交易日==5").iloc[0]
+            self.assertAlmostEqual(edge['日均超额收益_百分点'],pool.W1_net_pct.iloc[0]-pool.W1_net_pct.mean())
+
+        def test_exit_modes_and_t_plus_one(self):
+            g=self.g.copy();g.loc[self.cal[1],'ac']=17.
+            e=path_for_signal(self.signal,g,self.cal,'full')
+            self.assertEqual(e['sell_idx'],2)
+            none=path_for_signal(self.signal,g,self.cal,'none')
+            self.assertEqual(none['sell_date'],self.cal[1]+pd.Timedelta(weeks=8))
+
+        def test_unmatured_even_when_cancelled(self):
+            g=self.g.iloc[:4].copy();g.loc[self.cal[1],['open','ao']]=22.
+            p=fixed_pool_outcomes({'600001.SH':g},pd.DataFrame([self.signal]),self.cal[:4])
+            self.assertFalse(p.W1_mature.iloc[0]);self.assertTrue(np.isnan(p.W1_net_pct.iloc[0]))
+
+        def test_config_and_exports_have_no_allocation(self):
+            self.assertNotIn('capital',asdict(Config()));self.assertNotIn('slots',asdict(Config()))
+            self.assertNotIn('portfolio',globals())
+            self.assertTrue(zipfile.is_zipfile(io.BytesIO(make_zip({'signals':pd.DataFrame([self.signal])},{'test':True}))))
+    result=unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(EventTests))
+    if not result.wasSuccessful():raise SystemExit(1)
+
+
+if __name__=='__main__':
+    if '--self-test' in sys.argv:self_test()
+    else:main()
+
+
+
+
+
+
