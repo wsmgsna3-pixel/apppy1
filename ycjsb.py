@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""科技波段研究 T1.0 — streamlit run app.py
+"""科技波段研究 T1.1 退出诊断 — streamlit run app.py
 
 单文件；依赖 pandas、numpy、streamlit、tushare。python app.py --self-test 可离线验算。
 策略阈值不是回测寻优结果。历史统计不构成策略有效或实盘合格证明。
@@ -27,7 +27,9 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
-VERSION = "T1.0-FROZEN-20260908"
+VERSION = "T1.1-EXIT-DIAGNOSTIC-20260909"
+BASELINE_VERSION = "T1.0-FROZEN-20260908"
+EXIT_SCHEMES = {"none": "不提前退出（满8自然周）", "initial": "仅初始保护", "full": "T1.0完整退出"}
 DOWNLOAD_REVISION = "DL4"
 DOWNLOAD_WORKERS = 4
 API_MIN_INTERVAL = 0.36
@@ -412,7 +414,7 @@ def build_features(data, basic, member, calendar, cfg, progress=lambda text: Non
         g["last_quote"] = pd.Series(calendar, index=calendar).where(g.ac.notna()).ffill()
         g["ts_code"] = code
         g["name"] = base.loc[code, "name"]
-        stocks[code] = g[["open", "ao", "ac", "vol", "adj_factor", "up_limit", "down_limit",
+        stocks[code] = g[["open", "ao", "ac", "ah", "al", "vol", "adj_factor", "up_limit", "down_limit",
                           "atr", "mark", "last_quote"]].copy()
         cols = ["ts_code", "name", "source", "close", "ac", "structure", "atr", "ret20", "contraction",
                 "risk_distance", "circ_mv", "turnover_rate", "weekly_state", "weekly_k", "weekly_d", "weekly_macd"]
@@ -464,8 +466,10 @@ def execution_price(row, side):
     return raw * row["adj_factor"], raw
 
 
-def path_for_signal(signal, g, calendar):
+def path_for_signal(signal, g, calendar, exit_scheme="full"):
     """独立事件；同一退出轨迹复用于无限资金审计及三仓账户。"""
+    if exit_scheme not in EXIT_SCHEMES:
+        raise ValueError("未知退出方案")
     out = signal.copy()
     idx = calendar.get_indexer([signal["date"]])[0]
     out.update(entry_status="区间末待成交", buy_date=pd.NaT, sell_date=pd.NaT,
@@ -504,10 +508,10 @@ def path_for_signal(signal, g, calendar):
             out["delayed_days"] += 1
         if np.isfinite(row.ac):
             # 先用昨天已经确定的保护价检查收盘，再抬升明天的保护价。
-            if row.ac < stop and not pending:
+            if exit_scheme != "none" and row.ac < stop and not pending:
                 pending = "收盘跌破保护价"
             highest = max(highest, row.ac)
-            if np.isfinite(row.atr):
+            if exit_scheme == "full" and np.isfinite(row.atr):
                 stop = max(stop, highest - 3 * row.atr)
     if out["sell_idx"] == -1:
         out["reason"] = pending or "仍持有"
@@ -529,18 +533,101 @@ def path_for_signal(signal, g, calendar):
     return out
 
 
-def build_events(signals, stocks, calendar, progress=lambda text: None):
+def build_events(signals, stocks, calendar, progress=lambda text: None, exit_scheme="full"):
     result = []
     for n, signal in enumerate(signals.to_dict("records"), 1):
-        result.append(path_for_signal(signal, stocks[signal["ts_code"]], calendar))
+        result.append(path_for_signal(signal, stocks[signal["ts_code"]], calendar, exit_scheme))
         if n % 100 == 0 or n == len(signals):
-            progress(f"独立事件审计 {n}/{len(signals)}；提前退出的失败交易保留在后续统计中")
+            progress(f"{EXIT_SCHEMES[exit_scheme]}：事件审计 {n}/{len(signals)}")
     if result:
         return pd.DataFrame(result)
     columns = list(signals.columns) + ["entry_status", "buy_date", "sell_date", "buy_idx", "sell_idx",
                                       "net_return", "reason", "delayed_days"]
     columns += [f"W{w}_{suffix}" for w in (1, 2, 4, 8) for suffix in ("net_pct", "status")]
     return pd.DataFrame(columns=columns)
+
+
+def exit_diagnostics(event_sets, stocks, calendar, progress=lambda text: None):
+    """同一买点、同一买价、同一观察时点配对；未成熟事件不因提前退出而提前纳入。"""
+    full = event_sets["full"]
+    indexed = {key: frame.set_index("event_id") for key, frame in event_sets.items()}
+    rows = []
+    for n, event in enumerate(full.to_dict("records"), 1):
+        if event["entry_status"] != "已成交":
+            continue
+        code, event_id = event["ts_code"], event["event_id"]
+        j = int(event["buy_idx"])
+        g = stocks[code]
+        other = {key: frame.loc[event_id] for key, frame in indexed.items()}
+        for variant in other.values():
+            if variant.entry_status != "已成交" or variant.buy_idx != j or not np.isclose(variant.buy_price, event["buy_price"]):
+                raise RuntimeError("退出对照入场不一致，停止生成配对结果")
+        for week in (1, 2, 4, 8):
+            target = j + week * 5 - 1
+            row = {"event_id": event_id, "date": event["date"], "year": stamp(event["date"]).year,
+                "ts_code": code, "source": event["source"], "rank": event["rank"],
+                "week": week, "buy_date": event["buy_date"], "buy_price": event["buy_price"],
+                "mature": target < len(calendar), "target_date": calendar[target] if target < len(calendar) else pd.NaT,
+                "path_complete": False, "fixed_net_pct": np.nan, "mfe_gross_pct": np.nan,
+                "mae_gross_pct": np.nan, "full_exited_early": False}
+            for key, variant in other.items():
+                row[key + "_net_pct"] = variant.get(f"W{week}_net_pct", np.nan)
+            if target < len(calendar):
+                path = g.iloc[j:target+1]
+                row["path_complete"] = bool(path[["ac", "ah", "al"]].notna().all().all())
+                if np.isfinite(g.ac.iloc[target]):
+                    row["fixed_net_pct"] = (g.ac.iloc[target] * .999 * .998 / (event["buy_price"] * 1.001) - 1) * 100
+                if row["path_complete"]:
+                    row["mfe_gross_pct"] = (path.ah.max() / event["buy_price"] - 1) * 100
+                    row["mae_gross_pct"] = (path.al.min() / event["buy_price"] - 1) * 100
+                row["full_exited_early"] = 0 <= event["sell_idx"] <= target and event["reason"] != "满8周"
+            row["paired"] = bool(row["mature"] and row["path_complete"] and
+                all(np.isfinite(row[key]) for key in ("fixed_net_pct", "none_net_pct", "initial_net_pct", "full_net_pct")))
+            rows.append(row)
+        if n % 200 == 0:
+            progress(f"固定窗口价格路径与退出配对 {n}/{len(full)}")
+    details = pd.DataFrame(rows)
+    if details.empty:
+        return {"exit_diagnostic": pd.DataFrame(), "exit_pairs": details, "matched_rank": pd.DataFrame()}
+    summaries, rank_rows = [], []
+    for year in ["全部"] + sorted(details.year.unique().tolist()):
+        annual = details if year == "全部" else details[details.year == year]
+        for source in ("全部", "A", "B", "A+B"):
+            part = annual if source == "全部" else annual[annual.source == source]
+            for rank in ("全部", "前三名", "第一名"):
+                subset = part if rank == "全部" else part[part["rank"] <= (3 if rank == "前三名" else 1)]
+                for week, group in subset.groupby("week"):
+                    paired = group[group.paired]
+                    early = paired[paired.full_exited_early]
+                    row = {"年度": str(year), "来源": source, "排名": rank, "观察交易日": int(week)*5,
+                        "可成交事件": len(group), "未成熟": int((~group.mature).sum()),
+                        "成熟但不完整": int((group.mature & ~group.paired).sum()), "配对样本": len(paired)}
+                    for key, label in (("fixed", "固定观察"), ("none", "仅8周到期"), ("initial", "初始保护"), ("full", "完整退出")):
+                        values = paired[key + "_net_pct"]
+                        row[label + "均收益%"] = values.mean()
+                        row[label + "中位数%"] = values.median()
+                        row[label + "胜率%"] = values.gt(0).mean()*100 if len(values) else np.nan
+                    row.update({"仅到期减固定观察_百分点": (paired.none_net_pct-paired.fixed_net_pct).mean(),
+                        "初始保护减仅到期_百分点": (paired.initial_net_pct-paired.none_net_pct).mean(),
+                        "完整减初始保护_百分点": (paired.full_net_pct-paired.initial_net_pct).mean(),
+                        "最高浮盈中位数%": paired.mfe_gross_pct.median(), "最大浮亏中位数%": paired.mae_gross_pct.median(),
+                        "完整规则提前退出数": len(early),
+                        "提前退出后期末更高比例%": (early.fixed_net_pct>early.full_net_pct).mean()*100 if len(early) else np.nan,
+                        "提前退出后期末差值均值_百分点": (early.fixed_net_pct-early.full_net_pct).mean()})
+                    summaries.append(row)
+            # 排名对照按同日均值配对，避免信号密集的行情阶段主导事件加权均值。
+            for week, group in part[part.paired].groupby("week"):
+                for key, label in (("fixed", "固定观察"), ("full", "完整退出")):
+                    column = key + "_net_pct"
+                    daily_all = group.groupby("date")[column].mean()
+                    for top in (1, 3):
+                        selected = group[group["rank"] <= top].groupby("date")[column].mean()
+                        matched = pd.concat([selected.rename("top"), daily_all.rename("all")], axis=1).dropna()
+                        rank_rows.append({"年度": str(year), "来源": source, "观察交易日": int(week)*5,
+                            "收益口径": label, "前N名": top, "配对日期": len(matched),
+                            "前N名减同日全体_百分点": (matched.top-matched['all']).mean(),
+                            "前N名胜出日期比例%": (matched.top>matched['all']).mean()*100 if len(matched) else np.nan})
+    return {"exit_diagnostic": pd.DataFrame(summaries), "exit_pairs": details, "matched_rank": pd.DataFrame(rank_rows)}
 
 
 def prepare_market(stocks):
@@ -793,6 +880,15 @@ def make_zip(tables, manifest):
             archive.writestr(name + ".csv", frame.to_csv(index=False).encode("utf-8-sig"))
         archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2, default=str))
         archive.writestr("规则与口径.txt", "\n".join(f"{key}：{value}" for key, value in RULES.items()) +
+            "\nT1.1新增退出诊断，不修改T1.0买点/排序/去重/成交门槛。\n"
+            "exit_diagnostic按同一买点、同一买价、同一成熟观察窗口配对；A/B/A+B互斥。\n"
+            "固定观察为5/10/20/40交易日收盘估值，预扣退出成本，不代表该收盘可以成交。\n"
+            "三种可执行方案均保留8自然周到期及停牌/涨跌停限制；none无提前保护，initial保护价固定，full为原完整规则。\n"
+            "只有固定观察没有8自然周到期截断；它是价格路径参照，不是第四个实盘方案。\n"
+            "最高浮盈/最大浮亏为窗口内相对买价的原始高低幅度，未扣成本；不是可以同时实现的交易收益。\n"
+            "配对样本排除未成熟和路径不完整事件，计数单列；旧signal_groups保留原口径用于复核。\n"
+            "三仓方案各自重跑，后续成交股票可以不同，账户差值不能全归因于同一笔交易的退出。\n"
+            "matched_rank按同日同来源成熟样本比较，排名仍是全候选原排名，不在来源内重新排名。\n"
             "\n分组收益保留提前止损交易；未成熟/目标日缺行情不按0收益填充。\n"
             "账户收益含未平仓市值；胜率仅已平仓；独立事件观察收益与账户收益不可混用。\n"
             "跨年周按该周首个纳入观察的交易日归属；仅完整自然年判断五周覆盖目标。\n"
@@ -826,17 +922,45 @@ def run_research(token, cache_root, cfg, progress):
     del data
     gc.collect()
     events = build_events(signals, stocks, calendar, progress)
+    event_sets = {"full": events}
+    for scheme in ("none", "initial"):
+        event_sets[scheme] = build_events(signals, stocks, calendar, progress, exit_scheme=scheme)
+    diagnostic_tables = exit_diagnostics(event_sets, stocks, calendar, progress)
     market = prepare_market(stocks)
     nav, trades, open_positions, skipped = portfolio(events, market, calendar, cfg)
     if nav.empty:
         raise RuntimeError("所选区间没有交易日")
     weeks = weekly_coverage(signals, events, nav, cov, calendar, cfg, issues)
     years = annual_report(nav, trades, weeks, cfg, issues, mode)
+    variant_years, variant_totals = [], []
+    for scheme in ("none", "initial", "full"):
+        if scheme == "full":
+            vn, vt, vo, vs, vy = nav, trades, open_positions, skipped, years.copy()
+        else:
+            vn, vt, vo, vs = portfolio(event_sets[scheme], market, calendar, cfg)
+            vw = weekly_coverage(signals, event_sets[scheme], vn, cov, calendar, cfg, issues)
+            vy = annual_report(vn, vt, vw, cfg, issues, mode)
+        if warnings:
+            vy["判定"] = "股票池受限，不判通过"
+        vy.insert(0, "退出方案", EXIT_SCHEMES[scheme])
+        variant_years.append(vy)
+        variant_totals.append({"退出方案": EXIT_SCHEMES[scheme], "期末权益": vn.equity.iloc[-1],
+            "总收益%": (vn.equity.iloc[-1]/cfg.capital-1)*100,
+            "全程最大回撤%": max_drawdown(vn.equity,cfg.capital), "已平仓笔数": len(vt),
+            "胜率%": vt.pnl.gt(0).mean()*100 if len(vt) else np.nan,
+            "平均资金使用率%": vn.exposure_pct.mean()})
+        if scheme != "full":
+            diagnostic_tables.update({f"{scheme}_events": event_sets[scheme], f"{scheme}_equity": vn,
+                f"{scheme}_trades": vt, f"{scheme}_open_positions": vo, f"{scheme}_orders_skipped": vs})
+    diagnostic_tables["exit_portfolio_annual"] = pd.concat(variant_years, ignore_index=True)
+    diagnostic_tables["exit_portfolio_total"] = pd.DataFrame(variant_totals)
     random_summary, random_raw = random_audit(events, market, calendar, cfg, nav, progress)
     stress, _, _, _ = portfolio(events, market, calendar, cfg, detail=False, cost_mult=2.0)
     stress_summary = pd.DataFrame([{"情景": "基准费用", "总收益%": (nav.equity.iloc[-1] / cfg.capital - 1) * 100},
                                   {"情景": "买卖综合费用翻倍（滑点不变）", "总收益%": (stress.equity.iloc[-1] / cfg.capital - 1) * 100}])
-    manifest = {"version": VERSION, "download_revision": DOWNLOAD_REVISION, "download_workers": DOWNLOAD_WORKERS,
+    manifest = {"version": VERSION, "baseline_version": BASELINE_VERSION, "exit_schemes": EXIT_SCHEMES,
+                "diagnostic_pairing": "同一买点同一成交价；5/10/20/40交易日已成熟且路径完整样本；来源互斥",
+                "download_revision": DOWNLOAD_REVISION, "download_workers": DOWNLOAD_WORKERS,
                 "created_at": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(),
                 "config": asdict(cfg), "rules": RULES, "pool_mode": mode, "warnings": warnings,
                 "universe_size": len(basic), "actual_account_start": nav.date.min(), "actual_account_end": nav.date.max(),
@@ -854,6 +978,7 @@ def run_research(token, cache_root, cfg, progress):
               "random_runs": random_raw, "concentration": concentration_report(trades),
               "observers": observer_report(events), "cost_stress": stress_summary, "data_issues": issues,
               "industry_intervals": member, "universe": basic, "daily_pool": cov.reset_index()}
+    tables.update(diagnostic_tables)
     zipped = make_zip(tables, manifest)
     run_id = hashlib.sha256(json.dumps(asdict(cfg), sort_keys=True).encode()).hexdigest()[:12]
     result_path = Path(cache_root) / "results" / f"{VERSION}_{run_id}.zip"
@@ -872,6 +997,7 @@ def show_results(st, tables, manifest, zipped):
     nav = tables["equity"]
     st.subheader(f"{manifest['version']} · {str(manifest['actual_account_start'])[:10]} 至 {str(manifest['actual_account_end'])[:10]}")
     st.caption("当前展示的是上次完成结果；修改侧栏后需重新运行才会更新。")
+    st.caption("顶部账户与逐年成绩沿用T1.0完整退出作为基准；新增三方案对照见“退出诊断”。")
     metrics = st.columns(4)
     metrics[0].metric("账户总收益", f"{(nav.equity.iloc[-1] / cfg['capital'] - 1) * 100:.2f}%")
     metrics[1].metric("最大回撤", f"{max_drawdown(nav.equity, cfg['capital']):.2f}%")
@@ -883,8 +1009,8 @@ def show_results(st, tables, manifest, zipped):
                    f"；缺失/异常记录 {manifest['data_issues']} 条。成功数据已缓存，下次运行补缺。")
     st.caption("股票池：" + manifest["pool_mode"] + "。公司行动按复权总收益近似；账户权益含未平仓市值。")
     st.download_button("下载完整回测结果（ZIP）", zipped,
-        file_name=f"tech_swing_T1_0_{cfg['start']}_{cfg['end']}.zip", mime="application/zip")
-    tabs = st.tabs(["逐年成绩", "覆盖与空窗", "买点与排名", "随机对照", "交易与持仓", "数据与规则"])
+        file_name=f"tech_swing_T1_1_{cfg['start']}_{cfg['end']}.zip", mime="application/zip")
+    tabs = st.tabs(["逐年成绩", "覆盖与空窗", "买点与排名", "随机对照", "交易与持仓", "数据与规则", "退出诊断"])
     with tabs[0]:
         st.dataframe(tables["annual"], use_container_width=True, hide_index=True)
         st.line_chart(nav.set_index("date")[["equity"]])
@@ -912,6 +1038,27 @@ def show_results(st, tables, manifest, zipped):
         st.dataframe(pd.DataFrame(RULES.items(), columns=["项目", "冻结规则"]), use_container_width=True, hide_index=True)
         st.dataframe(tables["data_issues"], use_container_width=True, hide_index=True)
         st.json(manifest)
+    with tabs[6]:
+        if "exit_diagnostic" not in tables:
+            st.info("当前显示旧版结果，请重新运行生成退出诊断。")
+        else:
+            st.write("三种退出方式的三仓账户结果")
+            st.caption("每种方式独立重跑账户，空位释放时间不同，后续买入股票也会不同。原完整退出是对照基准。")
+            st.dataframe(tables["exit_portfolio_total"], use_container_width=True, hide_index=True)
+            st.dataframe(tables["exit_portfolio_annual"], use_container_width=True, hide_index=True)
+            st.write("同一批买点配对：固定观察、仅到期、初始保护、完整退出")
+            st.caption("固定观察是价格路径参照；只比较已成熟且路径完整的相同事件。最高浮盈不等于可实现利润。")
+            report = tables["exit_diagnostic"]
+            if not report.empty:
+                cols = st.columns(3)
+                year = cols[0].selectbox("诊断年度", ["全部"] + sorted(x for x in report['年度'].unique() if x != "全部"))
+                source = cols[1].selectbox("互斥信号来源", ["全部", "A", "B", "A+B"])
+                rank = cols[2].selectbox("原信号排名", ["全部", "前三名", "第一名"])
+                view = report[(report['年度']==year)&(report['来源']==source)&(report['排名']==rank)]
+                st.dataframe(view, use_container_width=True, hide_index=True)
+            st.write("同日排名对照")
+            st.caption("逐日比较前N名与同日全体，再对日期等权平均；同日样本少时差异可能为零。不是独立验证或显著性检验。")
+            st.dataframe(tables["matched_rank"], use_container_width=True, hide_index=True)
 
 
 def self_test():
@@ -990,6 +1137,34 @@ def self_test():
             self.assertAlmostEqual(nav.equity.iloc[-1], cfg.capital + trades.pnl.sum())
             self.assertTrue((nav.positions <= 3).all())
 
+        def test_three_exit_schemes_and_pairing(self):
+            g = self.g.copy()
+            g.loc[self.cal[2], ["ac", "close", "ah", "high"]] = 27.0
+            g.loc[self.cal[3:5], ["ac", "close", "ao", "open"]] = 23.0
+            g.loc[self.cal[3:5], "up_limit"] = 30.0
+            g.loc[self.cal[6:8], ["ac", "close", "ao", "open"]] = 17.0
+            g.loc[self.cal[6:8], "down_limit"] = 15.0
+            event_sets = {s: pd.DataFrame([path_for_signal(self.signal,g,self.cal,s)]) for s in EXIT_SCHEMES}
+            self.assertEqual(event_sets['full'].sell_idx.iloc[0], 4)
+            self.assertEqual(event_sets['initial'].sell_idx.iloc[0], 7)
+            self.assertEqual(event_sets['none'].reason.iloc[0], '满8周')
+            report = exit_diagnostics(event_sets, {self.signal['ts_code']:g}, self.cal)
+            pairs = report['exit_pairs']
+            self.assertTrue(pairs.paired.all())
+            self.assertGreater(pairs.loc[pairs.week==2,'full_net_pct'].iloc[0], pairs.loc[pairs.week==2,'initial_net_pct'].iloc[0])
+            # 固定观察始终按目标日股价计算，不把提前退出收益当成股票后续表现。
+            expected=(g.ac.iloc[10]*.999*.998/(event_sets['full'].buy_price.iloc[0]*1.001)-1)*100
+            self.assertAlmostEqual(pairs.loc[pairs.week==2,'fixed_net_pct'].iloc[0],expected)
+            short_cal = self.cal[:9]
+            short = {s:pd.DataFrame([path_for_signal(self.signal,g.iloc[:9],short_cal,s)]) for s in EXIT_SCHEMES}
+            rows=exit_diagnostics(short,{self.signal['ts_code']:g.iloc[:9]},short_cal)['exit_pairs']
+            self.assertFalse(rows.loc[rows.week==2,'paired'].iloc[0])
+            self.assertFalse(rows.loc[rows.week==2,'mature'].iloc[0])
+            # 路径内任一行情缺失，单列为不完整，不混入最高浮盈/最大浮亏配对。
+            missing=g.copy(); missing.loc[self.cal[3],'ah']=np.nan
+            rows=exit_diagnostics(event_sets,{self.signal['ts_code']:missing},self.cal)['exit_pairs']
+            self.assertFalse(rows.paired.any())
+
         def test_split_is_not_loss(self):
             baseline = path_for_signal(self.signal, self.g, self.cal)
             g = self.g.copy()
@@ -1048,8 +1223,8 @@ def self_test():
 
 def main():
     import streamlit as st
-    st.set_page_config(page_title="科技波段 T1.0", layout="wide")
-    st.title("科技波段 T1.0 · 独立研发第一版")
+    st.set_page_config(page_title="科技波段 T1.1 退出诊断", layout="wide")
+    st.title("科技波段 T1.1 · 退出诊断版")
     st.write("整理突破 / 回调再启动 · 统一排序和退出 · 30万元三仓 · 持仓上限8周 · 四路并发下载")
     try:
         default_token = str(st.secrets.get("TUSHARE_TOKEN", st.secrets.get("tushare_token", "")))
@@ -1067,10 +1242,11 @@ def main():
         st.caption("四路并发下载，分接口限速；遇到频次限制自动退避重试。沿用已有缓存，只下载缺失端点；托管服务重启能否保留取决于磁盘。")
         st.caption("科技范围固定：电子、计算机、通信、国防军工，以及自动化/新能源设备/医疗器械等指定细分。明细随结果导出。")
         run = st.button("运行冻结规则回测", type="primary", use_container_width=True)
-    with st.expander("第一版规则与数据边界"):
+    with st.expander("冻结规则与数据边界"):
         st.dataframe(pd.DataFrame(RULES.items(), columns=["项目", "规则"]), use_container_width=True, hide_index=True)
         st.write("缺行情跳过，未知收益不填零；按原交易日历推进持仓年龄。历史行业权限不足会显示快照池限制。")
         st.write("不承诺每年五周空窗；结果直接报告达标与否。参数未依据本次真实回测优化。")
+        st.write("T1.1冻结原买点和排名，新增同事件退出配对与三方案三仓回测。无提前保护方案仅用于诊断。")
     if run:
         if not token.strip():
             st.error("请输入Tushare Token，或在 secrets 中设置 TUSHARE_TOKEN。")
