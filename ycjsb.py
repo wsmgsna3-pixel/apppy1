@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""科技波段研究 T3.1 周线SKDJ上穿25形态 — streamlit run app.py
+"""科技波段研究 T3.2 周线SKDJ同日排序验证 — streamlit run app.py
 
 单文件；依赖 pandas、numpy、streamlit、tushare。python app.py --self-test 可离线验算。
 策略阈值不是回测寻优结果。历史统计不构成策略有效或实盘合格证明。
@@ -27,7 +27,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
-VERSION = "T3.1-WEEKLY-SHAPE-20260910"
+VERSION = "T3.2-SAME-DAY-RANK-20260910"
 DOWNLOAD_REVISION = "DL4"
 DOWNLOAD_WORKERS = 4
 API_MIN_INTERVAL = 0.36
@@ -520,7 +520,7 @@ def metrics(g):
         mfe_ge10_pct=c.mfe_pct.ge(10).sum()/c.mfe_pct.notna().sum()*100 if n and c.mfe_pct.notna().any() else np.nan)
 
 
-def build_reports(events,calendar,cfg):
+def build_shape_reports(events,calendar,cfg):
     names=['events','summary','feature_groups','joint_groups','diagnostics','thresholds','daily_comparison','annual_coverage','status_counts']
     if events.empty:return {n:pd.DataFrame() for n in names}
     e,thresholds=assign_bins(events);q=e[e.qualified].copy()
@@ -557,6 +557,169 @@ def build_reports(events,calendar,cfg):
         diagnostics=pd.DataFrame(diag),thresholds=thresholds,daily_comparison=pd.DataFrame(daily),annual_coverage=pd.DataFrame(cover),status_counts=status)
 
 
+RANK_GROUPS=('第1名','第2名','第3名','前三名','后三名')
+RANK_NOTES={
+    '主检验':'固定K−D降序、前三名、同日至少6个合格候选、20交易日窗口；两个观察模式独立，不选择历史最优组合',
+    '辅助检验':'K斜率、上穿前斜率、加速度、间距扩大速度分别排序；不合成评分，不自动推荐历史冠军',
+    '名次':'信号当日收盘按指标降序，同分按流通市值降序，再按代码；先排全体候选，取消单不补位；各退出窗口共用信号时名次',
+    '比较':'逐日比较第1/2/3名、前三名、后三名与同日全部候选及未选中候选；后三名是同一排序的末三名，仅作对照',
+    '数量':'主表至少6个候选，保证前三名与后三名不重叠；另列全部日期。少于3只时前三名代表实际已有数量，无选满假设',
+    '未知':'同日任何合格候选的对应退出结果未知，或该排序指标缺失，则该日不进入严格同日比较；报告被排除的日期数，不将未知补零',
+    '胜率':'闭合事件胜率与日期平均净收益为不同统计；取消单仅在已确定发单收益中按零，不进入闭合交易胜率',
+    '稳健性':'按年统计；20日、至少6候选、前三名另做8个日历周连续区块重采样2000次；仅给探索性95%区间，不宣称未见样本有效',
+    '年份':'固定数值排序无需校准，从2022年起均可计算；2023—2026单独汇总便于对照T3.1分位研究，所有历史仍已被观察',
+    '导入':'可以读取T3.1/T3.2结果ZIP直接重算排序，无需Token和下载；沿用原信号、成交、成本和未知状态，不能补足其尚未结束的交易',
+}
+RULES.update(RANK_NOTES)
+STUDY_NOTES='\n'.join(f'{k}：{v}' for k,v in RULES.items())
+
+
+def ranked_signals(events):
+    """仅用信号已知字段生成名次；与未来收益和成交状态无关。"""
+    fields=['event_id','ts_code','mode','signal_date','year','circ_mv_yi']+list(FEATURES)
+    u=events.loc[events.qualified,fields].drop_duplicates('event_id').copy()
+    if u.empty:return u
+    keys=['mode','signal_date']
+    u['candidate_count']=u.groupby(keys).event_id.transform('size')
+    for c in FEATURES:
+        values=pd.to_numeric(u[c],errors='coerce')
+        u[c]=values.where(np.isfinite(values))
+        u['rank_'+c]=np.nan
+        valid=u[c].notna()&u.circ_mv_yi.notna()
+        order=u[valid].sort_values(keys+[c,'circ_mv_yi','ts_code'],ascending=[True,True,False,False,True],kind='stable')
+        u.loc[order.index,'rank_'+c]=order.groupby(keys).cumcount()+1
+        u['known_'+c]=valid.groupby([u[k] for k in keys]).transform('all')
+        u['tied_'+c]=u.groupby(keys)[c].transform('nunique').le(1)
+    return u.reset_index(drop=True)
+
+
+def block_interval(daily):
+    """完整同日差值，连续8周区块抽样，保留无比较日期的周。"""
+    v=daily[daily.comparable].copy()
+    if len(v)<40:return dict(ci_dates=len(v),edge_ci_low=np.nan,edge_ci_high=np.nan,ci_status='可比日期不足40')
+    key=v.signal_date.dt.to_period('W-FRI')
+    w=v.groupby(key).agg(total=('edge_pp','sum'),count=('edge_pp','size'))
+    axis=pd.period_range(daily.signal_date.min(),daily.signal_date.max(),freq='W-FRI')
+    if len(axis)<16:return dict(ci_dates=len(v),edge_ci_low=np.nan,edge_ci_high=np.nan,ci_status='日历周不足16')
+    a=w.reindex(axis,fill_value=0).to_numpy(float);rng=np.random.default_rng(3208)
+    starts=rng.integers(0,len(a),size=(2000,math.ceil(len(a)/8)))
+    ids=((starts[:,:,None]+np.arange(8))%len(a)).reshape(2000,-1)[:,:len(a)]
+    sample=a[ids].sum(axis=1);valid=sample[:,1]>0
+    lo,hi=np.quantile(sample[valid,0]/sample[valid,1],[.025,.975])
+    return dict(ci_dates=len(v),edge_ci_low=lo,edge_ci_high=hi,ci_status='8周区块，2000次；探索性')
+
+
+def ranking_reports(events,progress=lambda _:None):
+    names=['ranked_signals','ranking_daily','ranking_summary','ranking_robustness']
+    if events.empty or not events.qualified.any():return {n:pd.DataFrame() for n in names}
+    u=ranked_signals(events)
+    added=['event_id','candidate_count']+[prefix+c for c in FEATURES for prefix in ['rank_','known_','tied_']]
+    q=events[events.qualified].drop(columns=[c for c in added if c!='event_id' and c in events],errors='ignore').merge(u[added],on='event_id',how='left',validate='many_to_one')
+    # 分组累计后向量计算，避免每个日期反复遍历全量事件。
+    rows=[]
+    for number,((mode,rule),g) in enumerate(q.groupby(['mode','exit_rule']),1):
+        by=g.groupby('signal_date',sort=True)
+        base=by.agg(candidate_count=('event_id','size'),all_resolved=('resolved','all'),
+            all_sum=('order_net_pct','sum'),all_closed=('closed','sum'),all_filled=('filled','sum'))
+        for c in FEATURES:
+            known=by['known_'+c].first();ties=by['tied_'+c].first()
+            rank=g['rank_'+c]
+            for group in RANK_GROUPS:
+                select=(rank.eq(int(group[1])) if group in RANK_GROUPS[:3]
+                        else (rank.le(3) if group=='前三名' else rank.gt(g.candidate_count-3)))
+                part=g[select].copy()
+                part['closed_return']=part.net_pct.where(part.closed)
+                part['win']=part.closed&part.net_pct.gt(0)
+                stats=part.groupby('signal_date').agg(selected_count=('event_id','size'),selected_sum=('order_net_pct','sum'),
+                    selected_closed=('closed','sum'),selected_filled=('filled','sum'),selected_wins=('win','sum'),
+                    closed_sum=('closed_return','sum'))
+                f=base.join(stats).copy()
+                countcols=['selected_count','selected_closed','selected_filled','selected_wins']
+                f[countcols]=f[countcols].fillna(0).astype(int)
+                f['feature_known']=known;f['all_tied']=ties
+                f['comparable']=f.all_resolved&known&f.selected_count.gt(0)
+                f['selected_order_pct']=(f.selected_sum/f.selected_count.replace(0,np.nan)).where(f.comparable)
+                f['all_order_pct']=(f.all_sum/f.candidate_count).where(f.comparable)
+                f['others_order_pct']=((f.all_sum-f.selected_sum)/(f.candidate_count-f.selected_count).replace(0,np.nan)).where(f.comparable)
+                f['edge_pp']=f.selected_order_pct-f.all_order_pct
+                f['edge_vs_others_pp']=f.selected_order_pct-f.others_order_pct
+                f['mode']=mode;f['exit_rule']=rule;f['feature']=c;f['rank_group']=group
+                f['year']=f.index.year.astype(str)
+                rows.append(f.reset_index())
+        progress(f'同日排序汇总 {number}/10')
+    daily=pd.concat(rows,ignore_index=True);summary=[];robust=[]
+    for key,whole in daily.groupby(['mode','exit_rule','feature','rank_group'],sort=True):
+        identity=dict(zip(['mode','exit_rule','feature','rank_group'],key))
+        periods=[('全部',whole),('2023及以后',whole[whole.year.ge('2023')])]+list(whole.groupby('year'))
+        for year,period in periods:
+            for scope in ['全部日期','至少6候选']:
+                p=period if scope=='全部日期' else period[period.candidate_count.ge(6)]
+                v=p[p.comparable];closed=int(v.selected_closed.sum());n=len(v)
+                result=dict(identity,year=year,scope=scope,signal_dates=len(p),comparable_dates=n,
+                    unknown_dates=int((~p.all_resolved).sum()),missing_feature_dates=int((~p.feature_known).sum()),
+                    absent_rank_dates=int(p.selected_count.eq(0).sum()),excluded_dates=int((~p.comparable).sum()),
+                    all_tied_dates=int(v.all_tied.sum()),selected_orders=int(v.selected_count.sum()),closed=closed,
+                    cancelled=int((v.selected_count-v.selected_filled).sum()),
+                    event_mean_pct=v.closed_sum.sum()/closed if closed else np.nan,
+                    event_win_pct=v.selected_wins.sum()/closed*100 if closed else np.nan,
+                    day_equal_order_pct=v.selected_order_pct.mean(),day_equal_all_pct=v.all_order_pct.mean(),
+                    day_equal_others_pct=v.others_order_pct.mean(),edge_pp=v.edge_pp.mean(),edge_vs_others_pp=v.edge_vs_others_pp.mean(),
+                    positive_edge_dates_pct=v.edge_pp.gt(0).mean()*100 if n else np.nan,
+                    worst_date_pct=v.selected_order_pct.min(),p10_date_pct=v.selected_order_pct.quantile(.1) if n else np.nan)
+                summary.append(result)
+                if year=='全部' and scope=='至少6候选' and key[1]=='持有20日' and key[3]=='前三名':
+                    robust.append(dict(identity,year=year,scope=scope,edge_pp=v.edge_pp.mean(),**block_interval(p)))
+    return dict(ranked_signals=u,ranking_daily=daily,ranking_summary=pd.DataFrame(summary),ranking_robustness=pd.DataFrame(robust))
+
+
+def build_reports(events,calendar,cfg):
+    tables=build_shape_reports(events,calendar,cfg)
+    tables.update(ranking_reports(tables['events']))
+    return tables
+
+
+def reanalyze_zip(source,progress=lambda _:None):
+    """只读取固定成员，不解压文件，不读取或执行压缩包中的代码。"""
+    with zipfile.ZipFile(source) as z:
+        if sum(x.file_size for x in z.infolist())>1024**3:raise ValueError('结果解压后超过1GB，请缩小研究区间。')
+        manifest=json.loads(z.read('manifest.json'))
+        if not str(manifest.get('version','')).startswith(('T3.1-','T3.2-')):raise ValueError('请上传T3.1或T3.2生成的结果ZIP。')
+        keep=['events','summary','feature_groups','joint_groups','diagnostics','thresholds','daily_comparison',
+              'annual_coverage','status_counts','data_issues','universe','industry_intervals']
+        tables={}
+        for name in keep:
+            if name+'.csv' not in z.namelist():continue
+            try:tables[name]=pd.read_csv(z.open(name+'.csv'),dtype={'year':str,'ts_code':str,'event_id':str})
+            except pd.errors.EmptyDataError:tables[name]=pd.DataFrame()
+    if 'events' not in tables:raise ValueError('结果缺少events.csv。')
+    e=tables['events']
+    if not e.empty:
+        required={'event_id','ts_code','mode','signal_date','year','circ_mv_yi','exit_rule','qualified',
+            'closed','filled','resolved','order_net_pct','net_pct'}|set(FEATURES)
+        if required-set(e):raise ValueError('事件明细缺少字段：'+','.join(sorted(required-set(e))))
+        for c in ['qualified','closed','filled','resolved']:
+            if not e[c].astype(str).isin(['True','False']).all():raise ValueError('布尔状态异常：'+c)
+            e[c]=e[c].astype(str).eq('True')
+        for c in ['signal_date','buy_date','sell_date']:
+            if c in e:e[c]=pd.to_datetime(e[c],errors='raise')
+        if e.signal_date.isna().any() or not e['mode'].isin(MODES).all() or not e.exit_rule.isin(EXITS).all():raise ValueError('事件日期、观察模式或退出规则异常。')
+        if e.duplicated(['event_id','exit_rule']).any():raise ValueError('同事件同退出窗口有重复行。')
+        fixed=['ts_code','mode','signal_date','year','circ_mv_yi','qualified']+list(FEATURES)
+        if e.groupby('event_id')[fixed].nunique(dropna=False).gt(1).any().any():raise ValueError('同事件的信号字段跨退出窗口不一致。')
+        if (e.resolved&e.qualified&e.order_net_pct.isna()).any() or (e.closed&e.net_pct.isna()).any():raise ValueError('已确定事件缺少收益。')
+        if (e.closed&~e.resolved).any() or (e.closed&~e.filled).any():raise ValueError('成交或闭合状态不一致。')
+    progress('复用原信号和成交结果，开始同日排序')
+    tables.update(ranking_reports(e,progress))
+    old_version=manifest['version'];manifest=dict(manifest)
+    manifest.update(version=VERSION,source_version=old_version,source_created_at=manifest.get('created_at'),
+        created_at=datetime.now(ZoneInfo('Asia/Shanghai')).isoformat(),rules=RULES,
+        study='同日排序验证；主检验K−D降序前三名、至少6候选、持有20日；无资金组合',
+        analysis_mode='导入结果重算，未新增行情，未更新未完成交易')
+    manifest['limitations']=list(manifest.get('limitations',[]))+['导入结果保留原成交路径及数据截止日；不能补足未完成交易','辅助指标及窗口是探索性比较；不自动选择最优评分']
+    zipped=make_zip(tables,manifest)
+    return tables,manifest,zipped,''
+
+
 def make_zip(tables,manifest):
     buffer=io.BytesIO()
     with zipfile.ZipFile(buffer,'w',compression=zipfile.ZIP_DEFLATED) as z:
@@ -582,7 +745,7 @@ def run_research(token,cache_root,cfg,progress):
     manifest=dict(version=VERSION,config=asdict(cfg),rules=RULES,created_at=datetime.now(ZoneInfo('Asia/Shanghai')).isoformat(),
         data_start=start,data_end=end,data_hash=data_hash,pool_hash=hashlib.sha256(member.to_csv(index=False).encode()).hexdigest(),
         pool_mode=mode,warnings=pool_warnings,data_issues=len(issues),universe_size=len(basic),download_workers=DOWNLOAD_WORKERS,
-        study='周线N6上穿25；斜率、间距、加速度；两种观察模式×五种退出；无组合',
+        study='同日排序验证；主检验K−D降序前三名、至少6候选、持有20日；无资金组合',
         limitations=['历史反复观察，尚非前向验证','分位边界只用过去形态但并不消除研究选择偏差',
         '指标公式沿用项目SKDJ；未对截图软件逐点导出值做完整校验','未知事件与未完成事件单列，缺行情仍可能漏信号',
         '最高浮盈不是实际收益；日期对照为上穿信号而非全科技池','同股重复事件及各窗口相关，不提供独立样本显著性声明'])
@@ -604,78 +767,107 @@ LABELS={'mode':'观察模式','exit_rule':'退出规则','year':'信号年度','
     'no_signal_weeks':'无新信号周','no_filled_signal_weeks':'无可成交新信号周','full_year':'完整年度'}
 
 
+RANK_LABELS=dict(LABELS,rank_group='名次范围',scope='候选数量范围',signal_dates='信号日期数',
+    comparable_dates='可比日期数',unknown_dates='含未知结果日期',missing_feature_dates='指标缺失日期',
+    absent_rank_dates='无该名次日期',excluded_dates='不可比日期（去重）',all_tied_dates='全体指标同分日期',
+    selected_orders='入选订单数',event_mean_pct='可比日期闭合事件均值%',event_win_pct='可比日期闭合事件胜率%',
+    day_equal_order_pct='入选组日期等权收益%',day_equal_all_pct='同日全部候选收益%',
+    day_equal_others_pct='同日未选中候选收益%',edge_vs_others_pp='相对未选中候选差（百分点）',
+    worst_date_pct='最差日期组均值%',p10_date_pct='日期组均值10分位%',ci_dates='区间估计日期数',
+    edge_ci_low='同日收益差95%区间下限',edge_ci_high='同日收益差95%区间上限',ci_status='区间口径')
+
+
 def show_results(st,tables,manifest,zipped):
     cfg=manifest['config'];st.subheader(manifest['version'])
-    st.download_button('下载完整验证结果 ZIP',zipped,file_name=f"tech_swing_T3_1_{cfg['start']}_{cfg['end']}.zip",mime='application/zip')
-    if manifest['warnings'] or manifest['data_issues']:st.warning('数据受限：'+'；'.join(manifest['warnings'])+f"；问题记录{manifest['data_issues']}条")
-    if tables['events'].empty:st.info('本区间没有可识别的周线上穿25事件。');return
-    st.caption('先看样本量、未完成数与净收益，再看最高浮盈。第一年通常用于校准；各组不构成资金组合。')
+    st.download_button('下载T3.2完整验证结果 ZIP',zipped,file_name=f"tech_swing_T3_2_{cfg['start']}_{cfg['end']}.zip",mime='application/zip')
+    st.caption(f"行情截止：{manifest.get('data_end',cfg['end'])}。"+manifest.get('analysis_mode','重新计算行情与成交路径。'))
+    if manifest.get('warnings') or manifest.get('data_issues',0):st.warning('数据受限：'+'；'.join(manifest.get('warnings',[]))+f"；问题记录{manifest.get('data_issues',0)}条")
+    if tables['ranking_summary'].empty:st.info('没有可用于排序的合格上穿事件。');return
+    st.info('主检验固定：K−D降序、前三名、同日至少6候选、20日窗口。前三名是独立事件比较，没有三仓资金配置。')
     mode=st.selectbox('观察模式',MODES)
+    feature=st.selectbox('排序指标',['gap','cross_speed','pre_speed','acceleration','gap_change'],format_func=lambda c:FEATURES[c])
     rule=st.selectbox('退出口径',EXITS,index=2)
-    year=st.selectbox('信号年度',['全部']+sorted(tables['events'].year.unique()))
-    feat=st.selectbox('形态特征',list(FEATURES),format_func=lambda x:FEATURES[x])
-    def selected(name,filter_feature=False):
+    scope=st.selectbox('候选数量范围',['至少6候选','全部日期'])
+    year=st.selectbox('信号年度',['全部','2023及以后']+sorted(tables['events'].year.unique()))
+    def select(name):
         f=tables[name].copy()
-        for col,val in [('mode',mode),('exit_rule',rule),('year',year)]:
-            if col in f:
-                if col=='year' and name in ['thresholds','annual_coverage','status_counts'] and year=='全部':continue
-                f=f[f[col].eq(val)]
-        if filter_feature and 'feature' in f:f=f[f.feature.eq(feat)]
+        for col,val in [('mode',mode),('feature',feature),('exit_rule',rule),('scope',scope)]:
+            if col in f:f=f[f[col].eq(val)]
+        if 'year' in f and name!='ranking_robustness':f=f[f.year.eq(year)]
         if 'feature' in f:f['feature']=f.feature.map(FEATURES)
-        return f.rename(columns=LABELS)
-    tabs=st.tabs(['基准与单项形态','斜率×间距','同日对照','诊断与覆盖','事件与规则'])
+        return f.rename(columns=RANK_LABELS)
+    tabs=st.tabs(['同日排序结果','逐年与稳健性','逐日及信号明细','原形态基准与数据'])
     with tabs[0]:
-        st.dataframe(selected('summary'),hide_index=True)
-        st.dataframe(selected('feature_groups',True),hide_index=True)
-        st.caption('低/中/高边界按年冻结；全期汇总的各年边界可能不同。校准不足的事件只作基准，不能混称低组。')
-        st.dataframe(selected('thresholds',True),hide_index=True)
+        st.caption('先比较日期等权收益差，再看事件均值与胜率。两种观察模式独立，辅助指标和窗口不自动选优。')
+        st.dataframe(select('ranking_summary'),hide_index=True)
+        st.caption('同日所有候选结果均确定、且指标完整，才进入严格比较。排除原因可能重叠，以“不可比日期（去重）”为准。')
     with tabs[1]:
-        st.caption('比较上穿周增量与K−D的九格组合；不自动推荐最高收益格。')
-        st.dataframe(selected('joint_groups'),hide_index=True)
+        f=tables['ranking_summary'];f=f[f['mode'].eq(mode)&f.feature.eq(feature)&f.exit_rule.eq(rule)&f.scope.eq(scope)&f.rank_group.eq('前三名')&~f.year.isin(['全部','2023及以后'])]
+        st.dataframe(f.rename(columns=RANK_LABELS),hide_index=True)
+        st.caption('下表固定全部年份、20日、至少6候选、前三名。8周区块保留同周股票共振及部分时间相关性；探索性区间不等于实盘有效证明。')
+        f=tables['ranking_robustness'];f=f[f['mode'].eq(mode)&f.feature.eq(feature)] if not f.empty else f
+        st.dataframe(f.rename(columns=RANK_LABELS),hide_index=True)
     with tabs[2]:
-        st.caption('仅比较同日全信号结果均确定的日期；含确定取消单的零收益，不含未知。用于检查是否只是碰到整体好行情。')
-        st.dataframe(selected('daily_comparison',True),hide_index=True)
+        f=tables['ranking_daily'];f=f[f['mode'].eq(mode)&f.feature.eq(feature)&f.exit_rule.eq(rule)&f.rank_group.eq('前三名')]
+        if scope=='至少6候选':f=f[f.candidate_count.ge(6)]
+        if year=='2023及以后':f=f[f.year.ge('2023')]
+        elif year!='全部':f=f[f.year.eq(year)]
+        st.caption('日期表保留不可比日期，可定位未知结果；完整数据见ZIP。')
+        st.dataframe(f.tail(300),hide_index=True)
+        u=tables['ranked_signals'];u=u[u['mode'].eq(mode)]
+        if year=='2023及以后':u=u[u.year.ge('2023')]
+        elif year!='全部':u=u[u.year.eq(year)]
+        cols=['signal_date','ts_code','candidate_count',feature,'rank_'+feature,'circ_mv_yi','known_'+feature]
+        st.dataframe(u.sort_values(['signal_date','rank_'+feature])[cols].tail(300),hide_index=True)
     with tabs[3]:
-        st.dataframe(selected('diagnostics'),hide_index=True)
-        st.caption('无新信号周不等于资金空仓周；本版没有仓位系统。')
-        st.dataframe(selected('annual_coverage'),hide_index=True)
-    with tabs[4]:
-        st.dataframe(selected('status_counts'),hide_index=True)
-        e=tables['events'];e=e[(e['mode']==mode)&(e.exit_rule==rule)]
-        if year!='全部':e=e[e.year==year]
-        st.dataframe(e.tail(300),hide_index=True)
-        st.text(STUDY_NOTES);st.dataframe(tables['data_issues']);st.json(manifest)
+        f=tables.get('summary',pd.DataFrame())
+        if not f.empty:
+            f=f[f['mode'].eq(mode)&f.exit_rule.eq(rule)]
+            if year!='2023及以后':f=f[f.year.eq(year)]
+            st.dataframe(f.rename(columns=LABELS),hide_index=True)
+        st.text(STUDY_NOTES);st.dataframe(tables.get('data_issues',pd.DataFrame()));st.json(manifest)
 
 
 def main():
     import streamlit as st
-    st.set_page_config(page_title='周线SKDJ形态验证 T3.1',layout='wide')
-    st.title('周线SKDJ T3.1 · 上穿25形态验证')
+    st.set_page_config(page_title='周线SKDJ同日排序 T3.2',layout='wide')
+    st.title('周线SKDJ T3.2 · 同日排序验证')
     try:default=str(st.secrets.get('TUSHARE_TOKEN',st.secrets.get('tushare_token','')))
     except Exception:default=''
+    token=''
     with st.sidebar:
-        token=st.text_input('Tushare Token',value=os.environ.get('TUSHARE_TOKEN',default),type='password')
-        start=st.date_input('上穿事件开始日',value=date(2022,1,1));end=st.date_input('上穿事件结束日',value=latest_ready_day().date())
-        price=st.number_input('最低股价（高于，元）',value=10.,min_value=0.,step=1.)
-        low=st.number_input('最低流通市值（亿元）',value=50.,min_value=0.,step=10.)
-        high=st.number_input('最高流通市值（亿元）',value=1000.,min_value=1.,step=100.)
-        root=st.text_input('数据缓存目录',value='tech_swing_cache')
-        st.caption('沿用原缓存，四路并发补缺；固定周线N=6、平滑3；无三仓。')
-        run=st.button('运行周线形态验证',type='primary')
-    with st.expander('研究口径'):st.text(STUDY_NOTES)
-    if run:
-        if not token.strip():st.error('请输入Token或设置TUSHARE_TOKEN。')
-        elif start>end or low>=high or not root.strip():st.error('请检查日期、市值范围及缓存目录。')
+        source=st.radio('数据来源',['导入T3.1/T3.2结果（无需下载行情）','下载行情重新回测'])
+        if source.startswith('导入'):
+            uploaded=st.file_uploader('上传原回测结果ZIP',type=['zip'])
+            st.caption('使用ZIP内原日期与股票池设置。可直接上传刚完成的T3.1结果；未完成交易保持原状态。')
         else:
-            box=st.empty();last=[0.]
-            def progress(msg):
-                if time.monotonic()-last[0]>.25:box.info(msg);last[0]=time.monotonic()
-            try:
-                st.session_state['t31_result']=run_research(token,root.strip(),Config(ds(start),ds(end),price,low,high),progress)
-                box.success('验证完成，可下载完整结果。')
-            except Exception as exc:box.error(str(exc).replace(token,'[隐藏]')[:500]);st.info('成功下载的数据已缓存，修复后可继续补缺。')
-    if 't31_result' in st.session_state:
-        tables,manifest,zipped,_=st.session_state['t31_result'];show_results(st,tables,manifest,zipped)
+            token=st.text_input('Tushare Token',value=os.environ.get('TUSHARE_TOKEN',default),type='password')
+            start=st.date_input('上穿事件开始日',value=date(2022,1,1));end=st.date_input('上穿事件结束日',value=latest_ready_day().date())
+            price=st.number_input('最低股价（高于，元）',value=10.,min_value=0.,step=1.)
+            low=st.number_input('最低流通市值（亿元）',value=50.,min_value=0.,step=10.)
+            high=st.number_input('最高流通市值（亿元）',value=1000.,min_value=1.,step=100.)
+            root=st.text_input('数据缓存目录',value='tech_swing_cache')
+            st.caption('沿用原缓存，四路并发补缺；固定周线N=6、平滑3。')
+        run=st.button('运行T3.2同日排序验证',type='primary')
+    with st.expander('研究规则'):st.text(STUDY_NOTES)
+    if run:
+        box=st.empty();last=[0.]
+        def progress(msg):
+            if time.monotonic()-last[0]>.25:box.info(msg);last[0]=time.monotonic()
+        try:
+            if source.startswith('导入'):
+                if uploaded is None:raise ValueError('请先上传T3.1或T3.2结果ZIP。')
+                st.session_state['t32_result']=reanalyze_zip(io.BytesIO(uploaded.getvalue()),progress)
+            else:
+                if not token.strip():raise ValueError('请输入Token或设置TUSHARE_TOKEN。')
+                if start>end or low>=high or not root.strip():raise ValueError('请检查日期、市值范围及缓存目录。')
+                st.session_state['t32_result']=run_research(token,root.strip(),Config(ds(start),ds(end),price,low,high),progress)
+            box.success('T3.2验证完成，结果已保留，可下载。')
+        except Exception as exc:
+            msg=str(exc);msg=msg.replace(token,'[隐藏]') if token else msg
+            box.error(msg[:500])
+    if 't32_result' in st.session_state:
+        tables,manifest,zipped,_=st.session_state['t32_result'];show_results(st,tables,manifest,zipped)
 
 
 def self_test():
@@ -779,10 +971,66 @@ def self_test():
             payload=make_zip(tables,dict(version=VERSION))
             with zipfile.ZipFile(io.BytesIO(payload)) as z:self.assertIn('thresholds.csv',z.namelist())
             self.assertTrue(all(f.empty for f in build_reports(pd.DataFrame(),self.cal,cfg).values()))
+        def ranking_fixture(self):
+            records=[]
+            for day in pd.to_datetime(['2023-01-06','2023-01-13']):
+                for i in range(6):
+                    row=dict(event_id=f'{day.date()}_{i}',ts_code=f'{600000+i}.SH',mode=MODES[0],signal_date=day,
+                        year='2023',circ_mv_yi=100.+i,qualified=True,exit_rule='持有20日',closed=True,filled=True,resolved=True,
+                        net_pct=float(i),order_net_pct=float(i))
+                    row.update({c:float(6-i) for c in FEATURES});records.append(row)
+            return pd.DataFrame(records)
+        def test_rank_causal_and_ties(self):
+            e=self.ranking_fixture();a=ranked_signals(e)
+            changed=e.copy();changed['net_pct']=1000.;changed['filled']=False;changed['resolved']=False
+            pd.testing.assert_frame_equal(a,ranked_signals(changed))
+            e['gap']=5.;u=ranked_signals(e)
+            self.assertTrue(u.loc[u.ts_code=='600005.SH','rank_gap'].eq(1).all())
+            self.assertTrue(u.tied_gap.all())
+        def test_cancel_no_replacement_and_unknown_date(self):
+            e=self.ranking_fixture()
+            e.loc[0,['closed','filled']]=False;e.loc[0,'net_pct']=np.nan;e.loc[0,'order_net_pct']=0.
+            e.loc[11,'resolved']=False;e.loc[11,'order_net_pct']=np.nan;e.loc[11,'closed']=False;e.loc[11,'net_pct']=np.nan
+            t=ranking_reports(e)
+            s=t['ranking_summary'];r=s[s.feature.eq('gap')&s.rank_group.eq('前三名')&s.year.eq('全部')&s.scope.eq('至少6候选')].iloc[0]
+            self.assertEqual(r.comparable_dates,1);self.assertEqual(r.unknown_dates,1)
+            self.assertEqual(r.selected_orders,3);self.assertEqual(r.cancelled,1)
+            self.assertAlmostEqual(r.day_equal_order_pct,1.)
+            self.assertAlmostEqual(r.edge_pp,-1.5)
+            self.assertAlmostEqual(r.edge_vs_others_pp,-3.)
+        def test_missing_feature_and_sparse(self):
+            e=self.ranking_fixture();e.loc[5,'gap']=np.nan
+            t=ranking_reports(e);d=t['ranking_daily']
+            a=d[d.feature.eq('gap')&d.rank_group.eq('前三名')].sort_values('signal_date')
+            self.assertFalse(a.comparable.iloc[0]);self.assertTrue(a.comparable.iloc[1])
+            sparse=ranking_reports(e.iloc[:2].copy())['ranking_summary']
+            self.assertTrue(sparse.loc[sparse.scope.eq('至少6候选'),'comparable_dates'].eq(0).all())
+            self.assertEqual(sparse.loc[sparse.scope.eq('全部日期')&sparse.feature.eq('gap')&sparse.rank_group.eq('第3名')&sparse.year.eq('全部'),'absent_rank_dates'].iloc[0],1)
+        def test_import_roundtrip_and_validation(self):
+            e=self.ranking_fixture();manifest=dict(version='T3.1-WEEKLY-SHAPE-20260910',config=asdict(Config()),warnings=[],data_issues=0)
+            payload=make_zip({'events':e},manifest)
+            tables,new,blob,_=reanalyze_zip(io.BytesIO(payload))
+            self.assertEqual(new['version'],VERSION);self.assertFalse(tables['ranking_summary'].empty)
+            self.assertEqual(tables['events'].net_pct.tolist(),e.net_pct.tolist())
+            b,_,_,_=reanalyze_zip(io.BytesIO(blob))
+            pd.testing.assert_frame_equal(tables['ranking_summary'],b['ranking_summary'])
+            e.loc[0,'resolved']=False
+            with self.assertRaises(ValueError):reanalyze_zip(io.BytesIO(make_zip({'events':e},manifest)))
+        def test_block_interval_constant_edge(self):
+            days=pd.date_range('2023-01-06',periods=60,freq='W-FRI')
+            d=pd.DataFrame(dict(signal_date=days,comparable=True,edge_pp=2.))
+            r=block_interval(d)
+            self.assertAlmostEqual(r['edge_ci_low'],2.);self.assertAlmostEqual(r['edge_ci_high'],2.)
+
     result=unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(Tests))
     if not result.wasSuccessful():raise SystemExit(1)
 
 
 if __name__=='__main__':
     if '--self-test' in sys.argv:self_test()
+    elif '--reanalyze' in sys.argv:
+        import argparse
+        parser=argparse.ArgumentParser();parser.add_argument('--reanalyze',required=True);parser.add_argument('--output',required=True)
+        args=parser.parse_args();tables,manifest,zipped,_=reanalyze_zip(args.reanalyze,print);atomic_bytes(zipped,args.output)
+        print('已生成',args.output)
     else:main()
