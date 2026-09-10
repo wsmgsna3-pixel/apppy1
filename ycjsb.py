@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""科技波段研究 T3.0 日线SKDJ等待确认 — streamlit run app.py
+"""科技波段研究 T3.1 周线SKDJ上穿25形态 — streamlit run app.py
 
 单文件；依赖 pandas、numpy、streamlit、tushare。python app.py --self-test 可离线验算。
 策略阈值不是回测寻优结果。历史统计不构成策略有效或实盘合格证明。
@@ -27,8 +27,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
-VERSION = "T3.0-DAILY-SKDJ-20260910"
-WEEK_FILTERS = ("不过滤", "金叉或K拐头", "仅金叉")
+VERSION = "T3.1-WEEKLY-SHAPE-20260910"
 DOWNLOAD_REVISION = "DL4"
 DOWNLOAD_WORKERS = 4
 API_MIN_INTERVAL = 0.36
@@ -293,37 +292,6 @@ class DataClient:
         return data, pd.DataFrame(issues, columns=["date", "endpoint", "problem"])
 
 
-RULES = {
-    '股票池':'历史科技行业；不复权股价>10元，流通市值50—1000亿元（侧栏可调整）',
-    '日线':'N=6、9；RSV→EMA3→EMA3(K)→MA3(D)。缺报价后重新预热，避免跨缺口交叉',
-    '低位金叉':'前日K≤D，当日K>D且K、D均<25；金叉当日为D0',
-    '确认':'D1/D2/D3开盘入场分别使用D0/D1/D2收盘信息；观察期K一直>D，确认日K上升',
-    '比较':'D2、D3为主组；D1是不等待的辅助对照。每个N×买入日×周线规则独立研究',
-    '排序':'同一组、同一确认日，K−D降序；精确相同则当日流通市值降序，再按代码；取消单不补名次',
-    '周线':'统一N=9、平滑3；使用已完成周线，周五收盘纳入本周，其他交易日使用上一日历周',
-    '周线组':'不过滤；金叉或K拐头（K>D或K较前周上升）；仅金叉（K>D）。10周不作为门槛',
-    '入场':'下一交易日开盘；停牌、缺开盘/复权/限制价、开盘涨停时取消；不沿用C形态低点或5%高开过滤',
-    '退出':'对应日线N收盘死叉（K<D且前日K≥D）后下一交易日开盘卖；买入日第1天，第30交易日开盘到期',
-    '延迟':'退出指令一经触发不撤销；停牌、缺报价或开盘跌停则等待，实际可超过30交易日',
-    '成本':'买入费用0.10%、卖出费用0.20%，每边滑点0.10%；无最低收费模拟',
-    '事件':'同一金叉每组最多一笔；各组独立，不是多次加仓；不设资金总额或三仓',
-    '范围':'侧栏日期限定D0金叉日；确认、买入和退出可在区间结束之后，行情仅读取已完成日期',
-    '数据':'历史行业及风险警示重建仍有供应商限制；持有期间缺指标数据使退出路径不可确定，单列不计闭合收益',
-}
-STUDY_NOTES = '\n'.join(f'{k}：{v}' for k,v in RULES.items()) + '''
-EMA递推系数为0.5，以第一笔有效RSV初始化；每段连续数据前N+5笔不发指标，至少N+6笔才可用。
-金叉与确认时均检查股票池资格。已知资格不符是未发单；数据不足是未知，不冒充零收益。
-日期等权和排名超额仅使用同组当日所有已发单结果均已确定的日期，可能存在成熟度选择偏差。
-同金叉D2/D3配对同时展示两组都成交、早组成交晚组未成交、早组未成交晚组成交和都未成交。
-跳过的交易有独立计数；未确认、待买入、尚未退出、数据未知不作为亏损或零收益进入胜率。
-基准是同日全部合格日线信号，不是整个科技池随机选股；本版不能自动证明市场超额能力。
-排名第1/2/3及前三名均为独立事件统计，不是有限资金组合收益。不同N不混排。
-同股重复金叉的独立事件可能重叠；分组和持有窗口相关，不把事件数当作独立统计样本。
-周线死叉周龄仅诊断，按交易周数计；周线K拐头不等于价格反转，不自动挑选表现最优参数。
-所有年份均为已经观察过的历史，正收益还需要冻结后的前向验证。
-'''
-
-
 def latest_ready_day():
     now=datetime.now(ZoneInfo('Asia/Shanghai'))
     return pd.Timestamp(now.date()-timedelta(days=1 if now.hour<18 else 0))
@@ -347,30 +315,6 @@ def skdj(frame, n):
     return output
 
 
-def completed_weekly(g):
-    keys=g.index.to_period('W-FRI')
-    valid=g[['ac','ah','al']].notna().all(axis=1)
-    w=g.assign(key=keys,valid=valid).groupby('key').agg(ac=('ac','last'),ah=('ah','max'),al=('al','min'),valid=('valid','all'))
-    w.loc[~w.valid,['ac','ah','al']]=np.nan
-    kd=skdj(w,9);w=w.join(kd)
-    w['k_prev']=w.k.shift();w['death']=w.k.lt(w.d)&w.k.shift().ge(w.d.shift())
-    age=[];last=None
-    for i,row in enumerate(w.itertuples()):
-        if pd.isna(row.k) or pd.isna(row.d):last=None
-        elif row.death:last=i
-        elif row.k>row.d:last=None
-        age.append(i-last if last is not None else np.nan)
-    w['death_age']=age
-    cols=['k','d','k_prev','death_age']
-    out=pd.DataFrame(index=g.index)
-    friday=g.index.weekday==4
-    for col in cols:
-        current=pd.Series(keys.map(w[col]),index=g.index,dtype=float)
-        previous=pd.Series(keys.map(w[col].shift()),index=g.index,dtype=float)
-        out['w_'+col]=previous.where(~friday,current)
-    return out
-
-
 def eligibility(g, code, info, intervals, calendar, cfg):
     active=np.zeros(len(calendar),dtype=bool)
     for m in intervals.itertuples():
@@ -383,111 +327,156 @@ def eligibility(g, code, info, intervals, calendar, cfg):
     return eligible,known
 
 
-def exit_path(g, kd, buy_i, death=None):
-    """一个可执行买单；各周线组复用相同路径。"""
-    cal=g.index
-    result=dict(filled=False,closed=False,resolved=False,entry_status='待买入',exit_reason='',
+# 分组边界只从先前年份的信号形态获得，不使用未来收益。
+FEATURES = {
+    'pre_speed':'上穿前两周平均K增量',
+    'cross_speed':'上穿周K增量',
+    'acceleration':'K增量的变化',
+    'gap':'K减D',
+    'gap_change':'K减D较前周扩大值',
+}
+MODES=('周收盘确认','周中逐日观察')
+EXITS=('持有5日','持有10日','持有20日','持有40日','周线死叉或40日')
+RULES={
+    '研究问题':'周线N=6上穿25时，K斜率、K−D及其扩大速度能否区分后续收益；无资金组合、无三仓',
+    '股票池':'历史科技行业；信号日不复权股价>10元，流通市值50—1000亿元；保留上市180日及风险警示近似排除',
+    '指标':'沿用RSV(N=6)→EMA3→EMA3(K)→MA3(D)；不是屏幕角度；连续有效周至少12周预热',
+    '基准事件':'前一完成周K≤25，本次K>25；先保留全部上穿，K>D与否单独诊断，不预先删除纠缠样本',
+    '周收盘确认':'当周最后交易日收盘上穿，下一交易日开盘买；区间最后一个未确认完成周不作为周收盘信号',
+    '周中逐日观察':'每天收盘以截至当日周OHLC计算暂态周线；对比上一完成周K；每股每周仅记录首次上穿，不事后要求周末仍站上25',
+    '周中斜率':'本周暂态K减上一完成周K，尚非完整一周；按信号星期另作诊断；每日暂态值不重复参与周EMA',
+    '特征':'上穿前两周平均增量=(K前1周−K前3周)/2；上穿周增量=K−K前1周；加速度=本次增量−前周增量；间距=K−D；间距变化=本次间距−前周间距',
+    '分组':'每个观察模式、每年冻结边界：仅用该年前的合格信号形态计算1/3、2/3分位；至少100个历史事件；不足则只记基准并标记校准不足',
+    '联合比较':'上穿周增量低中高 × K−D低中高，九格比较；另看间距扩大/持平/收窄，不自动选择最佳门槛或评分',
+    '买入':'信号次交易日开盘；涨停或停牌取消；缺必要行情单列未知；取消不延后追买',
+    '固定窗口':'第5/10/20/40个持有交易日收盘发出退出指令，下一交易日开盘卖；因此正常记录持有天数为6/11/21/41（含卖出日）',
+    '形态退出':'对应观察模式周K<D且前一完成周K≥D，收盘触发后次交易日卖；周收盘模式只在完成周判断；未触发则第40日收盘发退出指令',
+    '执行':'A股T+1；退出指令不撤销；已知开盘跌停或停牌等待可执行开盘；关键退出行情缺失则路径未知，不猜测可延迟成交',
+    '相关性':'D为最近3周K均值，因此K−D=(2×本周K增量+前周K增量)/3；斜率和间距相关，联合表现好不能算两份独立证据',
+    '成本':'买入费用0.10%、卖出费用0.20%；每边滑点0.10%，限制在涨跌停价内；不模拟最低收费',
+    '统计':'净收益均值、中位数、胜率、10分位、去掉最好1%后的均值；最高浮盈为诊断，不等于可实现收益',
+    '对照':'同模式同日全部合格上穿信号；日期等权差只用当日所有事件结果已确定的日期（取消单按0）；不是整个科技池超额',
+    '未完成':'待买入、待卖出、缺数据均单列，不填0；同时导出逐年和逐事件结果，避免近期未完成样本冒充失败',
+    '限制':'重复使用的历史不是未见样本证明；同股事件可重叠，各窗口相关；科技历史行业、风险警示、退市及公司行动数据仍有限制',
+}
+STUDY_NOTES='\n'.join(f'{k}：{v}' for k,v in RULES.items())
+
+
+def weekly_shape(g):
+    """O(日数)暂态周指标；每个日值仅使用当日及之前数据。"""
+    key=g.index.to_period('W-FRI')
+    good=g[['ac','ah','al']].notna().all(axis=1)&g.ac.gt(0)&g.ah.ge(g.al)
+    x=g.assign(key=key,good=good)
+    w=x.groupby('key').agg(ac=('ac','last'),ah=('ah','max'),al=('al','min'),good=('good','all'))
+    w.loc[~w.good,['ac','ah','al']]=np.nan
+    # 内部未遮罩状态用于计算当前暂态周，公开指标仍有预热门槛。
+    w['slow']=np.nan;w['raw_k']=np.nan;w['count']=0
+    seg=(~w.good).cumsum()
+    for _,part in w[w.good].groupby(seg[w.good],sort=False):
+        lo=part.al.rolling(6).min();hi=part.ah.rolling(6).max()
+        r=100*(part.ac-lo)/(hi-lo).replace(0,np.nan);r=r.mask(hi.eq(lo)&hi.notna(),50.)
+        slow=r.ewm(span=3,adjust=False).mean();raw=slow.ewm(span=3,adjust=False).mean()
+        w.loc[part.index,'slow']=slow;w.loc[part.index,'raw_k']=raw
+        w.loc[part.index,'count']=np.arange(len(part))+1
+    w=w.join(skdj(w,6))
+    def mapped(series):return pd.Series(key.map(series),index=g.index,dtype=float)
+    prev_lo=mapped(w.al.rolling(5,min_periods=5).min().shift())
+    prev_hi=mapped(w.ah.rolling(5,min_periods=5).max().shift())
+    low=pd.concat([prev_lo,x.groupby('key').al.cummin()],axis=1).min(axis=1).where(prev_lo.notna())
+    high=pd.concat([prev_hi,x.groupby('key').ah.cummax()],axis=1).max(axis=1).where(prev_hi.notna())
+    current_good=x.groupby('key').good.cummin().astype(bool)
+    r=100*(g.ac-low)/(high-low).replace(0,np.nan);r=r.mask(high.eq(low)&high.notna(),50.)
+    ps=mapped(w.slow.shift());pk=mapped(w.raw_k.shift())
+    slow=(r+ps)/2;slow=slow.where(ps.notna(),r)
+    raw=(slow+pk)/2;raw=raw.where(pk.notna(),slow)
+    d=(raw+pk+mapped(w.raw_k.shift(2)))/3
+    count=mapped(w['count'].shift()).fillna(0)+1
+    valid=current_good&count.ge(12)
+    out=pd.DataFrame({'k':raw.where(valid),'d':d.where(valid)},index=g.index)
+    out['k1']=mapped(w.k.shift());out['k2']=mapped(w.k.shift(2));out['k3']=mapped(w.k.shift(3));out['d1']=mapped(w.d.shift())
+    out['pre_speed']=(out.k1-out.k3)/2
+    out['cross_speed']=out.k-out.k1
+    out['acceleration']=out.cross_speed-(out.k1-out.k2)
+    out['gap']=out.k-out.d;out['gap_change']=out.gap-(out.k1-out.d1)
+    # 下一周确实存在，或已到周五，才能把该行当成已完成周。
+    last=np.r_[key[:-1]!=key[1:],g.index[-1].weekday()==4]
+    out['complete']=last
+    out['cross']=out.k.gt(25)&out.k1.le(25)
+    out['death']=out.k.lt(out.d)&out.k1.ge(out.d1)
+    out['week']=key.astype(str)
+    return out
+
+
+def trade_path(g,shape,buy_i,mode,exit_rule):
+    result=dict(filled=False,closed=False,resolved=False,status='待买入',exit_reason='',
         buy_date=pd.NaT,sell_date=pd.NaT,buy_adj=np.nan,sell_adj=np.nan,net_pct=np.nan,
-        order_net_pct=np.nan,hold_days=np.nan,overdue_days=0,mfe_pct=np.nan,mae_pct=np.nan)
+        order_net_pct=np.nan,hold_days=np.nan,delayed_days=0,mfe_pct=np.nan,mae_pct=np.nan)
     if buy_i>=len(g):return result
     row=g.iloc[buy_i]
-    vals=[row.open,row.adj_factor,row.up_limit,row.down_limit,row.vol]
-    if not np.isfinite(vals).all() or min(row.open,row.adj_factor)<=0 or row.vol<=0:
-        result.update(entry_status='缺报价或停牌取消',resolved=True,order_net_pct=0.);return result
-    if row.open>=row.up_limit-.005:
-        result.update(entry_status='开盘涨停取消',resolved=True,order_net_pct=0.);return result
+    needed=[row.open,row.adj_factor,row.up_limit,row.down_limit,row.vol]
+    if pd.notna(row.vol) and row.vol<=0:
+        result.update(status='停牌或涨停取消',resolved=True,order_net_pct=0.);return result
+    if not np.isfinite(needed).all():result['status']='买入数据未知';return result
+    if row.vol<=0 or row.open<=0 or row.open>=row.up_limit-.005:
+        result.update(status='停牌或涨停取消',resolved=True,order_net_pct=0.);return result
+    if row.adj_factor<=0 or row.down_limit<=0 or row.up_limit<row.down_limit:
+        result['status']='买入数据异常';return result
     buy=min(row.open*1.001,row.up_limit)*row.adj_factor
-    result.update(filled=True,entry_status='已成交',buy_date=cal[buy_i],buy_adj=buy)
-    deadline=buy_i+29
-    ka,da=kd.k.to_numpy(),kd.d.to_numpy()
-    if death is None:death=((kd.k<kd.d)&(kd.k.shift()>=kd.d.shift())).to_numpy()
-    request=None;reason='';unknown=False
-    for j in range(buy_i,min(len(g),deadline+1)):
-        # 开盘到期优先于当日收盘指标；买入当日收盘死叉最早次日卖。
-        if j==deadline:request=j;reason='30交易日到期';break
-        if np.isnan(ka[j]) or np.isnan(da[j]):unknown=True;break
-        if death[j]:request=j+1;reason='日线死叉';break
-    if unknown:
-        result.update(exit_reason='持有期间指标缺失，退出时点未知');return result
-    if request is None:
-        result.update(exit_reason='未触发退出，观察未结束');return result
+    result.update(filled=True,status='已成交未退出',buy_date=g.index[buy_i],buy_adj=buy)
+    horizon=40 if exit_rule=='周线死叉或40日' else int(exit_rule[2:-1])
+    deadline=buy_i+horizon # 收盘观察horizon日，再下一日开盘执行。
+    request=deadline if deadline<len(g) else None;reason=f'{horizon}日窗口到期'
+    if exit_rule=='周线死叉或40日':
+        for j in range(buy_i,min(deadline,len(g))):
+            if mode=='周收盘确认' and not shape.complete.iloc[j]:continue
+            if shape[['k','d','k1','d1']].iloc[j].isna().any():
+                result.update(status='形态退出路径未知',exit_reason='持有期周指标缺失');return result
+            if shape.death.iloc[j]:request=j+1;reason='周线死叉';break
+    if request is None:result['exit_reason']='窗口未结束';return result
     result['exit_reason']=reason
     for j in range(request,len(g)):
         row=g.iloc[j]
-        if not np.isfinite([row.open,row.adj_factor,row.down_limit,row.vol]).all() or min(row.open,row.adj_factor)<=0 or row.vol<=0:continue
-        if row.open<=row.down_limit+.005:continue
+        if pd.notna(row.vol) and row.vol<=0:continue
+        if not np.isfinite([row.open,row.adj_factor,row.down_limit,row.vol]).all():
+            result['status']='退出数据未知';return result
+        if row.vol<=0 or row.adj_factor<=0 or row.down_limit<=0 or row.open<=row.down_limit+.005:continue
         sell=max(row.open*.999,row.down_limit)*row.adj_factor
         net=(sell*.998/(buy*1.001)-1)*100
-        # 卖出日在开盘退出，不使用之后的盘中高低价。
-        highs=list(g.ah.iloc[buy_i:j].dropna())+[sell]
-        lows=list(g.al.iloc[buy_i:j].dropna())+[sell]
-        complete=g[['ah','al']].iloc[buy_i:j].notna().all().all()
-        result.update(closed=True,resolved=True,sell_date=cal[j],sell_adj=sell,net_pct=net,order_net_pct=net,
-            hold_days=j-buy_i+1,overdue_days=max(0,j-deadline),
-            mfe_pct=(max(highs)/buy-1)*100 if complete else np.nan,
-            mae_pct=(min(lows)/buy-1)*100 if complete else np.nan)
+        held=g.iloc[buy_i:j];complete=held[['ah','al']].notna().all().all()
+        result.update(closed=True,resolved=True,status='已闭合',sell_date=g.index[j],sell_adj=sell,net_pct=net,
+            order_net_pct=net,hold_days=j-buy_i+1,delayed_days=j-request,
+            mfe_pct=(max(held.ah.max(),sell)/buy-1)*100 if complete else np.nan,
+            mae_pct=(min(held.al.min(),sell)/buy-1)*100 if complete else np.nan)
         return result
-    result['exit_reason']=reason+'，待可执行卖出'
-    return result
+    result['status']='待可执行卖出';return result
 
 
-def evaluate_stock(g, code, name, eligible, known, cfg):
-    rows=[];cal=g.index;weekly=completed_weekly(g)
-    for n in (6,9):
-        kd=skdj(g,n)
-        death=(kd.k.lt(kd.d)&kd.k.shift().ge(kd.d.shift())).to_numpy()
-        gold=kd.k.gt(kd.d)&kd.k.shift().le(kd.d.shift())&kd.k.lt(25)&kd.d.lt(25)
-        idx=np.flatnonzero((gold&eligible&(cal>=stamp(cfg.start))&(cal<=stamp(cfg.end))).to_numpy())
-        for i in idx:
-            cohort=f'{n}_{ds(cal[i])}_{code}'
-            for delay in (1,2,3):
-                confirm=i+delay-1;buy_i=i+delay
-                base=dict(cohort_id=cohort,ts_code=code,name=name,n=n,delay=delay,gold_date=cal[i],year=str(cal[i].year),
-                    signal_date=cal[confirm] if confirm<len(g) else pd.NaT,
-                    planned_buy_date=cal[buy_i] if buy_i<len(g) else pd.NaT,
-                    gold_k=kd.k.iloc[i],gold_d=kd.d.iloc[i],score=np.nan,k=np.nan,d=np.nan,k_change=np.nan,
-                    gap_change=np.nan,circ_mv_yi=np.nan,w_k=np.nan,w_d=np.nan,w_k_change=np.nan,w_death_age=np.nan,
-                    weekly_state='未知',qualified=False,filled=False,closed=False,resolved=False,
-                    entry_status='待确认',exit_reason='',buy_date=pd.NaT,sell_date=pd.NaT,buy_adj=np.nan,
-                    sell_adj=np.nan,net_pct=np.nan,order_net_pct=np.nan,hold_days=np.nan,overdue_days=0,mfe_pct=np.nan,mae_pct=np.nan)
-                if confirm<len(g):
-                    k,d=kd.iloc[confirm];prev=kd.iloc[confirm-1] if confirm else pd.Series({'k':np.nan,'d':np.nan})
-                    w=weekly.iloc[confirm]
-                    base.update(k=k,d=d,score=k-d,k_change=k-prev.k,gap_change=k-d-(prev.k-prev.d),
-                        circ_mv_yi=g.circ_mv.iloc[confirm]/10000,w_k=w.w_k,w_d=w.w_d,
-                        w_k_change=w.w_k-w.w_k_prev,w_death_age=w.w_death_age)
-                    wok=np.isfinite([w.w_k,w.w_d,w.w_k_prev]).all()
-                    if wok:
-                        base['weekly_state']='金叉' if w.w_k>w.w_d else ('K拐头' if w.w_k>w.w_k_prev else 'K未拐头')
-                    continuous=kd.iloc[i:confirm+1]
-                    if not known.iloc[confirm] or continuous.isna().any().any():
-                        base['entry_status']='确认数据不足'
-                    elif not eligible.iloc[confirm]:
-                        base.update(entry_status='确认时股票池不合格',resolved=True,order_net_pct=0.)
-                    elif not continuous.k.gt(continuous.d).all():
-                        base.update(entry_status='等待期间金叉失效',resolved=True,order_net_pct=0.)
-                    elif not k>prev.k:
-                        base.update(entry_status='确认日K未上升',resolved=True,order_net_pct=0.)
-                    else:
-                        base.update(qualified=True)
-                        base.update(exit_path(g,kd,buy_i,death))
-                for wf in WEEK_FILTERS:
-                    r=base.copy();r['weekly_filter']=wf
-                    if r['qualified'] and wf!='不过滤':
-                        wk,wd,change=r['w_k'],r['w_d'],r['w_k_change']
-                        valid=np.isfinite([wk,wd,change]).all()
-                        allow=valid and (wk>wd or (wf=='金叉或K拐头' and change>0))
-                        if not allow:
-                            r.update(qualified=False,filled=False,closed=False,resolved=valid,
-                                entry_status='周线过滤剔除' if valid else '周线数据不足',exit_reason='',buy_date=pd.NaT,sell_date=pd.NaT,
-                                buy_adj=np.nan,sell_adj=np.nan,net_pct=np.nan,order_net_pct=0. if valid else np.nan,
-                                hold_days=np.nan,overdue_days=0,mfe_pct=np.nan,mae_pct=np.nan)
-                    rows.append(r)
+def stock_events(g,code,name,eligible,known,cfg):
+    shape=weekly_shape(g);rows=[]
+    in_range=(g.index>=stamp(cfg.start))&(g.index<=stamp(cfg.end))
+    for mode in MODES:
+        trigger=shape.cross.copy()
+        if mode=='周收盘确认':trigger&=shape.complete
+        else:
+            # 首次上穿先去重再检查资格，不能用同周后来成功/合格的信号替换首次。
+            trigger&=trigger.groupby(shape.week).cumsum().eq(1)
+        for i in np.flatnonzero(trigger&in_range):
+            f=shape.iloc[i];day=g.index[i]
+            base=dict(event_id=f'{code}|{mode}|{ds(day)}',ts_code=code,name=name,mode=mode,signal_date=day,
+                year=str(day.year),weekday=day.weekday()+1,week=f.week,n=6,k=f.k,d=f.d,k1=f.k1,k2=f.k2,k3=f.k3,
+                circ_mv_yi=g.circ_mv.iloc[i]/10000,qualified=bool(eligible.iloc[i]),qualification_known=bool(known.iloc[i]),
+                kd_state='K>D' if f.k>f.d else 'K≤D',
+                gap_direction='扩大' if f.gap_change>0 else ('收窄' if f.gap_change<0 else '持平'))
+            base.update({c:float(f[c]) for c in FEATURES})
+            for rule in EXITS:
+                if eligible.iloc[i]:path=trade_path(g,shape,i+1,mode,rule)
+                else:path=dict(filled=False,closed=False,resolved=False,status='资格不符' if known.iloc[i] else '资格未知',net_pct=np.nan,order_net_pct=np.nan)
+                rows.append(dict(base,exit_rule=rule,**path))
     return rows
 
 
 def calculate_events(data,basic,member,calendar,cfg,progress):
-    all_rows=[];base=basic.set_index('ts_code');members={c:m for c,m in member.groupby('ts_code')}
+    rows=[];base=basic.set_index('ts_code');members={c:m for c,m in member.groupby('ts_code')}
     for number,(code,part) in enumerate(data.groupby('ts_code',sort=True),1):
         if code not in base.index or code not in members:continue
         g=part.drop_duplicates('date').set_index('date').sort_index().reindex(calendar)
@@ -495,98 +484,77 @@ def calculate_events(data,basic,member,calendar,cfg,progress):
             g[c]=pd.to_numeric(g[c],errors='coerce')
         for c,a in [('open','ao'),('high','ah'),('low','al'),('close','ac')]:g[a]=g[c]*g.adj_factor
         eligible,known=eligibility(g,code,base.loc[code],members[code],calendar,cfg)
-        all_rows.extend(evaluate_stock(g,code,base.loc[code,'name'],eligible,known,cfg))
-        if number%25==0:progress(f'SKDJ逐股研究 {number}/{len(base)}；路径每个N和买入日只计算一次')
-    events=pd.DataFrame(all_rows)
-    if events.empty:return events
-    group=['n','delay','weekly_filter','signal_date']
-    events['rank']=np.nan
-    order=events[events.qualified].sort_values(group+['score','circ_mv_yi','ts_code'],ascending=[True]*4+[False,False,True])
-    events.loc[order.index,'rank']=order.groupby(group).cumcount()+1
-    return events.sort_values(['gold_date','ts_code','n','delay','weekly_filter']).reset_index(drop=True)
+        rows.extend(stock_events(g,code,base.loc[code,'name'],eligible,known,cfg))
+        if number%25==0:progress(f'周线形态研究 {number}/{len(base)}；两个观察模式、五种退出口径')
+    return pd.DataFrame(rows)
 
 
-def rank_parts(e):
-    yield '全部',e
-    for rank in (1,2,3):yield f'第{rank}名',e[e['rank'].eq(rank)]
-    yield '前三名',e[e['rank'].le(3)]
-    yield '其余名次',e[e['rank'].gt(3)]
+def assign_bins(events):
+    e=events.copy();thresholds=[]
+    for c in FEATURES:e[c+'_bin']='校准不足'
+    unique=e[e.qualified].drop_duplicates('event_id')
+    for mode in MODES:
+        for year in sorted(e.year.unique()):
+            history=unique[(unique['mode']==mode)&(unique.year<year)]
+            target=(e['mode']==mode)&(e.year==year)
+            for c in FEATURES:
+                v=history[c].dropna();lo=hi=np.nan
+                if len(v)>=100:
+                    lo,hi=v.quantile([1/3,2/3]);value=e.loc[target,c]
+                    e.loc[target,c+'_bin']=np.select([value.isna(),value.le(lo),value.le(hi)],['特征缺失','低','中'],default='高')
+                thresholds.append(dict(mode=mode,year=year,feature=c,history_events=len(v),low_edge=lo,high_edge=hi,
+                    history_through=int(year)-1,status='已冻结' if len(v)>=100 else '校准不足'))
+    e['joint_bin']=e.cross_speed_bin+'斜率 / '+e.gap_bin+'间距'
+    return e,pd.DataFrame(thresholds)
+
+
+def metrics(g):
+    c=g[g.closed];v=c.net_pct.dropna();n=len(v)
+    # ceil确保小样本至少移除一个最好值，另列有效样本数。
+    cut=max(1,math.ceil(n*.01)) if n else 0;trim=v.sort_values().iloc[:n-cut]
+    return dict(events=len(g),filled=int(g.filled.sum()),closed=n,unresolved=int((~g.resolved).sum()),
+        cancelled=int((g.resolved&~g.filled).sum()),mean_net_pct=v.mean(),median_net_pct=v.median(),
+        win_pct=v.gt(0).mean()*100 if n else np.nan,p10_net_pct=v.quantile(.1) if n else np.nan,
+        trim_top1_mean_pct=trim.mean(),trim_remaining=len(trim),mean_hold_days=c.hold_days.mean() if n else np.nan,
+        mean_mfe_pct=c.mfe_pct.mean() if n else np.nan,mean_mae_pct=c.mae_pct.mean() if n else np.nan,
+        mfe_ge10_pct=c.mfe_pct.ge(10).sum()/c.mfe_pct.notna().sum()*100 if n and c.mfe_pct.notna().any() else np.nan)
 
 
 def build_reports(events,calendar,cfg):
-    keys=['n','delay','weekly_filter']
-    names=['events','summary','ranking_daily','ranking_summary','delay_pairs','delay_summary','weekly_diagnostic','annual_coverage','status_counts']
-    tables={name:pd.DataFrame() for name in names};tables['events']=events
-    if events.empty:return tables
-    summary=[];ranking_daily=[];ranking_summary=[];coverage=[];diagnostic=[]
-    status=events.groupby(keys+['entry_status'],dropna=False).size().rename('count').reset_index()
-    tables['status_counts']=status
-    for group,e in events.groupby(keys,sort=True):
-        meta=dict(zip(keys,group));issued=e[e.qualified]
-        agg=issued.groupby('signal_date').order_net_pct.agg(['size','count','mean'])
-        valid_dates=agg.index[agg['size'].eq(agg['count'])]
-        for year in ['全部']+sorted(e.year.unique()):
-            y=e if year=='全部' else e[e.year.eq(year)]
-            for label,s in rank_parts(y):
-                filled=s[s.filled];done=s[s.closed];q=s[s.qualified]
-                day=q.groupby('signal_date').order_net_pct.agg(['size','count','mean'])
-                day=day[day.index.isin(valid_dates)]
-                summary.append(dict(meta,year=year,rank_group=label,cohorts=len(s),orders=len(q),filled=len(filled),closed=len(done),
-                    unresolved=int((~s.resolved).sum()),mean_net_pct=done.net_pct.mean(),median_net_pct=done.net_pct.median(),
-                    win_pct=done.net_pct.gt(0).mean()*100 if len(done) else np.nan,
-                    mean_hold_days=done.hold_days.mean(),p10_net_pct=done.net_pct.quantile(.1),
-                    mean_mfe_pct=done.mfe_pct.mean(),mean_mae_pct=done.mae_pct.mean(),
-                    mean_order_net_pct=q.order_net_pct.mean(),comparable_dates=len(day),day_equal_net_pct=day['mean'].mean(),
-                    timeout_exits=int(done.exit_reason.eq('30交易日到期').sum()),overdue_exits=int(done.overdue_days.gt(0).sum())))
-                differences=[]
-                for date_,d in day.iterrows():
-                    edge=d['mean']-agg.loc[date_,'mean'];differences.append(edge)
-                    if year!='全部':ranking_daily.append(dict(meta,year=year,rank_group=label,signal_date=date_,
-                        order_mean_pct=d['mean'],all_signal_mean_pct=agg.loc[date_,'mean'],edge_pp=edge))
-                ranking_summary.append(dict(meta,year=year,rank_group=label,dates=len(differences),
-                    edge_vs_all_signals_pp=np.mean(differences) if differences else np.nan))
-        # 覆盖按确认信号日期归年；开始/结束之外的确认信号不计入区间覆盖。
-        obs=calendar[(calendar>=stamp(cfg.start))&(calendar<=stamp(cfg.end))]
-        for year in sorted(obs.year.unique()):
-            dates=obs[obs.year==year];weeks=dates.to_period('W-SUN').unique()
-            q=issued[issued.signal_date.isin(dates)];f=q[q.filled]
-            signal_weeks=q.signal_date.dt.to_period('W-SUN').unique();fill_weeks=f.signal_date.dt.to_period('W-SUN').unique()
-            complete=stamp(cfg.start)<=pd.Timestamp(year=year,month=1,day=1) and stamp(cfg.end)>=pd.Timestamp(year=year,month=12,day=31) and latest_ready_day()>=pd.Timestamp(year=year,month=12,day=31)
-            coverage.append(dict(meta,year=str(year),observed_weeks=len(weeks),no_signal_weeks=len(weeks.difference(signal_weeks)),
-                no_filled_signal_weeks=len(weeks.difference(fill_weeks)),orders=len(q),filled=len(f),full_year=complete))
-        if group[2]=='不过滤':
-            for (year,state),part in e[e.qualified].groupby(['year','weekly_state']):
-                done=part[part.closed]
-                diagnostic.append(dict(meta,year=year,weekly_state=state,orders=len(part),closed=len(done),
-                    mean_net_pct=done.net_pct.mean(),win_pct=done.net_pct.gt(0).mean()*100 if len(done) else np.nan,
-                    median_death_age=part.w_death_age.median() if part.w_death_age.notna().any() else np.nan))
-    pairs=[];pair_summary=[]
-    for (n,wf),e in events.groupby(['n','weekly_filter']):
-        columns=['cohort_id','gold_date','year','qualified','filled','closed','resolved','entry_status','order_net_pct','net_pct','buy_adj','rank']
-        a=e[e.delay.eq(2)][columns];b=e[e.delay.eq(3)][columns]
-        p=a.merge(b,on=['cohort_id','gold_date','year'],suffixes=('_D2','_D3'),validate='one_to_one')
-        p['n']=n;p['weekly_filter']=wf
-        p['both_closed']=p.closed_D2&p.closed_D3
-        p['net_difference_pp']=(p.net_pct_D3-p.net_pct_D2).where(p.both_closed)
-        p['buy_price_change_pct']=(p.buy_adj_D3/p.buy_adj_D2-1)*100
-        p['both_resolved']=p.resolved_D2&p.resolved_D3
-        p['policy_difference_pp']=(p.order_net_pct_D3-p.order_net_pct_D2).where(p.both_resolved)
-        pairs.append(p)
-        for year in ['全部']+sorted(p.year.unique()):
-            s=p if year=='全部' else p[p.year.eq(year)];known=s[s.both_resolved];both=s[s.both_closed]
-            early=known[known.filled_D2&~known.filled_D3];late=known[~known.filled_D2&known.filled_D3]
-            pair_summary.append(dict(n=n,weekly_filter=wf,year=year,cohorts=len(s),resolved_pairs=len(known),both_closed=len(both),
-                D2_mean_net_pct=both.net_pct_D2.mean(),D3_mean_net_pct=both.net_pct_D3.mean(),
-                D2_win_pct=both.net_pct_D2.gt(0).mean()*100 if len(both) else np.nan,
-                D3_win_pct=both.net_pct_D3.gt(0).mean()*100 if len(both) else np.nan,
-                D3_minus_D2_pp=both.net_difference_pp.mean(),mean_buy_price_change_pct=both.buy_price_change_pct.mean(),
-                early_only=len(early),early_only_losers=int(early.net_pct_D2.lt(0).sum()),early_only_winners=int(early.net_pct_D2.gt(0).sum()),
-                late_only=len(late),neither_filled=int((~known.filled_D2&~known.filled_D3).sum()),
-                resolved_policy_difference_pp=known.policy_difference_pp.mean()))
-    tables.update(summary=pd.DataFrame(summary),ranking_daily=pd.DataFrame(ranking_daily),ranking_summary=pd.DataFrame(ranking_summary),
-        delay_pairs=pd.concat(pairs,ignore_index=True),delay_summary=pd.DataFrame(pair_summary),
-        weekly_diagnostic=pd.DataFrame(diagnostic),annual_coverage=pd.DataFrame(coverage))
-    return tables
+    names=['events','summary','feature_groups','joint_groups','diagnostics','thresholds','daily_comparison','annual_coverage','status_counts']
+    if events.empty:return {n:pd.DataFrame() for n in names}
+    e,thresholds=assign_bins(events);q=e[e.qualified].copy()
+    summary=[];feature=[];joint=[];diag=[];daily=[]
+    for (mode,rule),whole in q.groupby(['mode','exit_rule']):
+        for year,g in [('全部',whole)]+list(whole.groupby('year')):
+            identity=dict(mode=mode,exit_rule=rule,year=year)
+            summary.append(dict(identity,**metrics(g)))
+            # 完整日期的全信号基准，包含确定取消的零发单收益。
+            dates=g.groupby('signal_date').resolved.all();good=g[g.signal_date.isin(dates[dates].index)]
+            baseline=good.groupby('signal_date').order_net_pct.mean()
+            for c in FEATURES:
+                for bucket,part in g.groupby(c+'_bin'):
+                    feature.append(dict(identity,feature=c,bucket=bucket,**metrics(part)))
+                    subgroup=good[good[c+'_bin']==bucket].groupby('signal_date').order_net_pct.mean()
+                    delta=subgroup-baseline.reindex(subgroup.index)
+                    daily.append(dict(identity,feature=c,bucket=bucket,complete_dates=len(delta),
+                        day_equal_order_pct=subgroup.mean(),same_day_all_pct=baseline.reindex(subgroup.index).mean(),
+                        edge_pp=delta.mean(),positive_edge_dates_pct=delta.gt(0).mean()*100 if len(delta) else np.nan))
+            for bucket,part in g.groupby('joint_bin'):
+                joint.append(dict(identity,bucket=bucket,**metrics(part)))
+            for c in ['gap_direction','kd_state','weekday']:
+                for bucket,part in g.groupby(c):diag.append(dict(identity,diagnostic=c,bucket=str(bucket),**metrics(part)))
+    cover=[];cal=calendar[(calendar>=stamp(cfg.start))&(calendar<=stamp(cfg.end))]
+    for mode in MODES:
+        u=q[q['mode']==mode].drop_duplicates('event_id')
+        for year in sorted(set(cal.year)):
+            days=cal[cal.year==year];weeks=set(days.to_period('W-FRI'))
+            p=u[u.year==str(year)];sw=set(pd.DatetimeIndex(p.signal_date).to_period('W-FRI'));fw=set(pd.DatetimeIndex(p.loc[p.filled,'signal_date']).to_period('W-FRI'))
+            cover.append(dict(mode=mode,year=str(year),observed_weeks=len(weeks),no_signal_weeks=len(weeks-sw),no_filled_signal_weeks=len(weeks-fw),
+                full_year=stamp(cfg.start)<=pd.Timestamp(year,1,1) and min(stamp(cfg.end),calendar.max())>=pd.Timestamp(year,12,31)))
+    status=e.groupby(['mode','exit_rule','year','status']).size().reset_index(name='count')
+    return dict(events=e,summary=pd.DataFrame(summary),feature_groups=pd.DataFrame(feature),joint_groups=pd.DataFrame(joint),
+        diagnostics=pd.DataFrame(diag),thresholds=thresholds,daily_comparison=pd.DataFrame(daily),annual_coverage=pd.DataFrame(cover),status_counts=status)
 
 
 def make_zip(tables,manifest):
@@ -603,97 +571,98 @@ def run_research(token,cache_root,cfg,progress):
     basic,member,mode,pool_warnings=client.universe()
     ready=latest_ready_day();effective_end=min(stamp(cfg.end),ready)
     if effective_end<stamp(cfg.start):raise RuntimeError('尚未进入指定区间')
-    start=ds(stamp(cfg.start)-pd.Timedelta(days=450));end=ds(min(ready,effective_end+pd.Timedelta(days=85)))
+    start=ds(stamp(cfg.start)-pd.Timedelta(days=450));end=ds(min(ready,effective_end+pd.Timedelta(days=110)))
     calendar=client.calendar(start,end)
     data,issues=client.download(calendar,set(basic.ts_code))
     hashed=pd.util.hash_pandas_object(data,index=False).to_numpy();hashed.sort();data_hash=hashlib.sha256(hashed.tobytes()).hexdigest()
     events=calculate_events(data,basic,member,calendar,cfg,progress)
-    del data;gc.collect()
-    progress('汇总收益、排名、同一金叉延迟配对和年度覆盖')
+    del data;gc.collect();progress('按先前年份冻结形态分组，汇总年度及同日对照')
     tables=build_reports(events,calendar,cfg)
     tables.update(data_issues=issues,universe=basic,industry_intervals=member)
     manifest=dict(version=VERSION,config=asdict(cfg),rules=RULES,created_at=datetime.now(ZoneInfo('Asia/Shanghai')).isoformat(),
         data_start=start,data_end=end,data_hash=data_hash,pool_hash=hashlib.sha256(member.to_csv(index=False).encode()).hexdigest(),
         pool_mode=mode,warnings=pool_warnings,data_issues=len(issues),universe_size=len(basic),download_workers=DOWNLOAD_WORKERS,
-        study='N6/N9 × D1/D2/D3 × 三种周线规则；D1仅辅助；无资金组合',
-        limitations=['重复观察历史，非未见样本证明','排名对照为同日全部信号，不是整个科技池',
-        '真实周线只使用完成周；周中不使用暂态周线','历史行业完整性及风险警示重建仍有限制',
-        '持有路径数据缺失及尚未卖出不计闭合收益，存在完整样本选择风险','复权收益近似公司行动，未逐笔重建税费'])
+        study='周线N6上穿25；斜率、间距、加速度；两种观察模式×五种退出；无组合',
+        limitations=['历史反复观察，尚非前向验证','分位边界只用过去形态但并不消除研究选择偏差',
+        '指标公式沿用项目SKDJ；未对截图软件逐点导出值做完整校验','未知事件与未完成事件单列，缺行情仍可能漏信号',
+        '最高浮盈不是实际收益；日期对照为上穿信号而非全科技池','同股重复事件及各窗口相关，不提供独立样本显著性声明'])
     zipped=make_zip(tables,manifest)
     run_id=hashlib.sha256(json.dumps(asdict(cfg),sort_keys=True).encode()).hexdigest()[:12]
     path=Path(cache_root)/'results'/f'{VERSION}_{run_id}.zip';atomic_bytes(zipped,path)
     return tables,manifest,zipped,str(path)
 
 
-LABELS={'n':'日线N','delay':'金叉后第几交易日买入','weekly_filter':'周线过滤','year':'金叉年度','rank_group':'名次范围',
-'cohorts':'金叉事件数','orders':'发单数','filled':'成交数','closed':'已闭合数','unresolved':'结果未确定数',
-'mean_net_pct':'平均净收益%','median_net_pct':'净收益中位数%','win_pct':'胜率%',
-'mean_hold_days':'平均持有交易日','p10_net_pct':'收益10分位%','mean_mfe_pct':'平均最高浮盈%',
-'mean_mae_pct':'平均最大浮亏%','mean_order_net_pct':'已知发单平均净收益%','comparable_dates':'完整结果日期数',
-'day_equal_net_pct':'日期等权发单净收益%','timeout_exits':'到期退出数','overdue_exits':'超30日退出数',
-'dates':'比较日期数','edge_vs_all_signals_pp':'相对同日全部信号收益差_百分点',
-'resolved_pairs':'两组结果均确定','both_closed':'两组都成交并闭合','D2_mean_net_pct':'D2配对平均净收益%',
-'D3_mean_net_pct':'D3配对平均净收益%','D2_win_pct':'D2配对胜率%','D3_win_pct':'D3配对胜率%',
-'D3_minus_D2_pp':'D3减D2配对收益_百分点','mean_buy_price_change_pct':'D3买价相对D2变化%',
-'early_only':'仅D2成交','early_only_losers':'D3避开的D2亏损笔数','early_only_winners':'D3错过的D2盈利笔数',
-'late_only':'仅D3成交','neither_filled':'两组均未成交','resolved_policy_difference_pp':'含确定未买入的D3减D2_百分点',
-'observed_weeks':'观察周数','no_signal_weeks':'无新信号周','no_filled_signal_weeks':'无可成交新信号周',
-'full_year':'完整年度','weekly_state':'周线状态','median_death_age':'死叉周龄中位数','entry_status':'状态','count':'数量'}
+LABELS={'mode':'观察模式','exit_rule':'退出规则','year':'信号年度','feature':'形态特征','bucket':'分组',
+    'events':'合格事件数','filled':'成交数','closed':'闭合数','unresolved':'结果未知或未完成','cancelled':'取消数',
+    'mean_net_pct':'平均净收益%','median_net_pct':'净收益中位数%','win_pct':'胜率%', 'p10_net_pct':'收益10分位%',
+    'trim_top1_mean_pct':'去掉最好1%后均值%','trim_remaining':'去极值后笔数','mean_hold_days':'平均持有日（含卖出日）',
+    'mean_mfe_pct':'平均最高浮盈%','mean_mae_pct':'平均最大浮亏%','mfe_ge10_pct':'最高浮盈达10%的比例%',
+    'complete_dates':'完整结果日期数','day_equal_order_pct':'日期等权发单收益%','same_day_all_pct':'同日全部信号收益%',
+    'edge_pp':'相对同日基准差（百分点）','positive_edge_dates_pct':'超越基准日期占比%',
+    'diagnostic':'诊断项','history_events':'历史校准事件数','low_edge':'低组上界','high_edge':'中组上界',
+    'history_through':'校准截止年度','status':'状态','count':'数量','observed_weeks':'观察周数',
+    'no_signal_weeks':'无新信号周','no_filled_signal_weeks':'无可成交新信号周','full_year':'完整年度'}
 
 
 def show_results(st,tables,manifest,zipped):
     cfg=manifest['config'];st.subheader(manifest['version'])
-    st.download_button('下载完整研究结果（ZIP）',zipped,file_name=f"tech_swing_T3_0_{cfg['start']}_{cfg['end']}.zip",mime='application/zip')
-    st.caption('保留上次完成结果；更改侧栏后需重新运行。D1仅为不等待对照；各测试组独立，不能累加成组合收益。')
+    st.download_button('下载完整验证结果 ZIP',zipped,file_name=f"tech_swing_T3_1_{cfg['start']}_{cfg['end']}.zip",mime='application/zip')
     if manifest['warnings'] or manifest['data_issues']:st.warning('数据受限：'+'；'.join(manifest['warnings'])+f"；问题记录{manifest['data_issues']}条")
-    if tables['events'].empty:st.info('该区间没有符合股票池要求的低位金叉。');return
-    years=['全部']+sorted(tables['events'].year.unique())
-    year=st.selectbox('金叉年度',years,key='result_year')
-    rank=st.selectbox('名次范围',['全部','第1名','第2名','第3名','前三名','其余名次'],key='result_rank')
-    tabs=st.tabs(['收益与胜率','同金叉D2/D3比较','排序是否有效','周线与覆盖','事件明细','规则与数据'])
-    def selected(name):
-        f=tables[name]
-        if 'year' in f:f=f[f.year.eq(year)]
-        if 'rank_group' in f:f=f[f.rank_group.eq(rank)]
+    if tables['events'].empty:st.info('本区间没有可识别的周线上穿25事件。');return
+    st.caption('先看样本量、未完成数与净收益，再看最高浮盈。第一年通常用于校准；各组不构成资金组合。')
+    mode=st.selectbox('观察模式',MODES)
+    rule=st.selectbox('退出口径',EXITS,index=2)
+    year=st.selectbox('信号年度',['全部']+sorted(tables['events'].year.unique()))
+    feat=st.selectbox('形态特征',list(FEATURES),format_func=lambda x:FEATURES[x])
+    def selected(name,filter_feature=False):
+        f=tables[name].copy()
+        for col,val in [('mode',mode),('exit_rule',rule),('year',year)]:
+            if col in f:
+                if col=='year' and name in ['thresholds','annual_coverage','status_counts'] and year=='全部':continue
+                f=f[f[col].eq(val)]
+        if filter_feature and 'feature' in f:f=f[f.feature.eq(feat)]
+        if 'feature' in f:f['feature']=f.feature.map(FEATURES)
         return f.rename(columns=LABELS)
+    tabs=st.tabs(['基准与单项形态','斜率×间距','同日对照','诊断与覆盖','事件与规则'])
     with tabs[0]:
-        st.caption('先看已闭合数及未确定数，再比较收益。未卖出和路径未知不当作零收益。按金叉年度归组。')
-        st.dataframe(selected('summary'),use_container_width=True,hide_index=True)
+        st.dataframe(selected('summary'),hide_index=True)
+        st.dataframe(selected('feature_groups',True),hide_index=True)
+        st.caption('低/中/高边界按年冻结；全期汇总的各年边界可能不同。校准不足的事件只作基准，不能混称低组。')
+        st.dataframe(selected('thresholds',True),hide_index=True)
     with tabs[1]:
-        st.caption('此表固定全部金叉，不按排名筛选。两组都闭合的比较之外，单列第三天避开的亏损及错过的盈利。未确定事件不填0。')
-        st.dataframe(selected('delay_summary'),use_container_width=True,hide_index=True)
+        st.caption('比较上穿周增量与K−D的九格组合；不自动推荐最高收益格。')
+        st.dataframe(selected('joint_groups'),hide_index=True)
     with tabs[2]:
-        st.caption('同组、同日全部已发单信号作为参照；只用整日结果确定的日期。不是科技全池超额收益。')
-        st.dataframe(selected('ranking_summary'),use_container_width=True,hide_index=True)
+        st.caption('仅比较同日全信号结果均确定的日期；含确定取消单的零收益，不含未知。用于检查是否只是碰到整体好行情。')
+        st.dataframe(selected('daily_comparison',True),hide_index=True)
     with tabs[3]:
-        f=tables['annual_coverage'];f=f if year=='全部' else f[f.year.eq(year)]
-        st.caption('覆盖按确认日期归年；无信号周不是资金空仓周。部分年度和数据受限时不判断全年目标。')
-        st.dataframe(f.rename(columns=LABELS),use_container_width=True,hide_index=True)
-        f=tables['weekly_diagnostic'];f=f if year=='全部' or f.empty else f[f.year.eq(year)]
-        st.caption('仅不过滤组的周线状态诊断；不使用10周放行。')
-        st.dataframe(f.rename(columns=LABELS),use_container_width=True,hide_index=True)
+        st.dataframe(selected('diagnostics'),hide_index=True)
+        st.caption('无新信号周不等于资金空仓周；本版没有仓位系统。')
+        st.dataframe(selected('annual_coverage'),hide_index=True)
     with tabs[4]:
-        st.dataframe(tables['status_counts'].rename(columns=LABELS),use_container_width=True,hide_index=True)
-        st.dataframe(tables['events'].tail(300),use_container_width=True,hide_index=True)
-    with tabs[5]:st.text(STUDY_NOTES);st.dataframe(tables['data_issues'],use_container_width=True);st.json(manifest)
+        st.dataframe(selected('status_counts'),hide_index=True)
+        e=tables['events'];e=e[(e['mode']==mode)&(e.exit_rule==rule)]
+        if year!='全部':e=e[e.year==year]
+        st.dataframe(e.tail(300),hide_index=True)
+        st.text(STUDY_NOTES);st.dataframe(tables['data_issues']);st.json(manifest)
 
 
 def main():
     import streamlit as st
-    st.set_page_config(page_title='科技日线SKDJ T3.0',layout='wide')
-    st.title('科技日线SKDJ T3.0 · 等待确认研究')
+    st.set_page_config(page_title='周线SKDJ形态验证 T3.1',layout='wide')
+    st.title('周线SKDJ T3.1 · 上穿25形态验证')
     try:default=str(st.secrets.get('TUSHARE_TOKEN',st.secrets.get('tushare_token','')))
     except Exception:default=''
     with st.sidebar:
         token=st.text_input('Tushare Token',value=os.environ.get('TUSHARE_TOKEN',default),type='password')
-        start=st.date_input('低位金叉开始日',value=date(2022,1,1));end=st.date_input('低位金叉结束日',value=latest_ready_day().date())
+        start=st.date_input('上穿事件开始日',value=date(2022,1,1));end=st.date_input('上穿事件结束日',value=latest_ready_day().date())
         price=st.number_input('最低股价（高于，元）',value=10.,min_value=0.,step=1.)
         low=st.number_input('最低流通市值（亿元）',value=50.,min_value=0.,step=10.)
         high=st.number_input('最高流通市值（亿元）',value=1000.,min_value=1.,step=100.)
         root=st.text_input('数据缓存目录',value='tech_swing_cache')
-        st.caption('沿用T1/T2缓存，四路并发补缺；全部18组一次计算，无资金配置。')
-        run=st.button('运行SKDJ验证',type='primary')
-    with st.expander('固定规则'):st.text(STUDY_NOTES)
+        st.caption('沿用原缓存，四路并发补缺；固定周线N=6、平滑3；无三仓。')
+        run=st.button('运行周线形态验证',type='primary')
+    with st.expander('研究口径'):st.text(STUDY_NOTES)
     if run:
         if not token.strip():st.error('请输入Token或设置TUSHARE_TOKEN。')
         elif start>end or low>=high or not root.strip():st.error('请检查日期、市值范围及缓存目录。')
@@ -702,11 +671,11 @@ def main():
             def progress(msg):
                 if time.monotonic()-last[0]>.25:box.info(msg);last[0]=time.monotonic()
             try:
-                st.session_state['t30_result']=run_research(token,root.strip(),Config(ds(start),ds(end),price,low,high),progress)
-                box.success('研究完成，结果已保留，可下载。')
+                st.session_state['t31_result']=run_research(token,root.strip(),Config(ds(start),ds(end),price,low,high),progress)
+                box.success('验证完成，可下载完整结果。')
             except Exception as exc:box.error(str(exc).replace(token,'[隐藏]')[:500]);st.info('成功下载的数据已缓存，修复后可继续补缺。')
-    if 't30_result' in st.session_state:
-        tables,manifest,zipped,_=st.session_state['t30_result'];show_results(st,tables,manifest,zipped)
+    if 't31_result' in st.session_state:
+        tables,manifest,zipped,_=st.session_state['t31_result'];show_results(st,tables,manifest,zipped)
 
 
 def self_test():
@@ -714,87 +683,102 @@ def self_test():
     from unittest.mock import patch
     class Tests(unittest.TestCase):
         def setUp(self):
-            self.cal=pd.bdate_range('2022-01-03',periods=150)
-            self.g=pd.DataFrame(dict(open=20.,high=21.,low=19.,close=20.,ac=20.,ah=21.,al=19.,ao=20.,
-                pre_close=20.,adj_factor=1.,up_limit=22.,down_limit=18.,vol=1000.,circ_mv=2000000.,turnover_rate=1.),index=self.cal)
-            self.kd=pd.DataFrame(dict(k=30.,d=20.),index=self.cal)
-        def test_skdj_flat_and_missing(self):
-            kd=skdj(self.g,9)
-            self.assertAlmostEqual(kd.k.dropna().iloc[-1],50.)
-            self.assertAlmostEqual(kd.d.dropna().iloc[-1],50.)
-            self.g.loc[self.cal[60],['ac','ah','al']]=np.nan
-            changed=skdj(self.g,9)
-            self.assertTrue(changed.iloc[60:69].isna().all().all())
-            self.assertTrue(changed.iloc[-1].notna().all())
-        def test_skdj_recursive_reference(self):
-            self.g['ac']=20+.5*np.sin(np.arange(len(self.g))/3)
-            n=6;slow=None;prior=None;ks=[];expected={}
-            for i in range(n-1,len(self.g)):
-                rsv=100*(self.g.ac.iloc[i]-19)/2
-                slow=rsv if slow is None else .5*rsv+.5*slow
-                prior=slow if prior is None else .5*slow+.5*prior
-                ks.append(prior)
-                if i>=n+5:expected[i]=(prior,sum(ks[-3:])/3)
-            actual=skdj(self.g,n)
-            for i,(k,d) in expected.items():
-                self.assertAlmostEqual(actual.k.iloc[i],k)
-                self.assertAlmostEqual(actual.d.iloc[i],d)
-        def test_indicator_and_weekly_causality(self):
-            rng=np.random.default_rng(7);c=20*np.exp(np.cumsum(rng.normal(0,.025,len(self.g))))
-            self.g['ac']=c;self.g['ah']=c+1;self.g['al']=c-1
-            full=completed_weekly(self.g)
-            for i in (102,104,109,123):
-                pd.testing.assert_frame_equal(full.iloc[:i+1],completed_weekly(self.g.iloc[:i+1]))
-                pd.testing.assert_frame_equal(skdj(self.g,6).iloc[:i+1],skdj(self.g.iloc[:i+1],6))
-            i=102
-            changed=self.g.copy();changed.loc[self.cal[i+1]:,['ac','ah','al']]*=5
-            pd.testing.assert_frame_equal(full.iloc[:i+1],completed_weekly(changed).iloc[:i+1])
-        def test_exit_next_open_and_costs(self):
-            self.kd.loc[self.cal[12]:,'k']=19.
-            result=exit_path(self.g,self.kd,10)
-            self.assertEqual(result['sell_date'],self.cal[13])
-            expected=(20*.999*.998/(20*1.001*1.001)-1)*100
-            self.assertAlmostEqual(result['net_pct'],expected)
-            self.assertEqual(result['hold_days'],4)
-        def test_same_day_death_and_day30(self):
-            self.kd.loc[self.cal[10]:,'k']=19.
-            self.assertEqual(exit_path(self.g,self.kd,10)['sell_date'],self.cal[11])
-            self.kd['k']=30.
-            self.assertEqual(exit_path(self.g,self.kd,10)['sell_date'],self.cal[39])
-        def test_limit_delay_persistent_and_no_intraday_lookahead(self):
-            self.kd.loc[self.cal[12],'k']=19.
-            self.g.loc[self.cal[13],['open','ao']]=18.
-            r=exit_path(self.g,self.kd,10)
-            self.assertEqual(r['sell_date'],self.cal[14])
-            self.g.loc[self.cal[14],'ah']=1000.
-            self.assertEqual(exit_path(self.g,self.kd,10)['mfe_pct'],r['mfe_pct'])
-        def test_cancel_missing_and_pending(self):
-            self.g.loc[self.cal[10],'open']=22.
-            r=exit_path(self.g,self.kd,10)
-            self.assertFalse(r['filled']);self.assertEqual(r['order_net_pct'],0.)
-            self.g.loc[self.cal[10],'open']=20.
-            self.kd.loc[self.cal[11],'k']=np.nan
-            r=exit_path(self.g,self.kd,10)
-            self.assertTrue(r['filled']);self.assertFalse(r['resolved']);self.assertTrue(np.isnan(r['net_pct']))
-            r=exit_path(self.g,self.kd,len(self.g));self.assertFalse(r['resolved'])
-        def test_waiting_days_and_week_filter(self):
-            kd=pd.DataFrame(dict(k=19.,d=20.),index=self.cal)
-            kd.loc[self.cal[40:44],'k']=[21.,22.,23.,24.]
-            w=pd.DataFrame(dict(w_k=15.,w_d=20.,w_k_prev=16.,w_death_age=15.),index=self.cal)
-            cfg=Config(ds(self.cal[40]),ds(self.cal[40]))
-            with patch(__name__+'.skdj',return_value=kd),patch(__name__+'.completed_weekly',return_value=w):
-                e=pd.DataFrame(evaluate_stock(self.g,'600001.SH','test',pd.Series(True,index=self.cal),pd.Series(True,index=self.cal),cfg))
-            a=e[(e.n==6)&(e.weekly_filter=='不过滤')].set_index('delay')
-            self.assertEqual(a.loc[2,'buy_date'],self.cal[42])
-            self.assertEqual(a.loc[3,'buy_date'],self.cal[43])
-            self.assertEqual(a.loc[2,'score'],2.)
-            self.assertEqual(a.loc[3,'score'],3.)
-            # 15周但K仍下降也不放行。
-            self.assertFalse(e[e.weekly_filter!='不过滤'].qualified.any())
-            kd.loc[self.cal[42],'k']=19.
-            with patch(__name__+'.skdj',return_value=kd),patch(__name__+'.completed_weekly',return_value=w):
-                e=pd.DataFrame(evaluate_stock(self.g,'600001.SH','test',pd.Series(True,index=self.cal),pd.Series(True,index=self.cal),cfg))
-            self.assertFalse(e[e.delay==3].qualified.any())
+            self.cal=pd.bdate_range('2021-01-04',periods=800)
+            t=np.arange(len(self.cal));c=25+6*np.sin(t/18)+2*np.sin(t/5)
+            self.g=pd.DataFrame(dict(open=c,high=c+1,low=c-1,close=c,ac=c,ah=c+1,al=c-1,ao=c,
+                pre_close=c,adj_factor=1.,up_limit=c*1.1,down_limit=c*.9,vol=1000.,circ_mv=2000000.,turnover_rate=1.),index=self.cal)
+        def test_completed_equals_original_formula(self):
+            shape=weekly_shape(self.g)
+            w=self.g.groupby(self.cal.to_period('W-FRI')).agg(ac=('ac','last'),ah=('ah','max'),al=('al','min'))
+            expected=skdj(w,6)
+            actual=shape[shape.complete]
+            np.testing.assert_allclose(actual.k,expected.k,equal_nan=True)
+            np.testing.assert_allclose(actual.d,expected.d,equal_nan=True)
+        def test_provisional_matches_bruteforce(self):
+            full=weekly_shape(self.g)
+            for i in [100,101,102,103,104,127,388,620]:
+                prefix=self.g.iloc[:i+1]
+                w=prefix.groupby(prefix.index.to_period('W-FRI')).agg(ac=('ac','last'),ah=('ah','max'),al=('al','min'))
+                expected=skdj(w,6).iloc[-1]
+                self.assertAlmostEqual(full.k.iloc[i],expected.k)
+                self.assertAlmostEqual(full.d.iloc[i],expected.d)
+                short=weekly_shape(prefix)
+                pd.testing.assert_frame_equal(full.drop(columns='complete').iloc[:i+1],short.drop(columns='complete'))
+            altered=self.g.copy();altered.loc[self.cal[301]:,['ac','ah','al']]*=4
+            pd.testing.assert_frame_equal(full.iloc[:301],weekly_shape(altered).iloc[:301])
+        def test_missing_week_resets(self):
+            self.g.loc[self.cal[302],['ac','ah','al']]=np.nan
+            s=weekly_shape(self.g)
+            self.assertTrue(s.k.iloc[302:360].isna().all())
+            self.assertTrue(s.k.iloc[-20:].notna().all())
+            self.g[['ac','ah','al']]=20.
+            self.assertAlmostEqual(weekly_shape(self.g).k.iloc[-1],50.)
+        def test_first_cross_per_week(self):
+            shape=weekly_shape(self.g);shape['cross']=False
+            shape.loc[self.cal[200:205],'cross']=[True,False,True,True,True]
+            shape.loc[self.cal[200:205],['k','d']]=[30.,20.]
+            eligible=pd.Series(True,index=self.cal);eligible.iloc[200]=False
+            cfg=Config(ds(self.cal[200]),ds(self.cal[204]))
+            with patch(__name__+'.weekly_shape',return_value=shape):
+                e=pd.DataFrame(stock_events(self.g,'600001.SH','test',eligible,pd.Series(True,index=self.cal),cfg))
+            p=e[e['mode']=='周中逐日观察']
+            self.assertEqual(len(p),5);self.assertTrue(p.signal_date.eq(self.cal[200]).all())
+            self.assertFalse(p.qualified.any())
+            w=e[e['mode']=='周收盘确认'];self.assertEqual(len(w),5)
+            self.assertTrue(w.signal_date.eq(self.cal[204]).all())
+        def test_execution_cost_and_horizon(self):
+            g=self.g.copy()
+            g[['open','ac','ao','close']]=20.;g['ah']=21.;g['al']=19.;g['up_limit']=22.;g['down_limit']=18.
+            s=weekly_shape(g)
+            r=trade_path(g,s,100,MODES[0],'持有5日')
+            self.assertEqual(r['sell_date'],self.cal[105]);self.assertEqual(r['hold_days'],6)
+            self.assertAlmostEqual(r['net_pct'],(20*.999*.998/(20*1.001*1.001)-1)*100)
+            g.loc[self.cal[105],'open']=18.
+            r=trade_path(g,s,100,MODES[0],'持有5日');self.assertEqual(r['sell_date'],self.cal[106])
+            before=r['mfe_pct'];g.loc[self.cal[106],'ah']=9999
+            self.assertEqual(trade_path(g,s,100,MODES[0],'持有5日')['mfe_pct'],before)
+            g.loc[self.cal[100],'open']=22.
+            self.assertTrue(trade_path(g,s,100,MODES[0],'持有5日')['resolved'])
+            g.loc[self.cal[100],'open']=np.nan
+            self.assertFalse(trade_path(g,s,100,MODES[0],'持有5日')['resolved'])
+            g.loc[self.cal[100],'open']=20.
+            g.loc[self.cal[105],'open']=np.nan
+            r=trade_path(g,s,100,MODES[0],'持有5日')
+            self.assertEqual(r['status'],'退出数据未知');self.assertFalse(r['closed'])
+        def test_weekly_death_modes_and_pending(self):
+            s=weekly_shape(self.g);s['death']=False;s.loc[self.cal[101],'death']=True
+            a=trade_path(self.g,s,100,MODES[1],EXITS[-1]);b=trade_path(self.g,s,100,MODES[0],EXITS[-1])
+            self.assertEqual(a['sell_date'],self.cal[102]);self.assertEqual(b['sell_date'],self.cal[140])
+            s.loc[self.cal[100],'death']=True
+            self.assertEqual(trade_path(self.g,s,100,MODES[1],EXITS[-1])['sell_date'],self.cal[101])
+            self.assertFalse(trade_path(self.g,s,799,MODES[1],'持有5日')['resolved'])
+            self.assertFalse(trade_path(self.g,s,800,MODES[1],'持有5日')['filled'])
+        def test_bins_use_only_prior_shapes(self):
+            rows=[]
+            for year in ['2022','2023','2024']:
+                for i in range(120):
+                    row=dict(event_id=year+str(i),mode=MODES[0],year=year,qualified=True)
+                    row.update({c:float(i) for c in FEATURES});rows.append(row)
+            e=pd.DataFrame(rows);a,t=assign_bins(e)
+            changed=e.copy();changed.loc[changed.year.ge('2023'),list(FEATURES)]=9999.
+            b,u=assign_bins(changed)
+            pd.testing.assert_frame_equal(t[t.year=='2023'],u[u.year=='2023'])
+            self.assertTrue(a.loc[a.year=='2022','gap_bin'].eq('校准不足').all())
+            self.assertEqual(a[(a.year=='2023')&(a.gap_bin=='低')].shape[0],40)
+        def test_end_to_end_reports(self):
+            cfg=Config('20220101',ds(self.cal[-1]));eligible=pd.Series(True,index=self.cal)
+            e=pd.DataFrame(stock_events(self.g,'600001.SH','test',eligible,eligible,cfg))
+            self.assertFalse(e.empty)
+            tables=build_reports(e,self.cal,cfg)
+            self.assertFalse(tables['summary'].empty)
+            for row in tables['summary'].itertuples():
+                g=e[(e['mode']==row.mode)&(e.exit_rule==row.exit_rule)]
+                if row.year!='全部':g=g[g.year==row.year]
+                self.assertEqual(row.closed,int(g.closed.sum()))
+                if row.closed:self.assertAlmostEqual(row.mean_net_pct,g.loc[g.closed,'net_pct'].mean())
+            payload=make_zip(tables,dict(version=VERSION))
+            with zipfile.ZipFile(io.BytesIO(payload)) as z:self.assertIn('thresholds.csv',z.namelist())
+            self.assertTrue(all(f.empty for f in build_reports(pd.DataFrame(),self.cal,cfg).values()))
     result=unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(Tests))
     if not result.wasSuccessful():raise SystemExit(1)
 
