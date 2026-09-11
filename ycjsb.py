@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""科技波段研究 gpt1.0 价格波段与逐周跟踪 — streamlit run app.py
+"""科技波段研究 gpt1.1 价格波段与逐周跟踪 — streamlit run app.py
 
 单文件；依赖 pandas、numpy、streamlit、tushare。python app.py --self-test 可离线验算。
 策略阈值不是回测寻优结果。历史统计不构成策略有效或实盘合格证明。
@@ -27,7 +27,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
-VERSION = "gpt1.0"
+VERSION = "gpt1.1"
 DOWNLOAD_REVISION = "DL4"
 DOWNLOAD_WORKERS = 4
 API_MIN_INTERVAL = 0.36
@@ -311,7 +311,7 @@ def eligibility(g, code, info, intervals, calendar, cfg):
 
 
 RULES={
- '版本':'gpt1.0；无SKDJ、无资金组合；前五名是独立事件推荐，不模拟五仓',
+ '版本':'gpt1.1；无SKDJ、无资金组合；前五名是独立事件推荐，不模拟五仓',
  '股票池':'历史科技股；信号日不复权价>10元，流通市值50—1000亿元；保留上市180日、风险警示近似排除',
  '启动':'日收盘首次由不高于变为高于此前两个完整交易周的最高价；默认每日更新，周内最多一次；周收盘模式仅检查完整周收盘',
  '周线':'所有结构高低点只来自此前完整周；不使用本周最终高低点提前计算。缺报价的周不作有效结构',
@@ -333,6 +333,7 @@ RULES={
  '空窗':'统计每年无新合格信号的交易周，目标≤5；另列未满5只周。不等同于实际资金空仓，不强行凑满',
  '参数声明':'2周结构、13个4周窗口、至少4段上涨、10%空间及2%—10%风险均为本轮固定假设，未经过寻优；不因空窗过长自动放宽',
 }
+RULES['诊断']='仅事后分析，不参与选股或成交。浮盈/不利波动按复权价格相对含滑点买价，未扣手续费；收盘最大回撤按持有期间收盘及最终成交价。盘中退出当天高低价先后未知，报告上下界；开盘退出不计当天高低价。5%、10%及2R仅为固定诊断分档，不代表可成交止盈。已退出、仍持有及缺失路径分开；未成交不进入持仓诊断。'
 STUDY_NOTES='\n'.join(f'{k}：{v}' for k,v in RULES.items())
 
 
@@ -392,10 +393,10 @@ def lifecycle(g,buy_i,stop):
     if not 2<=risk<=10:cancel('开盘风险不符取消');return out,marks
     out.update(filled=True,status='持有中',buy_date=cal[i],buy_adj=buy,buy_raw=buy_raw,risk_pct_actual=risk,r_amount=r)
     protect=stop;peak=buy;last_close=buy;trailing=False;pending=False;trigger_i=-1;reason=''
-    def finish(j,price):
+    def finish(j,price,at_open=False):
         sell=max(price*.999,down[j])*ad[j];net=(sell*.998/(buy*1.001)-1)*100
         out.update(closed=True,resolved=True,status='已退出',sell_i=j,sell_date=cal[j],sell_adj=sell,net_pct=net,
-            order_net_pct=net,hold_days=j-buy_i+1,exit_reason=reason,max_close_gain_pct=(peak/buy-1)*100,
+            exit_at_open=at_open,order_net_pct=net,hold_days=j-buy_i+1,exit_reason=reason,max_close_gain_pct=(peak/buy-1)*100,
             exit_delay_days=max(0,j-trigger_i-1) if pending else 0)
     for j in range(buy_i,n):
         suspended=np.isfinite(vol[j]) and vol[j]<=0
@@ -403,12 +404,12 @@ def lifecycle(g,buy_i,stop):
             if not np.isfinite([op[j],lo[j],cl[j],ad[j],down[j],vol[j]]).all() or min(op[j],cl[j],ad[j],down[j])<=0:
                 out.update(status='持有路径未知',unknown_from=j,exit_reason='关键日线行情缺失',max_close_gain_pct=(peak/buy-1)*100);break
             if pending and j>buy_i:
-                if op[j]>down[j]+.005:finish(j,op[j]);break
+                if op[j]>down[j]+.005:finish(j,op[j],True);break
             elif lo[j]*ad[j]<=protect:
                 reason='移动止盈' if trailing else '初始止损';trigger_i=j
                 target=min(op[j],protect/ad[j])
                 if j==buy_i or target<=down[j]+.005 or op[j]<=down[j]+.005:pending=True
-                else:finish(j,target);break
+                else:finish(j,target,op[j]*ad[j]<=protect);break
             last_close=cl[j]*ad[j]
             if not pending:
                 peak=max(peak,last_close)
@@ -420,6 +421,85 @@ def lifecycle(g,buy_i,stop):
     if not out['closed'] and out['unknown_from']<0:
         out.update(status='待可执行退出' if pending else '持有中',exit_reason=reason,max_close_gain_pct=(peak/buy-1)*100,hold_days=n-buy_i)
     return out,marks
+
+
+def path_diagnostic(g,path):
+    """事后持仓路径诊断；只读取已确定交易，不回流到信号或退出。"""
+    out=dict(diagnostic_complete=False,diagnostic_note='未成交',mfe_low_pct=np.nan,mfe_high_pct=np.nan,
+        mae_low_pct=np.nan,mae_high_pct=np.nan,close_mdd_pct=np.nan,w1_mfe_low_pct=np.nan,w2_mfe_low_pct=np.nan,
+        stop_hit5='不适用',stop_hit10='不适用',stop_hit2r='不适用')
+    if not path['filled']:return out
+    buy=path['buy_adj'];start=path['buy_i'];closed=path['closed'];end=path['sell_i'] if closed else len(g)-1
+    unknown=path['unknown_from'];complete=unknown<0
+    if unknown>=0:end=min(end,int(unknown)-1)
+    peak=possible_peak=buy;trough=possible_trough=buy;close_peak=buy;mdd=0.;early={};full_days=0
+    for j in range(start,end+1):
+        x=g.iloc[j]
+        if np.isfinite(x.vol) and x.vol<=0:
+            early[j-start+1]=(peak/buy-1)*100
+            continue
+        if not np.isfinite([x.open,x.adj_factor,x.vol]).all() or min(x.open,x.adj_factor)<=0:
+            complete=False;break
+        opening=x.open*x.adj_factor
+        is_exit=closed and j==path['sell_i']
+        if is_exit:
+            sell=path['sell_adj']
+            peak=max(peak,opening,sell);trough=min(trough,opening,sell)
+            possible_peak=max(possible_peak,peak);possible_trough=min(possible_trough,trough)
+            if not path['exit_at_open']:
+                if not np.isfinite([x.high,x.low]).all() or x.low<=0 or x.high<x.low:complete=False
+                else:
+                    possible_peak=max(possible_peak,x.high*x.adj_factor)
+                    possible_trough=min(possible_trough,x.low*x.adj_factor)
+            mdd=max(mdd,(1-sell/close_peak)*100)
+        else:
+            if not np.isfinite([x.high,x.low,x.close]).all() or x.low<=0 or x.high<max(x.low,x.close,x.open) or x.low>min(x.close,x.open):
+                complete=False;break
+            peak=max(peak,x.high*x.adj_factor);trough=min(trough,x.low*x.adj_factor)
+            possible_peak=max(possible_peak,peak);possible_trough=min(possible_trough,trough)
+            close=x.close*x.adj_factor;close_peak=max(close_peak,close);mdd=max(mdd,(1-close/close_peak)*100)
+            full_days+=1
+        early[j-start+1]=(peak/buy-1)*100
+    low=(peak/buy-1)*100;high=(possible_peak/buy-1)*100
+    out.update(diagnostic_complete=bool(complete),diagnostic_note='完整已退出' if complete and closed else '完整截至当前' if complete else '路径不完整，仅为已知片段',
+        mfe_low_pct=low,mfe_high_pct=high,mae_low_pct=(1-trough/buy)*100,
+        mae_high_pct=(1-possible_trough/buy)*100,close_mdd_pct=max(0.,mdd))
+    for n in [5,10]:
+        if complete and (closed or end-start+1>=n):
+            available=[v for k,v in early.items() if k<=n]
+            out[f'w{n//5}_mfe_low_pct']=max(available) if available else np.nan
+    if path['exit_reason']=='初始止损' and closed:
+        for label,threshold in [('5',5.),('10',10.),('2r',2*path['r_amount']/buy*100)]:
+            out['stop_hit'+label]=('未知' if not complete else '确定达到' if low>=threshold else '确定未达' if high<threshold else '退出日先后不明')
+    return out
+
+
+def diagnostic_reports(e):
+    names=['diagnostic_events','diagnostic_summary','stop_excursion_summary']
+    if e.empty:return {n:pd.DataFrame() for n in names}
+    d=e[e.base_pass].copy()
+    if d.empty:return {n:pd.DataFrame() for n in names}
+    summary=[];bins=[]
+    for group,mask in groups(d):
+        whole=d[mask]
+        for year,g in [('全部',whole)]+list(whole.groupby('year')):
+            filled=g[g.filled];done=filled[filled.closed];valid=done[done.diagnostic_complete.eq(True)]
+            stopped=done[done.exit_reason.eq('初始止损')];n=len(valid)
+            summary.append(dict(group=group,year=year,events=len(g),filled=len(filled),closed=len(done),
+                diagnostic_closed=n,closed_missing=len(done)-n,open_or_unknown=int((~filled.closed).sum()),
+                stop_count=len(stopped),mfe_low_median_pct=valid.mfe_low_pct.median(),
+                mfe_low_mean_pct=valid.mfe_low_pct.mean(),mae_high_mean_pct=valid.mae_high_pct.mean(),
+                close_mdd_mean_pct=valid.close_mdd_pct.mean(),
+                confirmed_ge10=int(valid.mfe_low_pct.ge(10).sum()),
+                confirmed_ge10_then_loss=int((valid.mfe_low_pct.ge(10)&valid.net_pct.lt(0)).sum()),
+                confirmed_ge10_then_loss_pct=(valid.mfe_low_pct.ge(10)&valid.net_pct.lt(0)).mean()*100 if n else np.nan))
+            for threshold,col in [('价格浮盈5%','stop_hit5'),('价格浮盈10%','stop_hit10'),('价格浮盈2R','stop_hit2r')]:
+                for category in ['确定未达','确定达到','退出日先后不明','未知']:
+                    sub=stopped[stopped[col].eq(category)]
+                    bins.append(dict(group=group,year=year,threshold=threshold,category=category,count=len(sub),
+                        stop_total=len(stopped),share_of_stops_pct=len(sub)/len(stopped)*100 if len(stopped) else np.nan,
+                        mean_net_pct=sub.net_pct.mean(),mean_hold_days=sub.hold_days.mean()))
+    return dict(diagnostic_events=d,diagnostic_summary=pd.DataFrame(summary),stop_excursion_summary=pd.DataFrame(bins))
 
 
 def calculate(data,basic,member,calendar,cfg,progress):
@@ -439,7 +519,7 @@ def calculate(data,basic,member,calendar,cfg,progress):
                 initial_stop_raw=float(x.initial_stop/g.adj_factor.iloc[i]),pool_pass=bool(eligible.iloc[i]),pool_known=bool(known.iloc[i]),base_pass=base_pass,main_pass=base_pass and bool(x.space_pass))
             row.update({c:x[c] for c in ['trigger_level','initial_stop','history_blocks','up_blocks','history_ready','typical_up_pct','typical_down_pct','risk_pct','risk_pass','space_pass','score']})
             if base_pass:
-                path,weekly=lifecycle(g,i+1,float(x.initial_stop));row.update(path)
+                path,weekly=lifecycle(g,i+1,float(x.initial_stop));row.update(path);row.update(path_diagnostic(g,path))
                 marks.extend(dict(event_id=event_id,**w) for w in weekly)
             else:
                 row.update(filled=False,closed=False,resolved=False,status='基础资格不符',buy_i=i+1,sell_i=-1,net_pct=np.nan,order_net_pct=np.nan)
@@ -579,7 +659,7 @@ def run_research(token,cache_root,cfg,progress):
     hashed=pd.util.hash_pandas_object(data,index=False).to_numpy();hashed.sort();data_hash=hashlib.sha256(hashed.tobytes()).hexdigest()
     e,marks=calculate(data,basic,member,calendar,cfg,progress);del data;gc.collect()
     progress('汇总前五名逐周收益，保留提前退出事件')
-    tables=build_reports(e,marks,calendar,cfg);tables['top5_weekly_history']=recommendation_history(e,marks)
+    tables=build_reports(e,marks,calendar,cfg);tables['top5_weekly_history']=recommendation_history(e,marks);tables.update(diagnostic_reports(e))
     tables.update(data_issues=issues,universe=basic,industry_intervals=member)
     manifest=dict(version=VERSION,config=asdict(cfg),rules=RULES,created_at=datetime.now(ZoneInfo('Asia/Shanghai')).isoformat(),
         data_start=start,data_end=end,data_hash=data_hash,pool_hash=hashlib.sha256(member.to_csv(index=False).encode()).hexdigest(),
@@ -603,25 +683,37 @@ LABELS={'group':'样本组','year':'信号年份','week_no':'持有周次','matu
  'no_signal_weeks':'无新信号周','max_daily_below5_signal_weeks':'有信号但每日均不足5只周',
  'full_year':'完整年度','selected_events':'推荐事件数','unique_stocks':'不同股票数'}
 
+LABELS.update({'diagnostic_complete':'路径完整','mfe_low_pct':'最大浮盈下界%','mfe_high_pct':'最大浮盈上界%',
+ 'mae_low_pct':'最大不利波动下界%','mae_high_pct':'最大不利波动上界%','close_mdd_pct':'收盘最大回撤%',
+ 'w1_mfe_low_pct':'前5交易日浮盈下界%','w2_mfe_low_pct':'前10交易日浮盈下界%',
+ 'stop_hit5':'止损前达到5%','stop_hit10':'止损前达到10%','stop_hit2r':'止损前达到2R',
+ 'diagnostic_closed':'已退出且路径完整','closed_missing':'已退出但诊断缺失','open_or_unknown':'持有中或退出未知',
+ 'stop_count':'初始止损笔数','mfe_low_median_pct':'浮盈下界中位数%','mfe_low_mean_pct':'浮盈下界均值%',
+ 'mae_high_mean_pct':'不利波动上界均值%','close_mdd_mean_pct':'收盘最大回撤均值%',
+ 'confirmed_ge10':'确定浮盈≥10%笔数','confirmed_ge10_then_loss':'浮盈≥10%后净亏损笔数',
+ 'confirmed_ge10_then_loss_pct':'浮盈≥10%后亏损占完整已退出样本%',
+ 'threshold':'诊断门槛','category':'分类','count':'笔数','stop_total':'全部初始止损笔数','share_of_stops_pct':'占全部止损%',
+ 'events':'信号数','closed':'已退出','mean_hold_days':'平均持有交易日'})
+
 
 def load_result(payload):
     with zipfile.ZipFile(io.BytesIO(payload)) as z:
         manifest=json.loads(z.read('manifest.json'))
-        if manifest.get('version')!=VERSION:raise ValueError('只能载入 gpt1.0 结果，旧版口径不兼容')
+        if manifest.get('version')!=VERSION:raise ValueError('只能载入 gpt1.1 结果，旧版口径不兼容')
         tables={}
         for name in z.namelist():
             if name.endswith('.csv'):
                 try:tables[Path(name).stem]=pd.read_csv(z.open(name),dtype={'year':str,'ts_code':str})
                 except pd.errors.EmptyDataError:tables[Path(name).stem]=pd.DataFrame()
-    required={'events','weekly_summary','coverage','top5_weekly_history'}
+    required={'events','weekly_summary','coverage','top5_weekly_history','diagnostic_summary','diagnostic_events'}
     if not required.issubset(tables):raise ValueError('结果文件不完整')
     return tables,manifest,payload,'已导入结果'
 
 
 def main():
     import streamlit as st
-    st.set_page_config(page_title='gpt1.0 科技周线选股',layout='wide')
-    st.title('gpt1.0 · 科技周线选股验证')
+    st.set_page_config(page_title='gpt1.1 科技周线选股',layout='wide')
+    st.title('gpt1.1 · 科技周线选股验证')
     st.caption('价格启动＋历史上行能力筛选；前五名独立跟踪；不模拟资金组合。新规则尚未证明盈利。')
     with st.sidebar:
         st.header('研究设置')
@@ -633,9 +725,9 @@ def main():
         min_mv=st.number_input('流通市值下限（亿元）',min_value=0.,value=50.)
         max_mv=st.number_input('流通市值上限（亿元）',min_value=0.,value=1000.)
         cache=st.text_input('行情缓存目录',value='tech_swing_cache')
-        run=st.button('运行 gpt1.0',type='primary')
+        run=st.button('运行 gpt1.1',type='primary')
         st.caption('四路并发，复用历史行情缓存。持仓跟踪至最新已完成行情，不设固定退出期限。')
-        upload=st.file_uploader('载入已完成的 gpt1.0 结果',type=['zip'])
+        upload=st.file_uploader('载入已完成的 gpt1.1 结果',type=['zip'])
         if st.button('载入结果',disabled=upload is None):
             try:st.session_state['gpt_result']=load_result(upload.getvalue())
             except Exception as ex:st.error(str(ex))
@@ -656,11 +748,11 @@ def main():
     tables,manifest,payload,path=st.session_state['gpt_result']
     c=manifest['config']
     st.write(f"结果：{manifest['version']}｜{c['start']}—{c['end']}｜{c['signal_mode']}｜行情至 {manifest['data_end']}")
-    st.download_button('下载本次完整结果',payload,file_name=f"gpt1.0_{c['start']}_{c['end']}.zip",mime='application/zip')
+    st.download_button('下载本次完整结果',payload,file_name=f"gpt1.1_{c['start']}_{c['end']}.zip",mime='application/zip')
     for warning in manifest.get('warnings',[]):st.warning(str(warning))
     if manifest.get('data_issues',0):st.warning(f"存在 {manifest['data_issues']} 条数据问题，请查看质量表；未知结果不计为零收益。")
     def show(df):st.dataframe(df.rename(columns=LABELS),use_container_width=True,hide_index=True)
-    tabs=st.tabs(['逐周主表','每批前五名','退出与对照','空窗与数据'])
+    tabs=st.tabs(['逐周主表','每批前五名','退出与对照','空窗与数据','买点与退出诊断'])
     with tabs[0]:
         st.caption('已退出事件冻结最终收益。每周先要求整批达到观察年龄，再统计；胜率分母为收益已知的已成交事件。')
         df=tables['weekly_summary']
@@ -703,6 +795,23 @@ def main():
         show(tables.get('data_issues',pd.DataFrame()))
         with st.expander('数据与版本记录'):st.json(manifest)
 
+    with tabs[4]:
+        st.caption('诊断不改变买卖。最大浮盈为价格涨幅，非可兑现净利润；盘中退出日按上下界处理。已退出且行情完整的交易用于主分类，持有中及未知单列。')
+        diag=tables.get('diagnostic_summary',pd.DataFrame())
+        if diag.empty:st.info('尚无可诊断事件。')
+        else:
+            dg=st.selectbox('诊断样本组',list(dict.fromkeys(diag.group)))
+            dy=st.selectbox('诊断信号年份',list(dict.fromkeys(diag.year.astype(str))))
+            show(diag[diag.group.eq(dg)&diag.year.astype(str).eq(dy)])
+            st.write('初始止损前是否曾上涨：分母为对应组、年份的全部初始止损笔数，未知不会被归入未上涨。')
+            bins=tables['stop_excursion_summary'];show(bins[bins.group.eq(dg)&bins.year.astype(str).eq(dy)])
+            st.caption('净利润回吐：至少曾出现10%价格浮盈但最终净亏损；不能据此认定在最高价卖出可实现。收盘最大回撤只反映收盘路径，不等于盘中最大回撤。')
+            detail=tables['diagnostic_events']
+            mask=dict(groups(detail))[dg];detail=detail[mask]
+            if dy!='全部':detail=detail[detail.year.astype(str).eq(dy)]
+            cols=['ts_code','name','signal_date','rank','status','exit_reason','net_pct','diagnostic_complete','mfe_low_pct','mfe_high_pct','mae_low_pct','mae_high_pct','close_mdd_pct','w1_mfe_low_pct','w2_mfe_low_pct','stop_hit5','stop_hit10','stop_hit2r']
+            show(detail[[x for x in cols if x in detail]])
+
 
 def self_test():
     def frame(n=30):
@@ -739,7 +848,19 @@ def self_test():
     assert abs(f.loc[g.index.to_period('W-FRI')==w.index[idx],'typical_up_pct'].iloc[0]-expected)<1e-9
     damaged=g.copy();damaged.loc[damaged.index[300],'ac']=np.nan
     assert not price_setup(damaged,'周中逐日').history_ready.iloc[-1]
-    print('gpt1.0 self-test PASS: stops, T+1, trailing causality, limits, missing data, maturity, frozen losses, weekly feature causality; no real-market profitability claim.')
+    # 盘中退出当日高点不能确定发生在卖出前；开盘退出必须排除当日高点。
+    g=frame();g.loc[g.index[1],['high','low']]=[130,94]
+    path,_=lifecycle(g,0,95.);diag=path_diagnostic(g,path)
+    assert diag['stop_hit10']=='退出日先后不明' and diag['mfe_low_pct']<1 and diag['mfe_high_pct']>29
+    g.loc[g.index[1],'open']=94
+    path,_=lifecycle(g,0,95.);diag=path_diagnostic(g,path)
+    assert path['exit_at_open'] and diag['stop_hit10']=='确定未达'
+    g=frame();g.loc[g.index[1],'high']=115;g.loc[g.index[2],'low']=94
+    path,_=lifecycle(g,0,95.);diag=path_diagnostic(g,path)
+    assert diag['stop_hit10']=='确定达到'
+    g.loc[g.index[1],'high']=np.nan
+    assert path_diagnostic(g,path)['stop_hit10']=='未知'
+    print('gpt1.1 self-test PASS: stops, T+1, trailing causality, limits, missing data, maturity, frozen losses, weekly feature causality, excursion bounds and missing highs; no real-market profitability claim.')
 
 
 if __name__=='__main__':
