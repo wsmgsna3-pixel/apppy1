@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""科技波段研究 gpt1.1 价格波段与逐周跟踪 — streamlit run app.py
+"""科技波段研究 gpt1.2 价格波段与逐周跟踪 — streamlit run app.py
 
 单文件；依赖 pandas、numpy、streamlit、tushare。python app.py --self-test 可离线验算。
 策略阈值不是回测寻优结果。历史统计不构成策略有效或实盘合格证明。
@@ -27,7 +27,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
-VERSION = "gpt1.1"
+VERSION = "gpt1.2"
 DOWNLOAD_REVISION = "DL4"
 DOWNLOAD_WORKERS = 4
 API_MIN_INTERVAL = 0.36
@@ -311,7 +311,7 @@ def eligibility(g, code, info, intervals, calendar, cfg):
 
 
 RULES={
- '版本':'gpt1.1；无SKDJ、无资金组合；前五名是独立事件推荐，不模拟五仓',
+ '版本':'gpt1.2；无SKDJ、无资金组合；前五名是独立事件推荐，不模拟五仓',
  '股票池':'历史科技股；信号日不复权价>10元，流通市值50—1000亿元；保留上市180日、风险警示近似排除',
  '启动':'日收盘首次由不高于变为高于此前两个完整交易周的最高价；默认每日更新，周内最多一次；周收盘模式仅检查完整周收盘',
  '周线':'所有结构高低点只来自此前完整周；不使用本周最终高低点提前计算。缺报价的周不作有效结构',
@@ -334,6 +334,9 @@ RULES={
  '参数声明':'2周结构、13个4周窗口、至少4段上涨、10%空间及2%—10%风险均为本轮固定假设，未经过寻优；不因空窗过长自动放宽',
 }
 RULES['诊断']='仅事后分析，不参与选股或成交。浮盈/不利波动按复权价格相对含滑点买价，未扣手续费；收盘最大回撤按持有期间收盘及最终成交价。盘中退出当天高低价先后未知，报告上下界；开盘退出不计当天高低价。5%、10%及2R仅为固定诊断分档，不代表可成交止盈。已退出、仍持有及缺失路径分开；未成交不进入持仓诊断。'
+EXIT_MODES=['原规则','首周失败退出','提前保护']
+RULES['gpt1.2退出对照']='固定全部原信号、排名、前五名及买入；三种退出独立运行，不叠加。首周失败退出：第5个交易日收盘检查此前5日盘中最高价，若从未达到含滑点买价的105%，发出退出指令，第6日起首个可执行开盘卖出；已触发止损者优先执行原指令。缺最高价无法判定则列未知，W1收盘标记仍保留。提前保护：只将原2R收盘启动门槛改为min(2R,买价×10%)，回撤距离仍为1R；当日收盘上移的线次日生效。其余初始止损、T+1、停牌、涨跌停及费用均不变。'
+RULES['对照评价']='逐周比较必须是同一事件、同一周且两规则结果都已知；提前退出者冻结收益，未成熟不纳入。另列双方均已退出配对，不能用其代替逐周表；单方仍持有或未知不强行结算。事后统计改善亏损、削减盈利及大赢家损失，只用于评估，不回流到交易。新增5%/10%门槛为固定研究假设，不搜索最佳阈值；空窗按原推荐名单不变。'
 STUDY_NOTES='\n'.join(f'{k}：{v}' for k,v in RULES.items())
 
 
@@ -373,7 +376,8 @@ def price_setup(g,mode):
     return f
 
 
-def lifecycle(g,buy_i,stop):
+def lifecycle(g,buy_i,stop,exit_mode='原规则'):
+    if exit_mode not in EXIT_MODES:raise ValueError('未知退出规则')
     n=len(g);cal=g.index
     out=dict(filled=False,closed=False,resolved=False,status='待买入',exit_reason='',buy_i=buy_i,sell_i=-1,
         buy_date=pd.NaT,sell_date=pd.NaT,buy_adj=np.nan,buy_raw=np.nan,sell_adj=np.nan,
@@ -393,6 +397,8 @@ def lifecycle(g,buy_i,stop):
     if not 2<=risk<=10:cancel('开盘风险不符取消');return out,marks
     out.update(filled=True,status='持有中',buy_date=cal[i],buy_adj=buy,buy_raw=buy_raw,risk_pct_actual=risk,r_amount=r)
     protect=stop;peak=buy;last_close=buy;trailing=False;pending=False;trigger_i=-1;reason=''
+    early_peak=buy;early_known=True;hi=g.high.to_numpy()
+    activation=min(2*r,buy*.10) if exit_mode=='提前保护' else 2*r
     def finish(j,price,at_open=False):
         sell=max(price*.999,down[j])*ad[j];net=(sell*.998/(buy*1.001)-1)*100
         out.update(closed=True,resolved=True,status='已退出',sell_i=j,sell_date=cal[j],sell_adj=sell,net_pct=net,
@@ -413,11 +419,22 @@ def lifecycle(g,buy_i,stop):
             last_close=cl[j]*ad[j]
             if not pending:
                 peak=max(peak,last_close)
-                if peak-buy>=2*r:trailing=True;protect=max(protect,peak-r)
+                if peak-buy>=activation:trailing=True;protect=max(protect,peak-r)
+        early_unknown=False
+        if exit_mode=='首周失败退出' and j-buy_i+1<=5:
+            if not suspended:
+                if np.isfinite(hi[j]) and hi[j]>=max(op[j],cl[j],lo[j]):early_peak=max(early_peak,hi[j]*ad[j])
+                else:early_known=False
+            if j-buy_i+1==5 and not pending:
+                if not early_known and early_peak<buy*1.05:early_unknown=True
+                elif early_peak<buy*1.05:
+                    pending=True;reason='首周上涨不足';trigger_i=j
         if (j-buy_i+1)%5==0:
             marks.append(dict(week_no=(j-buy_i+1)//5,mark_i=j,mark_date=cal[j],
                 net_pct=(last_close*.999*.998/(buy*1.001)-1)*100,mark_kind='停牌沿用最近价' if suspended else '收盘标记',
                 protect_adj=protect,trail_active=trailing,pending_exit=pending))
+        if early_unknown:
+            out.update(status='持有路径未知',unknown_from=j+1,exit_reason='首周最高价缺失，无法判断后续退出');break
     if not out['closed'] and out['unknown_from']<0:
         out.update(status='待可执行退出' if pending else '持有中',exit_reason=reason,max_close_gain_pct=(peak/buy-1)*100,hold_days=n-buy_i)
     return out,marks
@@ -502,7 +519,7 @@ def diagnostic_reports(e):
     return dict(diagnostic_events=d,diagnostic_summary=pd.DataFrame(summary),stop_excursion_summary=pd.DataFrame(bins))
 
 
-def calculate(data,basic,member,calendar,cfg,progress):
+def calculate(data,basic,member,calendar,cfg,progress,variant_sink=None):
     rows=[];marks=[];base=basic.set_index('ts_code');members={c:m for c,m in member.groupby('ts_code')}
     for num,(code,part) in enumerate(data.groupby('ts_code',sort=True),1):
         if code not in base.index or code not in members:continue
@@ -521,6 +538,11 @@ def calculate(data,basic,member,calendar,cfg,progress):
             if base_pass:
                 path,weekly=lifecycle(g,i+1,float(x.initial_stop));row.update(path);row.update(path_diagnostic(g,path))
                 marks.extend(dict(event_id=event_id,**w) for w in weekly)
+                if variant_sink is not None:
+                    for exit_mode in EXIT_MODES[1:]:
+                        vp,vm=lifecycle(g,i+1,float(x.initial_stop),exit_mode)
+                        variant_sink[0].append(dict(event_id=event_id,exit_mode=exit_mode,**vp))
+                        variant_sink[1].extend(dict(event_id=event_id,exit_mode=exit_mode,**w) for w in vm)
             else:
                 row.update(filled=False,closed=False,resolved=False,status='基础资格不符',buy_i=i+1,sell_i=-1,net_pct=np.nan,order_net_pct=np.nan)
             rows.append(row)
@@ -641,6 +663,64 @@ def recommendation_history(e,marks):
     return pd.concat(rows,ignore_index=True) if rows else pd.DataFrame()
 
 
+def exit_experiment_reports(e,marks,sink,progress=lambda _:None):
+    names=['exit_events','exit_weekly_marks','exit_weekly_comparison','exit_final_pairs','exit_final_comparison','exit_top5_weekly_history']
+    if e.empty or not sink[0]:return {n:pd.DataFrame() for n in names}
+    meta=['event_id','ts_code','name','signal_date','year','signal_week','rank','selected','main_pass','base_pass','mature_weeks','score']
+    base=e[e.base_pass].copy();v=pd.DataFrame(sink[0]).merge(base[meta],on='event_id',how='left',validate='many_to_one')
+    vm=pd.DataFrame(sink[1]);pair_rows=[];final=[];weekly=[];hist=[]
+    for mode in EXIT_MODES[1:]:
+        t=v[v.exit_mode.eq(mode)].copy();q=vm[vm.exit_mode.eq(mode)] if not vm.empty else vm
+        paired=t.merge(base[['event_id','filled','closed','net_pct','status']],on='event_id',suffixes=('','_base'),validate='one_to_one')
+        if not paired.filled.eq(paired.filled_base).all():raise RuntimeError('退出试验买入名单发生变化，不能比较')
+        paired['both_closed']=paired.closed&paired.closed_base
+        paired['base_net_pct']=paired.net_pct_base.where(paired.both_closed)
+        paired['variant_net_pct']=paired.net_pct.where(paired.both_closed)
+        paired['delta_pp']=paired.variant_net_pct-paired.base_net_pct
+        paired['base_status']=paired.status_base;paired['variant_status']=paired.status;paired['variant_reason']=paired.exit_reason
+        pair_rows.append(paired[meta+['exit_mode','base_status','variant_status','variant_reason','both_closed','base_net_pct','variant_net_pct','delta_pp']])
+        for group,mask in groups(paired):
+            whole=paired[mask]
+            for year,g in [('全部',whole)]+list(whole.groupby('year')):
+                closed=g[g.both_closed];b=closed.base_net_pct;n=closed.variant_net_pct;delta=n-b
+                final.append(dict(exit_mode=mode,group=group,year=year,events=len(g),paired_closed=len(closed),
+                    not_both_closed=len(g)-len(closed),base_mean_net_pct=b.mean(),variant_mean_net_pct=n.mean(),
+                    mean_delta_pp=delta.mean(),median_delta_pp=delta.median(),
+                    base_win_pct=b.gt(0).mean()*100 if len(b) else np.nan,variant_win_pct=n.gt(0).mean()*100 if len(n) else np.nan,
+                    improved=int(delta.gt(1e-9).sum()),worsened=int(delta.lt(-1e-9).sum()),
+                    loss_improved=int((b.lt(0)&delta.gt(1e-9)).sum()),loss_to_profit=int((b.lt(0)&n.gt(0)).sum()),
+                    winner_reduced=int((b.gt(0)&delta.lt(-1e-9)).sum()),winner_to_nonprofit=int((b.gt(0)&n.le(0)).sum()),
+                    big_winner_reduced=int((b.ge(20)&delta.lt(-1e-9)).sum()),
+                    positive_delta_sum_pp=delta.clip(lower=0).sum(),negative_delta_sum_pp=delta.clip(upper=0).sum()))
+        for w in range(1,int(base.mature_weeks.max())+1):
+            if w%25==0:progress(f'{mode}：对照 W{w}')
+            bv=weekly_view(base,marks,w);tv=weekly_view(t,q,w)
+            if tv.empty:continue
+            bh=bv.set_index('event_id')
+            tv['base_order_pct']=tv.event_id.map(bh.week_order_pct)
+            tv['base_known']=tv.event_id.map(bh.week_known).fillna(False).astype(bool)
+            tv['both_known']=tv.week_known&tv.base_known
+            tv['paired_delta_pp']=(tv.week_order_pct-tv.base_order_pct).where(tv.both_known)
+            h=tv[tv.selected].copy()
+            hist.append(h[meta+['exit_mode','filled','exited','holding','cancelled','week_known','week_net_pct','week_order_pct','base_order_pct','both_known','paired_delta_pp']].assign(week_no=w))
+            for group,mask in groups(tv):
+                whole=tv[mask]
+                for year,g in [('全部',whole)]+list(whole.groupby('year')):
+                    comparable=g[g.both_known];b=comparable.base_order_pct;n=comparable.week_order_pct;delta=n-b
+                    trades=comparable[comparable.filled]
+                    weekly.append(dict(exit_mode=mode,group=group,year=year,week_no=w,mature_events=len(g),
+                        paired_known=len(comparable),excluded_unknown=len(g)-len(comparable),paired_filled=len(trades),
+                        cancelled=int(comparable.cancelled.sum()),base_mean_order_pct=b.mean(),variant_mean_order_pct=n.mean(),
+                        mean_delta_pp=delta.mean(),median_delta_pp=delta.median(),
+                        base_mean_net_pct=trades.base_order_pct.mean(),variant_mean_net_pct=trades.week_net_pct.mean(),
+                        base_win_pct=trades.base_order_pct.gt(0).mean()*100 if len(trades) else np.nan,
+                        variant_win_pct=trades.week_net_pct.gt(0).mean()*100 if len(trades) else np.nan,
+                        improved=int(delta.gt(1e-9).sum()),worsened=int(delta.lt(-1e-9).sum())))
+    return dict(exit_events=v,exit_weekly_marks=vm,exit_weekly_comparison=pd.DataFrame(weekly),
+        exit_final_pairs=pd.concat(pair_rows,ignore_index=True),exit_final_comparison=pd.DataFrame(final),
+        exit_top5_weekly_history=pd.concat(hist,ignore_index=True) if hist else pd.DataFrame())
+
+
 def make_zip(tables,manifest):
     out=io.BytesIO()
     with zipfile.ZipFile(out,'w',compression=zipfile.ZIP_DEFLATED) as z:
@@ -657,9 +737,12 @@ def run_research(token,cache_root,cfg,progress):
     start=ds(stamp(cfg.start)-pd.Timedelta(days=450));end=ds(ready)
     calendar=client.calendar(start,end);data,issues=client.download(calendar,set(basic.ts_code))
     hashed=pd.util.hash_pandas_object(data,index=False).to_numpy();hashed.sort();data_hash=hashlib.sha256(hashed.tobytes()).hexdigest()
-    e,marks=calculate(data,basic,member,calendar,cfg,progress);del data;gc.collect()
+    variant_sink=([],[])
+    e,marks=calculate(data,basic,member,calendar,cfg,progress,variant_sink);del data;gc.collect()
     progress('汇总前五名逐周收益，保留提前退出事件')
     tables=build_reports(e,marks,calendar,cfg);tables['top5_weekly_history']=recommendation_history(e,marks);tables.update(diagnostic_reports(e))
+    progress('按相同事件与相同观察周比较三种退出规则')
+    tables.update(exit_experiment_reports(e,marks,variant_sink,progress))
     tables.update(data_issues=issues,universe=basic,industry_intervals=member)
     manifest=dict(version=VERSION,config=asdict(cfg),rules=RULES,created_at=datetime.now(ZoneInfo('Asia/Shanghai')).isoformat(),
         data_start=start,data_end=end,data_hash=data_hash,pool_hash=hashlib.sha256(member.to_csv(index=False).encode()).hexdigest(),
@@ -695,25 +778,37 @@ LABELS.update({'diagnostic_complete':'路径完整','mfe_low_pct':'最大浮盈�
  'threshold':'诊断门槛','category':'分类','count':'笔数','stop_total':'全部初始止损笔数','share_of_stops_pct':'占全部止损%',
  'events':'信号数','closed':'已退出','mean_hold_days':'平均持有交易日'})
 
+LABELS.update({'exit_mode':'退出规则','paired_known':'双方结果已知事件','excluded_unknown':'因未知排除事件',
+ 'paired_filled':'双方已知成交数','base_mean_order_pct':'原规则订单均值%','variant_mean_order_pct':'新规则订单均值%',
+ 'base_mean_net_pct':'原规则成交均值%','variant_mean_net_pct':'新规则成交均值%',
+ 'mean_delta_pp':'新减原平均差额百分点','median_delta_pp':'差额中位数百分点',
+ 'base_win_pct':'原规则胜率%','variant_win_pct':'新规则胜率%','improved':'收益提高笔数','worsened':'收益降低笔数',
+ 'paired_closed':'双方均已退出','not_both_closed':'非双方均退出事件','loss_improved':'原亏损改善笔数',
+ 'loss_to_profit':'原亏损转盈利笔数','winner_reduced':'原盈利缩水笔数','winner_to_nonprofit':'原盈利转非盈利笔数',
+ 'big_winner_reduced':'原收益≥20%缩水笔数','positive_delta_sum_pp':'正差额合计百分点（非账户收益）',
+ 'negative_delta_sum_pp':'负差额合计百分点（非账户收益）','both_closed':'双方均退出',
+ 'base_net_pct':'原规则最终净收益%','variant_net_pct':'新规则最终净收益%','delta_pp':'新减原差额百分点',
+ 'base_status':'原规则状态','variant_status':'新规则状态','variant_reason':'新规则退出原因'})
+
 
 def load_result(payload):
     with zipfile.ZipFile(io.BytesIO(payload)) as z:
         manifest=json.loads(z.read('manifest.json'))
-        if manifest.get('version')!=VERSION:raise ValueError('只能载入 gpt1.1 结果，旧版口径不兼容')
+        if manifest.get('version')!=VERSION:raise ValueError('只能载入 gpt1.2 结果，旧版口径不兼容')
         tables={}
         for name in z.namelist():
             if name.endswith('.csv'):
                 try:tables[Path(name).stem]=pd.read_csv(z.open(name),dtype={'year':str,'ts_code':str})
                 except pd.errors.EmptyDataError:tables[Path(name).stem]=pd.DataFrame()
-    required={'events','weekly_summary','coverage','top5_weekly_history','diagnostic_summary','diagnostic_events'}
+    required={'events','weekly_summary','coverage','top5_weekly_history','diagnostic_summary','diagnostic_events','exit_weekly_comparison','exit_final_comparison','exit_events','exit_weekly_marks'}
     if not required.issubset(tables):raise ValueError('结果文件不完整')
     return tables,manifest,payload,'已导入结果'
 
 
 def main():
     import streamlit as st
-    st.set_page_config(page_title='gpt1.1 科技周线选股',layout='wide')
-    st.title('gpt1.1 · 科技周线选股验证')
+    st.set_page_config(page_title='gpt1.2 科技周线选股',layout='wide')
+    st.title('gpt1.2 · 科技周线选股与退出对照')
     st.caption('价格启动＋历史上行能力筛选；前五名独立跟踪；不模拟资金组合。新规则尚未证明盈利。')
     with st.sidebar:
         st.header('研究设置')
@@ -725,9 +820,9 @@ def main():
         min_mv=st.number_input('流通市值下限（亿元）',min_value=0.,value=50.)
         max_mv=st.number_input('流通市值上限（亿元）',min_value=0.,value=1000.)
         cache=st.text_input('行情缓存目录',value='tech_swing_cache')
-        run=st.button('运行 gpt1.1',type='primary')
+        run=st.button('运行 gpt1.2',type='primary')
         st.caption('四路并发，复用历史行情缓存。持仓跟踪至最新已完成行情，不设固定退出期限。')
-        upload=st.file_uploader('载入已完成的 gpt1.1 结果',type=['zip'])
+        upload=st.file_uploader('载入已完成的 gpt1.2 结果',type=['zip'])
         if st.button('载入结果',disabled=upload is None):
             try:st.session_state['gpt_result']=load_result(upload.getvalue())
             except Exception as ex:st.error(str(ex))
@@ -748,13 +843,13 @@ def main():
     tables,manifest,payload,path=st.session_state['gpt_result']
     c=manifest['config']
     st.write(f"结果：{manifest['version']}｜{c['start']}—{c['end']}｜{c['signal_mode']}｜行情至 {manifest['data_end']}")
-    st.download_button('下载本次完整结果',payload,file_name=f"gpt1.1_{c['start']}_{c['end']}.zip",mime='application/zip')
+    st.download_button('下载本次完整结果',payload,file_name=f"gpt1.2_{c['start']}_{c['end']}.zip",mime='application/zip')
     for warning in manifest.get('warnings',[]):st.warning(str(warning))
     if manifest.get('data_issues',0):st.warning(f"存在 {manifest['data_issues']} 条数据问题，请查看质量表；未知结果不计为零收益。")
     def show(df):st.dataframe(df.rename(columns=LABELS),use_container_width=True,hide_index=True)
-    tabs=st.tabs(['逐周主表','每批前五名','退出与对照','空窗与数据','买点与退出诊断'])
+    tabs=st.tabs(['逐周主表','每批前五名','退出与对照','空窗与数据','买点与退出诊断','退出规则对照'])
     with tabs[0]:
-        st.caption('已退出事件冻结最终收益。每周先要求整批达到观察年龄，再统计；胜率分母为收益已知的已成交事件。')
+        st.caption('本页为原规则。新增两种退出请看「退出规则对照」。已退出事件冻结最终收益。每周先要求整批达到观察年龄，再统计；胜率分母为收益已知的已成交事件。')
         df=tables['weekly_summary']
         if df.empty:st.info('尚无成熟样本。')
         else:
@@ -812,6 +907,25 @@ def main():
             cols=['ts_code','name','signal_date','rank','status','exit_reason','net_pct','diagnostic_complete','mfe_low_pct','mfe_high_pct','mae_low_pct','mae_high_pct','close_mdd_pct','w1_mfe_low_pct','w2_mfe_low_pct','stop_hit5','stop_hit10','stop_hit2r']
             show(detail[[x for x in cols if x in detail]])
 
+    with tabs[5]:
+        st.caption('三个方案买入与推荐完全相同，两种新规则分别与原规则比较。优先看同一事件的逐周差额，再看双方均退出样本。空窗周数不会因退出试验改变。')
+        table=tables['exit_weekly_comparison']
+        if table.empty:st.info('尚无可比较的成熟事件。')
+        else:
+            eg=st.selectbox('对照样本组',list(dict.fromkeys(table.group)))
+            ey=st.selectbox('对照信号年份',list(dict.fromkeys(table.year.astype(str))))
+            ev=st.selectbox('新退出规则',EXIT_MODES[1:])
+            show(table[table.group.eq(eg)&table.year.astype(str).eq(ey)&table.exit_mode.eq(ev)])
+            st.write('双方均已退出：改善亏损与削减盈利必须一起看')
+            final=tables['exit_final_comparison']
+            show(final[final.group.eq(eg)&final.year.astype(str).eq(ey)&final.exit_mode.eq(ev)])
+            st.caption('同周收益包含已退出收益及仍持有标记收益；取消买入为0，未知不补0。误杀计数为事后原规则盈利、新规则净收益更低的配对事件，并非实盘可提前知道。')
+            with st.expander('逐笔对照'):
+                pairs=tables['exit_final_pairs'];sub=pairs[pairs.exit_mode.eq(ev)]
+                if ey!='全部':sub=sub[sub.year.astype(str).eq(ey)]
+                sub=sub[dict(groups(sub))[eg]]
+                show(sub[['ts_code','name','signal_date','rank','base_status','variant_status','both_closed','base_net_pct','variant_net_pct','delta_pp','variant_reason']])
+
 
 def self_test():
     def frame(n=30):
@@ -860,7 +974,17 @@ def self_test():
     assert diag['stop_hit10']=='确定达到'
     g.loc[g.index[1],'high']=np.nan
     assert path_diagnostic(g,path)['stop_hit10']=='未知'
-    print('gpt1.1 self-test PASS: stops, T+1, trailing causality, limits, missing data, maturity, frozen losses, weekly feature causality, excursion bounds and missing highs; no real-market profitability claim.')
+    g=frame();out,marks=lifecycle(g,0,92.,'首周失败退出')
+    assert out['sell_i']==5 and out['exit_reason']=='首周上涨不足' and len(marks)==1
+    out,marks=lifecycle(g.iloc[:5],0,92.,'首周失败退出')
+    assert not out['closed'] and len(marks)==1
+    g.loc[g.index[1],'high']=np.nan
+    out,marks=lifecycle(g,0,92.,'首周失败退出');assert out['unknown_from']==5 and len(marks)==1
+    g=frame();g.loc[g.index[1],['high','close','low']]=[112,111,99]
+    g.loc[g.index[2],['open','high','low','close']]=[110,111,102,108]
+    out,_=lifecycle(g,0,92.,'提前保护');assert out['sell_i']==2
+    baseline,_=lifecycle(g,0,92.);assert not baseline['closed']
+    print('gpt1.2 self-test PASS: stops, T+1, trailing causality, limits, missing data, maturity, frozen losses, weekly feature causality, excursion bounds, missing highs and independent exits; no real-market profitability claim.')
 
 
 if __name__=='__main__':
