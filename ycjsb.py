@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""科技波段研究 gpt1.5 动量、反转与历史同行比较 — streamlit run app.py
+"""科技波段研究 gpt1.6 动量、反转与历史同行比较 — streamlit run app.py
 
 单文件；依赖 pandas、numpy、streamlit、tushare。python app.py --self-test 可离线验算。
 策略阈值不是回测寻优结果。历史统计不构成策略有效或实盘合格证明。
@@ -27,7 +27,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
-VERSION = "gpt1.5"
+VERSION = "gpt1.6"
 DOWNLOAD_REVISION = "DL4"
 DOWNLOAD_WORKERS = 4
 API_MIN_INTERVAL = 0.36
@@ -468,7 +468,7 @@ def make_zip(tables,manifest):
 
 STRATEGIES={'原始动量':'mom_raw','行业调整动量':'mom_adj','短期反转':'rev_raw','行业调整反转':'rev_adj'}
 RULES={
- '研究目的':'gpt1.5 独立比较四个单项；不混合评分，不筛选两周新高或历史上涨空间。四组共用同一可比较股票池和同一逐股交易路径，无资金组合。',
+ '研究目的':'gpt1.6 独立比较四个单项；不混合评分，不筛选两周新高或历史上涨空间。四组共用同一可比较股票池和同一逐股交易路径，无资金组合。',
  '股票池':'历史科技股票，信号日未复权股价严格>10元，流通市值50—1000亿元，上市至少180天。价格市值可在侧栏修改。风险警示使用原有涨跌停幅度近似识别，历史行业记录仍可能不完整。',
  '周频':'每个完整交易周最后一个交易日收盘计算一次，次交易日开盘买入；不是每个工作日重复推荐。全周休市不计入交易周窗口，未完成周不发信号。',
  '动量':'C为复权周收盘价；动量=100×(C[t−2]/C[t−28]−1)，衡量26个交易周收益，跳过最近2个交易周。',
@@ -487,17 +487,21 @@ RULES={
  '空窗':'每年无方向合格推荐的交易周，目标≤5。每周能排序不等于有盈利机会，单靠排名覆盖率不算策略成功。',
  '历史限制':'2022—2026数据已被多次观察，本轮结果为历史研究，不能称为全新样本外。新信号和统一8%初始止损均不同于gpt1.2，不能将跨版本差异全部归因于因子。',
 }
-RULES['版本对照']='gpt1.5保留gpt1.3选股、排名、8%止损和移动保护规则。只增加事后诊断，不用诊断收益改变选股。'
+RULES['版本对照']='gpt1.6保留gpt1.3选股、排名、8%止损和移动保护规则。只增加事后诊断，不用诊断收益改变选股。'
 RULES['无退出路径']='固定观察W1—W12（5—60个市场交易日），从同一实际含滑点买价起，忽略止损和止盈继续观察。收盘标记预扣双边费用与滑点，不是可执行卖出收益；停牌沿用最近复权收盘，末日停牌、跌停和限制数据缺失另计。'
 RULES['路径幅度']='最高/最低价相对含滑点买价为毛价格幅度，含买入日；最大上涨下限为0，最大下跌上限为0。收盘最大回撤含买价起点。极值不代表可兑现利润，也不推断同日高低点顺序。报价缺失后整个后续诊断窗口记未知，不恢复成完整路径。'
 RULES['退出配对']='只在已成交且无退出路径及原规则周收益均已知的同一事件比较；退出贡献=原规则收益−无退出收盘标记。分别报告原规则盈利/亏损与无退出盈利/亏损的四格计数。诊断期限不改变实际持仓期限。'
 RULES['入场对照']='逐信号日期比较前五名与排除前五名后的共同池；两组全部已成交事件的诊断均完整才纳入日期均值。未成交不计收益，数量另列。同步比较最大上涨、最大下跌；不把高波动直接认定为优势。'
 RULES['评分检验']='每周横截面评分与无退出标记收益、最大上涨、最大下跌的秩相关，完整已成交样本不少于10且变量有差异才计算；逐日期等权汇总。事件及观察窗重叠，不报告独立样本显著性或自动选优。'
-RULES['止损先后']='gpt1.5新增前五名初始止损与首次上涨10%的先后分类：退出前、开盘退出当日、盘中退出当日先后未知、退出次日起才达到、观察期未达到、路径未知。只含该观察周内已实际初始止损事件；未知不从分母删除。不把止损后高点解释为持有时可获得的利润。'
-RULES['早退验证']='gpt1.5冻结两个单独对照：满5个、满10个市场交易日收盘，买入以来最高复权价尚未达到实际含滑点买价的110%，则下一交易日开盘退出。达到10%后保留原规则；检查只做一次。保留8%止损和原移动止盈，不补位、不再买入。'
+RULES['止损先后']='gpt1.6新增前五名初始止损与首次上涨10%的先后分类：退出前、开盘退出当日、盘中退出当日先后未知、退出次日起才达到、观察期未达到、路径未知。只含该观察周内已实际初始止损事件；未知不从分母删除。不把止损后高点解释为持有时可获得的利润。'
+RULES['早退验证']='gpt1.6冻结两个单独对照：满5个、满10个市场交易日收盘，买入以来最高复权价尚未达到实际含滑点买价的110%，则下一交易日开盘退出。达到10%后保留原规则；检查只做一次。保留8%止损和原移动止盈，不补位、不再买入。'
 RULES['早退执行']='先执行原规则止损止盈。检查前已经退出不复活；已有待执行退出不被覆盖。早退仅在检查收盘后生效，跌停/停牌延后至可执行开盘。必要最高价缺失则检查未知，不推断未上涨。停牌占市场交易日；日内最高价是观察特征，不视为可成交止盈价。'
 RULES['早退统计']='四种方法的前五名名单保持一致，每笔共用原买入。逐周在同事件、同年龄、双方结果已知的成交样本比较，提前退出后收益冻结；未知数量单列。另统计取消订单口径、最终共同已退出结果与逐股周收益。'
 RULES['事后标签']='8周完整价格路径中从未上涨10%、曾上涨20%仅作事后诊断标签，不进入买卖。统计原规则在检查日及以前已退出、早退触发与实际执行、对基准盈利交易的损害；不能将无退出深亏全部视为可节省损失。'
+RULES['检查日特征']='gpt1.6保留全部选股、原退出和两种早退规则。只对已触发早退的事件记录检查日已知六项特征：收盘相对买价、最近3日收盘变化、从持有期最高价回落、持有区间收盘位置、距10日均线、最近3日均量相对买入前20日均量。量以成交量/复权因子统一口径；每项所需窗口不足或价格停牌等不完整记缺失，不补零。'
+RULES['误删标签']='W8为主观察期，W4/W12为敏感性观察。以早退净收益减原规则同周净收益为差额，分为收益改善、原盈利受损、其他收益受损、无差异、未知。标签只用于事后评估；盈利受损不等于所有曾上涨股票，未知不算无差异。'
+RULES['特征分层']='每一检查年份，仅使用此前年份已经触发早退的检查日特征，固定取1/3和2/3分位点划分低中高层；至少60条有效历史记录且分位点不同，否则不分层并披露。阈值不使用收益标签，同年及未来特征不进入阈值。按检查年份逐年展示，首年通常无阈值。'
+RULES['检验边界']='六项分别诊断，不合成新评分、不自动挑最佳特征或改变退出。分层只说明观察关系，不等于分层交易策略收益。历史已反复观察，不称为全新样本外；同股重复事件及多方案重叠不是独立样本。'
 STUDY_NOTES='\n'.join(f'{k}：{v}' for k,v in RULES.items())
 
 
@@ -589,7 +593,7 @@ def score_cross_sections(features):
     return f
 
 
-def calculate(data,basic,member,calendar,cfg,progress,full_calendar=None,diagnostic_sink=None,early_sink=None,early_marks_sink=None):
+def calculate(data,basic,member,calendar,cfg,progress,full_calendar=None,diagnostic_sink=None,early_sink=None,early_marks_sink=None,checkpoint_sink=None):
     full_calendar=calendar if full_calendar is None else full_calendar
     complete_i=complete_week_indices(calendar,full_calendar)
     signal_i=complete_i[(calendar[complete_i]>=stamp(cfg.start))&(calendar[complete_i]<=stamp(cfg.end))]
@@ -623,6 +627,7 @@ def calculate(data,basic,member,calendar,cfg,progress,full_calendar=None,diagnos
                 for label,days in EARLY_VARIANTS.items():
                     ep,em=early_lifecycle(g,int(row.signal_i)+1,days)
                     early_sink.append(dict(event_id=row.event_id,variant=label,**ep))
+                    if checkpoint_sink is not None:checkpoint_sink.append(dict(event_id=row.event_id,variant=label,**checkpoint_features(g,ep)))
                     if early_marks_sink is not None:early_marks_sink.extend(dict(event_id=row.event_id,variant=label,**x) for x in em)
             paths.append(dict(event_id=row.event_id,**path))
             marks.extend(dict(event_id=row.event_id,**x) for x in weekly)
@@ -974,6 +979,98 @@ def early_reports(e,marks,paths,emarks,diagnostics,progress=lambda _:None):
     return out
 
 
+CHECK_FEATURES={'cp_return_pct':'检查日相对买价涨幅%', 'recent3_pct':'最近3日收盘变化%',
+ 'peak_pullback_pct':'距持有期最高价回落%', 'range_position':'持有区间收盘位置0—1',
+ 'ma10_gap_pct':'距10日均线%', 'volume_ratio':'近3日均量/买前20日均量'}
+
+
+def checkpoint_features(g,p):
+    out={f:np.nan for f in CHECK_FEATURES};b=int(p['buy_i']);j=int(p['early_check_i'])
+    out.update(check_date=g.index[j] if j<len(g) else pd.NaT,triggered=p['early_trigger_i']>=0)
+    if not out['triggered']:return out
+    # Every window stops at the check close; never read subsequent prices.
+    def prices(start,end):
+        if start<0:return None
+        x=g.iloc[start:end+1]
+        cols=['open','high','low','close','adj_factor','vol']
+        if len(x)!=end-start+1 or not np.isfinite(x[cols].to_numpy()).all() or not (x[cols]>0).all().all():return None
+        if (x.high<x[['open','close','low']].max(axis=1)).any() or (x.low>x[['open','close']].min(axis=1)).any():return None
+        return x
+    x=prices(b,j)
+    if x is not None:
+        c=float(x.close.iloc[-1]*x.adj_factor.iloc[-1]);h=(x.high*x.adj_factor).max();l=(x.low*x.adj_factor).min()
+        out.update(cp_return_pct=(c/p['buy_adj']-1)*100,peak_pullback_pct=(c/h-1)*100,
+                   range_position=(c-l)/(h-l) if h>l else np.nan)
+    x=prices(j-3,j)
+    if x is not None:out['recent3_pct']=(x.close.iloc[-1]*x.adj_factor.iloc[-1]/(x.close.iloc[0]*x.adj_factor.iloc[0])-1)*100
+    x=prices(j-9,j)
+    if x is not None:
+        cl=x.close*x.adj_factor;out['ma10_gap_pct']=(cl.iloc[-1]/cl.mean()-1)*100
+    if b>=20:
+        hist=g.iloc[b-20:b][['vol','adj_factor']];recent=g.iloc[j-2:j+1][['vol','adj_factor']]
+        if np.isfinite(hist.to_numpy()).all() and np.isfinite(recent.to_numpy()).all() and (hist.adj_factor>0).all() and (recent.adj_factor>0).all() and (hist.vol>=0).all() and (recent.vol>=0).all():
+            denom=(hist.vol/hist.adj_factor).mean()
+            if denom>0:out['volume_ratio']=(recent.vol/recent.adj_factor).mean()/denom
+    out['feature_known_count']=sum(np.isfinite(out[f]) for f in CHECK_FEATURES)
+    return out
+
+
+def distinction_stat(g,feature):
+    valid=g[g[feature].notna()];p=valid[valid.effect_pp.notna()];helped=p[p.effect_pp.gt(1e-9)];hurt=p[p.effect_pp.lt(-1e-9)]
+    corr=p[feature].rank().corr(p.effect_pp.rank()) if len(p)>=10 and p[feature].nunique()>1 and p.effect_pp.nunique()>1 else np.nan
+    return dict(triggered_events=len(g),feature_known=len(valid),feature_missing=len(g)-len(valid),paired_count=len(p),
+        outcome_unknown=int(valid.effect_pp.isna().sum()),helped_count=len(helped),hurt_count=len(hurt),
+        hurt_winner_count=int((p.effect_pp.lt(-1e-9)&p.base_week_net_pct.gt(0)).sum()),
+        feature_median=valid[feature].median(),helped_feature_median=helped[feature].median(),hurt_feature_median=hurt[feature].median(),
+        base_mean_pct=p.base_week_net_pct.mean(),early_mean_pct=p.week_net_pct.mean(),effect_mean_pp=p.effect_pp.mean(),
+        positive_contribution_pp=p.effect_pp.clip(lower=0).mean(),negative_contribution_pp=p.effect_pp.clip(upper=0).mean(),
+        feature_effect_rank_corr=corr)
+
+
+def distinction_reports(e,snapshots,history,progress=lambda _:None):
+    out={k:pd.DataFrame() for k in ['checkpoint_features','distinction_events','distinction_summary','distinction_bins','distinction_thresholds']}
+    out['checkpoint_features']=snapshots
+    if snapshots.empty or history.empty:return out
+    if snapshots.duplicated(['event_id','variant']).any():raise ValueError('检查日特征主键重复')
+    snapshots=snapshots[snapshots.triggered].copy()
+    if snapshots.empty:return out
+    snapshots['check_date']=pd.to_datetime(snapshots.check_date)
+    if snapshots.check_date.isna().any():raise ValueError('触发早退的检查日缺失')
+    # Eligibility uses only original selections, never hindsight profitability.
+    members=[]
+    for strategy,col in STRATEGIES.items():
+        g=snapshots.merge(e.loc[e['selected_'+col],['event_id']],on='event_id',validate='many_to_one').copy()
+        g['strategy']=strategy;g['check_year']=g.check_date.dt.year.astype(str);members.append(g)
+    members=pd.concat(members,ignore_index=True)
+    h=history[history.week_no.isin([4,8,12])].copy()
+    d=h.merge(members,on=['event_id','variant','strategy'],validate='many_to_one')
+    d['effect_pp']=d.week_net_pct-d.base_week_net_pct
+    d['outcome']=np.select([d.effect_pp.isna(),d.effect_pp.gt(1e-9),d.effect_pp.lt(-1e-9)&d.base_week_net_pct.gt(0),d.effect_pp.lt(-1e-9)],
+                            ['未知','收益改善','原盈利受损','其他收益受损'],default='无差异')
+    summaries=[];thresholds=[];bins=[]
+    for (strategy,variant),member in members.groupby(['strategy','variant']):
+        progress(f'检查日特征分层：{strategy} / {variant}')
+        events=d[d.strategy.eq(strategy)&d.variant.eq(variant)]
+        for f in CHECK_FEATURES:
+            for w,whole in events.groupby('week_no'):
+                for yr,p in [('全部',whole)]+list(whole.groupby('check_year')):
+                    summaries.append(dict(strategy=strategy,variant=variant,feature=f,check_year=yr,week_no=w,**distinction_stat(p,f)))
+            for yr in sorted(member.check_year.unique()):
+                cutoff=pd.Timestamp(int(yr),1,1);train=member[member.check_date.lt(cutoff)][f].dropna()
+                lo,hi=train.quantile([1/3,2/3]).to_numpy() if len(train) else (np.nan,np.nan)
+                state='可分层' if len(train)>=60 and hi>lo else '历史不足或分位点相同'
+                thresholds.append(dict(strategy=strategy,variant=variant,feature=f,check_year=yr,training_count=len(train),
+                    training_before=cutoff,low_cut=lo,high_cut=hi,threshold_status=state))
+                current=events[events.check_year.eq(yr)].copy()
+                if state=='可分层':
+                    current['feature_bin']=np.select([current[f].isna(),current[f].le(lo),current[f].le(hi)],['特征缺失','低','中'],default='高')
+                else:current['feature_bin']='尚无历史阈值'
+                for (w,bin_name),p in current.groupby(['week_no','feature_bin']):
+                    bins.append(dict(strategy=strategy,variant=variant,feature=f,check_year=yr,week_no=w,feature_bin=bin_name,**distinction_stat(p,f)))
+    out.update(distinction_events=d,distinction_summary=pd.DataFrame(summaries),distinction_bins=pd.DataFrame(bins),distinction_thresholds=pd.DataFrame(thresholds))
+    return out
+
+
 def run_research(token,cache_root,cfg,progress):
     client=DataClient(token,cache_root,progress);basic,member,pool_mode,pool_warnings=client.universe()
     if '快照' in pool_mode or 'l2_name' not in member or member.l2_name.fillna('').str.strip().eq('').all():
@@ -984,14 +1081,15 @@ def run_research(token,cache_root,cfg,progress):
     full=client.calendar(start,ds(ready+pd.Timedelta(days=14)));calendar=full[full<=ready]
     data,issues=client.download(calendar,set(basic.ts_code))
     hashed=pd.util.hash_pandas_object(data,index=False).to_numpy();hashed.sort();data_hash=hashlib.sha256(hashed.tobytes()).hexdigest()
-    diagnostic_rows=[];early_rows=[];early_marks=[]
-    e,marks,f,schedule=calculate(data,basic,member,calendar,cfg,progress,full,diagnostic_rows,early_rows,early_marks);del data;gc.collect()
+    diagnostic_rows=[];early_rows=[];early_marks=[];checkpoint_rows=[]
+    e,marks,f,schedule=calculate(data,basic,member,calendar,cfg,progress,full,diagnostic_rows,early_rows,early_marks,checkpoint_rows);del data;gc.collect()
     progress('汇总四种评分的前五名、全池分层和空窗')
     tables=build_reports(e,marks,f,schedule,calendar,cfg,progress);tables.update(data_issues=issues,universe=basic,industry_intervals=member)
     diagnostic_frame=pd.concat(diagnostic_rows,ignore_index=True) if diagnostic_rows else pd.DataFrame()
     del diagnostic_rows;gc.collect()
     tables.update(entry_exit_reports(e,marks,diagnostic_frame,progress))
     tables.update(early_reports(e,marks,pd.DataFrame(early_rows),pd.DataFrame(early_marks),diagnostic_frame,progress))
+    tables.update(distinction_reports(e,pd.DataFrame(checkpoint_rows),tables['early_weekly_details'],progress))
     manifest=dict(version=VERSION,config=asdict(cfg),rules=RULES,created_at=datetime.now(ZoneInfo('Asia/Shanghai')).isoformat(),
         data_start=start,data_end=ds(calendar.max()),data_hash=data_hash,pool_hash=hashlib.sha256(member.to_csv(index=False).encode()).hexdigest(),
         pool_mode=pool_mode,warnings=pool_warnings,data_issues=len(issues),universe_size=len(basic),download_workers=DOWNLOAD_WORKERS,
@@ -1032,10 +1130,13 @@ LABELS.update({'stop_up10_timing':'初始止损与上涨10%先后','category':'�
 
 LABELS.update({'variant': '早退方案', 'unknown_pairs': '成交结果未知配对数', 'not_filled_unknown': '未成交且状态未知', 'base_mean_pct': '原规则配对均益%', 'early_mean_pct': '早退配对均益%', 'delta_pp': '早退减原规则百分点', 'base_win_pct': '原规则配对胜率%', 'early_win_pct': '早退配对胜率%', 'base_ge20_pct': '原规则盈利≥20%占比', 'early_ge20_pct': '早退盈利≥20%占比', 'early_triggered': '已触发早退数', 'early_executed': '已实际早退数', 'helped_count': '收益改善数', 'hurt_count': '收益降低数', 'saved_loss_count': '原亏损减轻数', 'hurt_winner_count': '原盈利受损数', 'gain_contribution_pp': '改善贡献百分点', 'loss_contribution_pp': '损害贡献百分点', 'known_orders': '双方已知订单数', 'base_order_mean_pct': '原规则订单均益%', 'early_order_mean_pct': '早退订单均益%', 'base_week_net_pct': '原规则当周净收益%', 'early_check_state': '早退检查状态', 'early_peak_pct': '检查时最高毛涨幅%', 'early_trigger_i': '早退触发交易日序号', 'both_closed': '共同已退出数', 'base_hold_days': '原规则平均持有交易日', 'early_hold_days': '早退平均持有交易日', 'mature_filled': '8周成熟成交总数', 'label_unknown': '8周标签未知数', 'category_events': '该标签事件数', 'base_exited_by_check': '原规则检查日及以前已退出数'})
 
+LABELS.update({'feature': '特征', 'check_year': '检查年份', 'check_date': '检查日', 'triggered_events': '已触发早退事件数', 'feature_known': '特征有效数', 'feature_missing': '特征缺失数', 'outcome_unknown': '特征有效但结果未知数', 'feature_median': '特征中位数', 'helped_feature_median': '收益改善组特征中位数', 'hurt_feature_median': '收益受损组特征中位数', 'effect_mean_pp': '早退减原规则均值百分点', 'effect_pp': '早退减原规则百分点', 'positive_contribution_pp': '改善贡献百分点', 'negative_contribution_pp': '损害贡献百分点', 'feature_effect_rank_corr': '特征与早退差额秩相关', 'training_count': '历史有效特征数', 'training_before': '历史截止日前', 'low_cut': '历史1/3分位点', 'high_cut': '历史2/3分位点', 'threshold_status': '分层可用状态', 'feature_bin': '特征层', 'outcome': '事后结果分类'})
+LABELS.update(CHECK_FEATURES)
+
 def load_result(payload):
     with zipfile.ZipFile(io.BytesIO(payload)) as z:
         manifest=json.loads(z.read('manifest.json'))
-        if manifest.get('version')!=VERSION:raise ValueError('本页需gpt1.5结果；旧结果不含可执行早退路径，请复用缓存重新运行')
+        if manifest.get('version')!=VERSION:raise ValueError('本页需gpt1.6结果；旧结果不含可执行早退路径，请复用缓存重新运行')
         tables={}
         for name in z.namelist():
             if name.endswith('.csv'):
@@ -1044,7 +1145,7 @@ def load_result(payload):
     required={'events','weekly_summary','selections','coverage','rank_layers','industry_adjustment_summary','signal_calendar','top5_weekly_history','path_diagnostics','entry_exit_summary','entry_rank_summary','entry_date_comparison'}
     required.update(['survivor_summary','final_summary','industry_adjustment_dates','pool_filter_counts',
                      'industry_profile','entry_date_summary','entry_top5_details'])
-    if manifest.get('version')==VERSION:required.update(['stop_timing_summary','early_paths','early_weekly_summary','early_weekly_details','early_final_summary','early_target_summary'])
+    if manifest.get('version')==VERSION:required.update(['stop_timing_summary','early_paths','early_weekly_summary','early_weekly_details','early_final_summary','early_target_summary','checkpoint_features','distinction_events','distinction_summary','distinction_bins','distinction_thresholds'])
     if not required.issubset(tables):raise ValueError('结果文件缺少必要表格：'+', '.join(sorted(required-set(tables))))
     tables.setdefault('stop_timing_summary',pd.DataFrame())
     return tables,manifest,payload,'已载入结果'
@@ -1052,8 +1153,8 @@ def load_result(payload):
 
 def main():
     import streamlit as st
-    st.set_page_config(page_title='gpt1.5 动量与反转验证',layout='wide')
-    st.title('gpt1.5 · 第一周、第二周进展不足早退验证')
+    st.set_page_config(page_title='gpt1.6 动量与反转验证',layout='wide')
+    st.title('gpt1.6 · 早退误删与检查日特征诊断')
     st.caption('四个单项独立验证；周收盘选股，次交易日开盘执行。前五名是研究候选，尚未证明盈利。')
     with st.sidebar:
         st.header('研究设置')
@@ -1063,11 +1164,11 @@ def main():
         min_mv=st.number_input('流通市值下限（亿元）',min_value=0.,value=50.)
         max_mv=st.number_input('流通市值上限（亿元）',min_value=0.,value=1000.)
         cache=st.text_input('行情缓存目录',value='tech_swing_cache')
-        run=st.button('运行 gpt1.5',type='primary')
+        run=st.button('运行 gpt1.6',type='primary')
         st.caption('四路下载并复用缓存；四组重合股票共用一次退出计算。历史二级行业数据必须可用。')
-        upload=st.file_uploader('载入gpt1.5结果',type=['zip'])
+        upload=st.file_uploader('载入gpt1.6结果',type=['zip'])
         if st.button('载入结果',disabled=upload is None):
-            try:st.session_state['gpt15_result']=load_result(upload.getvalue())
+            try:st.session_state['gpt16_result']=load_result(upload.getvalue())
             except Exception as ex:st.error(str(ex))
     if run:
         if not token:st.error('请填写Tushare Token，或载入已完成的结果。')
@@ -1076,13 +1177,13 @@ def main():
             status=st.empty()
             try:
                 cfg=Config(start=ds(start),end=ds(end),min_price=price,min_mv=min_mv,max_mv=max_mv)
-                st.session_state['gpt15_result']=run_research(token,cache,cfg,status.info)
+                st.session_state['gpt16_result']=run_research(token,cache,cfg,status.info)
                 status.success('计算完成。')
             except Exception as ex:status.error(f'本次未完成：{ex}')
     with st.expander('本版固定规则与统计口径'):st.text(STUDY_NOTES)
-    if 'gpt15_result' not in st.session_state:
+    if 'gpt16_result' not in st.session_state:
         st.info('本版统一8%初始止损，保留2R启动及回撤1R保护；不设固定持仓期限。运行后比较四组及评分分层。');return
-    tables,manifest,payload,path=st.session_state['gpt15_result'];cfg=manifest['config']
+    tables,manifest,payload,path=st.session_state['gpt16_result'];cfg=manifest['config']
     st.write(f"程序 {VERSION}｜结果 {manifest['version']}｜信号 {cfg['start']}—{cfg['end']}｜行情至 {manifest['data_end']}")
     st.download_button('下载完整结果',payload,file_name=f"{manifest['version']}_{cfg['start']}_{cfg['end']}.zip",mime='application/zip')
     for warning in manifest.get('warnings',[]):st.warning(str(warning))
@@ -1096,7 +1197,7 @@ def main():
         out=df[df.strategy.eq(strategy)] if 'strategy' in df else df
         return out[out.year.astype(str).eq(year)] if 'year' in out else out
     def show(df):st.dataframe(df.rename(columns=LABELS),use_container_width=True,hide_index=True)
-    tabs=st.tabs(['逐周收益','前五名明细','行业调整对照','排序分层','覆盖与数据','入场与退出诊断','第一周／第二周早退'])
+    tabs=st.tabs(['逐周收益','前五名明细','行业调整对照','排序分层','覆盖与数据','入场与退出诊断','第一周／第二周早退','早退误删特征'])
     with tabs[0]:
         group=st.selectbox('样本组',['前五名']+[f'第{r}名' for r in range(1,6)])
         df=subset(tables['weekly_summary'])
@@ -1219,6 +1320,33 @@ def main():
                 show(d[d.week_no.eq(w)])
 
 
+    with tabs[7]:
+        st.caption('只诊断已经触发早退的股票。全部特征截至检查日收盘，收益标签来自事后同笔对照；本版没有新增过滤器或改变交易。')
+        dv=st.selectbox('特征研究早退方案',list(EARLY_VARIANTS))
+        feature=st.selectbox('检查日特征',list(CHECK_FEATURES),format_func=lambda x:CHECK_FEATURES[x])
+        dw=st.selectbox('特征验证观察周次',[8,4,12])
+        d=tables['distinction_summary']
+        def feature_subset(d):
+            if d.empty:return d
+            return d[d.strategy.eq(strategy)&d.variant.eq(dv)&d.feature.eq(feature)]
+        d=feature_subset(d)
+        if d.empty:st.info('没有可研究的早退事件。')
+        else:
+            st.write('逐检查年份比较：收益改善事件与收益受损事件的特征差异')
+            show(d[d.week_no.eq(dw)])
+            st.caption('这里按检查年份展示全部年份，不沿用上方信号年份筛选。相关系数为特征与早退收益差额的关系；负值表示特征越高，早退越不划算。不能仅凭全期相关选规则。')
+        with st.expander('此前年份固定分位点，在后续年份观察',expanded=True):
+            d=feature_subset(tables['distinction_bins'])
+            if not d.empty:show(d[d.week_no.eq(dw)])
+            st.caption('阈值仅来自该检查年份之前的特征，不使用收益标签；至少60条有效历史记录。首年通常不能分层。低中高层展示的是关系诊断，不是新策略收益，历史也不是全新样本外。')
+        with st.expander('历史阈值与样本数'):show(feature_subset(tables['distinction_thresholds']))
+        with st.expander('检查日特征与事后结果逐笔核对'):
+            d=tables['distinction_events']
+            if not d.empty:
+                d=d[d.strategy.eq(strategy)&d.variant.eq(dv)&d.week_no.eq(dw)]
+                show(d[['ts_code','name','signal_date','check_date','check_year','base_week_net_pct','week_net_pct','effect_pp','outcome']+list(CHECK_FEATURES)])
+
+
 def diagnostic_self_test():
     def frame(n=65):
      return pd.DataFrame(dict(open=100.,high=101.,low=99.,close=100.,adj_factor=1.,up_limit=150.,down_limit=50.,vol=100.),index=pd.bdate_range('2024-01-01',periods=n))
@@ -1302,7 +1430,36 @@ def early_self_test():
     q,_=early_lifecycle(x,0,5);assert q['early_trigger_i']==p['early_trigger_i'] and np.isclose(q['net_pct'],p['net_pct'])
     print('PASS: early exit causality, priority, T+1 next open, price limits, suspension, pending, cancel, missing highs, adjustments',flush=True)
 
+def checkpoint_self_test():
+    g=pd.DataFrame(dict(open=100.,high=101.,low=99.,close=100.,adj_factor=1.,up_limit=150.,down_limit=50.,vol=100.),index=pd.bdate_range('2022-01-03',periods=90))
+    p,_=early_lifecycle(g,30,5);q=checkpoint_features(g,p)
+    assert q['triggered'] and q['check_date']==g.index[34]
+    assert np.isclose(q['cp_return_pct'],(100/100.1-1)*100) and q['recent3_pct']==0 and q['range_position']==.5 and q['volume_ratio']==1 and q['ma10_gap_pct']==0
+    x=g.copy();x.loc[x.index[35]:,['open','high','low','close','vol']]*=2
+    pd.testing.assert_series_equal(pd.Series(q),pd.Series(checkpoint_features(x,p)))
+    x=g.copy();x.loc[x.index[32]:,['open','high','low','close','up_limit','down_limit']]/=2;x.loc[x.index[32]:,'vol']*=2;x.loc[x.index[32]:,'adj_factor']=2
+    r=checkpoint_features(x,p)
+    for f in CHECK_FEATURES:assert np.isclose(q[f],r[f])
+    x=g.copy();x.loc[x.index[31],'vol']=0;r=checkpoint_features(x,p);assert np.isnan(r['range_position'])
+    p0,_=early_lifecycle(g,0,5);assert np.isnan(checkpoint_features(g,p0)['volume_ratio'])
+    # Prior-year thresholds use feature values only, not current/future features or any outcome label.
+    ids=[f'E{i}' for i in range(90)];dates=list(pd.date_range('2022-01-01',periods=70))+list(pd.date_range('2023-01-01',periods=20))
+    snap=pd.DataFrame(dict(event_id=ids,variant='W1未达10%早退',check_date=dates,triggered=True,**{f:np.arange(90.) for f in CHECK_FEATURES}))
+    e=pd.DataFrame(dict(event_id=ids,**{'selected_'+c:[c=='mom_raw']*90 for c in STRATEGIES.values()}))
+    h=pd.DataFrame(dict(event_id=ids,variant='W1未达10%早退',strategy='原始动量',week_no=8,base_week_net_pct=1.,week_net_pct=np.linspace(-1,3,90)))
+    t=distinction_reports(e,snap,h)
+    r=t['distinction_thresholds'];r=r[r.check_year.eq('2023')];assert r.training_count.eq(70).all() and np.allclose(r.low_cut,23.) and np.allclose(r.high_cut,46.)
+    x=snap.copy();x.loc[x.check_date.ge(pd.Timestamp('2023-01-01')),list(CHECK_FEATURES)]=10000
+    hh=h.copy();hh['week_net_pct']=1000
+    u=distinction_reports(e,x,hh)
+    pd.testing.assert_frame_equal(t['distinction_thresholds'],u['distinction_thresholds'])
+    b=t['distinction_bins'];assert b[b.check_year.eq('2022')].feature_bin.eq('尚无历史阈值').all()
+    for f in CHECK_FEATURES:
+     assert b[(b.feature==f)&b.check_year.eq('2023')].triggered_events.sum()==20
+    print('PASS: checkpoint formulas, future invariance, split-normalized volume, missing/suspended data, strictly earlier-year thresholds independent of outcomes',flush=True)
+
 def self_test():
+    checkpoint_self_test()
     early_self_test()
     stop_timing_self_test()
     diagnostic_self_test()
@@ -1344,7 +1501,7 @@ def self_test():
     assert np.isclose(out['initial_stop_raw'],100.1*.92)
     g.loc[g.index[0],'low']=90;g.loc[g.index[1],['open','low','close']]=[91,90,92]
     out,_=lifecycle(g,0);assert out['sell_i']==1 and np.isclose(out['sell_adj'],91*.999)
-    print('gpt1.5 self-test PASS: leave-one-out peers, historical industry intervals, no future weekly prices, score ties, small industries, frozen 8% risk and T+1. No profitability claim.')
+    print('gpt1.6 self-test PASS: leave-one-out peers, historical industry intervals, no future weekly prices, score ties, small industries, frozen 8% risk and T+1. No profitability claim.')
 
 
 if __name__=='__main__':
