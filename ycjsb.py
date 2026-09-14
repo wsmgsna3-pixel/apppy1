@@ -1,14 +1,13 @@
 # -*- coding: utf-8 -*-
-"""科技波段研究 gpt1.7.1 内存修复；策略保持gpt1.7 中期趋势、回落与重新转强 — streamlit run app.py
+"""科技波段研究 gpt1.8 同一中期趋势池排序验证 — streamlit run app.py
 
 单文件；依赖 pandas、numpy、streamlit、tushare。python app.py --self-test 可离线验算。
 策略阈值不是回测寻优结果。历史统计不构成策略有效或实盘合格证明。
-gpt1.7.1维护说明：四路有界下载，仅科技池SQLite落盘，旧端点缓存成功迁移后去重；
-行情逐股读取，价格与收益保持float64；诊断路径按周读取，报告与ZIP流式写入；
-页面按需读取，完整ZIP不常驻session_state。gpt1.7策略和统计定义不变。
-进度写入云端日志并显示内存；原环境缓存仍在时可重试，删除应用/重建环境不保证保留。
+gpt1.8说明：同一中期趋势A池，固定比较四种排序；未证明任一方法盈利。
+只对A池生成交易路径，诊断子组逐个读取，行情缓存和四路下载保持兼容。
+可复用gpt1.7.1结果离线重新比较，沿用原截止日、价格与费用，不需要下载行情。
 部署：用本文件内容覆盖Streamlit实际入口（例如ycjsb.py），保持原缓存目录。
-依赖仅需 pandas、numpy、streamlit、tushare；数据库与压缩模块来自Python标准库。
+依赖仅需 pandas、numpy、streamlit、tushare；不新增第三方依赖。
 官方数据字段：https://tushare.pro/document/2?doc_id=32 / 183 / 335
 """
 from __future__ import annotations
@@ -39,7 +38,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
-VERSION = "gpt1.7.1"
+VERSION = "gpt1.8"
 DOWNLOAD_REVISION = "DL4_DISK_V1"
 DOWNLOAD_WORKERS = 4
 API_MIN_INTERVAL = 0.36
@@ -612,7 +611,10 @@ def lifecycle(g,buy_i,stop=None):
 
 def weekly_view(e,marks,w):
     """只在整批达到观察年龄后纳入；提前卖出不能提前变成熟样本。"""
-    v=e[e.base_pass&e.mature_weeks.ge(w)].copy()
+    cols=['event_id','ts_code','name','signal_date','year','filled','closed','resolved','buy_i','sell_i',
+          'net_pct','mature_weeks','base_pass','buy_date','sell_date','exit_reason']
+    for col in STRATEGIES.values():cols += [col,'rank_'+col,'layer_'+col,'selected_'+col]
+    v=e.loc[e.base_pass&e.mature_weeks.ge(w),[c for c in cols if c in e]].copy()
     if v.empty:return v
     v['mark_i']=v.buy_i+5*w-1
     v['exited']=v.closed&v.sell_i.le(v.mark_i)
@@ -646,9 +648,19 @@ def make_zip(tables,manifest):
 
 
 LEGACY_STRATEGIES={'原始动量':'mom_raw','行业调整动量':'mom_adj','短期反转':'rev_raw','行业调整反转':'rev_adj'}
-ENTRY_STAGES={'中期趋势':'entry_trend','趋势回落':'entry_pullback','回落后转强':'entry_reclaim'}
-STRATEGIES={'回落后转强':'entry_reclaim','趋势回落':'entry_pullback','中期趋势':'entry_trend',**LEGACY_STRATEGIES}
+ENTRY_STAGES={'中期趋势':'entry_trend'}
+STRATEGIES={'中期趋势':'entry_trend','趋势池原始动量':'rank_mom','趋势池行业动量':'rank_industry','趋势池短期反转':'rank_reversal'}
 RULES={'版本': 'gpt1.7验证入场条件；三个新组分别为中期趋势、趋势回落、回落后转强。旧四种因子作为参照；新规则未证明有效。没有资金组合。', '共同股票池': '历史科技股票，信号日未复权股价严格>10元，流通市值50—1000亿元，上市至少180天。复用此前共同样本：29个交易周历史完整、历史二级行业可用且至少10只其他合格同行。风险警示仍用历史涨跌停幅度近似，供应商行业历史有局限。', '周频': 't为刚完成的交易周；完整周最后交易日收盘确认，下一交易日开盘买入。周内不使用最终周线。整周休市不计交易周。', '中期趋势A': '26周收益为C[t−2]/C[t−28]−1，必须>0；上一周收盘C[t−1]>MA13[t−1]，且MA13[t−1]>MA13[t−2]。判断趋势用上一完整周，避免本周反弹自己制造趋势合格。', '趋势回落B': '在A基础上，上一周收盘C[t−1]<C[t−3]，即截至上一周最近两周收盘净下跌。它不要求两周都下跌，不预先排除回落幅度较大的股票。', '回落后转强C': '在B基础上，本周收盘C[t]>H[t−1]（上一完整周最高价）。确认发生于本周收盘，不能用本周内提前看到的片段行情代替。', '新组统一排序': '三组都按26周上涨效率降序：100×(C[t−2]−C[t−28])/过去26个周收盘变化绝对值之和。分母窗口同样截至t−2。分母为0则不可用。越少来回波动、越接近持续向上，效率越高；这是形态分数，不是预测收益。', '幅度检验': '效率高可能对应慢涨，因此同时报告净收益≥10%/20%、最大上涨幅度和剔除最高1%后的收益。没有用本轮结果寻优涨幅门槛；高胜率低收益仍不算达标。', '推荐与分层': '每个新组在自身合格候选中按同一效率取前5，同分依次按流通市值降序、代码升序。不足5只不补位；无合格股票不退回较宽组。新组五层分别在该组候选中划分，旧组五层在共同池内划分，同分不拆开。', '对照': 'A/B/C逐层嵌套候选，但各自前五名可能不同。同日对照比较双方已知订单均值，取消订单计0，未知或单方有信号的日期另列；不是同一股票延后买入试验。新组与原始动量跨组比较同时改变了排序与条件，不能只归因于某一项。', '旧因子': '原动量=100×(C[t−2]/C[t−28]−1)；原反转=−100×(C[t]/C[t−2]−1)。行业调整继续扣除同日同业其他股票相应收益中位数，不是回归残差或中性组合。旧组仍要求评分>0并取前5。', '买卖执行': '统一沿用8%初始价格止损；最高收盘浮盈达到2R后，保护线=最高收盘价−1R，只上移且次日生效。R为含滑点买价的8%。不使用第一周或第二周早退，没有固定持仓期限。', '成交与成本': '信号后次交易日开盘买入；开盘涨停或已知停牌取消，取消不补位。T+1；跌停/停牌导致退出延迟。买入费0.10%、卖出费0.20%，每边滑点0.10%。关键路径缺失单列未知，日线不能还原真实成交队列。', '逐周收益': 'W1/W2/...按买入起5/10/...个市场交易日。整批达到观察年龄才纳入；提前退出冻结实际收益，仍持有按收盘标记并预扣退出成本。未知不补零，另报含取消0的订单均值。', '重复': '同股后续完整周仍符合条件可再次入选，作为独立假设事件记账，彼此可能重叠；不是加仓指令或账户收益，也不是统计独立样本。', '空窗': '每年无新候选推荐的交易周目标≤5；同时列未满5只及各阶段剩余候选。不能通过放宽/降级补位掩盖空窗，也不等于实际资金空仓时间。', '无退出诊断': 'W1—W12继续观察原买价之后的价格路径，忽略退出仅用于诊断。最大上涨/下跌是毛价格幅度，极值不代表可兑现利润；无退出收盘标记扣成本，末日停牌/跌停状态另列。路径缺失后后续诊断未知。', '诊断基准': '无退出同日对照要求前五已成交路径全部已知，其余共同池仅使用已知成交路径并披露缺失比例。避免因一只缺报价剔除整周；仍存在可用样本选择偏差。不得与旧版严格完整共同池的同日表直接拼接。', '止损先后': '另列8周等观察期内初始止损与首次上涨10%的先后；盘中同日先后未知单列，不把卖出后高点视为已持有利润。', '历史限制': '2022—2026已经反复研究，不能称为全新样本外。13周均线、2周回落、26周效率及上一周高点均为本次固定假设，没有寻优或收益保证。'}
+for obsolete in ['趋势回落B','回落后转强C','新组统一排序','推荐与分层','对照','版本','旧因子']:
+    RULES.pop(obsolete,None)
+RULES.update({
+ '版本':'gpt1.8，同一中期趋势池比较四种排序；这是固定比较实验，不自动选择历史收益最高的方法。',
+ '共同实验池':'沿用gpt1.7中期趋势A条件；四组用完全相同的合格候选，不增加回落或转强硬门槛。共同池基准现在仅指A池，不能与旧版全科技共同池基准直接拼接。',
+ '四种排序':'上涨效率（中期趋势旧组）、26周原始动量、同行调整26周动量、最近2周收益取负。行业调整仍相对原科技共同池的其他历史同行计算。四组均降序，同分按流通市值降序、代码升序。',
+ '分数与名额':'排序分数可为负，四组均不另设分数门槛，不足5只不补足；评分分层在同一个A池进行。',
+ '同日对照':'前五名对本组其余A池候选，先算同日已知订单均值，再对日期等权。前五须全部已知，其余未知排除并披露数量；另报其余也全已知的严格口径。取消订单计0，未知不补零。',
+ '复用历史结果':'gpt1.7.1结果包含原始因子与逐笔路径，可离线重新排名；保持原数据截止日、原费用与退出规则，不补未来行情。完整基准事件用于验证A池覆盖，缺失则拒绝复用。',
+ '检验目标':'同时检查前五名相对其余候选的增益、跨年表现、收益≥10%比例、未触及10%比例及剔除最高1%后的均益。历史已反复查看，不能视作新样本外。'})
 STUDY_NOTES='\n'.join(f'{k}：{v}' for k,v in RULES.items())
 
 
@@ -737,27 +749,22 @@ def score_cross_sections(features):
     f.loc[common.index,'rev_adj']=f.loc[common.index,'industry_short_pct']-f.loc[common.index,'short_return_pct']
     tech=f[f.common_pass].groupby('signal_date',observed=True).mom_raw.median()
     f.loc[common.index,'industry_vs_tech_pp']=f.loc[common.index,'industry_mom_pct']-f.loc[common.index,'signal_date'].map(tech)
-    for col in LEGACY_STRATEGIES.values():
-        f['rank_'+col]=np.nan;f['layer_'+col]=np.nan;f['selected_'+col]=False
-        order=f.loc[f.common_pass,['signal_date',col,'circ_mv_yi','ts_code']].sort_values(['signal_date',col,'circ_mv_yi','ts_code'],ascending=[True,False,False,True])
+    eligible=f.common_pass & f.trend_ok.eq(True) & f.trend_efficiency.gt(0)
+    eligible &= f[['mom_raw','mom_adj','short_return_pct','trend_efficiency']].notna().all(axis=1)
+    for col,source,sign in [('entry_trend','trend_efficiency',1),('rank_mom','mom_raw',1),
+                            ('rank_industry','mom_adj',1),('rank_reversal','short_return_pct',-1)]:
+        f['eligible_'+col]=eligible
+        f[col]=(sign*f[source]).where(eligible)
+        f['rank_'+col]=np.nan;f['layer_'+col]=np.nan
+        order=f.loc[eligible,['signal_date',col,'circ_mv_yi','ts_code']].sort_values(
+            ['signal_date',col,'circ_mv_yi','ts_code'],ascending=[True,False,False,True])
         f.loc[order.index,'rank_'+col]=order.groupby('signal_date',observed=True).cumcount()+1
-        # 中位秩分层，同分不切开，避免市值成为虚假的评分信息。
         r=order.groupby('signal_date',observed=True)[col].rank(ascending=False,method='average')
         size=order.groupby('signal_date',observed=True)[col].transform('size')
-        layer=np.minimum(5,np.floor((r-1)/size*5)+1)
-        f.loc[order.index,'layer_'+col]=layer
-        f['selected_'+col]=f.common_pass&f['rank_'+col].le(5)&f[col].gt(0)
-    for col,flag in [('entry_trend','trend_ok'),('entry_pullback','pullback_ok'),('entry_reclaim','reclaim_ok')]:
-        eligible=f.common_pass & f.get(flag,pd.Series(False,index=f.index)).eq(True)
-        score=f.get('trend_efficiency',pd.Series(np.nan,index=f.index))
-        eligible&=score.notna()&score.gt(0)
-        f[col]=score.where(eligible);f['eligible_'+col]=eligible
-        f['rank_'+col]=np.nan;f['layer_'+col]=np.nan
-        order=f.loc[eligible,['signal_date',col,'circ_mv_yi','ts_code']].sort_values(['signal_date',col,'circ_mv_yi','ts_code'],ascending=[True,False,False,True])
-        f.loc[order.index,'rank_'+col]=order.groupby('signal_date',observed=True).cumcount()+1
-        r=order.groupby('signal_date',observed=True)[col].rank(ascending=False,method='average');size=order.groupby('signal_date',observed=True)[col].transform('size')
         f.loc[order.index,'layer_'+col]=np.minimum(5,np.floor((r-1)/size*5)+1)
-        f['selected_'+col]=eligible&f['rank_'+col].le(5)
+        # Scores can be negative: no method-specific eligibility gates in this experiment.
+        f['selected_'+col]=eligible & f['rank_'+col].le(5)
+
     return f
 
 
@@ -786,7 +793,7 @@ def calculate(data,basic,member,calendar,cfg,progress,full_calendar=None,diagnos
     f=score_cross_sections(feature_frame);del feature_frame;gc.collect()
     if isinstance(data,MarketStore):f=compact_frame(f)
     if f.empty:return f,pd.DataFrame(),f,pd.DataFrame({'signal_date':calendar[signal_i]})
-    common=f[f.common_pass].copy();paths=[];marks=[];bycode=common.groupby('ts_code',observed=True).indices
+    common=f[f.eligible_entry_trend].copy();paths=[];marks=[];bycode=common.groupby('ts_code',observed=True).indices
     for num,(code,part) in enumerate(data.groupby('ts_code',sort=True,observed=True),1):
         if code not in bycode:continue
         g=prepared_stock(part,calendar)
@@ -896,8 +903,8 @@ def build_reports(e,marks,f,schedule,calendar,cfg,progress=lambda _:None,output=
                 for layer in range(1,6):
                     g=v[v['layer_'+col].eq(layer)]
                     for yr,p in years(g):layers.append(dict(strategy=strategy,layer=layer,year=yr,week_no=w,**period_stat(p)))
-        mature=schedule[calendar.searchsorted(schedule.signal_date)+1+5*w<=len(calendar)]
-        for family,raw,adj in [('动量','mom_raw','mom_adj'),('反转','rev_raw','rev_adj')]:
+        mature=mature_schedule(e,schedule,calendar,w)
+        for family,raw,adj in [('趋势池原始动量','entry_trend','rank_mom'),('趋势池行业动量','entry_trend','rank_industry'),('趋势池短期反转','entry_trend','rank_reversal')]:
             dates.append(date_comparison(v,mature,w,family,raw,adj))
     tables.update(weekly_summary=pd.DataFrame(summary),survivor_summary=pd.DataFrame(survivors),rank_layers=pd.DataFrame(layers),
         top5_weekly_history=history if isinstance(history,CSVSpool) else (pd.concat(history,ignore_index=True) if history else pd.DataFrame()))
@@ -990,6 +997,7 @@ def entry_stat(g):
         unbounded_trim_top1_pct=distribution(valid.unbounded_net_pct)['trim_top1_mean_pct'],
         unbounded_ge10_pct=pct(valid.unbounded_net_pct.ge(10)),unbounded_ge20_pct=pct(valid.unbounded_net_pct.ge(20)),
         max_up_mean_pct=valid.max_up_pct.mean(),max_up_median_pct=valid.max_up_pct.median(),
+        never_up10_count=int(valid.max_up_pct.lt(10).sum()),never_up10_pct=pct(valid.max_up_pct.lt(10)),
         max_up_ge10_pct=pct(valid.max_up_pct.ge(10)),max_up_ge20_pct=pct(valid.max_up_pct.ge(20)),
         max_down_mean_pct=valid.max_down_pct.mean(),max_down_le8_pct=pct(valid.max_down_pct.le(-8)),
         close_mdd_mean_pct=valid.close_mdd_pct.mean(),
@@ -1008,7 +1016,8 @@ def entry_exit_reports(e,marks,paths,progress=lambda _:None,output=None):
     out.update({k:pd.DataFrame() for k in names});out['path_diagnostics']=paths
     if paths.empty or e.empty:return out
     if not isinstance(paths,SQLSpool) and paths.duplicated(['event_id','week_no']).any():raise ValueError('诊断主键重复')
-    summaries=[];rank_dates=[];dates=[];details=[];stop_timing=[]
+    summaries=[];rank_dates=[];dates=[];stop_timing=[]
+    details=CSVSpool(output.root/'diagnostic_top_stream.csv.gz') if isinstance(output,DiskTables) else []
     for w in DIAGNOSTIC_WEEKS:
         progress(f'入场与退出配对诊断 W{w}/12')
         v=weekly_view(e,marks,w)
@@ -1018,8 +1027,7 @@ def entry_exit_reports(e,marks,paths,progress=lambda _:None,output=None):
         for yr,p in years(v):summaries.append(dict(strategy='共同池基准',group='全部',year=yr,week_no=w,**entry_stat(p)))
         for strategy,col in STRATEGIES.items():
             selected=v['selected_'+col];chosen=v[selected]
-            groups=[('前五名',chosen)]+[(f'第{r}名',chosen[chosen['rank_'+col].eq(r)]) for r in range(1,6)]
-            groups += [(f'评分第{layer}层',v[v['layer_'+col].eq(layer)]) for layer in range(1,6)]
+            groups=diagnostic_groups(v,chosen,col)
             for group,g in groups:
                 for yr,p in years(g):summaries.append(dict(strategy=strategy,group=group,year=yr,week_no=w,**entry_stat(p)))
             stopped=chosen[chosen.exited & chosen.exit_reason.eq('初始止损')]
@@ -1071,7 +1079,7 @@ def entry_exit_reports(e,marks,paths,progress=lambda _:None,output=None):
                 dsum.append(r)
     out.update(stop_timing_summary=pd.DataFrame(stop_timing),entry_exit_summary=pd.DataFrame(summaries),entry_rank_dates=rank_dates,entry_rank_summary=pd.DataFrame(rs),
         entry_date_comparison=dates,entry_date_summary=pd.DataFrame(dsum),
-        entry_top5_details=pd.concat(details,ignore_index=True) if details else pd.DataFrame())
+        entry_top5_details=details if isinstance(details,CSVSpool) else (pd.concat(details,ignore_index=True) if details else pd.DataFrame()))
     return out
 
 
@@ -1079,55 +1087,55 @@ ENTRY_FEATURES=['prev_close','prev_high','prev_ma13','prev_ma13_change_pct','pri
                 'trend_efficiency','reclaim_margin_pct','trend_ok','pullback_ok','reclaim_ok']
 
 
+def mature_schedule(e,schedule,calendar,w):
+    if 'mature_weeks' in schedule:return schedule[schedule.mature_weeks.ge(w)]
+    if calendar is None:raise ValueError('缺少真实交易周龄，不能用自然日代替')
+    return schedule[calendar.searchsorted(schedule.signal_date)+1+5*w<=len(calendar)]
+
+
+def diagnostic_groups(v,chosen,col):
+    # Yield one subgroup at a time. A list of five full-pool slices caused the old peak.
+    yield '前五名',chosen
+    for r in range(1,6):yield f'第{r}名',chosen[chosen['rank_'+col].eq(r)]
+    for layer in range(1,6):yield f'评分第{layer}层',v[v['layer_'+col].eq(layer)]
+
+
 def entry_stage_reports(e,marks,f,schedule,calendar,progress=lambda _:None):
-    out={k:pd.DataFrame() for k in ['entry_filter_dates','entry_filter_summary','entry_stage_dates','entry_stage_summary']}
-    rows=[]
-    for day in schedule.signal_date:
-        p=f[f.signal_date.eq(day)] if not f.empty else f
-        row=dict(signal_date=day,year=str(day.year),common_count=int(p.common_pass.sum()) if len(p) else 0)
-        for col in ENTRY_STAGES.values():
-            row[col+'_count']=int(p['eligible_'+col].sum()) if len(p) else 0
-            row[col+'_selected']=int(p['selected_'+col].sum()) if len(p) else 0
-        rows.append(row)
-    daily=pd.DataFrame(rows);summary=[]
-    if not daily.empty:
-        for yr,p in years(daily):
-            for name,col in ENTRY_STAGES.items():
-                prev={'entry_trend':'common','entry_pullback':'entry_trend','entry_reclaim':'entry_pullback'}[col]
-                summary.append(dict(strategy=name,year=yr,observed_weeks=len(p),eligible_events=int(p[col+'_count'].sum()),
-                    previous_events=int(p[prev+'_count'].sum()),excluded_events=int((p[prev+'_count']-p[col+'_count']).sum()),
-                    no_signal_weeks=int(p[col+'_selected'].eq(0).sum()),fewer_than5_signal_weeks=int(p[col+'_selected'].between(1,4).sum()),
-                    selected_events=int(p[col+'_selected'].sum())))
-    out.update(entry_filter_dates=daily,entry_filter_summary=pd.DataFrame(summary))
-    if e.empty:return out
-    pairs=[('趋势回落 对 中期趋势','entry_trend','entry_pullback'),('回落后转强 对 趋势回落','entry_pullback','entry_reclaim'),
-           ('回落后转强 对 原始动量','mom_raw','entry_reclaim')]
-    dates=[];summaries=[]
+    rows=[];summary=[]
     for w in [1,2,4,8,12]:
-        progress(f'新入场各阶段同日对照 W{w}')
+        progress(f'同一趋势池：前五名对其余候选 W{w}')
+        if e.empty:continue
         v=weekly_view(e,marks,w)
-        if v.empty:continue
-        mature=schedule[calendar.searchsorted(schedule.signal_date)+1+5*w<=len(calendar)]
-        for label,ref,trial in pairs:dates.append(date_comparison(v,mature,w,label,ref,trial))
-    if dates:
-        d=pd.concat(dates,ignore_index=True)
-        for (label,w),g in d.groupby(['family','week_no'],observed=True):
+        for day in mature_schedule(e,schedule,calendar,w).signal_date:
+            g=v[v.signal_date.eq(day)]
+            for name,col in STRATEGIES.items():
+                top=g[g['selected_'+col]];rest=g[~g['selected_'+col]]
+                valid=len(top)>0 and top.week_known.all() and rest.week_known.any()
+                strict=valid and rest.week_known.all()
+                rows.append(dict(strategy=name,signal_date=day,year=str(day.year),week_no=w,
+                    top_events=len(top),rest_events=len(rest),top_unknown=int((~top.week_known).sum()),
+                    rest_unknown=int((~rest.week_known).sum()),paired=valid,strict_pair=strict,
+                    top_mean=top.week_order_pct.mean() if valid else np.nan,
+                    rest_mean=rest.week_order_pct.mean() if valid else np.nan,
+                    delta_pp=top.week_order_pct.mean()-rest.week_order_pct.mean() if valid else np.nan))
+    d=pd.DataFrame(rows)
+    if not d.empty:
+        for (name,w),g in d.groupby(['strategy','week_no'],observed=True):
             for yr,p in years(g):
-                q=p[p.comparison_status.eq('可比较')]
-                summaries.append(dict(comparison=label,week_no=w,year=yr,mature_dates=len(p),paired_dates=len(q),
-                    reference_only=int(p.comparison_status.eq('仅原始有推荐').sum()),trial_only=int(p.comparison_status.eq('仅调整有推荐').sum()),
-                    neither=int(p.comparison_status.eq('双方无推荐').sum()),unknown_dates=int(p.comparison_status.eq('结果未知').sum()),
-                    reference_mean_pct=q.raw_mean.mean(),trial_mean_pct=q.adjusted_mean.mean(),delta_pp=q.delta_pp.mean(),
-                    trial_better_pct=q.delta_pp.gt(1e-9).mean()*100 if len(q) else np.nan))
-        out.update(entry_stage_dates=d.rename(columns={'family':'comparison','raw_mean':'reference_mean_pct','adjusted_mean':'trial_mean_pct'}),entry_stage_summary=pd.DataFrame(summaries))
-    return out
+                q=p[p.paired];strict=q[q.strict_pair]
+                summary.append(dict(strategy=name,year=yr,week_no=w,observed_dates=len(p),paired_dates=len(q),
+                    excluded_dates=len(p)-len(q),top_mean=q.top_mean.mean(),rest_mean=q.rest_mean.mean(),
+                    delta_pp=q.delta_pp.mean(),better_dates_pct=q.delta_pp.gt(0).mean()*100 if len(q) else np.nan,
+                    rest_unknown=int(q.rest_unknown.sum()),rest_events=int(q.rest_events.sum()),
+                    strict_dates=len(strict),strict_delta_pp=strict.delta_pp.mean()))
+    return {'ranking_dates':d,'ranking_summary':pd.DataFrame(summary)}
 
 
 def run_research(token,cache_root,cfg,progress):
     root=Path(cache_root);root.mkdir(parents=True,exist_ok=True)
     with research_lock(root):
         # Previous interrupted work is disposable; persistent market DB and completed results remain.
-        work=root/'work_gpt171';shutil.rmtree(work,ignore_errors=True);work.mkdir()
+        work=root/'work_gpt18';shutil.rmtree(work,ignore_errors=True);work.mkdir()
         started=time.monotonic(); stages=[]
         def report(message):
             rss=memory_mb();print(f'[{VERSION}] {message} | {rss}',flush=True)
@@ -1153,17 +1161,18 @@ def run_research(token,cache_root,cfg,progress):
             tables=DiskTables(work/'reports')
             build_reports(e,marks,f,schedule,calendar,cfg,report,output=tables)
             tables.update(data_issues=issues,universe=basic,industry_intervals=member)
+            del f;gc.collect()
             entry_exit_reports(e,marks,diagnostics,report,output=tables)
-            tables.update(entry_stage_reports(e,marks,f,schedule,calendar,report))
-            del e,f;gc.collect()
+            tables.update(entry_stage_reports(e,marks,None,schedule,calendar,report))
+            del e;gc.collect()
             manifest=dict(version=VERSION,config=asdict(cfg),rules=RULES,created_at=datetime.now(ZoneInfo('Asia/Shanghai')).isoformat(),
                 data_start=start,data_end=ds(calendar.max()),data_hash=data_hash,pool_hash=hashlib.sha256(member.to_csv(index=False).encode()).hexdigest(),
                 pool_mode=pool_mode,warnings=pool_warnings,data_issues=len(issues),universe_size=len(basic),download_workers=DOWNLOAD_WORKERS,
                 last_signal_date=str(schedule.signal_date.max().date()) if not schedule.empty else None,
                 limitations=['行业调整为同行收益中位数调整，不是回归残差或中性组合','方向合格不等于正期望；覆盖率不能单独证明有效',
                     '共同样本要求报价完整及足够同行，可能产生数据可用性选择','独立事件可重叠，不能当账户收益',
-                    '行业区间和历史风险警示仍有供应商限制','各组统一8%初始止损；新组对原动量同时改变了条件和排序','已经反复使用的历史不是新样本外'])
-            manifest.update(strategy_version='gpt1.7',storage_revision=DOWNLOAD_REVISION,
+                    '行业区间和历史风险警示仍有供应商限制','四组使用同一个A候选池与统一退出规则，仅排序不同','已经反复使用的历史不是新样本外'])
+            manifest.update(strategy_version='gpt1.8',storage_revision=DOWNLOAD_REVISION,
                 data_hash_scheme='sha256(sorted daily tech-only CSV digests)',runtime_memory_mb=memory_mb(),
                 memory_notes=['四路并发、最多四个待处理日期','仅科技池一份持久行情；日事务提交，按股票读取',
                     '诊断路径按观察周读取；报告逐表落盘；页面按需读取','本地缓存不能保证跨删除应用/重新部署保留'])
@@ -1228,203 +1237,208 @@ def load_result(payload,cache_root='tech_swing_cache'):
         except BaseException:
             Path(temp).unlink(missing_ok=True);raise
     with zipfile.ZipFile(path) as z:manifest=json.loads(z.read('manifest.json'))
-    if manifest.get('version') not in ('gpt1.7','gpt1.7.1'):
-        raise ValueError('本页接受gpt1.7或gpt1.7.1结果；更早版本不含本次入场条件。')
+    if manifest.get('version') != VERSION:
+        raise ValueError('本页显示gpt1.8结果；gpt1.7.1请使用复用旧结果重新比较入口。')
     tables=ZipTables(path)
     required={'events','weekly_summary','selections','coverage','rank_layers','industry_adjustment_summary',
         'signal_calendar','top5_weekly_history','path_diagnostics','entry_exit_summary','entry_rank_summary',
         'entry_date_comparison','survivor_summary','final_summary','industry_adjustment_dates','pool_filter_counts',
-        'industry_profile','entry_date_summary','entry_top5_details','stop_timing_summary','entry_filter_dates',
-        'entry_filter_summary','entry_stage_dates','entry_stage_summary'}
+        'industry_profile','entry_date_summary','entry_top5_details','stop_timing_summary','ranking_summary','ranking_dates'}
     if not required.issubset(tables):raise ValueError('结果文件缺少必要表格：'+', '.join(sorted(required-set(tables))))
     return tables,manifest,None,str(path)
 
 
+def replay_research(source,cache_root,progress=lambda _:None):
+    """Re-rank a complete prior result using only saved signal-time features and paths."""
+    root=Path(cache_root);root.mkdir(parents=True,exist_ok=True)
+    with research_lock(root), tempfile.TemporaryDirectory(prefix='replay18_',dir=root) as temp:
+        work=Path(temp);marks=SQLSpool(work/'marks.sqlite');paths=SQLSpool(work/'paths.sqlite')
+        stages=[];started=time.monotonic()
+        def report(message):
+            stages.append(dict(stage=message,elapsed_seconds=round(time.monotonic()-started,1),**memory_mb()))
+            progress(message)
+        try:
+            with zipfile.ZipFile(source) as z:
+                old=json.loads(z.read('manifest.json'))
+                if old.get('version')!='gpt1.7.1':raise ValueError('复用入口仅接受完整gpt1.7.1结果包')
+                for rule in ['中期趋势A','买卖执行','成交与成本','周频']:
+                    if old.get('rules',{}).get(rule)!=RULES.get(rule):raise ValueError('旧包规则不一致：'+rule)
+                cfg=Config(**old['config'])
+                report('复用旧结果：读取信号时点因子，不下载行情')
+                inputs=['event_id','ts_code','name','signal_date','signal_i','year','signal_week','pool_pass','pool_known',
+                    'industry_key','industry_ambiguous','circ_mv_yi','signal_close','history_ready','mom_raw','short_return_pct']+ENTRY_FEATURES
+                chunks=[];old_selected=set()
+                for chunk in pd.read_csv(z.open('factor_candidates.csv'),usecols=inputs+['selected_entry_trend'],
+                    dtype={'year':str,'ts_code':str},float_precision='round_trip',chunksize=10000):
+                    old_selected.update(chunk.loc[chunk.selected_entry_trend,'event_id'])
+                    chunk['signal_date']=pd.to_datetime(chunk.signal_date)
+                    chunks.append(chunk[inputs])
+                f=compact_frame(pd.concat(chunks,ignore_index=True));chunks.clear()
+                f=compact_frame(score_cross_sections(f));gc.collect()
+                if set(f.loc[f.selected_entry_trend,'event_id'])!=old_selected:
+                    raise ValueError('复算的中期趋势前五名与旧版不一致，停止以防数据或排名口径变动')
+                common=f[f.eligible_entry_trend].copy();ids=set(common.event_id)
+                # Read all old common-pool event ages to include dates with no A candidates.
+                header=pd.read_csv(z.open('events.csv'),nrows=0).columns
+                path_cols=['event_id','initial_stop_adj','initial_stop_raw','filled','closed','resolved','status','exit_reason',
+                    'buy_i','sell_i','buy_date','sell_date','buy_adj','buy_raw','sell_adj','risk_pct_actual','r_amount',
+                    'net_pct','order_net_pct','hold_days','max_close_gain_pct','unknown_from','exit_delay_days','exit_at_open',
+                    'base_pass','mature_weeks']
+                path_cols=[c for c in path_cols if c in header];chunks=[];age={}
+                for chunk in pd.read_csv(z.open('events.csv'),usecols=path_cols+['signal_date'],float_precision='round_trip',chunksize=10000):
+                    for day,p in chunk.groupby('signal_date',sort=False):
+                        if p.mature_weeks.nunique()!=1 or (day in age and age[day]!=int(p.mature_weeks.iloc[0])):
+                            raise ValueError('旧事件交易周龄不一致')
+                        age[day]=int(p.mature_weeks.iloc[0])
+                    p=chunk[chunk.event_id.isin(ids)][path_cols].copy()
+                    for c in ['buy_date','sell_date']:
+                        if c in p:p[c]=pd.to_datetime(p[c],errors='raise')
+                    if len(p):chunks.append(p)
+                if chunks:life=pd.concat(chunks,ignore_index=True)
+                else:life=pd.DataFrame(columns=path_cols)
+                chunks.clear()
+                if life.event_id.duplicated().any() or set(life.event_id)!=ids:raise ValueError('旧结果缺少或重复A池交易路径')
+                e=compact_frame(common.merge(life,on='event_id',validate='one_to_one'));del common,life;gc.collect()
+                schedule=pd.read_csv(z.open('signal_calendar.csv'))
+                schedule['mature_weeks']=schedule.signal_date.map(age)
+                if schedule.mature_weeks.isna().any():raise ValueError('旧包缺少批次交易周龄，请走行情缓存计算入口')
+                schedule['signal_date']=pd.to_datetime(schedule.signal_date)
+                report('读取A池周度标记与价格路径；其余科技股票不进入本轮诊断')
+                for filename,sink in [('weekly_marks.csv',marks),('path_diagnostics.csv',paths)]:
+                    for chunk in pd.read_csv(z.open(filename),float_precision='round_trip',chunksize=10000):
+                        p=chunk[chunk.event_id.isin(ids)].copy()
+                        if 'mark_date' in p:p['mark_date']=pd.to_datetime(p.mark_date)
+                        sink.append(p)
+                    sink.finish()
+                tables=DiskTables(work/'reports')
+                build_reports(e,marks,f,schedule,None,cfg,report,output=tables)
+                # Factors have been saved; diagnostic functions only need compact event columns.
+                del f;gc.collect()
+                entry_exit_reports(e,marks,paths,report,output=tables)
+                tables.update(entry_stage_reports(e,marks,None,schedule,None,report))
+                for name in ['universe','industry_intervals','data_issues']:
+                    try:tables[name]=pd.read_csv(z.open(name+'.csv'))
+                    except pd.errors.EmptyDataError:tables[name]=pd.DataFrame()
+                del e;gc.collect()
+            manifest=dict(old,version=VERSION,strategy_version=VERSION,rules=RULES,
+                created_at=datetime.now(ZoneInfo('Asia/Shanghai')).isoformat(),source_version=old['version'],
+                replay=True,runtime_memory_mb=memory_mb(),memory_notes=['只计算共同A池','诊断子组逐个生成','逐周视图只保留统计字段'],
+                limitations=['历史已反复研究，不是新样本外','共同池改为A池，不能与旧全科技基准直接拼接',
+                    '复用原数据截止日，不代表实时选股','实验四种排序，未自动选出或证明优胜方法'])
+            tables['resource_usage']=pd.DataFrame(stages)
+            digest=hashlib.sha256(json.dumps(asdict(cfg),sort_keys=True).encode()).hexdigest()[:12]
+            path=root/'results'/f'{VERSION}_replay_{digest}.zip'
+            write_zip(tables,manifest,path)
+            return ZipTables(path),manifest,None,str(path)
+        finally:marks.close();paths.close();gc.collect()
+
+
 def main():
     import streamlit as st
-    st.set_page_config(page_title='gpt1.7.1 周线入场质量验证',layout='wide')
-    st.title('gpt1.7.1 · 周线入场验证与内存修复')
-    st.caption('三层新入场条件与旧因子参照；统一退出规则。周收盘确认，次交易日开盘买入，前五名尚未证明盈利。')
+    st.set_page_config(page_title='gpt1.8 同池排序验证',layout='wide')
+    st.title('gpt1.8 · 同一中期趋势池，验证前五名排序')
+    st.caption('四组候选条件相同，退出规则相同；区别仅在排序。没有自动选择历史收益最高的方法。')
     with st.sidebar:
-        st.header('研究设置')
-        token=st.text_input('Tushare Token',type='password',value=os.environ.get('TUSHARE_TOKEN',''))
-        start=st.date_input('信号开始',date(2022,1,1));end=st.date_input('信号结束',latest_ready_day().date())
-        price=st.number_input('最低股价（严格大于）',min_value=0.,value=10.)
-        min_mv=st.number_input('流通市值下限（亿元）',min_value=0.,value=50.)
-        max_mv=st.number_input('流通市值上限（亿元）',min_value=0.,value=1000.)
         cache=st.text_input('行情缓存目录',value='tech_swing_cache')
-        run=st.button('运行 gpt1.7.1',type='primary')
-        st.caption('四路下载，逐日保存，逐股计算；已保存日期跳过。策略与gpt1.7相同。')
-        upload=st.file_uploader('载入gpt1.7 / gpt1.7.1结果',type=['zip'])
-        if st.button('载入结果',disabled=upload is None):
-            try:st.session_state['gpt17_result']=load_result(upload,cache)
-            except Exception as ex:st.error(str(ex))
-    if run:
-        st.session_state.pop('gpt17_result',None);gc.collect()
-        if not token:st.error('请填写Tushare Token，或载入已完成的结果。')
-        elif start>end or min_mv>=max_mv:st.error('请检查日期或市值范围。')
+        mode=st.radio('运行方式',['复用gpt1.7.1结果','行情缓存计算','打开gpt1.8结果'])
+        upload=None;run=False
+        if mode!='行情缓存计算':
+            upload=st.file_uploader('上传完整结果ZIP',type=['zip'],key=f"input18_{st.session_state.get('upload_revision18',0)}")
+            run=st.button('重新比较排序' if mode.startswith('复用') else '打开结果',disabled=upload is None,type='primary')
         else:
-            status=st.empty()
-            try:
-                cfg=Config(start=ds(start),end=ds(end),min_price=price,min_mv=min_mv,max_mv=max_mv)
-                st.session_state['gpt17_result']=run_research(token,cache,cfg,status.info)
-                status.success('计算完成。')
-            except Exception as ex:status.error(f'本次未完成：{ex}')
-    with st.expander('本版固定规则与统计口径'):st.text(STUDY_NOTES)
-    if 'gpt17_result' not in st.session_state:
-        saved=sorted((Path(cache)/'results').glob('*.zip'),key=lambda p:p.stat().st_mtime,reverse=True)
+            token=st.text_input('Tushare Token',type='password',value=os.environ.get('TUSHARE_TOKEN',''))
+            start=st.date_input('信号开始',date(2022,1,1));end=st.date_input('信号结束',latest_ready_day().date())
+            price=st.number_input('最低股价（严格大于）',min_value=0.,value=10.)
+            min_mv=st.number_input('流通市值下限（亿元）',min_value=0.,value=50.)
+            max_mv=st.number_input('流通市值上限（亿元）',min_value=0.,value=1000.)
+            run=st.button('四路下载/复用缓存并计算',type='primary')
+        st.caption('复用旧结果无需Token与行情下载，沿用旧数据截止日。行情计算保留四路并发和断点恢复。')
+    if run:
+        st.session_state.pop('gpt18_result',None);st.session_state.pop('gpt17_result',None);gc.collect()
+        status=st.empty()
+        try:
+            if mode=='行情缓存计算':
+                if not token or start>end or min_mv>=max_mv:raise ValueError('请检查Token、日期和市值范围')
+                result=run_research(token,cache,Config(start=ds(start),end=ds(end),min_price=price,min_mv=min_mv,max_mv=max_mv),status.info)
+            elif mode.startswith('复用'):
+                root=Path(cache);root.mkdir(parents=True,exist_ok=True)
+                fd,temp=tempfile.mkstemp(prefix='upload18_',suffix='.zip',dir=root)
+                try:
+                    with os.fdopen(fd,'wb') as handle:upload.seek(0);shutil.copyfileobj(upload,handle,length=1024*1024)
+                    result=replay_research(temp,cache,status.info)
+                finally:Path(temp).unlink(missing_ok=True)
+            else:result=load_result(upload,cache)
+            st.session_state['gpt18_result']=result;status.success('完成，结果沿用已记录的数据截止日。')
+            st.session_state['upload_revision18']=st.session_state.get('upload_revision18',0)+1
+            st.rerun()  # Drop the old uploader widget and its in-memory ZIP after a successful run.
+        except Exception as exc:status.error(f'本次未完成：{exc}')
+    with st.expander('固定研究规则'):st.text(STUDY_NOTES)
+    if 'gpt18_result' not in st.session_state:
+        saved=sorted((Path(cache)/'results').glob('gpt1.8*.zip'),key=lambda p:p.stat().st_mtime,reverse=True)
         if saved:
-            previous=st.selectbox('已完成的本地结果',saved,format_func=lambda p:p.name)
-            if st.button('打开已完成结果'):
-                try:st.session_state['gpt17_result']=load_result(previous);st.rerun()
-                except Exception as ex:st.error(str(ex))
-    if 'gpt17_result' not in st.session_state:
-        st.info('本版统一8%初始止损，保留2R启动及回撤1R保护；不设固定持仓期限。运行后比较新入场三组、旧因子及评分分层。');return
-    # A hot code update may retain the prior version's eager session tuple.
-    if st.session_state['gpt17_result'][2] is not None:
-        previous=st.session_state.pop('gpt17_result')
-        source=previous[3] if Path(previous[3]).is_file() else previous[2]
-        st.session_state['gpt17_result']=load_result(source,cache)
-        del previous,source;gc.collect()
-    tables,manifest,payload,path=st.session_state['gpt17_result'];cfg=manifest['config']
-    st.write(f"程序 {VERSION}｜结果 {manifest['version']}｜信号 {cfg['start']}—{cfg['end']}｜行情至 {manifest['data_end']}")
-    st.caption(f'运行内存约 {memory_mb().get("VmRSS",0):.0f} MB；完整结果 {Path(path).stat().st_size/1024**2:.1f} MB。')
-    # Do not hold the ZIP in session_state. Opt-in download prevents eager extra copies.
-    if st.checkbox('准备下载完整结果',value=False):
-        with Path(path).open('rb') as handle:
-            st.download_button('下载完整结果',handle,file_name=f"{manifest['version']}_{cfg['start']}_{cfg['end']}.zip",mime='application/zip',on_click='ignore')
-    for warning in manifest.get('warnings',[]):st.warning(str(warning))
-    if manifest.get('data_issues',0):st.warning('存在行情接口或合并问题，未知交易不计为零，请查看数据质量。')
-    st.caption('效率高可能只是慢涨。须同时检查净收益、≥10%/20%占比、剔除大赢家后的表现及空窗，不能只看胜率。')
-    strategy=st.selectbox('研究方法',list(STRATEGIES))
-    cv=tables['coverage'];options=['全部']+sorted(cv.year.astype(str).unique().tolist()) if not cv.empty else ['全部']
-    year=st.selectbox('信号年份',options)
+            chosen=st.selectbox('已完成的本地结果',saved,format_func=lambda p:p.name)
+            if st.button('恢复本地结果'):
+                try:st.session_state['gpt18_result']=load_result(chosen);st.rerun()
+                except Exception as exc:st.error(str(exc))
+        st.info('本轮不增加买入硬门槛，不更改退出规则。上传gpt1.7.1结果即可重新比较。');return
+    tables,manifest,_,path=st.session_state['gpt18_result']
+    st.write(f"结果 {manifest['version']}｜行情截至 {manifest['data_end']}｜股票名单 {manifest['universe_size']} 只")
+    st.caption('共同池基准仅包含中期趋势A候选。独立事件可重叠，统计不是账户收益。')
+    for warning in manifest.get('warnings',[]):st.warning(warning)
+    if st.checkbox('准备下载完整结果'):
+        with Path(path).open('rb') as handle:st.download_button('下载结果',handle,file_name=f"gpt1.8_{manifest['config']['start']}_{manifest['config']['end']}.zip",mime='application/zip',on_click='ignore')
+    method=st.selectbox('排序方法',list(STRATEGIES))
+    cv=tables['coverage'];year=st.selectbox('信号年份',['全部']+sorted(cv.year.astype(str).unique().tolist()) if not cv.empty else ['全部'])
+    section=st.radio('查看报告',['逐周收益','前五名明细','同池排序增益','价格路径诊断','覆盖与运行记录'],horizontal=True)
     def subset(df):
         if df.empty:return df
-        out=df[df.strategy.eq(strategy)] if 'strategy' in df else df
-        return out[out.year.astype(str).eq(year)] if 'year' in out else out
-    table_no=0
+        if 'strategy' in df:df=df[df.strategy.eq(method)]
+        if 'year' in df:
+            if df.year.astype(str).eq('全部').any():df=df[df.year.astype(str).eq(year)]
+            elif year!='全部':df=df[df.year.astype(str).eq(year)]
+        return df
+    seq=0
     def show(df):
-        nonlocal table_no
-        table_no+=1
+        nonlocal seq
+        seq+=1
         if len(df)>500:
-            pages=(len(df)+499)//500
-            page=st.number_input(f'表格{table_no}页码（共{len(df)}行）',min_value=1,max_value=pages,value=1,key=f'page_{table_no}')
+            page=st.number_input(f'表{seq}页码（共{len(df)}行）',min_value=1,max_value=(len(df)+499)//500,value=1,key=f'p18_{section}_{seq}')
             df=df.iloc[(page-1)*500:page*500]
-        st.dataframe(df.rename(columns=LABELS),use_container_width=True,hide_index=True)
-    sections=(['逐周收益','前五名明细','行业调整对照','排序分层','覆盖与数据','入场与退出诊断','新入场逐层对照'])
-    section=st.radio('查看报告',sections,horizontal=True)
-    if section==sections[0]:
-        group=st.selectbox('样本组',['前五名']+[f'第{r}名' for r in range(1,6)])
-        df=subset(tables['weekly_summary'])
-        if df.empty:st.info('尚无成熟事件。')
-        else:show(df[df.group.eq(group)])
-        st.caption('已退出冻结实际收益；仍持有按收盘标记。远期周次只含已成熟批次，不能解释为同一批股票越来越赚钱。')
-        with st.expander('同期共同池基准'):
-            base=tables['weekly_summary']
-            if not base.empty:show(base[base.strategy.eq('共同池基准')&base.year.astype(str).eq(year)])
-        with st.expander('仅仍持有样本（辅助）'):
-            aux=subset(tables['survivor_summary'])
-            if not aux.empty:show(aux[aux.group.eq(group)])
-        with st.expander('最终收益：只含已退出，不能代替逐周表'):
-            final=subset(tables['final_summary'])
-            if not final.empty:show(final[final.group.eq(group)])
-    if section==sections[1]:
-        dates=pd.to_datetime(tables['signal_calendar'].signal_date)
-        if year!='全部':dates=dates[dates.dt.year.astype(str).eq(year)]
-        if dates.empty:st.info('所选年份无完整周批次。')
+        st.dataframe(df.rename(columns=LABELS),hide_index=True,use_container_width=True)
+    if section=='逐周收益':
+        group=st.selectbox('样本组',['前五名']+[f'第{i}名' for i in range(1,6)])
+        d=subset(tables['weekly_summary']);show(d[d.group.eq(group)] if not d.empty else d)
+        st.caption('W1/W2…是买入起5/10…个市场交易日。已退出冻结实际收益；没有固定持仓期限。')
+        with st.expander('整个A候选池基准'):
+            d=tables['weekly_summary'];show(d[d.strategy.eq('共同池基准')&d.year.astype(str).eq(year)] if not d.empty else d)
+    elif section=='前五名明细':
+        s=subset(tables['selections'])
+        if s.empty:st.info('没有符合条件的候选。')
         else:
-            day=st.selectbox('完整周信号批次',sorted(dates.dt.strftime('%Y-%m-%d').unique(),reverse=True))
-            s=tables['selections']
-            batch=s[s.strategy.eq(strategy)&pd.to_datetime(s.signal_date).dt.strftime('%Y-%m-%d').eq(day)].sort_values('rank') if not s.empty else s
-            if batch.empty:st.info('本批次没有方向合格推荐，不补足五只。')
-            else:
-                cols=['ts_code','name','rank','score','trend_efficiency','prior2_return_pct','prev_ma13_change_pct','reclaim_margin_pct','trend_ok','pullback_ok','reclaim_ok','industry_key','peer_count','mom_raw','short_return_pct','industry_mom_pct','industry_short_pct','circ_mv_yi','buy_date','buy_raw','initial_stop_raw','status','sell_date','exit_reason','net_pct','hold_days']
-                show(batch[cols]);h=tables.select('top5_weekly_history',strategy=strategy,event_id=set(batch.event_id))
-                h=h[h.strategy.eq(strategy)&h.event_id.isin(batch.event_id)] if not h.empty else h
-                if not h.empty:
-                    cap=st.number_input('显示周次上限（只影响表格）',min_value=1,max_value=int(h.week_no.max()),value=min(12,int(h.week_no.max())))
-                    wide=h[h.week_no.le(cap)].pivot(index=['ts_code','name','rank'],columns='week_no',values='week_net_pct')
-                    wide.columns=[f'W{int(w)} 净收益%' for w in wide.columns];show(wide.reset_index())
-            st.caption('最新批次来自已完成周。事后买入、退出及收益不参与信号排名；空白结合取消、待买入或未知状态解读。')
-    if section==sections[2]:
-        st.caption('此页是旧因子的行业调整参照。三个新入场组之间的比较请查看「新入场逐层对照」。')
-        st.caption('按同一日期比较双方前五名，日期等权。双方推荐不同，这是选股对照；各股买卖规则相同。含已知取消为0，未知批次排除。')
-        family='反转' if '反转' in strategy else '动量';d=tables['industry_adjustment_summary']
-        if not d.empty:show(d[d.family.eq(family)&d.year.astype(str).eq(year)])
-        with st.expander('同日比较明细'):
-            d=tables['industry_adjustment_dates']
-            if not d.empty:
-                d=d[d.family.eq(family)]
-                if year!='全部':d=d[d.year.astype(str).eq(year)]
-                show(d[d.week_no.isin([1,2,4,8,12])])
-    if section==sections[3]:
-        st.caption('新组仅在自身合格候选中按效率分五层；旧组在全共同池内分层。第1层最高，相同分数不拆开。不同层候选过少时结合样本数解读。')
-        w=st.selectbox('分层观察周次',[1,2,4,8,12]);d=subset(tables['rank_layers'])
-        if not d.empty:show(d[d.week_no.eq(w)])
-    if section==sections[4]:
-        st.caption('各组使用同一数据可用股票池。空窗目标为每年≤5个完整交易周无方向合格推荐；不是资金空仓时间。')
-        cov=cv[cv.strategy.eq(strategy)] if not cv.empty else cv
-        if year!='全部' and not cov.empty:cov=cov[cov.year.astype(str).eq(year)]
-        show(cov);show(tables['pool_filter_counts']);show(tables.get('data_issues',pd.DataFrame()))
-        with st.expander('历史行业强弱记录'):show(tables['industry_profile'])
-        with st.expander('版本与数据记录'):st.json(manifest)
+            day=st.selectbox('信号批次',sorted(s.signal_date.unique(),reverse=True));p=s[s.signal_date.eq(day)].sort_values('rank')
+            show(p[['ts_code','name','rank','score','signal_date','buy_date','buy_raw','initial_stop_raw','status','sell_date','exit_reason','net_pct']])
+            h=tables.select('top5_weekly_history',strategy=method,event_id=set(p.event_id))
+            if not h.empty:
+                wide=h.pivot(index=['ts_code','name','rank'],columns='week_no',values='week_net_pct');wide.columns=[f'W{int(w)}净收益%' for w in wide.columns];show(wide.reset_index())
+    elif section=='同池排序增益':
+        show(subset(tables['ranking_summary']))
+        st.caption('同日先比较前五名与其余A候选，再对日期等权。前五须全部已知，其余未知排除并披露；严格口径要求其余也全部已知。取消订单计0。')
+        w=st.selectbox('分层观察周次',[1,2,4,8,12]);d=subset(tables['rank_layers']);show(d[d.week_no.eq(w)] if not d.empty else d)
+        with st.expander('与上涨效率参照组的同日对照'):
+            d=tables['industry_adjustment_summary'];show(d[d.year.astype(str).eq(year)] if not d.empty else d)
+    elif section=='价格路径诊断':
+        d=subset(tables['entry_exit_summary']);show(d[d.group.eq('前五名')] if not d.empty else d)
+        st.caption('诊断继续观察卖出后的股价。最大上涨不等于可兑现利润；路径缺失不计为零。')
+        show(subset(tables['entry_rank_summary']))
+        with st.expander('初始止损与触及10%的先后'):show(subset(tables['stop_timing_summary']))
+    else:
+        show(subset(cv));show(tables.get('data_issues',pd.DataFrame()));show(tables.get('resource_usage',pd.DataFrame()));st.json(manifest)
 
 
-    if section==sections[5]:
-        st.caption('无退出路径只用于诊断入场，不是新交易策略。W1—W12为固定观察期；原规则仍按止损/止盈退出，没有12周强制卖出。')
-        dg=st.selectbox('诊断样本组',['前五名']+[f'第{r}名' for r in range(1,6)]+[f'评分第{i}层' for i in range(1,6)])
-        d=subset(tables['entry_exit_summary'])
-        if d.empty:st.info('尚无成熟的诊断样本。')
-        else:
-            d=d[d.group.eq(dg)]
-            st.write('入场后的价格路径：不执行止损止盈，仍扣设定费用与滑点')
-            show(d[['week_no','mature_events','filled','path_known_count','path_unknown_count','not_filled_count','restricted_marks',
-                'unbounded_mean_pct','unbounded_win_pct','unbounded_median_pct','unbounded_trim_top1_pct',
-                'unbounded_ge10_pct','unbounded_ge20_pct','max_up_mean_pct','max_up_ge10_pct','max_up_ge20_pct',
-                'max_down_mean_pct','max_down_le8_pct','close_mdd_mean_pct']])
-            st.write('同一事件比较：原规则收益减无退出标记收益，正值表示退出规则帮助减少损失或保留收益')
-            show(d[['week_no','paired_count','paired_unbounded_pct','paired_rule_pct','exit_contribution_pp',
-                'exit_helped_pct','exit_hurt_pct','rule_loss_path_profit','rule_profit_path_loss','both_profit','both_loss','either_zero']])
-        st.caption('最大上涨/下跌是毛价格幅度，不是可兑现利润。末日停牌、跌停及卖出限制数据未知仍是账面标记，另列数量。缺失路径不补零。')
-        with st.expander('初始止损与上涨10%的先后关系',expanded=True):
-            d=tables['stop_timing_summary']
-            if d.empty:st.info('当前样本没有可分类的初始止损事件。')
-            else:show(subset(d))
-            st.caption('只含各观察周内已经实际初始止损的前五名事件，未知也保留在分母。开盘退出日的高点不能算作退出前利润；盘中退出日高低点先后不明时单列。达到10%指毛价格幅度，不代表可以兑现。')
-        with st.expander('共同池无退出路径基准'):
-            d=tables['entry_exit_summary']
-            if not d.empty:show(d[d.strategy.eq('共同池基准')&d.year.astype(str).eq(year)])
-        with st.expander('前五名与其余共同池：同日、日期等权'):
-            show(subset(tables['entry_date_summary']))
-            st.caption('前五从基准剔除，前五成交路径须全部已知；其余共同池使用已知成交路径，缺失数量和比例另列。差额为前五减其余，存在可用样本选择偏差。')
-        with st.expander('评分与未来价格的秩相关'):
-            show(subset(tables['entry_rank_summary']))
-            st.caption('收益相关为正才支持高分对应较高收益；上涨相关为正但下跌相关为负可能只代表波动更大。无显著性检验；历史已反复观察。')
-        with st.expander('前五名逐股诊断'):
-            dw=st.selectbox('逐股诊断周次',list(DIAGNOSTIC_WEEKS))
-            d=tables['entry_top5_details']
-            if not d.empty:
-                d=d[d.strategy.eq(strategy)&d.week_no.eq(dw)]
-                if year!='全部':d=d[d.year.astype(str).eq(year)]
-                show(d)
-
-
-    if section==sections[6]:
-        st.caption('A中期趋势→B增加回落→C增加重新转强，排序均为26周上涨效率。显示所有阶段，避免只看最后一组。各组都没有补位、降级或提前退出。')
-        d=tables['entry_filter_summary']
-        if not d.empty:show(d[d.year.astype(str).eq(year)])
-        st.write('每加一道条件，同日可比较前五名的结果差额')
-        d=tables['entry_stage_summary']
-        if not d.empty:show(d[d.year.astype(str).eq(year)])
-        st.caption('参照与实验前五名可不同；单方有信号、双方无信号和结果未知日期单列。同日有信号的子集收益不能代表全年收益。C与原动量的对照同时改变排序和条件。')
-        with st.expander('逐周候选减少与空窗'):
-            d=tables['entry_filter_dates']
-            if year!='全部' and not d.empty:d=d[d.year.astype(str).eq(year)]
-            show(d)
-        with st.expander('各组逐年 W4/W8 净收益、胜率与大涨股占比'):
-            d=tables['weekly_summary']
-            if not d.empty:show(d[d.group.eq('前五名')&d.week_no.isin([4,8])&d.year.astype(str).ne('全部')])
+LABELS.update({'never_up10_count':'始终未触及上涨10%事件数','never_up10_pct':'始终未触及上涨10%比例%',
+    'raw_date_mean_pct':'上涨效率参照均益%','adjusted_date_mean_pct':'当前排序均益%','family':'排序方法','mean_delta_pp':'当前减效率百分点','top_mean':'前五名同日订单均益%','rest_mean':'其余候选同日订单均益%','delta_pp':'前五减其余百分点',
+    'better_dates_pct':'前五胜出日期%','rest_unknown':'其余未知事件数','rest_events':'其余事件数','strict_dates':'严格可比较日期数',
+    'strict_delta_pp':'严格口径增益百分点','score':'排序分数（各方法定义不同）'})
 
 
 def diagnostic_self_test():
@@ -1502,12 +1516,18 @@ def entry_self_test():
      mom_raw=np.arange(1.,13.),short_return_pct=np.arange(12.)-6,circ_mv_yi=np.arange(12.)+50,
      trend_efficiency=np.arange(1.,13.)*5,trend_ok=True,pullback_ok=[True]*8+[False]*4,reclaim_ok=[True]*3+[False]*9))
     q=score_cross_sections(feat)
-    assert q.eligible_entry_reclaim.sum()==3 and q.selected_entry_reclaim.sum()==3
-    assert q.selected_entry_trend.sum()==5 and q.selected_entry_pullback.sum()==5
-    assert (~q.eligible_entry_reclaim|q.eligible_entry_pullback).all() and (~q.eligible_entry_pullback|q.eligible_entry_trend).all()
-    assert q[q.selected_entry_reclaim].sort_values('rank_entry_reclaim').ts_code.tolist()==['2','1','0']
+    for col in STRATEGIES.values():
+        assert q['eligible_'+col].sum()==12 and q['selected_'+col].sum()==5
+    assert q[q.selected_rank_reversal].sort_values('rank_rank_reversal').ts_code.tolist()==['0','1','2','3','4']
+    feat['short_return_pct']=np.arange(1.,13.)
+    q=score_cross_sections(feat)
+    assert q.rank_reversal.dropna().lt(0).all() and q.selected_rank_reversal.sum()==5
+    feat['trend_ok']=False
+    q=score_cross_sections(feat)
+    assert not q[[f'selected_{c}' for c in STRATEGIES.values()]].any().any()
 
 def self_test():
+    entry_self_test()
     entry_self_test()
     stop_timing_self_test()
     diagnostic_self_test()
@@ -1535,13 +1555,14 @@ def self_test():
     ind,amb=industry_at(overlap,dates);assert amb.iloc[-1] and ind.iloc[-1]==''
     t=pd.DataFrame(dict(signal_date=[pd.Timestamp('2023-01-20')]*12,ts_code=[str(i) for i in range(12)],
         industry_key=['A']*12,pool_pass=True,history_ready=True,mom_raw=np.arange(12.),short_return_pct=np.arange(12.)-6,circ_mv_yi=np.arange(12.)+50))
+    t['trend_ok']=t.mom_raw.gt(0);t['trend_efficiency']=50.
     scored=score_cross_sections(t)
     assert scored.common_pass.all() and scored.peer_count.eq(11).all()
     assert np.isclose(scored.mom_adj.iloc[0],0-np.median(np.arange(1.,12.)))
-    assert scored.selected_mom_raw.sum()==5 and scored.selected_rev_raw.sum()==5
-    ties=t.copy();ties['mom_raw']=0.;ties['short_return_pct']=0.
+    assert all(scored['selected_'+c].sum()==5 for c in STRATEGIES.values())
+    assert scored.layer_entry_trend.nunique()==1
+    ties=t.copy();ties['mom_raw']=0.;ties['short_return_pct']=0.;ties['trend_ok']=False
     q=score_cross_sections(ties);assert not q[[f'selected_{c}' for c in STRATEGIES.values()]].any().any()
-    assert q.layer_mom_raw.nunique()==1
     assert not score_cross_sections(t.iloc[:10]).common_pass.any()
     g=pd.DataFrame(dict(open=100.,high=101.,low=99.,close=100.,adj_factor=1.,up_limit=150.,down_limit=50.,vol=100.),index=full[:20])
     g.loc[g.index[1],'low']=92
@@ -1554,4 +1575,8 @@ def self_test():
 
 if __name__=='__main__':
     if '--self-test' in sys.argv:self_test()
+    elif '--replay' in sys.argv:
+        import argparse
+        parser=argparse.ArgumentParser();parser.add_argument('--replay',required=True);parser.add_argument('--output-dir',default='tech_swing_cache')
+        args=parser.parse_args();result=replay_research(args.replay,args.output_dir,lambda text:print(text,flush=True));print(result[3])
     else:main()
