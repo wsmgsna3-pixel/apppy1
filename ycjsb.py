@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""科技波段研究 gpt1.8 同一中期趋势池排序验证 — streamlit run app.py
+"""科技波段研究 gpt1.9 同一中期趋势池排序验证 — streamlit run app.py
 
 单文件；依赖 pandas、numpy、streamlit、tushare。python app.py --self-test 可离线验算。
 策略阈值不是回测寻优结果。历史统计不构成策略有效或实盘合格证明。
-gpt1.8说明：同一中期趋势A池，固定比较四种排序；未证明任一方法盈利。
+gpt1.9：固定逐时训练评分，整批8周标签、一周间隔、每月重训；旧排序保留对照。
 只对A池生成交易路径，诊断子组逐个读取，行情缓存和四路下载保持兼容。
-可复用gpt1.7.1结果离线重新比较，沿用原截止日、价格与费用，不需要下载行情。
+可复用gpt1.8或gpt1.7.1结果离线重新比较，沿用原截止日、价格与费用，不需要下载行情。
 部署：用本文件内容覆盖Streamlit实际入口（例如ycjsb.py），保持原缓存目录。
 依赖仅需 pandas、numpy、streamlit、tushare；不新增第三方依赖。
 官方数据字段：https://tushare.pro/document/2?doc_id=32 / 183 / 335
@@ -13,6 +13,8 @@ gpt1.8说明：同一中期趋势A池，固定比较四种排序；未证明任�
 from __future__ import annotations
 
 import gc
+import ctypes
+import subprocess
 import gzip
 import sqlite3
 import shutil
@@ -38,7 +40,9 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
-VERSION = "gpt1.8"
+VERSION = "gpt1.9"
+RUN_SUFFIX = ('_'+hashlib.sha256(os.environ['TECH_RESEARCH_JOB_TAG'].encode()).hexdigest()[:12]
+              if os.environ.get('TECH_RESEARCH_JOB_TAG') else '')
 DOWNLOAD_REVISION = "DL4_DISK_V1"
 DOWNLOAD_WORKERS = 4
 API_MIN_INTERVAL = 0.36
@@ -101,6 +105,108 @@ def memory_mb():
         return values
     except (OSError, ValueError):
         return {}
+
+
+def release_memory():
+    before=memory_mb();gc.collect();trim=False
+    try:
+        libc=ctypes.CDLL(None);fn=libc.malloc_trim
+        fn.argtypes=[ctypes.c_size_t];fn.restype=ctypes.c_int;trim=bool(fn(0))
+    except (AttributeError,OSError):pass
+    return dict(before=before,after=memory_mb(),malloc_trim=trim)
+
+
+def new_job(root,mode,upload=None,token=None,cfg=None):
+    root=Path(root).resolve();root.mkdir(parents=True,exist_ok=True)
+    job=Path(tempfile.mkdtemp(prefix='job19_',dir=root));os.chmod(job,0o700)
+    try:
+        config=dict(mode=mode,cache_root=str(root),config=asdict(cfg) if cfg is not None else None)
+        if upload is not None:
+            source=job/'source.zip'
+            with source.open('wb') as out:upload.seek(0);shutil.copyfileobj(upload,out,length=1024*1024)
+            config['source']=str(source)
+        if token:config['token']=token
+        atomic_bytes(json.dumps(config).encode(),job/'job.json');os.chmod(job/'job.json',0o600)
+        return dict(directory=str(job),phase='staged',before_upload_release=memory_mb())
+    except BaseException:shutil.rmtree(job,ignore_errors=True);raise
+
+
+def start_worker(job):
+    root=Path(job['directory']);job['parent_cleanup']=release_memory()
+    env=os.environ.copy()
+    env['TECH_RESEARCH_JOB_TAG']=root.name
+    for key in ['OPENBLAS_NUM_THREADS','OMP_NUM_THREADS','MKL_NUM_THREADS']:env[key]='1'
+    with (root/'worker.log').open('wb') as log:
+        process=subprocess.Popen([sys.executable,'-u',str(Path(__file__).resolve()),'--worker',str(root/'job.json')],
+                                 stdout=log,stderr=log,env=env)
+    job['process']=process;job['phase']='running';job['parent_after_launch']=memory_mb()
+
+
+def worker_main(config_path):
+    config_path=Path(config_path);root=config_path.parent;config={}
+    try:
+        config=json.loads(config_path.read_text());config_path.unlink()
+        def progress(message):
+            atomic_bytes(json.dumps(dict(message=message,child_memory=memory_mb()),ensure_ascii=False).encode(),root/'progress.json')
+        if config['mode']=='replay':result=replay_research(config['source'],config['cache_root'],progress)
+        elif config['mode']=='fresh':result=run_research(config['token'],config['cache_root'],Config(**config['config']),progress)
+        else:raise ValueError('未知计算模式')
+        atomic_bytes(json.dumps(dict(ok=True,path=result[3],child_after_pack=memory_mb())).encode(),root/'result.json')
+        return 0
+    except Exception as exc:
+        message=str(exc)
+        if config.get('token'):message=message.replace(config['token'],'***')
+        atomic_bytes(json.dumps(dict(ok=False,error=message,child_memory=memory_mb()),ensure_ascii=False).encode(),root/'result.json')
+        return 1
+    finally:
+        config_path.unlink(missing_ok=True);(root/'source.zip').unlink(missing_ok=True)
+
+
+def finish_worker(job):
+    process=job['process'];code=process.poll()
+    if code is None:return None
+    root=Path(job['directory']);metadata=root/'result.json'
+    data=json.loads(metadata.read_text()) if metadata.exists() else dict(ok=False,error=f'计算进程退出，退出码 {code}；已完成的行情缓存可复用。')
+    if not data.get('ok') or code!=0:raise RuntimeError(data.get('error',f'计算进程退出码 {code}'))
+    audit={k:v for k,v in job.items() if k not in ('process','phase','directory')}
+    audit.update(child_after_pack=data['child_after_pack'],parent_after_child_exit=release_memory(),child_exit_code=code)
+    path=Path(data['path']);temp=path.with_suffix('.memory.tmp')
+    try:
+        shutil.copyfile(path,temp)
+        with zipfile.ZipFile(temp,'a',compression=zipfile.ZIP_DEFLATED) as z:
+            z.writestr('process_memory.json',json.dumps(audit,ensure_ascii=False,indent=2))
+        os.replace(temp,path)
+    finally:temp.unlink(missing_ok=True)
+    return load_result(path)
+
+
+def render_job(st):
+    # Let one complete full render finish without the uploader before launching.
+    @st.fragment(run_every=2)
+    def monitor():
+        job=st.session_state.get('gpt19_job')
+        if job is None:return
+        if job['phase']=='staged':
+            job['phase']='ready';st.info('上传已保存，正在释放上传页面；随后自动开始计算。');return
+        try:
+            if job['phase']=='ready':start_worker(job)
+            root=Path(job['directory']);p=root/'progress.json'
+            info=json.loads(p.read_text()) if p.exists() else {'message':'计算进程正在启动'}
+            st.info(info['message']);st.caption(f"页面内存 {memory_mb()}；计算进程 {info.get('child_memory',{})}")
+            if st.button('停止本次计算（保留已下载行情）'):
+                job['process'].terminate()
+                try:job['process'].wait(timeout=3)
+                except subprocess.TimeoutExpired:job['process'].kill();job['process'].wait(timeout=3)
+                shutil.rmtree(root,ignore_errors=True);st.session_state.pop('gpt19_job',None);release_memory();st.rerun()
+            result=finish_worker(job)
+            if result is not None:
+                st.session_state['gpt19_result']=result;st.session_state.pop('gpt19_job',None)
+                shutil.rmtree(root,ignore_errors=True);st.rerun()
+        except Exception as exc:
+            st.error(f'本次未完成：{exc}。行情缓存保留，可直接重试。')
+            if st.button('返回运行页面'):
+                shutil.rmtree(job['directory'],ignore_errors=True);st.session_state.pop('gpt19_job',None);st.rerun()
+    monitor()
 
 
 def compact_frame(df):
@@ -649,18 +755,35 @@ def make_zip(tables,manifest):
 
 LEGACY_STRATEGIES={'原始动量':'mom_raw','行业调整动量':'mom_adj','短期反转':'rev_raw','行业调整反转':'rev_adj'}
 ENTRY_STAGES={'中期趋势':'entry_trend'}
-STRATEGIES={'中期趋势':'entry_trend','趋势池原始动量':'rank_mom','趋势池行业动量':'rank_industry','趋势池短期反转':'rank_reversal'}
+STATIC_STRATEGIES={'中期趋势':'entry_trend','趋势池原始动量':'rank_mom','趋势池行业动量':'rank_industry','趋势池短期反转':'rank_reversal'}
+STRATEGIES=dict(STATIC_STRATEGIES, **{'逐时训练评分':'rank_learn'})
+
 RULES={'版本': 'gpt1.7验证入场条件；三个新组分别为中期趋势、趋势回落、回落后转强。旧四种因子作为参照；新规则未证明有效。没有资金组合。', '共同股票池': '历史科技股票，信号日未复权股价严格>10元，流通市值50—1000亿元，上市至少180天。复用此前共同样本：29个交易周历史完整、历史二级行业可用且至少10只其他合格同行。风险警示仍用历史涨跌停幅度近似，供应商行业历史有局限。', '周频': 't为刚完成的交易周；完整周最后交易日收盘确认，下一交易日开盘买入。周内不使用最终周线。整周休市不计交易周。', '中期趋势A': '26周收益为C[t−2]/C[t−28]−1，必须>0；上一周收盘C[t−1]>MA13[t−1]，且MA13[t−1]>MA13[t−2]。判断趋势用上一完整周，避免本周反弹自己制造趋势合格。', '趋势回落B': '在A基础上，上一周收盘C[t−1]<C[t−3]，即截至上一周最近两周收盘净下跌。它不要求两周都下跌，不预先排除回落幅度较大的股票。', '回落后转强C': '在B基础上，本周收盘C[t]>H[t−1]（上一完整周最高价）。确认发生于本周收盘，不能用本周内提前看到的片段行情代替。', '新组统一排序': '三组都按26周上涨效率降序：100×(C[t−2]−C[t−28])/过去26个周收盘变化绝对值之和。分母窗口同样截至t−2。分母为0则不可用。越少来回波动、越接近持续向上，效率越高；这是形态分数，不是预测收益。', '幅度检验': '效率高可能对应慢涨，因此同时报告净收益≥10%/20%、最大上涨幅度和剔除最高1%后的收益。没有用本轮结果寻优涨幅门槛；高胜率低收益仍不算达标。', '推荐与分层': '每个新组在自身合格候选中按同一效率取前5，同分依次按流通市值降序、代码升序。不足5只不补位；无合格股票不退回较宽组。新组五层分别在该组候选中划分，旧组五层在共同池内划分，同分不拆开。', '对照': 'A/B/C逐层嵌套候选，但各自前五名可能不同。同日对照比较双方已知订单均值，取消订单计0，未知或单方有信号的日期另列；不是同一股票延后买入试验。新组与原始动量跨组比较同时改变了排序与条件，不能只归因于某一项。', '旧因子': '原动量=100×(C[t−2]/C[t−28]−1)；原反转=−100×(C[t]/C[t−2]−1)。行业调整继续扣除同日同业其他股票相应收益中位数，不是回归残差或中性组合。旧组仍要求评分>0并取前5。', '买卖执行': '统一沿用8%初始价格止损；最高收盘浮盈达到2R后，保护线=最高收盘价−1R，只上移且次日生效。R为含滑点买价的8%。不使用第一周或第二周早退，没有固定持仓期限。', '成交与成本': '信号后次交易日开盘买入；开盘涨停或已知停牌取消，取消不补位。T+1；跌停/停牌导致退出延迟。买入费0.10%、卖出费0.20%，每边滑点0.10%。关键路径缺失单列未知，日线不能还原真实成交队列。', '逐周收益': 'W1/W2/...按买入起5/10/...个市场交易日。整批达到观察年龄才纳入；提前退出冻结实际收益，仍持有按收盘标记并预扣退出成本。未知不补零，另报含取消0的订单均值。', '重复': '同股后续完整周仍符合条件可再次入选，作为独立假设事件记账，彼此可能重叠；不是加仓指令或账户收益，也不是统计独立样本。', '空窗': '每年无新候选推荐的交易周目标≤5；同时列未满5只及各阶段剩余候选。不能通过放宽/降级补位掩盖空窗，也不等于实际资金空仓时间。', '无退出诊断': 'W1—W12继续观察原买价之后的价格路径，忽略退出仅用于诊断。最大上涨/下跌是毛价格幅度，极值不代表可兑现利润；无退出收盘标记扣成本，末日停牌/跌停状态另列。路径缺失后后续诊断未知。', '诊断基准': '无退出同日对照要求前五已成交路径全部已知，其余共同池仅使用已知成交路径并披露缺失比例。避免因一只缺报价剔除整周；仍存在可用样本选择偏差。不得与旧版严格完整共同池的同日表直接拼接。', '止损先后': '另列8周等观察期内初始止损与首次上涨10%的先后；盘中同日先后未知单列，不把卖出后高点视为已持有利润。', '历史限制': '2022—2026已经反复研究，不能称为全新样本外。13周均线、2周回落、26周效率及上一周高点均为本次固定假设，没有寻优或收益保证。'}
 for obsolete in ['趋势回落B','回落后转强C','新组统一排序','推荐与分层','对照','版本','旧因子']:
     RULES.pop(obsolete,None)
 RULES.update({
- '版本':'gpt1.8，同一中期趋势池比较四种排序；这是固定比较实验，不自动选择历史收益最高的方法。',
+ '版本':'gpt1.9，同一中期趋势池比较四种排序；这是固定比较实验，不自动选择历史收益最高的方法。',
  '共同实验池':'沿用gpt1.7中期趋势A条件；四组用完全相同的合格候选，不增加回落或转强硬门槛。共同池基准现在仅指A池，不能与旧版全科技共同池基准直接拼接。',
  '四种排序':'上涨效率（中期趋势旧组）、26周原始动量、同行调整26周动量、最近2周收益取负。行业调整仍相对原科技共同池的其他历史同行计算。四组均降序，同分按流通市值降序、代码升序。',
  '分数与名额':'排序分数可为负，四组均不另设分数门槛，不足5只不补足；评分分层在同一个A池进行。',
  '同日对照':'前五名对本组其余A池候选，先算同日已知订单均值，再对日期等权。前五须全部已知，其余未知排除并披露数量；另报其余也全已知的严格口径。取消订单计0，未知不补零。',
  '复用历史结果':'gpt1.7.1结果包含原始因子与逐笔路径，可离线重新排名；保持原数据截止日、原费用与退出规则，不补未来行情。完整基准事件用于验证A池覆盖，缺失则拒绝复用。',
  '检验目标':'同时检查前五名相对其余候选的增益、跨年表现、收益≥10%比例、未触及10%比例及剔除最高1%后的均益。历史已反复查看，不能视作新样本外。'})
+LEARN_FEATURES=['mom_raw','mom_adj','short_return_pct','trend_efficiency',
+                'prev_ma13_change_pct','ma_distance_pct','log_circ_mv','industry_vs_tech_pp']
+LEARN_SPEC=dict(target_week=8,gap_trading_days=5,window_signal_weeks=104,
+                min_training_dates=52,min_training_events=1000,refit='每月首个信号日',
+                ridge_lambda=1.0,training_target_clip_pct=[-50.,50.],features=LEARN_FEATURES)
+RULES.update({
+ '版本':'gpt1.9，新增固定逐时训练评分；四种旧排序保留作对照，不自动选择历史赢家。',
+ '共同实验池':'沿用中期趋势A条件。四种旧排序覆盖同一A池，新模型仅在训练充分且信号特征完整时评分；缺失和准备期另列。共同池基准仅指A池，不能与旧版全科技基准拼接。',
+ '逐时训练':'仅训练整批已满8周且标记日早于训练日5个交易日的历史订单。已退出冻结净收益，未退出按W8收盘净标记，取消为0；未知排除并披露。不是只取已平仓交易。每月首个信号日重训，使用最近104个成熟信号周，至少52个有效日期和1000条已知订单。',
+ '模型固定':'8个信号时点特征：原始/行业动量、2周收益、上涨效率、前周MA13变化、前周收盘距MA13、流通市值自然对数、行业相对科技池动量。只用训练集均值和标准差；日期等权，最小化加权平均平方误差+1×系数平方和。训练目标截断至±50%，实际评估收益不截断。分数只用于排序，不是收益承诺。无参数搜索。',
+ '训练不足':'训练历史不足的日期不产生模型推荐，单列准备期并计入年度无信号周。数据或特征缺失不补分。模型与旧方法优劣只看双方同日已知订单对照，不把不同起始年份总均值当增益。',
+ '复用历史结果':'可复用完整gpt1.7.1或gpt1.8的信号时点因子与路径，不下载行情，保留原数据截止日、费用和退出规则。',
+ '内存':'上传结果先落盘并移除上传界面，计算在单独进程运行，完成后进程退出；页面只保留结果路径。尽力归还空闲堆内存，不清除行情缓存。父子进程内存分别记录，峰值是各进程生命周期高水位，不能当成本次增量。',
+ '历史限制':'2022—2026已反复研究。逐时训练避免本笔未来收益参与自身排名，但不是从未看过的新样本外，也不消除重叠事件、供应商修订或试验选择偏差。'})
+
 STUDY_NOTES='\n'.join(f'{k}：{v}' for k,v in RULES.items())
 
 
@@ -765,7 +888,92 @@ def score_cross_sections(features):
         # Scores can be negative: no method-specific eligibility gates in this experiment.
         f['selected_'+col]=eligible & f['rank_'+col].le(5)
 
+    for c in ['rank_learn','rank_rank_learn','layer_rank_learn']:f[c]=np.nan
+    f['selected_rank_learn']=False;f['eligible_rank_learn']=False
     return f
+
+
+def learning_matrix(frame):
+    x=frame.reindex(columns=LEARN_FEATURES).copy()
+    x['ma_distance_pct']=100*(frame.prev_close/frame.prev_ma13-1)
+    x['log_circ_mv']=np.log(frame.circ_mv_yi.where(frame.circ_mv_yi.gt(0)))
+    return x.replace([np.inf,-np.inf],np.nan)
+
+
+def walk_forward_scores(frame,labels,schedule):
+    """Pure chronological fit. labels are W8 outcomes, never terminal-only returns."""
+    x=learning_matrix(frame).to_numpy(dtype=float)
+    finite=np.isfinite(x).all(axis=1)
+    y=frame.event_id.map(labels).to_numpy(dtype=float)
+    days=pd.to_datetime(frame.signal_date)
+    ends=frame.buy_i.to_numpy(dtype=float)+5*LEARN_SPEC['target_week']-1
+    scores=np.full(len(frame),np.nan);fits=[];states=[];coefficients=[]
+    active=None;month=None;fit_day=None
+    calendar=schedule.sort_values('signal_date').drop_duplicates('signal_date')
+    for row in calendar.itertuples():
+        day=pd.Timestamp(row.signal_date);key=day.to_period('M')
+        if key!=month:
+            month=key;fit_day=day;active=None
+            boundary=float(row.signal_i)-LEARN_SPEC['gap_trading_days']
+            past=(ends<boundary)&days.lt(day).to_numpy()
+            recent=np.sort(days[past].unique())[-LEARN_SPEC['window_signal_weeks']:]
+            window=past&days.isin(recent).to_numpy()
+            train=window&finite&np.isfinite(y)
+            n=int(train.sum());date_count=days[train].nunique()
+            ready=date_count>=LEARN_SPEC['min_training_dates'] and n>=LEARN_SPEC['min_training_events']
+            fits.append(dict(fit_date=day,fit_signal_i=row.signal_i,label_boundary_exclusive=boundary,
+                first_training_date=days[train].min(),last_training_date=days[train].max(),
+                last_label_end_i=float(ends[train].max()) if n else np.nan,training_dates=date_count,
+                training_events=n,window_events=int(window.sum()),unknown_targets=int((window&~np.isfinite(y)).sum()),
+                missing_features=int((window&~finite).sum()),model_ready=ready))
+            if ready:
+                counts=days[train].value_counts()
+                weight=(1/days[train].map(counts).to_numpy(dtype=float))/date_count
+                xx=x[train];yy=np.clip(y[train],*LEARN_SPEC['training_target_clip_pct'])
+                mean=weight@xx;scale=np.sqrt(weight@((xx-mean)**2));scale[scale<1e-12]=1.
+                z=(xx-mean)/scale;intercept=float(weight@yy)
+                beta=np.linalg.solve(z.T@(weight[:,None]*z)+LEARN_SPEC['ridge_lambda']*np.eye(len(LEARN_FEATURES)),
+                                     z.T@(weight*(yy-intercept)))
+                active=(mean,scale,beta,intercept)
+                for i,name in enumerate(LEARN_FEATURES):
+                    coefficients.append(dict(fit_date=day,feature=name,training_mean=mean[i],training_std=scale[i],
+                                             coefficient=beta[i],intercept=intercept))
+        current=days.eq(day).to_numpy();usable=current&finite
+        if active is not None:
+            mean,scale,beta,intercept=active
+            scores[usable]=((x[usable]-mean)/scale)@beta+intercept
+        states.append(dict(signal_date=day,year=str(day.year),fit_date=fit_day,model_ready=active is not None,
+            candidate_events=int(current.sum()),missing_features=int((current&~finite).sum()),
+            scored_events=int(usable.sum()) if active is not None else 0,
+            status='可评分' if active is not None else '训练不足'))
+    return scores,pd.DataFrame(fits),pd.DataFrame(coefficients),pd.DataFrame(states)
+
+
+def apply_learning(e,f,marks,schedule,progress=lambda _:None):
+    progress('逐时训练：8周整批成熟、一周间隔、每月重训；不搜索参数')
+    empty={k:pd.DataFrame() for k in ['training_audit','model_coefficients','model_schedule']}
+    if e.empty:return empty
+    view=weekly_view(e,marks,LEARN_SPEC['target_week'])
+    labels=view.set_index('event_id').week_order_pct if not view.empty else pd.Series(dtype=float)
+    clocks=f.groupby('signal_date',observed=True).signal_i.first()
+    dates=schedule[['signal_date']].copy();dates['signal_i']=dates.signal_date.map(clocks)
+    if dates.signal_i.isna().any():raise ValueError('缺少信号交易日序号，无法审计训练间隔')
+    scores,audit,coefficients,states=walk_forward_scores(e,labels,dates)
+    col='rank_learn';e[col]=scores;e['eligible_'+col]=np.isfinite(scores)
+    order=e.loc[e['eligible_'+col],['signal_date',col,'circ_mv_yi','ts_code']].sort_values(
+        ['signal_date',col,'circ_mv_yi','ts_code'],ascending=[True,False,False,True])
+    e['rank_'+col]=np.nan;e['layer_'+col]=np.nan
+    e.loc[order.index,'rank_'+col]=order.groupby('signal_date',observed=True).cumcount()+1
+    ranks=order.groupby('signal_date',observed=True)[col].rank(ascending=False,method='average')
+    size=order.groupby('signal_date',observed=True)[col].transform('size')
+    e.loc[order.index,'layer_'+col]=np.minimum(5,np.floor((ranks-1)/size*5)+1)
+    e['selected_'+col]=e['rank_'+col].le(5)
+    columns=[col,'rank_'+col,'layer_'+col,'eligible_'+col,'selected_'+col]
+    indexed=e[['event_id']+columns].set_index('event_id')
+    for c in columns:
+        values=f.event_id.map(indexed[c])
+        f[c]=values.eq(True) if c.startswith(('eligible_','selected_')) else values
+    return dict(training_audit=audit,model_coefficients=coefficients,model_schedule=states)
 
 
 def calculate(data,basic,member,calendar,cfg,progress,full_calendar=None,diagnostic_sink=None,marks_sink=None):
@@ -904,7 +1112,7 @@ def build_reports(e,marks,f,schedule,calendar,cfg,progress=lambda _:None,output=
                     g=v[v['layer_'+col].eq(layer)]
                     for yr,p in years(g):layers.append(dict(strategy=strategy,layer=layer,year=yr,week_no=w,**period_stat(p)))
         mature=mature_schedule(e,schedule,calendar,w)
-        for family,raw,adj in [('趋势池原始动量','entry_trend','rank_mom'),('趋势池行业动量','entry_trend','rank_industry'),('趋势池短期反转','entry_trend','rank_reversal')]:
+        for family,raw,adj in [('趋势池原始动量','entry_trend','rank_mom'),('趋势池行业动量','entry_trend','rank_industry'),('趋势池短期反转','entry_trend','rank_reversal'),('逐时训练评分','entry_trend','rank_learn')]:
             dates.append(date_comparison(v,mature,w,family,raw,adj))
     tables.update(weekly_summary=pd.DataFrame(summary),survivor_summary=pd.DataFrame(survivors),rank_layers=pd.DataFrame(layers),
         top5_weekly_history=history if isinstance(history,CSVSpool) else (pd.concat(history,ignore_index=True) if history else pd.DataFrame()))
@@ -1135,7 +1343,7 @@ def run_research(token,cache_root,cfg,progress):
     root=Path(cache_root);root.mkdir(parents=True,exist_ok=True)
     with research_lock(root):
         # Previous interrupted work is disposable; persistent market DB and completed results remain.
-        work=root/'work_gpt18';shutil.rmtree(work,ignore_errors=True);work.mkdir()
+        work=root/'work_gpt19';shutil.rmtree(work,ignore_errors=True);work.mkdir()
         started=time.monotonic(); stages=[]
         def report(message):
             rss=memory_mb();print(f'[{VERSION}] {message} | {rss}',flush=True)
@@ -1159,7 +1367,9 @@ def run_research(token,cache_root,cfg,progress):
             data.close();data=None;marks.finish();diagnostics.finish();gc.collect()
             report('退出路径完成；汇总结果并逐表落盘')
             tables=DiskTables(work/'reports')
+            learning=apply_learning(e,f,marks,schedule,report)
             build_reports(e,marks,f,schedule,calendar,cfg,report,output=tables)
+            tables.update(learning)
             tables.update(data_issues=issues,universe=basic,industry_intervals=member)
             del f;gc.collect()
             entry_exit_reports(e,marks,diagnostics,report,output=tables)
@@ -1172,13 +1382,14 @@ def run_research(token,cache_root,cfg,progress):
                 limitations=['行业调整为同行收益中位数调整，不是回归残差或中性组合','方向合格不等于正期望；覆盖率不能单独证明有效',
                     '共同样本要求报价完整及足够同行，可能产生数据可用性选择','独立事件可重叠，不能当账户收益',
                     '行业区间和历史风险警示仍有供应商限制','四组使用同一个A候选池与统一退出规则，仅排序不同','已经反复使用的历史不是新样本外'])
-            manifest.update(strategy_version='gpt1.8',storage_revision=DOWNLOAD_REVISION,
+            manifest.update(strategy_version='gpt1.9',storage_revision=DOWNLOAD_REVISION,
                 data_hash_scheme='sha256(sorted daily tech-only CSV digests)',runtime_memory_mb=memory_mb(),
                 memory_notes=['四路并发、最多四个待处理日期','仅科技池一份持久行情；日事务提交，按股票读取',
                     '诊断路径按观察周读取；报告逐表落盘；页面按需读取','本地缓存不能保证跨删除应用/重新部署保留'])
+            manifest['learning']=LEARN_SPEC
             tables['resource_usage']=pd.DataFrame(stages)
             run_id=hashlib.sha256(json.dumps(asdict(cfg),sort_keys=True).encode()).hexdigest()[:12]
-            path=root/'results'/f'{VERSION}_{run_id}.zip'
+            path=root/'results'/f'{VERSION}_{run_id}{RUN_SUFFIX}.zip'
             report('正在流式打包，完成后才替换结果文件')
             write_zip(tables,manifest,path)
             report('计算完成；结果保存在磁盘，切换页面无需重跑')
@@ -1236,14 +1447,16 @@ def load_result(payload,cache_root='tech_swing_cache'):
             target=root/('import_'+digest.hexdigest()[:16]+'.zip');os.replace(path,target);path=target
         except BaseException:
             Path(temp).unlink(missing_ok=True);raise
-    with zipfile.ZipFile(path) as z:manifest=json.loads(z.read('manifest.json'))
+    with zipfile.ZipFile(path) as z:
+        manifest=json.loads(z.read('manifest.json'))
+        if 'process_memory.json' in z.namelist():manifest['process_memory']=json.loads(z.read('process_memory.json'))
     if manifest.get('version') != VERSION:
-        raise ValueError('本页显示gpt1.8结果；gpt1.7.1请使用复用旧结果重新比较入口。')
+        raise ValueError('本页显示gpt1.9结果；gpt1.8或gpt1.7.1请用复算入口。')
     tables=ZipTables(path)
     required={'events','weekly_summary','selections','coverage','rank_layers','industry_adjustment_summary',
         'signal_calendar','top5_weekly_history','path_diagnostics','entry_exit_summary','entry_rank_summary',
         'entry_date_comparison','survivor_summary','final_summary','industry_adjustment_dates','pool_filter_counts',
-        'industry_profile','entry_date_summary','entry_top5_details','stop_timing_summary','ranking_summary','ranking_dates'}
+        'industry_profile','entry_date_summary','entry_top5_details','stop_timing_summary','ranking_summary','ranking_dates','training_audit','model_coefficients','model_schedule'}
     if not required.issubset(tables):raise ValueError('结果文件缺少必要表格：'+', '.join(sorted(required-set(tables))))
     return tables,manifest,None,str(path)
 
@@ -1251,7 +1464,7 @@ def load_result(payload,cache_root='tech_swing_cache'):
 def replay_research(source,cache_root,progress=lambda _:None):
     """Re-rank a complete prior result using only saved signal-time features and paths."""
     root=Path(cache_root);root.mkdir(parents=True,exist_ok=True)
-    with research_lock(root), tempfile.TemporaryDirectory(prefix='replay18_',dir=root) as temp:
+    with research_lock(root), tempfile.TemporaryDirectory(prefix='replay19_',dir=root) as temp:
         work=Path(temp);marks=SQLSpool(work/'marks.sqlite');paths=SQLSpool(work/'paths.sqlite')
         stages=[];started=time.monotonic()
         def report(message):
@@ -1260,7 +1473,7 @@ def replay_research(source,cache_root,progress=lambda _:None):
         try:
             with zipfile.ZipFile(source) as z:
                 old=json.loads(z.read('manifest.json'))
-                if old.get('version')!='gpt1.7.1':raise ValueError('复用入口仅接受完整gpt1.7.1结果包')
+                if old.get('version') not in ('gpt1.7.1','gpt1.8'):raise ValueError('复用入口接受完整gpt1.7.1或gpt1.8结果包')
                 for rule in ['中期趋势A','买卖执行','成交与成本','周频']:
                     if old.get('rules',{}).get(rule)!=RULES.get(rule):raise ValueError('旧包规则不一致：'+rule)
                 cfg=Config(**old['config'])
@@ -1311,7 +1524,9 @@ def replay_research(source,cache_root,progress=lambda _:None):
                         sink.append(p)
                     sink.finish()
                 tables=DiskTables(work/'reports')
+                learning=apply_learning(e,f,marks,schedule,report)
                 build_reports(e,marks,f,schedule,None,cfg,report,output=tables)
+                tables.update(learning)
                 # Factors have been saved; diagnostic functions only need compact event columns.
                 del f;gc.collect()
                 entry_exit_reports(e,marks,paths,report,output=tables)
@@ -1324,10 +1539,11 @@ def replay_research(source,cache_root,progress=lambda _:None):
                 created_at=datetime.now(ZoneInfo('Asia/Shanghai')).isoformat(),source_version=old['version'],
                 replay=True,runtime_memory_mb=memory_mb(),memory_notes=['只计算共同A池','诊断子组逐个生成','逐周视图只保留统计字段'],
                 limitations=['历史已反复研究，不是新样本外','共同池改为A池，不能与旧全科技基准直接拼接',
-                    '复用原数据截止日，不代表实时选股','实验四种排序，未自动选出或证明优胜方法'])
+                    '复用原数据截止日，不代表实时选股','固定逐时训练评分与四个旧排序，未证明优胜方法'])
+            manifest['learning']=LEARN_SPEC
             tables['resource_usage']=pd.DataFrame(stages)
             digest=hashlib.sha256(json.dumps(asdict(cfg),sort_keys=True).encode()).hexdigest()[:12]
-            path=root/'results'/f'{VERSION}_replay_{digest}.zip'
+            path=root/'results'/f'{VERSION}_replay_{digest}{RUN_SUFFIX}.zip'
             write_zip(tables,manifest,path)
             return ZipTables(path),manifest,None,str(path)
         finally:marks.close();paths.close();gc.collect()
@@ -1335,15 +1551,17 @@ def replay_research(source,cache_root,progress=lambda _:None):
 
 def main():
     import streamlit as st
-    st.set_page_config(page_title='gpt1.8 同池排序验证',layout='wide')
-    st.title('gpt1.8 · 同一中期趋势池，验证前五名排序')
-    st.caption('四组候选条件相同，退出规则相同；区别仅在排序。没有自动选择历史收益最高的方法。')
+    st.set_page_config(page_title='gpt1.9 同池排序验证',layout='wide')
+    st.title('gpt1.9 · 逐时训练，验证前五名入场质量')
+    st.caption('新增固定逐时训练评分，旧排序保留对照。训练准备期不补位；这仍是实验，未证明盈利。')
+    if 'gpt19_job' in st.session_state:
+        render_job(st);return
     with st.sidebar:
         cache=st.text_input('行情缓存目录',value='tech_swing_cache')
-        mode=st.radio('运行方式',['复用gpt1.7.1结果','行情缓存计算','打开gpt1.8结果'])
+        mode=st.radio('运行方式',['复用gpt1.8或gpt1.7.1结果','行情缓存计算','打开gpt1.9结果'])
         upload=None;run=False
         if mode!='行情缓存计算':
-            upload=st.file_uploader('上传完整结果ZIP',type=['zip'],key=f"input18_{st.session_state.get('upload_revision18',0)}")
+            upload=st.file_uploader('上传完整结果ZIP',type=['zip'],key=f"input19_{st.session_state.get('upload_revision19',0)}")
             run=st.button('重新比较排序' if mode.startswith('复用') else '打开结果',disabled=upload is None,type='primary')
         else:
             token=st.text_input('Tushare Token',type='password',value=os.environ.get('TUSHARE_TOKEN',''))
@@ -1354,40 +1572,35 @@ def main():
             run=st.button('四路下载/复用缓存并计算',type='primary')
         st.caption('复用旧结果无需Token与行情下载，沿用旧数据截止日。行情计算保留四路并发和断点恢复。')
     if run:
-        st.session_state.pop('gpt18_result',None);st.session_state.pop('gpt17_result',None);gc.collect()
-        status=st.empty()
+        for key in ['gpt19_result','gpt18_result','gpt17_result']:st.session_state.pop(key,None)
         try:
             if mode=='行情缓存计算':
                 if not token or start>end or min_mv>=max_mv:raise ValueError('请检查Token、日期和市值范围')
-                result=run_research(token,cache,Config(start=ds(start),end=ds(end),min_price=price,min_mv=min_mv,max_mv=max_mv),status.info)
+                cfg=Config(start=ds(start),end=ds(end),min_price=price,min_mv=min_mv,max_mv=max_mv)
+                st.session_state['gpt19_job']=new_job(cache,'fresh',token=token,cfg=cfg)
             elif mode.startswith('复用'):
-                root=Path(cache);root.mkdir(parents=True,exist_ok=True)
-                fd,temp=tempfile.mkstemp(prefix='upload18_',suffix='.zip',dir=root)
-                try:
-                    with os.fdopen(fd,'wb') as handle:upload.seek(0);shutil.copyfileobj(upload,handle,length=1024*1024)
-                    result=replay_research(temp,cache,status.info)
-                finally:Path(temp).unlink(missing_ok=True)
-            else:result=load_result(upload,cache)
-            st.session_state['gpt18_result']=result;status.success('完成，结果沿用已记录的数据截止日。')
-            st.session_state['upload_revision18']=st.session_state.get('upload_revision18',0)+1
-            st.rerun()  # Drop the old uploader widget and its in-memory ZIP after a successful run.
-        except Exception as exc:status.error(f'本次未完成：{exc}')
+                st.session_state['gpt19_job']=new_job(cache,'replay',upload=upload)
+            else:st.session_state['gpt19_result']=load_result(upload,cache)
+            upload=None
+            st.session_state['upload_revision19']=st.session_state.get('upload_revision19',0)+1
+            st.rerun()
+        except Exception as exc:st.error(f'本次未完成：{exc}')
     with st.expander('固定研究规则'):st.text(STUDY_NOTES)
-    if 'gpt18_result' not in st.session_state:
-        saved=sorted((Path(cache)/'results').glob('gpt1.8*.zip'),key=lambda p:p.stat().st_mtime,reverse=True)
+    if 'gpt19_result' not in st.session_state:
+        saved=sorted((Path(cache)/'results').glob('gpt1.9*.zip'),key=lambda p:p.stat().st_mtime,reverse=True)
         if saved:
             chosen=st.selectbox('已完成的本地结果',saved,format_func=lambda p:p.name)
             if st.button('恢复本地结果'):
-                try:st.session_state['gpt18_result']=load_result(chosen);st.rerun()
+                try:st.session_state['gpt19_result']=load_result(chosen);st.rerun()
                 except Exception as exc:st.error(str(exc))
-        st.info('本轮不增加买入硬门槛，不更改退出规则。上传gpt1.7.1结果即可重新比较。');return
-    tables,manifest,_,path=st.session_state['gpt18_result']
+        st.info('本轮不增加买入硬门槛，不更改退出规则。优先上传gpt1.8结果复算，无需重新下载行情。');return
+    tables,manifest,_,path=st.session_state['gpt19_result']
     st.write(f"结果 {manifest['version']}｜行情截至 {manifest['data_end']}｜股票名单 {manifest['universe_size']} 只")
     st.caption('共同池基准仅包含中期趋势A候选。独立事件可重叠，统计不是账户收益。')
     for warning in manifest.get('warnings',[]):st.warning(warning)
     if st.checkbox('准备下载完整结果'):
-        with Path(path).open('rb') as handle:st.download_button('下载结果',handle,file_name=f"gpt1.8_{manifest['config']['start']}_{manifest['config']['end']}.zip",mime='application/zip',on_click='ignore')
-    method=st.selectbox('排序方法',list(STRATEGIES))
+        with Path(path).open('rb') as handle:st.download_button('下载结果',handle,file_name=f"gpt1.9_{manifest['config']['start']}_{manifest['config']['end']}.zip",mime='application/zip',on_click='ignore')
+    method=st.selectbox('排序方法',['逐时训练评分']+list(STATIC_STRATEGIES))
     cv=tables['coverage'];year=st.selectbox('信号年份',['全部']+sorted(cv.year.astype(str).unique().tolist()) if not cv.empty else ['全部'])
     section=st.radio('查看报告',['逐周收益','前五名明细','同池排序增益','价格路径诊断','覆盖与运行记录'],horizontal=True)
     def subset(df):
@@ -1402,13 +1615,13 @@ def main():
         nonlocal seq
         seq+=1
         if len(df)>500:
-            page=st.number_input(f'表{seq}页码（共{len(df)}行）',min_value=1,max_value=(len(df)+499)//500,value=1,key=f'p18_{section}_{seq}')
+            page=st.number_input(f'表{seq}页码（共{len(df)}行）',min_value=1,max_value=(len(df)+499)//500,value=1,key=f'p19_{section}_{seq}')
             df=df.iloc[(page-1)*500:page*500]
         st.dataframe(df.rename(columns=LABELS),hide_index=True,use_container_width=True)
     if section=='逐周收益':
         group=st.selectbox('样本组',['前五名']+[f'第{i}名' for i in range(1,6)])
         d=subset(tables['weekly_summary']);show(d[d.group.eq(group)] if not d.empty else d)
-        st.caption('W1/W2…是买入起5/10…个市场交易日。已退出冻结实际收益；没有固定持仓期限。')
+        st.caption('W1/W2…按5/10…个市场交易日，退出后冻结收益。模型准备期不推荐；不同方法全时期均值起始日期可能不同，增益请看双方同日对照。')
         with st.expander('整个A候选池基准'):
             d=tables['weekly_summary'];show(d[d.strategy.eq('共同池基准')&d.year.astype(str).eq(year)] if not d.empty else d)
     elif section=='前五名明细':
@@ -1424,21 +1637,30 @@ def main():
         show(subset(tables['ranking_summary']))
         st.caption('同日先比较前五名与其余A候选，再对日期等权。前五须全部已知，其余未知排除并披露；严格口径要求其余也全部已知。取消订单计0。')
         w=st.selectbox('分层观察周次',[1,2,4,8,12]);d=subset(tables['rank_layers']);show(d[d.week_no.eq(w)] if not d.empty else d)
-        with st.expander('与上涨效率参照组的同日对照'):
-            d=tables['industry_adjustment_summary'];show(d[d.year.astype(str).eq(year)] if not d.empty else d)
+        with st.expander('与上涨效率参照组的同日对照（排除训练准备期）',expanded=True):
+            d=tables['industry_adjustment_summary'];show(d[d.year.astype(str).eq(year)&d.family.eq(method)] if not d.empty else d)
     elif section=='价格路径诊断':
         d=subset(tables['entry_exit_summary']);show(d[d.group.eq('前五名')] if not d.empty else d)
         st.caption('诊断继续观察卖出后的股价。最大上涨不等于可兑现利润；路径缺失不计为零。')
         show(subset(tables['entry_rank_summary']))
         with st.expander('初始止损与触及10%的先后'):show(subset(tables['stop_timing_summary']))
     else:
-        show(subset(cv));show(tables.get('data_issues',pd.DataFrame()));show(tables.get('resource_usage',pd.DataFrame()));st.json(manifest)
+        show(subset(cv));show(tables.get('model_schedule',pd.DataFrame()));show(tables.get('training_audit',pd.DataFrame()))
+        with st.expander('逐月训练系数'):show(tables.get('model_coefficients',pd.DataFrame()))
+        show(tables.get('data_issues',pd.DataFrame()));show(tables.get('resource_usage',pd.DataFrame()));st.json(manifest)
 
 
 LABELS.update({'never_up10_count':'始终未触及上涨10%事件数','never_up10_pct':'始终未触及上涨10%比例%',
     'raw_date_mean_pct':'上涨效率参照均益%','adjusted_date_mean_pct':'当前排序均益%','family':'排序方法','mean_delta_pp':'当前减效率百分点','top_mean':'前五名同日订单均益%','rest_mean':'其余候选同日订单均益%','delta_pp':'前五减其余百分点',
     'better_dates_pct':'前五胜出日期%','rest_unknown':'其余未知事件数','rest_events':'其余事件数','strict_dates':'严格可比较日期数',
     'strict_delta_pp':'严格口径增益百分点','score':'排序分数（各方法定义不同）'})
+
+LABELS.update({'fit_date':'本次训练日','model_ready':'训练是否充分','training_dates':'有效训练周数',
+ 'training_events':'有效训练订单数','window_events':'训练窗口订单总数','unknown_targets':'收益未知订单数',
+ 'missing_features':'信号特征缺失数','first_training_date':'最早训练信号日','last_training_date':'最后训练信号日',
+ 'fit_signal_i':'训练日交易序号','last_label_end_i':'最晚标签交易序号','label_boundary_exclusive':'标签须早于此序号',
+ 'candidate_events':'A池候选数','scored_events':'可评分数','feature':'特征','training_mean':'训练特征均值',
+ 'training_std':'训练特征标准差','coefficient':'标准化后系数','intercept':'截距'})
 
 
 def diagnostic_self_test():
@@ -1516,7 +1738,7 @@ def entry_self_test():
      mom_raw=np.arange(1.,13.),short_return_pct=np.arange(12.)-6,circ_mv_yi=np.arange(12.)+50,
      trend_efficiency=np.arange(1.,13.)*5,trend_ok=True,pullback_ok=[True]*8+[False]*4,reclaim_ok=[True]*3+[False]*9))
     q=score_cross_sections(feat)
-    for col in STRATEGIES.values():
+    for col in STATIC_STRATEGIES.values():
         assert q['eligible_'+col].sum()==12 and q['selected_'+col].sum()==5
     assert q[q.selected_rank_reversal].sort_values('rank_rank_reversal').ts_code.tolist()==['0','1','2','3','4']
     feat['short_return_pct']=np.arange(1.,13.)
@@ -1526,7 +1748,29 @@ def entry_self_test():
     q=score_cross_sections(feat)
     assert not q[[f'selected_{c}' for c in STRATEGIES.values()]].any().any()
 
+def learning_self_test():
+    rng=np.random.default_rng(19);days=pd.date_range('2020-01-03',periods=100,freq='W-FRI')
+    frame=pd.DataFrame({'signal_date':np.repeat(days,25)})
+    n=len(frame);frame['event_id']=[str(i) for i in range(n)]
+    frame['buy_i']=np.repeat(np.arange(100)*5+5,25)
+    for col in LEARN_FEATURES:frame[col]=rng.normal(size=n)
+    frame['circ_mv_yi']=100.;frame['prev_close']=100.;frame['prev_ma13']=95.
+    labels=pd.Series(rng.normal(size=n),index=frame.event_id)
+    schedule=pd.DataFrame(dict(signal_date=days,signal_i=np.arange(100)*5+4))
+    score,audit,_,_=walk_forward_scores(frame,labels,schedule)
+    ready=audit[audit.model_ready];assert len(ready)>2 and np.isfinite(score).any()
+    assert (ready.last_label_end_i<ready.label_boundary_exclusive).all()
+    cutoff=ready.iloc[1]
+    changed=labels.copy();future=frame.buy_i.add(39).ge(cutoff.label_boundary_exclusive)
+    changed.loc[frame.loc[future,'event_id']]=100000.
+    other,_,_,_=walk_forward_scores(frame,changed,schedule)
+    past=frame.signal_date.le(cutoff.fit_date)
+    np.testing.assert_allclose(score[past],other[past],equal_nan=True)
+    print('Chronological learning cutoff and future-label isolation PASS')
+
+
 def self_test():
+    learning_self_test()
     entry_self_test()
     entry_self_test()
     stop_timing_self_test()
@@ -1559,7 +1803,8 @@ def self_test():
     scored=score_cross_sections(t)
     assert scored.common_pass.all() and scored.peer_count.eq(11).all()
     assert np.isclose(scored.mom_adj.iloc[0],0-np.median(np.arange(1.,12.)))
-    assert all(scored['selected_'+c].sum()==5 for c in STRATEGIES.values())
+    assert all(scored['selected_'+c].sum()==5 for c in STATIC_STRATEGIES.values())
+    assert not scored.selected_rank_learn.any()
     assert scored.layer_entry_trend.nunique()==1
     ties=t.copy();ties['mom_raw']=0.;ties['short_return_pct']=0.;ties['trend_ok']=False
     q=score_cross_sections(ties);assert not q[[f'selected_{c}' for c in STRATEGIES.values()]].any().any()
@@ -1574,7 +1819,8 @@ def self_test():
 
 
 if __name__=='__main__':
-    if '--self-test' in sys.argv:self_test()
+    if '--worker' in sys.argv:sys.exit(worker_main(sys.argv[sys.argv.index('--worker')+1]))
+    elif '--self-test' in sys.argv:self_test()
     elif '--replay' in sys.argv:
         import argparse
         parser=argparse.ArgumentParser();parser.add_argument('--replay',required=True);parser.add_argument('--output-dir',default='tech_swing_cache')
