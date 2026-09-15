@@ -1,7 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-周线 SKDJ 分级补位选股系统 (V17)
+周线 SKDJ 分级补位选股系统 (V19)
 ------------------------------------------------
+V19 修复（选股与回测逻辑与 V18 完全一致，回测记录可继续沿用）：
+1. 【内存】行情改为按年压缩存储、只保留股票池内股票、逐年读取后直接转成 numpy 数组，
+   不再把全市场多年日线拼成大 DataFrame。回测 5 年内存占用从 2GB 以上降到几百 MB，
+   避免 Streamlit Cloud 超内存重启。
+2. 【缓存不丢】侧边栏“缓存备份与恢复”：一键把行情仓库和回测记录打包下载到电脑，
+   重启后上传即可恢复，不用重新下载。
+3. 【断点续传】下载每满 40 天写盘一次，中途崩溃最多损失 40 天。
+4. 【自动迁移】旧版逐日缓存首次运行自动转入新仓库并删除旧文件，释放磁盘。
+5. 股票池新增股票时只按只补历史，不重下全部日期。
+
+V18 新增：
+1. 【下行尾部指标】每个对照组增加 熊股率（60个交易日内最大回撤≤-20%的比例）、
+   平均最大回撤、12周收益中位数。牛股率高但熊股率同样高，说明只是波动大，不是选股能力。
+2. 【报告区间筛选】侧边栏可设定报告起止日期，同一份回测记录可以分别查看
+   样本外区间（如 2018~2022）与原回测区间，互不混合。
+3. 保留 V17 的四路并发下载与一键导出（ZIP 中附带报告区间）。
+
 V17 新增（选股规则仍不变）：
 1. 【四路并发下载】行情同步默认 4 线程并发（侧边栏可调 1~8），遇到 Tushare
    限流自动退避重试；失败的日期下次运行自动补下。
@@ -71,14 +88,14 @@ except ImportError:
 
 warnings.filterwarnings("ignore")
 
-VERSION = "V17"
-MARKET_CACHE_FILE = "skdj_market_data_master.pkl"
-MARKET_CACHE_DIR = "skdj_market_data_daily_cache"
+VERSION = "V19"
+LOGIC_VERSION = "V18"   # 选股/回测逻辑版本，决定参数组编号与记录文件名
 
 SKDJ_N, SKDJ_M = 6, 3
 HOLD_WEEKS = 12
 FWD_HORIZONS = {"W2": 10, "W4": 20, "W8": 40, "W12": 60}
 BIG_WINNER_PCT = 30.0
+BIG_LOSER_PCT = -20.0
 RS_LOOKBACK_WEEKS = 12
 RS_TOP_PCT = 10.0
 SECTOR_MIN_MEMBERS = 5
@@ -96,8 +113,8 @@ BENCH_GROUPS = [
 TIER_ORDER = {"A": 0, "B": 1, "C": 2}
 TIER_LABEL = {"A": "A 标准上穿25", "B": "B 低位金叉", "C": "C 趋势回踩金叉"}
 
-st.set_page_config(page_title="SKDJ V17 对照回测系统", layout="wide")
-st.title("🔬 周线 SKDJ 分级补位选股系统 (V17)")
+st.set_page_config(page_title="SKDJ V19 对照回测系统", layout="wide")
+st.title("🔬 周线 SKDJ 分级补位选股系统 (V19)")
 st.markdown("SKDJ 信号 / 强势股 / 强势板块 与股票池同周对照 · 四路并发下载 · 一键导出")
 
 
@@ -347,18 +364,174 @@ def load_sw_l2_map(token):
 
 
 # ---------------------------
-# 行情增量下载与缓存（沿用原缓存目录，已下载的数据可直接复用）
+# 行情仓库（V19）：按年压缩存储、只存股票池内股票、逐年读取，内存占用约为 V18 的 1/10
 # ---------------------------
-def _market_partition_path(trade_date):
-    os.makedirs(MARKET_CACHE_DIR, exist_ok=True)
-    return os.path.join(MARKET_CACHE_DIR, f"{trade_date}.pkl.gz")
+STORE_DIR = "skdj_market_store"
+LEGACY_CACHE_DIR = "skdj_market_data_daily_cache"   # V14.5~V18 的逐日缓存，首次运行自动迁移
+PRICE_FIELDS = ("open", "high", "low", "close", "pre_close")   # float32 存储，读取时还原两位小数
+F64_FIELDS = ("vol", "adj_factor", "circ_mv")                    # float64 存储，保证与 V18 结果一致
+STORE_FIELDS = PRICE_FIELDS + F64_FIELDS
+FLUSH_EVERY_DAYS = 40
 
 
-def _market_partition_exists(trade_date):
+def _year_path(year):
+    return os.path.join(STORE_DIR, f"{int(year)}.npz")
+
+
+def _store_years():
+    if not os.path.isdir(STORE_DIR):
+        return []
+    years = []
+    for fn in os.listdir(STORE_DIR):
+        m = re.fullmatch(r"(\d{4})\.npz", fn)
+        if m:
+            years.append(int(m.group(1)))
+    return sorted(years)
+
+
+def load_year_meta(year):
+    path = _year_path(year)
+    if not os.path.exists(path):
+        return None
     try:
-        return os.path.getsize(_market_partition_path(trade_date)) >= 100
-    except OSError:
-        return False
+        with np.load(path, allow_pickle=False) as z:
+            return {'dates': z['dates'].astype(np.int64), 'codes': z['codes'].astype(str)}
+    except Exception:
+        return None
+
+
+def load_year(year):
+    path = _year_path(year)
+    if not os.path.exists(path):
+        return None
+    try:
+        with np.load(path, allow_pickle=False) as z:
+            data = {'dates': z['dates'].astype(np.int64), 'codes': z['codes'].astype(str)}
+            shape = (len(data['dates']), len(data['codes']))
+            for f in STORE_FIELDS:
+                arr = z[f]
+                if arr.shape != shape:
+                    raise ValueError(f"{f} 形状不符")
+                data[f] = arr
+        return data
+    except Exception:
+        try:
+            os.replace(path, path + ".broken")  # 损坏文件改名保留，缺失日期会重新下载
+        except OSError:
+            pass
+        return None
+
+
+def save_year(year, data):
+    os.makedirs(STORE_DIR, exist_ok=True)
+
+    def writer(temp_path):
+        with open(temp_path, "wb") as fh:
+            payload = {f: np.asarray(data[f], dtype=np.float32 if f in PRICE_FIELDS else np.float64) for f in STORE_FIELDS}
+            np.savez_compressed(fh, dates=np.asarray(data['dates'], dtype=np.int32),
+                                codes=np.asarray(data['codes'], dtype='<U12'), **payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+    _atomic_replace_bytes(writer, _year_path(year))
+
+
+def merge_year(existing, day_frames=None, backfill=None, keep_codes=()):
+    """
+    day_frames: {date_int: DataFrame(ts_code + 字段)}，整日下载的数据。
+      年文件已有日期时，只能写入年文件已覆盖的代码（新代码必须先补历史，避免把旧日期误当成停牌）。
+    backfill:   {ts_code: DataFrame(trade_date + 字段)}，单只股票补历史，只填年文件已有日期。
+    """
+    old_dates = existing['dates'] if existing is not None else np.array([], dtype=np.int64)
+    old_codes = existing['codes'] if existing is not None else np.array([], dtype=str)
+    has_old = len(old_dates) > 0
+    day_frames = dict(day_frames or {})
+    backfill = dict(backfill or {})
+
+    if day_frames:
+        allowed = set(old_codes.tolist()) if has_old else set(keep_codes)
+        for d in list(day_frames):
+            df = day_frames[d]
+            if not has_old:
+                allowed.update(df['ts_code'].tolist())
+            day_frames[d] = df[df['ts_code'].isin(allowed)]
+        if not has_old:
+            code_set = allowed
+        else:
+            code_set = set(old_codes.tolist())
+    else:
+        code_set = set(old_codes.tolist())
+    code_set = code_set | set(backfill)
+
+    new_dates = np.array(sorted(int(d) for d in day_frames), dtype=np.int64)
+    dates = np.union1d(old_dates, new_dates).astype(np.int64)
+    codes = np.array(sorted(code_set), dtype='<U12')
+    n, m = len(dates), len(codes)
+    out = {'dates': dates, 'codes': codes}
+    r_old = np.searchsorted(dates, old_dates)
+    c_old = np.searchsorted(codes, old_codes)
+    for f in STORE_FIELDS:
+        mat = np.full((n, m), np.nan, dtype=np.float32 if f in PRICE_FIELDS else np.float64)
+        if has_old and len(old_codes):
+            mat[np.ix_(r_old, c_old)] = existing[f]
+        out[f] = mat
+
+    if day_frames:
+        for d, df in day_frames.items():
+            if df.empty:
+                continue
+            r = int(np.searchsorted(dates, int(d)))
+            cidx = np.searchsorted(codes, df['ts_code'].to_numpy(dtype=str))
+            for f in STORE_FIELDS:
+                if f in df.columns:
+                    out[f][r, cidx] = pd.to_numeric(df[f], errors='coerce').to_numpy(dtype=float)
+
+    if backfill and n:
+        for code, df in backfill.items():
+            if df is None or df.empty:
+                continue
+            c = int(np.searchsorted(codes, code))
+            td = pd.to_numeric(df['trade_date'], errors='coerce').to_numpy(dtype=float)
+            ridx = np.searchsorted(dates, td)
+            ok = (ridx < n) & (dates[np.clip(ridx, 0, n - 1)] == td)
+            if not ok.any():
+                continue
+            for f in STORE_FIELDS:
+                if f in df.columns:
+                    out[f][ridx[ok], c] = pd.to_numeric(df[f], errors='coerce').to_numpy(dtype=float)[ok]
+    return out
+
+
+def store_summary():
+    years = _store_years()
+    n_dates, codes, size = 0, set(), 0
+    first = last = None
+    for y in years:
+        meta = load_year_meta(y)
+        if meta is None or len(meta['dates']) == 0:
+            continue
+        n_dates += len(meta['dates'])
+        codes.update(meta['codes'].tolist())
+        first = int(meta['dates'].min()) if first is None else min(first, int(meta['dates'].min()))
+        last = int(meta['dates'].max()) if last is None else max(last, int(meta['dates'].max()))
+        size += os.path.getsize(_year_path(y))
+    return {'years': years, 'n_dates': n_dates, 'n_codes': len(codes), 'first': first, 'last': last,
+            'size_mb': size / 1024 / 1024}
+
+
+# ---- 旧版逐日缓存（只读，用于迁移）
+def _legacy_partition_path(trade_date):
+    return os.path.join(LEGACY_CACHE_DIR, f"{trade_date}.pkl.gz")
+
+
+def _legacy_dates():
+    if not os.path.isdir(LEGACY_CACHE_DIR):
+        return []
+    out = []
+    for fn in os.listdir(LEGACY_CACHE_DIR):
+        m = re.fullmatch(r"(\d{8})\.pkl\.gz", fn)
+        if m:
+            out.append(m.group(1))
+    return sorted(out)
 
 
 def _valid_market_partition(payload, trade_date):
@@ -380,55 +553,89 @@ def _valid_market_partition(payload, trade_date):
     return True
 
 
-def _read_market_partition(trade_date):
-    partition_path = _market_partition_path(trade_date)
-    if not os.path.exists(partition_path):
+def _read_legacy_partition(trade_date):
+    path = _legacy_partition_path(trade_date)
+    if not os.path.exists(path):
         return None
     try:
-        with gzip.open(partition_path, "rb") as file_obj:
+        with gzip.open(path, "rb") as file_obj:
             payload = pickle.load(file_obj)
         if _valid_market_partition(payload, trade_date):
             return payload
     except (OSError, EOFError, pickle.UnpicklingError, AttributeError, ValueError):
         pass
-    try:
-        os.remove(partition_path)
-    except OSError:
-        pass
     return None
 
 
-def _write_market_partition(payload, trade_date):
-    def writer(temp_path):
-        with gzip.open(temp_path, "wb", compresslevel=3) as file_obj:
-            pickle.dump(payload, file_obj, protocol=pickle.HIGHEST_PROTOCOL)
-        with open(temp_path, "rb") as file_obj:
-            os.fsync(file_obj.fileno())
-    _atomic_replace_bytes(writer, _market_partition_path(trade_date))
+def _compact_day_frame(df_d, df_a, df_b, keep_codes):
+    """全市场当日数据 → 只保留需要的股票和字段。"""
+    df_d = df_d[df_d['ts_code'].isin(keep_codes)]
+    cols = ['ts_code'] + [c for c in ('open', 'high', 'low', 'close', 'pre_close', 'vol') if c in df_d.columns]
+    out = df_d[cols].drop_duplicates('ts_code', keep='last')
+    adj = df_a[df_a['ts_code'].isin(keep_codes)][['ts_code', 'adj_factor']].drop_duplicates('ts_code', keep='last')
+    out = out.merge(adj, on='ts_code', how='left')
+    if df_b is not None and not df_b.empty and 'circ_mv' in df_b.columns:
+        basic = df_b[df_b['ts_code'].isin(keep_codes)][['ts_code', 'circ_mv']].drop_duplicates('ts_code', keep='last')
+        out = out.merge(basic, on='ts_code', how='left')
+    else:
+        out['circ_mv'] = np.nan
+    return out.reset_index(drop=True)
 
 
-def _download_market_day(trade_date, token):
-    """在线程中运行：下载一天的日线/复权因子/市值并写入分区文件。不调用任何 streamlit 接口。"""
+def _fetch_market_day(trade_date, token, keep_codes):
+    """线程中运行，不调用 streamlit。优先读旧缓存，没有才下载。返回 (日期, 精简数据或None, 来源)。"""
+    payload = _read_legacy_partition(trade_date)
+    if payload is not None:
+        return trade_date, _compact_day_frame(payload['daily'], payload['adj'], payload['daily_basic'], keep_codes), "legacy"
     pro = _thread_pro(token)
     df_d = safe_tushare_call(pro.daily, max_retries=5, trade_date=trade_date)
     df_a = safe_tushare_call(pro.adj_factor, max_retries=5, trade_date=trade_date)
     df_b = safe_tushare_call(pro.daily_basic, max_retries=5, trade_date=trade_date, fields='ts_code,trade_date,circ_mv')
-    ok = False
-    if not df_d.empty and not df_a.empty:
-        payload = {
-            "version": 1, "trade_date": trade_date,
-            "daily_count": len(df_d), "adj_count": len(df_a),
-            "daily": df_d, "adj": df_a,
-            "daily_basic": df_b if not df_b.empty else pd.DataFrame(),
-        }
-        if _valid_market_partition(payload, trade_date):
-            _write_market_partition(payload, trade_date)
-            ok = True
     time.sleep(0.15)
-    return ok
+    if len(df_d) < 1000 or len(df_a) < 1000:
+        return trade_date, None, "api"
+    return trade_date, _compact_day_frame(df_d, df_a, df_b, keep_codes), "api"
 
 
-def sync_market_data_incrementally(start_date, end_date, token, n_workers=4):
+def _tushare_fetch_strict(func, max_retries=5, **kwargs):
+    """区分“接口正常但无数据”(返回空表) 与 “请求失败”(返回 None)。"""
+    for attempt in range(max_retries):
+        try:
+            df = func(**kwargs)
+            return df if df is not None else pd.DataFrame()
+        except Exception as e:
+            if any(h in str(e) for h in RATE_LIMIT_HINTS):
+                time.sleep(min(60.0, 8.0 * (attempt + 1)) + random.uniform(0, 2))
+            else:
+                time.sleep(0.8 * (attempt + 1))
+    return None
+
+
+def _fetch_stock_history(ts_code, start_date, end_date, token):
+    pro = _thread_pro(token)
+    d = _tushare_fetch_strict(pro.daily, ts_code=ts_code, start_date=start_date, end_date=end_date)
+    a = _tushare_fetch_strict(pro.adj_factor, ts_code=ts_code, start_date=start_date, end_date=end_date)
+    b = _tushare_fetch_strict(pro.daily_basic, ts_code=ts_code, start_date=start_date, end_date=end_date,
+                              fields='ts_code,trade_date,circ_mv')
+    time.sleep(0.1)
+    if d is None or a is None or b is None:
+        return ts_code, None
+    if d.empty:
+        return ts_code, pd.DataFrame(columns=['trade_date'])
+    cols = ['trade_date'] + [c for c in ('open', 'high', 'low', 'close', 'pre_close', 'vol') if c in d.columns]
+    out = d[cols].drop_duplicates('trade_date', keep='last')
+    if not a.empty:
+        out = out.merge(a[['trade_date', 'adj_factor']].drop_duplicates('trade_date'), on='trade_date', how='left')
+    else:
+        out['adj_factor'] = np.nan
+    if not b.empty and 'circ_mv' in b.columns:
+        out = out.merge(b[['trade_date', 'circ_mv']].drop_duplicates('trade_date'), on='trade_date', how='left')
+    else:
+        out['circ_mv'] = np.nan
+    return ts_code, out
+
+
+def sync_market_store(start_date, end_date, token, whitelist_keys, n_workers=4):
     token_c = clean_token_str(token)
     ts.set_token(token_c)
     pro = ts.pro_api(token_c)
@@ -438,121 +645,291 @@ def sync_market_data_incrementally(start_date, end_date, token, n_workers=4):
     all_dates = cal_raw[cal_raw['is_open'] == 1].sort_values('cal_date')['cal_date'].astype(str).tolist()
     today_str = datetime.now().strftime("%Y%m%d")
     valid_dates = [d for d in all_dates if d <= today_str]
-    missing_dates = [d for d in valid_dates if not _market_partition_exists(d)]
-
-    if missing_dates:
-        workers = int(max(1, min(8, n_workers)))
-        my_bar = st.progress(0, text=f"📥 需要同步 {len(missing_dates)} 天行情（{workers} 线程并发）...")
-        failed = []
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {executor.submit(_download_market_day, d, token_c): d for d in missing_dates}
-            for i, fut in enumerate(as_completed(futures), start=1):
-                d = futures[fut]
+    whitelist = set(whitelist_keys)
+    workers = int(max(1, min(8, n_workers)))
+    window_years = sorted({int(d[:4]) for d in valid_dates})
+    if os.path.isdir(STORE_DIR):  # 清理上次崩溃留下的半截临时文件
+        for fn in os.listdir(STORE_DIR):
+            if fn.endswith(".tmp") or fn.endswith(".restore"):
                 try:
-                    if not fut.result():
-                        failed.append(d)
+                    os.remove(os.path.join(STORE_DIR, fn))
+                except OSError:
+                    pass
+
+    # 1) 股票池新增的股票：先按只补齐仓库里已有日期的历史
+    need = {}
+    for y in window_years:
+        meta = load_year_meta(y)
+        if meta is None or len(meta['dates']) == 0:
+            continue
+        lo, hi = int(meta['dates'].min()), int(meta['dates'].max())
+        for c in whitelist - set(meta['codes'].tolist()):
+            r = need.setdefault(c, [lo, hi])
+            r[0], r[1] = min(r[0], lo), max(r[1], hi)
+    if need:
+        bar = st.progress(0, text=f"📥 股票池新增 {len(need)} 只，补齐历史（{workers} 线程）...")
+        fetched, failed = {}, 0
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(_fetch_stock_history, c, str(r[0]), str(r[1]), token_c) for c, r in need.items()]
+            for i, fut in enumerate(as_completed(futures), start=1):
+                try:
+                    code, df = fut.result()
                 except Exception:
-                    failed.append(d)
-                my_bar.progress(i / len(missing_dates), text=f"📥 行情同步中（{workers} 线程）: {i}/{len(missing_dates)}")
-        my_bar.empty()
+                    code, df = None, None
+                if df is None:
+                    failed += 1
+                else:
+                    fetched[code] = df
+                bar.progress(i / len(futures), text=f"📥 补齐历史: {i}/{len(futures)}")
+        bar.empty()
+        for y in window_years:
+            existing = load_year(y)
+            if existing is None or len(existing['dates']) == 0:
+                continue
+            have = set(existing['codes'].tolist())
+            bf = {c: df for c, df in fetched.items() if c not in have}
+            if bf:
+                save_year(y, merge_year(existing, backfill=bf))
+            del existing
+        gc.collect()
+        if failed:
+            st.warning(f"⚠️ {failed} 只股票历史补齐失败（多为限流），下次运行会自动重试。")
+
+    # 2) 缺失的交易日：旧缓存有就迁移，没有就下载
+    store_dates = set()
+    for y in _store_years():
+        meta = load_year_meta(y)
+        if meta is not None:
+            store_dates.update(int(d) for d in meta['dates'])
+    todo = sorted({d for d in valid_dates if int(d) not in store_dates} |
+                  {d for d in _legacy_dates() if int(d) not in store_dates})
+    if todo:
+        keep_by_year = {}
+        for y in sorted({int(d[:4]) for d in todo}):
+            meta = load_year_meta(y)
+            keep_by_year[y] = frozenset(whitelist | (set(meta['codes'].tolist()) if meta is not None else set()))
+        n_legacy = len([d for d in todo if os.path.exists(_legacy_partition_path(d))])
+        bar = st.progress(0, text=f"📥 需要处理 {len(todo)} 个交易日（旧缓存迁移 {n_legacy}，下载 {len(todo) - n_legacy}，{workers} 线程）...")
+        buffer, failed = {}, []
+
+        def flush():
+            for y, frames in buffer.items():
+                if not frames:
+                    continue
+                merged = merge_year(load_year(y), day_frames=frames, keep_codes=keep_by_year.get(y, whitelist))
+                save_year(y, merged)
+                del merged
+                for d in frames:
+                    try:
+                        os.remove(_legacy_partition_path(str(d)))
+                    except OSError:
+                        pass
+            buffer.clear()
+            gc.collect()
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(_fetch_market_day, d, token_c, keep_by_year[int(d[:4])]) for d in todo]
+            n_buf = 0
+            for i, fut in enumerate(as_completed(futures), start=1):
+                try:
+                    d, frame, _src = fut.result()
+                except Exception:
+                    d, frame = None, None
+                if frame is None:
+                    if d is not None:
+                        failed.append(d)
+                else:
+                    buffer.setdefault(int(d[:4]), {})[int(d)] = frame
+                    n_buf += 1
+                if n_buf >= FLUSH_EVERY_DAYS:
+                    flush()
+                    n_buf = 0
+                bar.progress(i / len(futures), text=f"📥 行情同步中（{workers} 线程）: {i}/{len(futures)}")
+            flush()
+        bar.empty()
+        if os.path.isdir(LEGACY_CACHE_DIR) and not _legacy_dates():
+            shutil.rmtree(LEGACY_CACHE_DIR, ignore_errors=True)
         if failed:
             st.warning(f"⚠️ {len(failed)} 天行情未下载成功（限流或当天数据尚未发布），下次运行会自动补下："
                        f"{', '.join(sorted(failed)[:8])}{' ...' if len(failed) > 8 else ''}")
     return valid_dates
 
 
-@st.cache_resource(ttl=3600 * 12, show_spinner=False)
-def _build_market_index(valid_dates, whitelist_keys, cache_stamp):
+class StockSeries:
+    """单只股票的前复权日线（numpy 数组，按日期升序）。"""
+    __slots__ = ("dates", "yw", "open", "high", "low", "close", "pre_close", "vol", "close_raw")
+
+    def __init__(self, **kw):
+        for k in self.__slots__:
+            setattr(self, k, kw[k])
+
+    def __len__(self):
+        return len(self.dates)
+
+    def pos(self, date_int):
+        i = int(np.searchsorted(self.dates, date_int))
+        return i if i < len(self.dates) and self.dates[i] == date_int else -1
+
+
+class MarketData:
+    def __init__(self, stocks, dates, mv, code_col):
+        self.stocks = stocks
+        self.dates = dates
+        self.mv = mv
+        self.code_col = code_col
+        self.date_row = {int(d): i for i, d in enumerate(dates)}
+
+    def __bool__(self):
+        return bool(self.stocks)
+
+    def has_date(self, date):
+        return int(date) in self.date_row
+
+    def mv_row(self, date):
+        r = self.date_row.get(int(date))
+        return None if r is None else self.mv[r]
+
+
+@st.cache_resource(max_entries=1, ttl=3600 * 12, show_spinner=False)
+def _build_market(start_int, end_int, codes, cache_stamp):
     del cache_stamp
-    whitelist_set = set(whitelist_keys)
-    with st.spinner("正在构建前复权行情索引..."):
-        daily_list, adj_list, basic_list = [], [], []
-        for trade_date in valid_dates:
-            payload = _read_market_partition(trade_date)
-            if payload is None:
-                continue
-            df_d, df_a, df_b = payload['daily'], payload['adj'], payload['daily_basic']
-            if whitelist_set:
-                df_d = df_d[df_d['ts_code'].isin(whitelist_set)]
-                df_a = df_a[df_a['ts_code'].isin(whitelist_set)]
-                if not df_b.empty:
-                    df_b = df_b[df_b['ts_code'].isin(whitelist_set)]
-            if not df_d.empty and not df_a.empty:
-                daily_list.append(df_d)
-                adj_list.append(df_a)
-                if not df_b.empty:
-                    basic_list.append(df_b)
+    codes_arr = np.array(codes, dtype='<U12')
+    date_parts, parts = [], {f: [] for f in STORE_FIELDS}
+    for y in _store_years():
+        if y < start_int // 10000 or y > end_int // 10000:
+            continue
+        data = load_year(y)
+        if data is None or len(data['dates']) == 0 or len(data['codes']) == 0:
+            continue
+        dmask = (data['dates'] >= start_int) & (data['dates'] <= end_int)
+        if not dmask.any():
+            continue
+        src = data['codes']
+        idx = np.clip(np.searchsorted(src, codes_arr), 0, len(src) - 1)
+        present = src[idx] == codes_arr
+        date_parts.append(data['dates'][dmask])
+        for f in STORE_FIELDS:
+            sub = data[f][dmask][:, idx].astype(np.float64)
+            sub[:, ~present] = np.nan
+            parts[f].append(sub)
+        del data
+    if not date_parts:
+        return MarketData({}, np.array([], dtype=np.int64), np.zeros((0, len(codes))), {})
 
-        if not daily_list or not adj_list:
-            return {}, pd.DataFrame()
-        daily_raw = pd.concat(daily_list, ignore_index=True)
-        adj_raw = pd.concat(adj_list, ignore_index=True)
-        basic_raw = pd.concat(basic_list, ignore_index=True) if basic_list else pd.DataFrame()
+    dates = np.concatenate(date_parts)
+    F = {}
+    for f in STORE_FIELDS:
+        F[f] = np.vstack(parts[f])
+        parts[f] = None
+    for f in PRICE_FIELDS:
+        F[f] = np.round(F[f], 2)
+    iso = pd.to_datetime(pd.Index(dates.astype(str)), format='%Y%m%d').isocalendar()
+    yw_all = iso['year'].to_numpy(dtype='int64') * 100 + iso['week'].to_numpy(dtype='int64')
 
-        merged_all = daily_raw.merge(adj_raw[['ts_code', 'trade_date', 'adj_factor']], on=['ts_code', 'trade_date'], how='inner')
-        merged_all['trade_date_str'] = merged_all['trade_date'].astype(str)
-        merged_all = merged_all.drop_duplicates(['ts_code', 'trade_date_str'], keep='last')
-        merged_all = merged_all.sort_values(['ts_code', 'trade_date_str'])
-        del daily_raw, adj_raw, daily_list, adj_list
-        gc.collect()
+    stocks = {}
+    for j, code in enumerate(codes):
+        close = F['close'][:, j]
+        adj = F['adj_factor'][:, j]
+        rows = np.flatnonzero(np.isfinite(close) & np.isfinite(adj))
+        if rows.size == 0:
+            continue
+        a = adj[rows]
+        latest = a[-1]
 
-        stock_qfq_dict = {}
-        for ts_code, group in merged_all.groupby('ts_code'):
-            df_g = group.copy()
-            df_g['close_raw'] = df_g['close']  # 未复权收盘价，用于最低股价判断
-            latest_adj = df_g['adj_factor'].iloc[-1]
-            if latest_adj > 0:
-                for col in ['open', 'high', 'low', 'close', 'pre_close']:
-                    if col in df_g.columns:
-                        df_g[col] = df_g[col] * df_g['adj_factor'] / latest_adj
-            stock_qfq_dict[ts_code] = df_g.set_index('trade_date_str')
-        del merged_all
-        gc.collect()
+        def q(field):
+            raw = F[field][rows, j]
+            return raw * a / latest if latest > 0 else raw
 
-        if not basic_raw.empty:
-            basic_raw['trade_date'] = basic_raw['trade_date'].astype(str)
-            basic_indexed = basic_raw.drop_duplicates(subset=['ts_code', 'trade_date']).set_index(['trade_date', 'ts_code'])
-        else:
-            basic_indexed = pd.DataFrame()
-    return stock_qfq_dict, basic_indexed
+        stocks[code] = StockSeries(
+            dates=dates[rows], yw=yw_all[rows], open=q('open'), high=q('high'), low=q('low'),
+            close=q('close'), pre_close=q('pre_close'), vol=F['vol'][rows, j].copy(), close_raw=close[rows].copy(),
+        )
+    mv = F['circ_mv']
+    del F
+    gc.collect()
+    return MarketData(stocks, dates, mv, {c: j for j, c in enumerate(codes)})
 
 
 def load_optimized_market_data(start_date, end_date, token, whitelist_keys):
     token_c = clean_token_str(token)
-    valid_dates = sync_market_data_incrementally(start_date, end_date, token_c, DOWNLOAD_WORKERS)
+    valid_dates = sync_market_store(start_date, end_date, token_c, whitelist_keys, DOWNLOAD_WORKERS)
     if not valid_dates:
-        return {}, pd.DataFrame()
-    valid_paths = [_market_partition_path(d) for d in valid_dates]
-    cache_stamp = (
-        sum(os.path.exists(p) for p in valid_paths),
-        max((os.path.getmtime(p) for p in valid_paths if os.path.exists(p)), default=0),
-    )
-    return _build_market_index(tuple(valid_dates), tuple(sorted(whitelist_keys)), cache_stamp)
+        return MarketData({}, np.array([], dtype=np.int64), np.zeros((0, 0)), {})
+    stamp = tuple((y, os.path.getmtime(_year_path(y)), os.path.getsize(_year_path(y))) for y in _store_years())
+    with st.spinner("正在构建前复权行情索引..."):
+        return _build_market(int(valid_dates[0]), int(valid_dates[-1]), tuple(sorted(whitelist_keys)), stamp)
+
+
+# ---- 缓存备份与恢复（Streamlit Cloud 重启会清空磁盘，靠它保住已下载的数据和回测记录）
+def build_cache_backup_zip():
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_STORED) as zf:  # npz 已压缩，不再二次压缩
+        for y in _store_years():
+            zf.write(_year_path(y), arcname=f"market_store/{y}.npz")
+        for fn in sorted(os.listdir(".")):
+            if re.fullmatch(r"skdj_v1[5-9]_[0-9a-f]{8}_(trades|weeks)\.csv", fn):
+                zf.write(fn, arcname=f"records/{fn}")
+    return buf.getvalue()
+
+
+def restore_cache_backup(file_bytes):
+    """行情年文件：本地没有、或备份覆盖的日期更多时才替换；回测记录：本地没有才恢复。"""
+    installed, skipped, records = [], [], []
+    with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
+        for name in zf.namelist():
+            m = re.fullmatch(r"market_store/(\d{4})\.npz", name)
+            if m:
+                year = int(m.group(1))
+                tmp_path = _year_path(year) + ".restore"
+                os.makedirs(STORE_DIR, exist_ok=True)
+                with open(tmp_path, "wb") as fh:
+                    fh.write(zf.read(name))
+                try:
+                    with np.load(tmp_path, allow_pickle=False) as z:
+                        new_n = len(z['dates'])
+                        shape_ok = all(z[f].shape == (len(z['dates']), len(z['codes'])) for f in STORE_FIELDS)
+                    if not shape_ok:
+                        raise ValueError
+                except Exception:
+                    os.remove(tmp_path)
+                    skipped.append(f"{year}(文件损坏)")
+                    continue
+                meta = load_year_meta(year)
+                if meta is None or new_n > len(meta['dates']):
+                    os.replace(tmp_path, _year_path(year))
+                    installed.append(year)
+                else:
+                    os.remove(tmp_path)
+                    skipped.append(f"{year}(本地更全)")
+                continue
+            m = re.fullmatch(r"records/(skdj_v1[5-9]_[0-9a-f]{8}_(trades|weeks)\.csv)", name)
+            if m and not os.path.exists(m.group(1)):
+                with open(m.group(1), "wb") as fh:
+                    fh.write(zf.read(name))
+                records.append(m.group(1))
+    return installed, skipped, records
 
 
 # ---------------------------
 # 周线指标
 # ---------------------------
-def build_weekly_arrays(df_daily):
+def build_weekly_arrays(s, upto=None):
     """把日线合成为 ISO 周线并计算 SKDJ（同花顺公式，N=6, M=3）。所有指标只用过去数据。"""
-    if df_daily is None or len(df_daily) == 0:
+    if s is None or len(s) == 0:
         return None
-    date_str = pd.Index(df_daily.index).astype(str)
-    dt = pd.to_datetime(date_str, format='%Y%m%d')
-    iso = dt.isocalendar()
-    frame = pd.DataFrame({
-        'yw': iso['year'].to_numpy(dtype='int64') * 100 + iso['week'].to_numpy(dtype='int64'),
-        'date': np.asarray(date_str, dtype='int64'),
-        'open': df_daily['open'].to_numpy(dtype=float),
-        'high': df_daily['high'].to_numpy(dtype=float),
-        'low': df_daily['low'].to_numpy(dtype=float),
-        'close': df_daily['close'].to_numpy(dtype=float),
-        'vol': pd.to_numeric(df_daily['vol'], errors='coerce').to_numpy(dtype=float),
+    m = len(s) if upto is None else int(upto) + 1
+    if m <= 0:
+        return None
+    yw = s.yw[:m]
+    starts = np.r_[0, np.flatnonzero(np.diff(yw)) + 1]
+    ends = np.r_[starts[1:] - 1, m - 1]
+    wk = pd.DataFrame({
+        'date': s.dates[ends].astype(np.int64),
+        'high': np.fmax.reduceat(s.high[:m], starts),
+        'low': np.fmin.reduceat(s.low[:m], starts),
+        'close': s.close[ends],
+        'vol': np.add.reduceat(np.nan_to_num(s.vol[:m], nan=0.0), starts),
     })
-    wk = frame.groupby('yw', sort=True).agg(
-        date=('date', 'last'), open=('open', 'first'), high=('high', 'max'),
-        low=('low', 'min'), close=('close', 'last'), vol=('vol', 'sum'),
-    ).reset_index(drop=True)
 
     lowv = wk['low'].rolling(SKDJ_N).min()
     highv = wk['high'].rolling(SKDJ_N).max()
@@ -571,21 +948,20 @@ def build_weekly_arrays(df_daily):
     }
 
 
-def get_weekly_view(ts_code, date, df_stock, weekly_cache, is_week_end):
+def get_weekly_view(ts_code, date_int, s, pos, weekly_cache, is_week_end):
     """周末日期用整段缓存（指标因果，不含未来）；周中日期截断后现算，避免用到本周后几天。"""
-    date_int = int(date)
     if is_week_end:
         wa = weekly_cache.get(ts_code)
         if wa is None:
-            wa = build_weekly_arrays(df_stock)
+            wa = build_weekly_arrays(s)
             weekly_cache[ts_code] = wa
         if wa is None:
             return None, -1
-        pos = int(np.searchsorted(wa['date'], date_int, side='right')) - 1
-        if pos < 0 or wa['date'][pos] != date_int:
+        wpos = int(np.searchsorted(wa['date'], date_int, side='right')) - 1
+        if wpos < 0 or wa['date'][wpos] != date_int:
             return None, -1
-        return wa, pos
-    wa = build_weekly_arrays(df_stock[df_stock.index <= date])
+        return wa, wpos
+    wa = build_weekly_arrays(s, upto=pos)
     if wa is None:
         return None, -1
     return wa, len(wa['date']) - 1
@@ -718,44 +1094,39 @@ def entry_block_reason(ts_code, next_open, next_high, next_low, signal_close):
     return None, gap_pct
 
 
-def get_price_arrays(ts_code, df_stock, price_cache):
-    arr = price_cache.get(ts_code)
-    if arr is None:
-        arr = {c: df_stock[c].to_numpy(dtype=float) for c in ('open', 'high', 'low', 'close')}
-        price_cache[ts_code] = arr
-    return arr
-
-
-def forward_metrics(ts_code, arr, pos):
+def forward_metrics(ts_code, s, pos):
     """次日开盘买入、不设止损的固定持有表现。None=无法买入；complete=False=后续数据不足60个交易日。"""
-    n = len(arr['open'])
+    n = len(s)
     b = pos + 1
     if b >= n:
         return {'complete': False}
-    reason, _ = entry_block_reason(ts_code, arr['open'][b], arr['high'][b], arr['low'][b], arr['close'][pos])
+    reason, _ = entry_block_reason(ts_code, s.open[b], s.high[b], s.low[b], s.close[pos])
     if reason:
         return None
     last = FWD_HORIZONS["W12"]
     if b + last - 1 >= n:
         return {'complete': False}
-    buy = arr['open'][b]
+    buy = s.open[b]
     out = {'complete': True}
     for key, days in FWD_HORIZONS.items():
-        out[key] = (arr['close'][b + days - 1] / buy - 1.0) * 100.0
-    out['MaxGain'] = (np.nanmax(arr['high'][b:b + last]) / buy - 1.0) * 100.0
-    out['MaxDD'] = (np.nanmin(arr['low'][b:b + last]) / buy - 1.0) * 100.0
+        out[key] = (s.close[b + days - 1] / buy - 1.0) * 100.0
+    out['MaxGain'] = (np.nanmax(s.high[b:b + last]) / buy - 1.0) * 100.0
+    out['MaxDD'] = (np.nanmin(s.low[b:b + last]) / buy - 1.0) * 100.0
     return out
 
 
 def summarize_fwd(items):
     comp = [x for x in items if x and x.get('complete')]
     if not comp:
-        return {'N': 0, 'W4': np.nan, 'W12': np.nan, 'MaxGain': np.nan, 'Big30': np.nan}
+        return {'N': 0, 'W4': np.nan, 'W12': np.nan, 'Med12': np.nan, 'MaxGain': np.nan,
+                'MaxDD': np.nan, 'Big30': np.nan, 'Bear20': np.nan}
     df = pd.DataFrame(comp)
     return {
         'N': len(df), 'W4': round(df['W4'].mean(), 3), 'W12': round(df['W12'].mean(), 3),
-        'MaxGain': round(df['MaxGain'].mean(), 3),
+        'Med12': round(df['W12'].median(), 3),
+        'MaxGain': round(df['MaxGain'].mean(), 3), 'MaxDD': round(df['MaxDD'].mean(), 3),
         'Big30': round((df['MaxGain'] >= BIG_WINNER_PCT).mean() * 100.0, 2),
+        'Bear20': round((df['MaxDD'] <= BIG_LOSER_PCT).mean() * 100.0, 2),
     }
 
 
@@ -799,39 +1170,35 @@ def build_strength_groups(pool_items, sector_map):
     return rs_group, sec_group, secrs_group, top_names
 
 
-def scan_date(date, whitelist_keys, stock_qfq_dict, basic_indexed, name_map, weekly_cache, is_week_end, cfg,
-              with_benchmark=False, price_cache=None, sector_map=None):
+def scan_date(date, whitelist_keys, market, name_map, weekly_cache, is_week_end, cfg,
+              with_benchmark=False, sector_map=None):
     funnel = {
         "股票池": len(whitelist_keys), "当日有行情": 0, "股价达标": 0, "市值达标": 0,
         "历史≥100天": 0, "非一字涨停": 0, "A级": 0, "B级": 0, "C级": 0, "市值缺失(未过滤)": 0,
     }
-    if price_cache is None:
-        price_cache = {}
-    mv_map = {}
-    if basic_indexed is not None and not basic_indexed.empty:
-        try:
-            mv_map = basic_indexed.xs(date, level='trade_date')['circ_mv'].to_dict()
-        except KeyError:
-            mv_map = {}
+    date = str(date)
+    date_int = int(date)
+    mv_row = market.mv_row(date_int)
 
     cands = []
     pool_items, a_fwd = [], []
     breadth_up, breadth_total = 0, 0
     for ts_code in whitelist_keys:
-        df_stock = stock_qfq_dict.get(ts_code)
-        if df_stock is None or df_stock.empty:
+        s = market.stocks.get(ts_code)
+        if s is None or len(s) == 0:
             continue
-        pos = int(df_stock.index.searchsorted(date))
-        if pos >= len(df_stock) or df_stock.index[pos] != date:
+        pos = s.pos(date_int)
+        if pos < 0:
             continue
         funnel["当日有行情"] += 1
 
-        raw_col = 'close_raw' if 'close_raw' in df_stock.columns else 'close'
-        if df_stock[raw_col].iat[pos] < cfg['min_price']:
+        close_raw = float(s.close_raw[pos])
+        if close_raw < cfg['min_price']:
             continue
         funnel["股价达标"] += 1
 
-        circ_mv = mv_map.get(ts_code, np.nan)
+        col = market.code_col.get(ts_code)
+        circ_mv = float(mv_row[col]) if (mv_row is not None and col is not None) else np.nan
         circ_mv = circ_mv / 10000.0 if pd.notna(circ_mv) else np.nan
         if pd.notna(circ_mv):
             if circ_mv < cfg['min_mv'] or circ_mv > cfg['max_mv']:
@@ -844,21 +1211,21 @@ def scan_date(date, whitelist_keys, stock_qfq_dict, basic_indexed, name_map, wee
             continue
         funnel["历史≥100天"] += 1
 
-        high, low, close_q = df_stock['high'].iat[pos], df_stock['low'].iat[pos], df_stock['close'].iat[pos]
-        pre = df_stock['pre_close'].iat[pos] if 'pre_close' in df_stock.columns else np.nan
+        high, low, close_q = s.high[pos], s.low[pos], s.close[pos]
+        pre = s.pre_close[pos]
         if not (pd.notna(pre) and pre > 0):
-            pre = df_stock['close'].iat[pos - 1]
+            pre = s.close[pos - 1]
         limit_rate = 0.195 if ts_code.startswith(('300', '301', '688', '689')) else 0.095
         if high == low and (close_q - pre) / pre >= limit_rate:
             continue
         funnel["非一字涨停"] += 1
 
-        wa, wpos = get_weekly_view(ts_code, date, df_stock, weekly_cache, is_week_end)
+        wa, wpos = get_weekly_view(ts_code, date_int, s, pos, weekly_cache, is_week_end)
         if wa is not None and wpos >= 0 and np.isfinite(wa['ma20'][wpos]):
             breadth_total += 1
             breadth_up += int(wa['close'][wpos] >= wa['ma20'][wpos])
 
-        fwd = forward_metrics(ts_code, get_price_arrays(ts_code, df_stock, price_cache), pos) if with_benchmark else None
+        fwd = forward_metrics(ts_code, s, pos) if with_benchmark else None
         if with_benchmark:
             pool_items.append((ts_code, fwd, relative_strength(wa, wpos)))
 
@@ -875,7 +1242,7 @@ def scan_date(date, whitelist_keys, stock_qfq_dict, basic_indexed, name_map, wee
             'ts_code': ts_code, 'name': name_map.get(ts_code, ts_code),
             'Total_Score': sig['score'], 'SKDJ_K': sig['k'], 'SKDJ_D': sig['d'],
             'K_Min_14W': sig['recent_k_min'], 'Weeks_Under': sig['weeks_under'],
-            'Signal_Close': sig['signal_close'], 'Close_Raw': round(float(df_stock[raw_col].iat[pos]), 2),
+            'Signal_Close': sig['signal_close'], 'Close_Raw': round(close_raw, 2),
             'Trend_Type': sig['trend_type'], 'MA20_Ext (%)': sig['ma20_ext_pct'],
             'vol_ratio': sig['vol_ratio'], 'circ_mv': round(circ_mv, 2) if pd.notna(circ_mv) else np.nan,
         }
@@ -922,22 +1289,22 @@ def scan_date(date, whitelist_keys, stock_qfq_dict, basic_indexed, name_map, wee
 # ---------------------------
 # 回测出场模拟（规则出场，仅用于参考；固定持有对照见 forward_metrics）
 # ---------------------------
-def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_dict, hold_weeks=HOLD_WEEKS):
+def track_future_performance(ts_code, selection_date, signal_close, market, hold_weeks=HOLD_WEEKS):
     results = {f'Return_W{w} (%)': np.nan for w in range(1, hold_weeks + 1)}
     results.update({'Exit_Reason': '持仓中', 'Buy_Price': np.nan, 'Gap_pct (%)': np.nan,
                     'Exit_Date': None, 'Final_Return (%)': np.nan, 'Hold_Days': 0})
-    if ts_code not in stock_qfq_dict:
+    s = market.stocks.get(ts_code)
+    if s is None:
         return results
-    df_full = stock_qfq_dict[ts_code]
-    hist_future = df_full[df_full.index > selection_date]
-    if hist_future.empty:
+    start = int(np.searchsorted(s.dates, int(selection_date), side='right'))
+    n_future = len(s) - start
+    if n_future <= 0:
         return results
 
-    next_row = hist_future.iloc[0]
-    buy_price = next_row['open']
+    buy_price = s.open[start]
     if pd.isna(buy_price) or buy_price <= 0 or not signal_close:
         return results
-    reason, gap_pct = entry_block_reason(ts_code, buy_price, next_row['high'], next_row['low'], signal_close)
+    reason, gap_pct = entry_block_reason(ts_code, buy_price, s.high[start], s.low[start], signal_close)
     results['Buy_Price'] = round(buy_price, 2)
     results['Gap_pct (%)'] = round(gap_pct, 2) if pd.notna(gap_pct) else np.nan
     if reason:
@@ -957,12 +1324,12 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
         results['Hold_Days'] = days
         results[f'Return_W{week} (%)'] = round(ret, 2)
 
-    for i in range(min(len(hist_future), max_days)):
-        row = hist_future.iloc[i]
+    for i in range(min(n_future, max_days)):
+        j = start + i
         day_count = i + 1
         current_week = (day_count - 1) // 5 + 1
-        curr_open, curr_close, curr_high, curr_low = row['open'], row['close'], row['high'], row['low']
-        curr_date = hist_future.index[i]
+        curr_open, curr_close, curr_high, curr_low = s.open[j], s.close[j], s.high[j], s.low[j]
+        curr_date = str(int(s.dates[j]))
 
         if pending_exit_reason is not None and day_count >= 2:
             close_out(pending_exit_reason, (curr_open - buy_price) / buy_price * 100.0, curr_date, day_count, current_week)
@@ -995,10 +1362,10 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
         if day_count % 5 == 0:
             results[f'Return_W{current_week} (%)'] = round((curr_close - buy_price) / buy_price * 100.0, 2)
 
-    if len(hist_future) >= max_days:
-        last_price = hist_future.iloc[max_days - 1]['close']
+    if n_future >= max_days:
+        last_price = s.close[start + max_days - 1]
         close_out(f"{hold_weeks}周期满平仓", (last_price - buy_price) / buy_price * 100.0,
-                  hist_future.index[max_days - 1], max_days, hold_weeks)
+                  str(int(s.dates[start + max_days - 1])), max_days, hold_weeks)
     return results
 
 
@@ -1016,6 +1383,9 @@ with st.sidebar:
     else:
         BACKTEST_WEEKS = int(st.number_input("回测周数（52≈1年）", value=52, min_value=4, max_value=520, step=4))
         backtest_date_end = st.date_input("回测截止日期", value=datetime.now().date())
+        st.caption("报告区间（只影响下方报告显示，不影响回测扫描）")
+        REPORT_START = st.date_input("报告起始日期", value=datetime(2015, 1, 1).date())
+        REPORT_END = st.date_input("报告截止日期", value=datetime.now().date())
 
     TOP_N = int(st.number_input("每周选股数量", value=3, min_value=1, max_value=10, step=1))
 
@@ -1043,11 +1413,11 @@ with st.sidebar:
                                            help="积分较低、频繁限流时调小"))
 
     tiers_enabled = ["A"] + (["B"] if USE_B else []) + (["C"] if USE_C else [])
-    CFG = {"v": VERSION, "top_n": TOP_N, "tiers": tiers_enabled,
+    CFG = {"v": LOGIC_VERSION, "top_n": TOP_N, "tiers": tiers_enabled,
            "min_price": MIN_PRICE, "min_mv": MIN_MV, "max_mv": MAX_MV}
     CFG_SIG = hashlib.md5(json.dumps(CFG, sort_keys=True).encode("utf-8")).hexdigest()[:8]
-    TRADES_FILE = f"skdj_v17_{CFG_SIG}_trades.csv"
-    WEEKS_FILE = f"skdj_v17_{CFG_SIG}_weeks.csv"
+    TRADES_FILE = f"skdj_v18_{CFG_SIG}_trades.csv"
+    WEEKS_FILE = f"skdj_v18_{CFG_SIG}_weeks.csv"
 
     with st.expander("🧹 缓存与记录维护"):
         st.caption(f"当前参数组编号：{CFG_SIG}（改任何参数都会自动使用独立的回测记录）")
@@ -1058,14 +1428,45 @@ with st.sidebar:
                         os.remove(p + suffix)
             st.success("当前参数组的回测记录已清除。")
         if st.button("清空行情缓存（需重新下载）"):
-            if os.path.isdir(MARKET_CACHE_DIR):
-                shutil.rmtree(MARKET_CACHE_DIR)
-            for cache_path in (MARKET_CACHE_FILE, MARKET_CACHE_FILE + ".tmp"):
-                if os.path.exists(cache_path):
-                    os.remove(cache_path)
+            for cache_dir in (STORE_DIR, LEGACY_CACHE_DIR):
+                if os.path.isdir(cache_dir):
+                    shutil.rmtree(cache_dir, ignore_errors=True)
             st.cache_data.clear()
             st.cache_resource.clear()
             st.success("行情缓存已清理。")
+
+    with st.expander("💾 缓存备份与恢复（重启后免重新下载）", expanded=False):
+        info = store_summary()
+        if info['n_dates']:
+            st.caption(f"行情仓库：{info['first']} ~ {info['last']}，{info['n_dates']} 个交易日，"
+                       f"{info['n_codes']} 只股票，{info['size_mb']:.1f} MB")
+        else:
+            st.caption("行情仓库目前为空。")
+        st.caption("Streamlit Cloud 重启或长时间休眠后磁盘会被清空。下载完大段行情或跑完回测后，"
+                   "生成一次备份存到电脑；重启后上传即可恢复行情和回测记录。")
+        if st.button("生成备份文件"):
+            with st.spinner("正在打包..."):
+                st.session_state['cache_backup'] = build_cache_backup_zip()
+                st.session_state['cache_backup_name'] = f"skdj_cache_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.zip"
+        if st.session_state.get('cache_backup'):
+            st.download_button(
+                label=f"⬇️ 下载备份 ZIP（{len(st.session_state['cache_backup']) / 1024 / 1024:.1f} MB）",
+                data=st.session_state['cache_backup'],
+                file_name=st.session_state.get('cache_backup_name', 'skdj_cache_backup.zip'),
+                mime="application/zip", key="download_cache_backup",
+            )
+        uploaded_backup = st.file_uploader("上传备份 ZIP 恢复", type=["zip"], key="cache_restore_uploader")
+        if uploaded_backup is not None:
+            upload_id = f"{uploaded_backup.name}-{uploaded_backup.size}"
+            if st.session_state.get('restored_upload_id') != upload_id:
+                try:
+                    installed, skipped, records = restore_cache_backup(uploaded_backup.getvalue())
+                    st.session_state['restored_upload_id'] = upload_id
+                    st.cache_resource.clear()
+                    st.success(f"已恢复行情年份：{installed or '无'}；回测记录 {len(records)} 个。"
+                               + (f" 跳过：{'、'.join(skipped)}" if skipped else ""))
+                except zipfile.BadZipFile:
+                    st.error("上传的不是有效的备份 ZIP。")
 
 token_clean = clean_token_str(TS_TOKEN_INPUT)
 
@@ -1108,12 +1509,12 @@ def run_picking(pro, whitelist_keys, name_map):
         return
     last_day = trade_days[-1]
     fetch_start = (datetime.strptime(last_day, "%Y%m%d") - timedelta(days=300)).strftime("%Y%m%d")
-    stock_qfq_dict, basic_indexed = load_optimized_market_data(fetch_start, last_day, token_clean, whitelist_keys)
-    if not stock_qfq_dict:
+    market = load_optimized_market_data(fetch_start, last_day, token_clean, whitelist_keys)
+    if not market:
         st.warning("⚠️ 未能加载到行情数据，请重试。")
         return
 
-    scan_day = next((d for d in reversed(trade_days) if _market_partition_exists(d)), None)
+    scan_day = next((d for d in reversed(trade_days) if market.has_date(d)), None)
     if scan_day is None:
         st.error("❌ 最近交易日都没有可用行情。")
         return
@@ -1123,7 +1524,7 @@ def run_picking(pro, whitelist_keys, name_map):
     if not is_week_end:
         st.info(f"ℹ️ {scan_day} 不是本周最后一个交易日，本周K线尚未收完，结果为临时值，周五收盘后可能变化。")
 
-    picks, all_cands, funnel, bench = scan_date(scan_day, whitelist_keys, stock_qfq_dict, basic_indexed,
+    picks, all_cands, funnel, bench = scan_date(scan_day, whitelist_keys, market,
                                                 name_map, {}, is_week_end, CFG)
 
     st.subheader(f"🎯 选股结果 [{scan_day}]")
@@ -1176,24 +1577,24 @@ def run_backtest(pro, whitelist_keys, name_map, sector_map=None):
     fetch_start = (datetime.strptime(min(dates_to_run), "%Y%m%d") - timedelta(days=300)).strftime("%Y%m%d")
     fetch_end = min(today_str, (datetime.strptime(max(dates_to_run), "%Y%m%d") + timedelta(days=130)).strftime("%Y%m%d"))
 
-    stock_qfq_dict, basic_indexed = load_optimized_market_data(fetch_start, fetch_end, token_clean, whitelist_keys)
-    if not stock_qfq_dict:
+    market = load_optimized_market_data(fetch_start, fetch_end, token_clean, whitelist_keys)
+    if not market:
         st.warning("⚠️ 未能加载到行情数据，请重试。")
         return
 
-    weekly_cache, price_cache = {}, {}
+    weekly_cache = {}
     skipped = 0
     bar = st.progress(0, text="回测扫描中...")
     for i, date in enumerate(dates_to_run):
-        if not _market_partition_exists(date):
+        if not market.has_date(date):
             skipped += 1
             continue
-        picks, _, funnel, bench = scan_date(date, whitelist_keys, stock_qfq_dict, basic_indexed,
+        picks, _, funnel, bench = scan_date(date, whitelist_keys, market,
                                             name_map, weekly_cache, True, CFG,
-                                            with_benchmark=True, price_cache=price_cache, sector_map=sector_map)
+                                            with_benchmark=True, sector_map=sector_map)
         has_open = False
         if not picks.empty:
-            future = [track_future_performance(r.ts_code, date, r.Signal_Close, stock_qfq_dict)
+            future = [track_future_performance(r.ts_code, date, r.Signal_Close, market)
                       for r in picks.itertuples(index=False)]
             picks = pd.concat([picks.reset_index(drop=True), pd.DataFrame(future)], axis=1)
             has_open = bool((picks['Exit_Reason'].astype(str) == '持仓中').any())
@@ -1273,7 +1674,7 @@ def weekly_full_sample_table(executed):
     return pd.DataFrame(rows)
 
 
-BENCH_METRICS = ('N', 'W4', 'W12', 'MaxGain', 'Big30')
+BENCH_METRICS = ('N', 'W4', 'W12', 'Med12', 'MaxGain', 'MaxDD', 'Big30', 'Bear20')
 
 
 def _half_label(date_series):
@@ -1323,15 +1724,21 @@ def benchmark_report_tables(comp, closed):
     for g, label in active:
         ex = comp[f'{g}_W12'] - comp['Pool_W12']
         big = comp[f'{g}_Big30'] - comp['Pool_Big30']
+        bear = comp[f'{g}_Bear20'] - comp['Pool_Bear20']
+        med = comp[f'{g}_Med12'] - comp['Pool_Med12']
         m, t, n = nw_tstat(ex)
         bm, bt, _ = nw_tstat(big)
+        brm, brt, _ = nw_tstat(bear)
         half = ex.groupby(comp['时期']).mean().dropna()
         rows.append({
             '候选组': label, '有效周数': n, '平均每周股数': round(comp[f'{g}_N'].mean(), 1),
             '12周超额%': round(m, 2), 't值': round(t, 2) if pd.notna(t) else np.nan,
             '跑赢池的半年': f"{int((half > 0).sum())}/{len(half)}",
             '跑赢池的周%': round((ex.dropna() > 0).mean() * 100, 0) if ex.notna().any() else np.nan,
+            '12周中位数差%': round(med.mean(), 2) if med.notna().any() else np.nan,
             '牛股率差(百分点)': round(bm, 1), '牛股率差t值': round(bt, 2) if pd.notna(bt) else np.nan,
+            '熊股率差(百分点)': round(brm, 1) if pd.notna(brm) else np.nan,
+            '熊股率差t值': round(brt, 2) if pd.notna(brt) else np.nan,
         })
     tables['候选组总览'] = pd.DataFrame(rows)
 
@@ -1366,6 +1773,15 @@ def benchmark_report_tables(comp, closed):
             row[label] = round(g_df[f'{g}_Big30'].mean(), 1)
         big_rows.append(row)
     tables['分时期_牛股率'] = pd.DataFrame(big_rows)
+
+    bear_rows = []
+    for key in list(comp.groupby('时期', sort=True).groups.keys()) + ['全部']:
+        g_df = comp if key == '全部' else comp[comp['时期'] == key]
+        row = {'时期': key, '股票池': round(g_df['Pool_Bear20'].mean(), 1)}
+        for g, label in active:
+            row[label] = round(g_df[f'{g}_Bear20'].mean(), 1)
+        bear_rows.append(row)
+    tables['分时期_熊股率'] = pd.DataFrame(bear_rows)
 
     tables['按市场宽度_12周超额'] = excess_rows('宽度分组', '宽度分组')
 
@@ -1414,6 +1830,15 @@ if not is_picking_mode and (os.path.exists(TRADES_FILE) or os.path.exists(WEEKS_
     try:
         weeks_log = _read_csv_safely(WEEKS_FILE)
         trades = _read_csv_safely(TRADES_FILE)
+        rs_str, re_str = REPORT_START.strftime("%Y%m%d"), REPORT_END.strftime("%Y%m%d")
+        if not weeks_log.empty:
+            weeks_log = weeks_log[weeks_log['Trade_Date'].astype(str).between(rs_str, re_str)].copy()
+        if not trades.empty:
+            trades = trades[trades['Trade_Date'].astype(str).between(rs_str, re_str)].copy()
+        if not weeks_log.empty:
+            st.caption(f"报告区间：{weeks_log['Trade_Date'].min()} ~ {weeks_log['Trade_Date'].max()}（共 {len(weeks_log)} 周）")
+        else:
+            st.info("所选报告区间内没有回测记录。")
 
         # ---- 空周统计
         if not weeks_log.empty:
@@ -1460,6 +1885,9 @@ if not is_picking_mode and (os.path.exists(TRADES_FILE) or os.path.exists(WEEKS_
             show_df(bench_tables['分时期_12周超额'])
             st.markdown("#### 🐂 分时期：牛股率%（60个交易日内最高涨幅≥30%的比例）")
             show_df(bench_tables['分时期_牛股率'])
+            st.markdown("#### 🐻 分时期：熊股率%（60个交易日内最大回撤≤-20%的比例）")
+            st.caption("牛股率和熊股率同时偏高，说明该组只是波动更大，不代表更会选股。")
+            show_df(bench_tables['分时期_熊股率'])
             st.markdown("#### 🌡️ 按市场宽度：12周超额")
             st.caption("宽度=过筛股票中周收盘站上20周线的比例，分组边界固定为30/50/70。")
             show_df(bench_tables['按市场宽度_12周超额'])
@@ -1534,6 +1962,7 @@ if not is_picking_mode and (os.path.exists(TRADES_FILE) or os.path.exists(WEEKS_
         meta = {
             '版本': VERSION, '参数组': CFG_SIG, '导出时间': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             '回测截止日期': backtest_date_end.strftime('%Y-%m-%d'), '回测周数设置': BACKTEST_WEEKS,
+            '报告区间': [REPORT_START.strftime('%Y-%m-%d'), REPORT_END.strftime('%Y-%m-%d')],
             '每周选股数': TOP_N, '启用层级': tiers_enabled, '最低股价': MIN_PRICE,
             '流通市值范围(亿)': [MIN_MV, MAX_MV],
             '对照组定义': {
@@ -1546,7 +1975,7 @@ if not is_picking_mode and (os.path.exists(TRADES_FILE) or os.path.exists(WEEKS_
         export_slot.download_button(
             label="📦 一键导出全部回测结果 (ZIP)",
             data=build_export_zip(export_tables, meta),
-            file_name=f"skdj_{VERSION}_{CFG_SIG}_回测结果_{datetime.now().strftime('%Y%m%d_%H%M')}.zip",
+            file_name=f"skdj_{VERSION}_{CFG_SIG}_{rs_str}-{re_str}_{datetime.now().strftime('%Y%m%d_%H%M')}.zip",
             mime="application/zip",
             key="download_all_zip",
             type="primary",
