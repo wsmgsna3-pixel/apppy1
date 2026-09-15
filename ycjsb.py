@@ -1,8 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-周线 SKDJ 分级补位选股系统 (V15)
+周线 SKDJ 分级补位选股系统 (V16)
 ------------------------------------------------
-在 Gemini V14.5 基础上的改动：
+V16 新增（不改变任何选股规则，只增加“对照组”用于识别行情依赖与过拟合）：
+A. 【同周对照】每个回测周同时计算三组的固定持有表现（次日开盘买入，不设止损）：
+   入选股票 / 当周全部 A 级候选 / 当周全部过筛股票池。
+   入选≈A候选 → 评分排序没有价值；A候选≈股票池 → 信号本身没有超额，赚的是行情。
+B. 【牛股率】12 周内最高涨幅 ≥30% 的比例，直接衡量“捕捉牛股”的能力，与出场规则无关。
+C. 【市场宽度】过筛股票池中周收盘站上 20 周线的比例，只做诊断与展示，不参与选股。
+D. 【分时期报告】按半年、按宽度分组给出上述对照，每周等权，避免同周股票同涨同跌放大样本。
+E. 未走完 12 周的近期周每次回测自动重扫结算。
+
+V15 改动：
 1. 【分级补位】A 级 = 原信号（周K上穿25且K>D）；A 级不足时依次用
    B 级（低位金叉 K≤30）、C 级（强势股回踩后周线再金叉）补满每周名额。
 2. 【漏斗诊断】选股时显示股票池逐层剩余数量，0 只时能看到卡在哪一步。
@@ -44,19 +53,21 @@ except ImportError:
 
 warnings.filterwarnings("ignore")
 
-VERSION = "V15"
+VERSION = "V16"
 MARKET_CACHE_FILE = "skdj_market_data_master.pkl"
 MARKET_CACHE_DIR = "skdj_market_data_daily_cache"
 
 SKDJ_N, SKDJ_M = 6, 3
 HOLD_WEEKS = 12
+FWD_HORIZONS = {"W2": 10, "W4": 20, "W8": 40, "W12": 60}
+BIG_WINNER_PCT = 30.0
 
 TIER_ORDER = {"A": 0, "B": 1, "C": 2}
 TIER_LABEL = {"A": "A 标准上穿25", "B": "B 低位金叉", "C": "C 趋势回踩金叉"}
 
-st.set_page_config(page_title="SKDJ V15 分级补位系统", layout="wide")
-st.title("🔬 周线 SKDJ 分级补位选股系统 (V15)")
-st.markdown("A 级为原始信号，A 级不足时由 B、C 级补位 · 漏斗诊断 · 空周统计")
+st.set_page_config(page_title="SKDJ V16 分级补位系统", layout="wide")
+st.title("🔬 周线 SKDJ 分级补位选股系统 (V16)")
+st.markdown("A 级为原始信号，A 级不足时由 B、C 级补位 · 同周对照组 · 分时期报告")
 
 
 # ---------------------------
@@ -168,9 +179,22 @@ def _append_rows_safely(path, new_rows, key_cols, sort_cols):
         _atomic_write_csv(combined.reset_index(drop=True), path)
 
 
-def _rewrite_file_safely(path, dataframe):
+def _replace_date_rows(path, date, new_rows, sort_cols):
+    """删除该日期的旧记录后写入新记录（用于重扫未结算的周）。"""
     with _file_lock(path):
-        _atomic_write_csv(dataframe.reset_index(drop=True), path)
+        existing = _read_csv_safely(path)
+        if not existing.empty and "Trade_Date" in existing.columns:
+            existing = existing[existing["Trade_Date"].astype(str) != str(date)]
+        parts = [p for p in (existing, new_rows) if p is not None and not p.empty]
+        if parts:
+            combined = pd.concat(parts, ignore_index=True, sort=False)
+            combined["Trade_Date"] = combined["Trade_Date"].astype(str).str.replace(r"\.0$", "", regex=True)
+            sort_cols = [c for c in sort_cols if c in combined.columns]
+            if sort_cols:
+                combined = combined.sort_values(sort_cols, kind="mergesort")
+        else:
+            combined = existing
+        _atomic_write_csv(combined.reset_index(drop=True), path)
 
 
 # ---------------------------
@@ -566,13 +590,78 @@ def evaluate_signal(wa, i):
 
 
 # ---------------------------
+# 买入可行性与固定持有指标（入选、A候选、股票池三组共用同一套规则）
+# ---------------------------
+def entry_block_reason(ts_code, next_open, next_high, next_low, signal_close):
+    """返回 (剔除原因或 None, 跳空幅度%)。与 V14.5 的开盘剔除规则一致。"""
+    if not (pd.notna(next_open) and next_open > 0 and pd.notna(signal_close) and signal_close > 0):
+        return "无有效开盘价", np.nan
+    is_20cm = ts_code.startswith(('300', '301', '688', '689'))
+    limit_rate_pct = 19.0 if is_20cm else 9.5
+    gap_pct = (next_open - signal_close) / signal_close * 100.0
+    if (next_open == next_high == next_low) and gap_pct >= limit_rate_pct:
+        return f"一字板无法买入(剔除: {round(gap_pct, 1)}%)", gap_pct
+    if is_20cm and gap_pct > 8.0:
+        return f"双创高开过大(剔除: {round(gap_pct, 2)}%)", gap_pct
+    if not is_20cm and gap_pct > 5.0:
+        return f"主板高开过大(剔除: {round(gap_pct, 2)}%)", gap_pct
+    if gap_pct < -4.0:
+        return f"恶劣低开(剔除: {round(gap_pct, 2)}%)", gap_pct
+    return None, gap_pct
+
+
+def get_price_arrays(ts_code, df_stock, price_cache):
+    arr = price_cache.get(ts_code)
+    if arr is None:
+        arr = {c: df_stock[c].to_numpy(dtype=float) for c in ('open', 'high', 'low', 'close')}
+        price_cache[ts_code] = arr
+    return arr
+
+
+def forward_metrics(ts_code, arr, pos):
+    """次日开盘买入、不设止损的固定持有表现。None=无法买入；complete=False=后续数据不足60个交易日。"""
+    n = len(arr['open'])
+    b = pos + 1
+    if b >= n:
+        return {'complete': False}
+    reason, _ = entry_block_reason(ts_code, arr['open'][b], arr['high'][b], arr['low'][b], arr['close'][pos])
+    if reason:
+        return None
+    last = FWD_HORIZONS["W12"]
+    if b + last - 1 >= n:
+        return {'complete': False}
+    buy = arr['open'][b]
+    out = {'complete': True}
+    for key, days in FWD_HORIZONS.items():
+        out[key] = (arr['close'][b + days - 1] / buy - 1.0) * 100.0
+    out['MaxGain'] = (np.nanmax(arr['high'][b:b + last]) / buy - 1.0) * 100.0
+    out['MaxDD'] = (np.nanmin(arr['low'][b:b + last]) / buy - 1.0) * 100.0
+    return out
+
+
+def summarize_fwd(items):
+    comp = [x for x in items if x and x.get('complete')]
+    if not comp:
+        return {'N': 0, 'W4': np.nan, 'W12': np.nan, 'MaxGain': np.nan, 'Big30': np.nan}
+    df = pd.DataFrame(comp)
+    return {
+        'N': len(df), 'W4': round(df['W4'].mean(), 3), 'W12': round(df['W12'].mean(), 3),
+        'MaxGain': round(df['MaxGain'].mean(), 3),
+        'Big30': round((df['MaxGain'] >= BIG_WINNER_PCT).mean() * 100.0, 2),
+    }
+
+
+# ---------------------------
 # 单日扫描（选股与回测共用）
 # ---------------------------
-def scan_date(date, whitelist_keys, stock_qfq_dict, basic_indexed, name_map, weekly_cache, is_week_end, cfg):
+def scan_date(date, whitelist_keys, stock_qfq_dict, basic_indexed, name_map, weekly_cache, is_week_end, cfg,
+              with_benchmark=False, price_cache=None):
     funnel = {
         "股票池": len(whitelist_keys), "当日有行情": 0, "股价达标": 0, "市值达标": 0,
         "历史≥100天": 0, "非一字涨停": 0, "A级": 0, "B级": 0, "C级": 0, "市值缺失(未过滤)": 0,
     }
+    if price_cache is None:
+        price_cache = {}
     mv_map = {}
     if basic_indexed is not None and not basic_indexed.empty:
         try:
@@ -581,6 +670,8 @@ def scan_date(date, whitelist_keys, stock_qfq_dict, basic_indexed, name_map, wee
             mv_map = {}
 
     cands = []
+    pool_fwd, a_fwd = [], []
+    breadth_up, breadth_total = 0, 0
     for ts_code in whitelist_keys:
         df_stock = stock_qfq_dict.get(ts_code)
         if df_stock is None or df_stock.empty:
@@ -618,13 +709,23 @@ def scan_date(date, whitelist_keys, stock_qfq_dict, basic_indexed, name_map, wee
         funnel["非一字涨停"] += 1
 
         wa, wpos = get_weekly_view(ts_code, date, df_stock, weekly_cache, is_week_end)
+        if wa is not None and wpos >= 0 and np.isfinite(wa['ma20'][wpos]):
+            breadth_total += 1
+            breadth_up += int(wa['close'][wpos] >= wa['ma20'][wpos])
+
+        fwd = forward_metrics(ts_code, get_price_arrays(ts_code, df_stock, price_cache), pos) if with_benchmark else None
+        if with_benchmark:
+            pool_fwd.append(fwd)
+
         sig = evaluate_signal(wa, wpos)
         if not sig:
             continue
         funnel[f"{sig['tier']}级"] += 1
+        if sig['tier'] == "A" and with_benchmark:
+            a_fwd.append(fwd)
         if sig['tier'] not in cfg['tiers']:
             continue
-        cands.append({
+        rec = {
             'Tier': sig['tier'], 'Tier_Label': TIER_LABEL[sig['tier']],
             'ts_code': ts_code, 'name': name_map.get(ts_code, ts_code),
             'Total_Score': sig['score'], 'SKDJ_K': sig['k'], 'SKDJ_D': sig['d'],
@@ -632,21 +733,44 @@ def scan_date(date, whitelist_keys, stock_qfq_dict, basic_indexed, name_map, wee
             'Signal_Close': sig['signal_close'], 'Close_Raw': round(float(df_stock[raw_col].iat[pos]), 2),
             'Trend_Type': sig['trend_type'], 'MA20_Ext (%)': sig['ma20_ext_pct'],
             'vol_ratio': sig['vol_ratio'], 'circ_mv': round(circ_mv, 2) if pd.notna(circ_mv) else np.nan,
-        })
+        }
+        if with_benchmark:
+            rec['_fwd'] = fwd
+            if fwd and fwd.get('complete'):
+                rec.update({'Fwd_W4 (%)': round(fwd['W4'], 2), 'Fwd_W12 (%)': round(fwd['W12'], 2),
+                            'Fwd_MaxGain (%)': round(fwd['MaxGain'], 2), 'Fwd_MaxDD (%)': round(fwd['MaxDD'], 2)})
+        cands.append(rec)
 
-    if not cands:
-        return pd.DataFrame(), pd.DataFrame(), funnel
-    all_cands = pd.DataFrame(cands)
-    all_cands['_order'] = all_cands['Tier'].map(TIER_ORDER)
-    all_cands = all_cands.sort_values(['_order', 'Total_Score'], ascending=[True, False], kind='mergesort').drop(columns='_order').reset_index(drop=True)
-    picks = all_cands.head(int(cfg['top_n'])).copy()
-    picks.insert(0, 'Rank', range(1, len(picks) + 1))
-    picks['Trade_Date'] = date
-    return picks, all_cands, funnel
+    bench = {
+        'Breadth': round(breadth_up / breadth_total * 100.0, 1) if breadth_total else np.nan,
+        'Breadth_Total': breadth_total,
+    }
+    picks, all_cands = pd.DataFrame(), pd.DataFrame()
+    if cands:
+        all_cands = pd.DataFrame(cands)
+        all_cands['_order'] = all_cands['Tier'].map(TIER_ORDER)
+        all_cands = all_cands.sort_values(['_order', 'Total_Score'], ascending=[True, False], kind='mergesort').drop(columns='_order').reset_index(drop=True)
+        picks = all_cands.head(int(cfg['top_n'])).copy()
+        picks.insert(0, 'Rank', range(1, len(picks) + 1))
+        picks['Trade_Date'] = date
+
+    if with_benchmark:
+        groups = {
+            'Pick': picks['_fwd'].tolist() if not picks.empty else [],
+            'A': a_fwd,
+            'Pool': pool_fwd,
+        }
+        for g, items in groups.items():
+            for k, v in summarize_fwd(items).items():
+                bench[f'{g}_{k}'] = v
+    for frame in (picks, all_cands):
+        if not frame.empty and '_fwd' in frame.columns:
+            frame.drop(columns='_fwd', inplace=True)
+    return picks, all_cands, funnel, bench
 
 
 # ---------------------------
-# 回测出场模拟
+# 回测出场模拟（规则出场，仅用于参考；固定持有对照见 forward_metrics）
 # ---------------------------
 def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_dict, hold_weeks=HOLD_WEEKS):
     results = {f'Return_W{w} (%)': np.nan for w in range(1, hold_weeks + 1)}
@@ -663,24 +787,11 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
     buy_price = next_row['open']
     if pd.isna(buy_price) or buy_price <= 0 or not signal_close:
         return results
-
-    is_20cm = ts_code.startswith(('300', '301', '688', '689'))
-    limit_rate_pct = 19.0 if is_20cm else 9.5
-    gap_pct = (buy_price - signal_close) / signal_close * 100.0
+    reason, gap_pct = entry_block_reason(ts_code, buy_price, next_row['high'], next_row['low'], signal_close)
     results['Buy_Price'] = round(buy_price, 2)
-    results['Gap_pct (%)'] = round(gap_pct, 2)
-
-    if (next_row['open'] == next_row['high'] == next_row['low']) and gap_pct >= limit_rate_pct:
-        results['Exit_Reason'] = f"一字板无法买入(剔除: {round(gap_pct, 1)}%)"
-        return results
-    if is_20cm and gap_pct > 8.0:
-        results['Exit_Reason'] = f"双创高开过大(剔除: {round(gap_pct, 2)}%)"
-        return results
-    if not is_20cm and gap_pct > 5.0:
-        results['Exit_Reason'] = f"主板高开过大(剔除: {round(gap_pct, 2)}%)"
-        return results
-    if gap_pct < -4.0:
-        results['Exit_Reason'] = f"恶劣低开(剔除: {round(gap_pct, 2)}%)"
+    results['Gap_pct (%)'] = round(gap_pct, 2) if pd.notna(gap_pct) else np.nan
+    if reason:
+        results['Exit_Reason'] = reason
         return results
 
     tier = 0
@@ -689,8 +800,8 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
     hard_stop_limit = -0.10
     max_days = hold_weeks * 5
 
-    def close_out(reason, ret, date, days, week):
-        results['Exit_Reason'] = reason
+    def close_out(reason_text, ret, date, days, week):
+        results['Exit_Reason'] = reason_text
         results['Final_Return (%)'] = round(ret, 2)
         results['Exit_Date'] = date
         results['Hold_Days'] = days
@@ -704,7 +815,6 @@ def track_future_performance(ts_code, selection_date, signal_close, stock_qfq_di
         curr_date = hist_future.index[i]
 
         if pending_exit_reason is not None and day_count >= 2:
-            # 按次日真实开盘价离场（V14.5 对“保本”固定记 +2%，偏乐观）
             close_out(pending_exit_reason, (curr_open - buy_price) / buy_price * 100.0, curr_date, day_count, current_week)
             return results
 
@@ -784,8 +894,8 @@ with st.sidebar:
     CFG = {"v": VERSION, "top_n": TOP_N, "tiers": tiers_enabled,
            "min_price": MIN_PRICE, "min_mv": MIN_MV, "max_mv": MAX_MV}
     CFG_SIG = hashlib.md5(json.dumps(CFG, sort_keys=True).encode("utf-8")).hexdigest()[:8]
-    TRADES_FILE = f"skdj_v15_{CFG_SIG}_trades.csv"
-    WEEKS_FILE = f"skdj_v15_{CFG_SIG}_weeks.csv"
+    TRADES_FILE = f"skdj_v16_{CFG_SIG}_trades.csv"
+    WEEKS_FILE = f"skdj_v16_{CFG_SIG}_weeks.csv"
 
     with st.expander("🧹 缓存与记录维护"):
         st.caption(f"当前参数组编号：{CFG_SIG}（改任何参数都会自动使用独立的回测记录）")
@@ -861,10 +971,12 @@ def run_picking(pro, whitelist_keys, name_map):
     if not is_week_end:
         st.info(f"ℹ️ {scan_day} 不是本周最后一个交易日，本周K线尚未收完，结果为临时值，周五收盘后可能变化。")
 
-    picks, all_cands, funnel = scan_date(scan_day, whitelist_keys, stock_qfq_dict, basic_indexed,
-                                         name_map, {}, is_week_end, CFG)
+    picks, all_cands, funnel, bench = scan_date(scan_day, whitelist_keys, stock_qfq_dict, basic_indexed,
+                                                name_map, {}, is_week_end, CFG)
 
     st.subheader(f"🎯 选股结果 [{scan_day}]")
+    if pd.notna(bench.get('Breadth')):
+        st.metric("市场宽度：过筛股票中周线站上20周线的比例（仅供参考，不参与选股）", f"{bench['Breadth']:.0f}%")
     if picks.empty:
         st.error("本次没有任何股票满足已启用的层级。请看下方漏斗，找出卡在哪一步。")
     else:
@@ -883,6 +995,10 @@ def run_picking(pro, whitelist_keys, name_map):
     st.success("选股完成（选股模式不写入回测记录）。")
 
 
+def _truthy(series):
+    return series.astype(str).str.strip().str.lower().isin(["true", "1", "1.0"])
+
+
 def run_backtest(pro, whitelist_keys, name_map):
     trade_days, week_end_set = load_calendar(pro, backtest_date_end, BACKTEST_WEEKS * 7 + 60)
     if not trade_days:
@@ -893,74 +1009,56 @@ def run_backtest(pro, whitelist_keys, name_map):
     target_dates = week_ends[-BACKTEST_WEEKS:]
 
     weeks_log = _read_csv_safely(WEEKS_FILE)
-    scanned = set(weeks_log['Trade_Date'].astype(str)) if not weeks_log.empty else set()
-    dates_to_run = [d for d in target_dates if d not in scanned]
-
-    trades = _read_csv_safely(TRADES_FILE)
-    open_dates = []
-    if not trades.empty and 'Exit_Reason' in trades.columns:
-        open_dates = sorted(trades.loc[trades['Exit_Reason'].astype(str) == '持仓中', 'Trade_Date'].astype(str).unique().tolist())
-
-    if not dates_to_run and not open_dates:
-        st.success("🎉 该区间已全部回测完成，且没有待结算的持仓。")
+    settled = set()
+    if not weeks_log.empty and 'Bench_Complete' in weeks_log.columns:
+        settled = set(weeks_log.loc[_truthy(weeks_log['Bench_Complete']), 'Trade_Date'].astype(str))
+    dates_to_run = [d for d in target_dates if d not in settled]
+    if not dates_to_run:
+        st.success("🎉 该区间已全部回测并结算完毕。")
         return
 
+    n_new = len([d for d in dates_to_run if weeks_log.empty or d not in set(weeks_log['Trade_Date'].astype(str))])
+    st.info(f"本次扫描 {len(dates_to_run)} 周（新周 {n_new}，未满12周需重新结算 {len(dates_to_run) - n_new}）。")
+
     today_str = datetime.now().strftime("%Y%m%d")
-    all_needed = dates_to_run + open_dates
-    fetch_start = (datetime.strptime(min(all_needed), "%Y%m%d") - timedelta(days=300)).strftime("%Y%m%d")
-    if open_dates:
-        fetch_end = today_str
-    else:
-        fetch_end = min(today_str, (datetime.strptime(max(dates_to_run), "%Y%m%d") + timedelta(days=130)).strftime("%Y%m%d"))
+    fetch_start = (datetime.strptime(min(dates_to_run), "%Y%m%d") - timedelta(days=300)).strftime("%Y%m%d")
+    fetch_end = min(today_str, (datetime.strptime(max(dates_to_run), "%Y%m%d") + timedelta(days=130)).strftime("%Y%m%d"))
 
     stock_qfq_dict, basic_indexed = load_optimized_market_data(fetch_start, fetch_end, token_clean, whitelist_keys)
     if not stock_qfq_dict:
         st.warning("⚠️ 未能加载到行情数据，请重试。")
         return
 
-    # 1) 重新结算“持仓中”的单子
-    if open_dates:
-        trades = _read_csv_safely(TRADES_FILE)
-        open_mask = trades['Exit_Reason'].astype(str) == '持仓中'
-        rows = trades.loc[open_mask].to_dict('records')
-        refreshed = []
-        for r in rows:
-            code, date = str(r['ts_code']), str(r['Trade_Date'])
-            df_s = stock_qfq_dict.get(code)
-            if df_s is not None and date in df_s.index:
-                sc = float(df_s.loc[date, 'close'])
-                r['Signal_Close'] = sc
-                r.update(track_future_performance(code, date, sc, stock_qfq_dict))
-            refreshed.append(r)
-        trades = pd.concat([trades.loc[~open_mask], pd.DataFrame(refreshed)], ignore_index=True, sort=False)
-        trades = trades.sort_values(['Trade_Date', 'Rank'], kind='mergesort')
-        _rewrite_file_safely(TRADES_FILE, trades)
-
-    # 2) 扫描新的周
-    weekly_cache = {}
+    weekly_cache, price_cache = {}, {}
     skipped = 0
-    if dates_to_run:
-        bar = st.progress(0, text="回测扫描中...")
-        for i, date in enumerate(dates_to_run):
-            if not _market_partition_exists(date):
-                skipped += 1
-                continue
-            picks, _, funnel = scan_date(date, whitelist_keys, stock_qfq_dict, basic_indexed,
-                                         name_map, weekly_cache, True, CFG)
-            if not picks.empty:
-                future = [track_future_performance(r.ts_code, date, r.Signal_Close, stock_qfq_dict)
-                          for r in picks.itertuples(index=False)]
-                picks = pd.concat([picks.reset_index(drop=True), pd.DataFrame(future)], axis=1)
-                _append_rows_safely(TRADES_FILE, picks, ["Trade_Date", "ts_code"], ["Trade_Date", "Rank"])
-            week_row = pd.DataFrame([{
-                'Trade_Date': date, 'A_Count': funnel["A级"], 'B_Count': funnel["B级"], 'C_Count': funnel["C级"],
-                'Pool_After_Filter': funnel["非一字涨停"], 'Picks': len(picks),
-                'Pick_Tiers': "".join(picks['Tier'].tolist()) if not picks.empty else "",
-                'Pick_Names': "、".join(picks['name'].astype(str).tolist()) if not picks.empty else "",
-            }])
-            _append_rows_safely(WEEKS_FILE, week_row, ["Trade_Date"], ["Trade_Date"])
-            bar.progress((i + 1) / len(dates_to_run), text=f"扫描 {date}：A{funnel['A级']} / B{funnel['B级']} / C{funnel['C级']}，入选 {len(picks)} 只")
-        bar.empty()
+    bar = st.progress(0, text="回测扫描中...")
+    for i, date in enumerate(dates_to_run):
+        if not _market_partition_exists(date):
+            skipped += 1
+            continue
+        picks, _, funnel, bench = scan_date(date, whitelist_keys, stock_qfq_dict, basic_indexed,
+                                            name_map, weekly_cache, True, CFG,
+                                            with_benchmark=True, price_cache=price_cache)
+        has_open = False
+        if not picks.empty:
+            future = [track_future_performance(r.ts_code, date, r.Signal_Close, stock_qfq_dict)
+                      for r in picks.itertuples(index=False)]
+            picks = pd.concat([picks.reset_index(drop=True), pd.DataFrame(future)], axis=1)
+            has_open = bool((picks['Exit_Reason'].astype(str) == '持仓中').any())
+        _replace_date_rows(TRADES_FILE, date, picks, ["Trade_Date", "Rank"])
+
+        week_row = {
+            'Trade_Date': date, 'A_Count': funnel["A级"], 'B_Count': funnel["B级"], 'C_Count': funnel["C级"],
+            'Pool_After_Filter': funnel["非一字涨停"], 'Picks': len(picks),
+            'Pick_Tiers': "".join(picks['Tier'].tolist()) if not picks.empty else "",
+            'Pick_Names': "、".join(picks['name'].astype(str).tolist()) if not picks.empty else "",
+        }
+        week_row.update(bench)
+        week_row['Bench_Complete'] = bool(bench.get('Pool_N', 0) > 0 and not has_open)
+        _replace_date_rows(WEEKS_FILE, date, pd.DataFrame([week_row]), ["Trade_Date"])
+        bar.progress((i + 1) / len(dates_to_run),
+                     text=f"扫描 {date}：A{funnel['A级']} / B{funnel['B级']} / C{funnel['C级']}，入选 {len(picks)} 只")
+    bar.empty()
     if skipped:
         st.warning(f"有 {skipped} 个周末交易日缺少行情数据被跳过，下次运行会自动补扫。")
     st.success("🎉 回测更新完毕，请查看下方报告。")
@@ -1015,6 +1113,66 @@ def weekly_full_sample_table(executed):
     return pd.DataFrame(rows)
 
 
+BENCH_METRICS = ('N', 'W4', 'W12', 'MaxGain', 'Big30')
+
+
+def _half_label(date_series):
+    s = date_series.astype(str)
+    return s.str[:4] + np.where(pd.to_numeric(s.str[4:6], errors='coerce') <= 6, 'H1', 'H2')
+
+
+def _bench_row(g, closed_part):
+    ex = g['Pick_W12'] - g['Pool_W12']
+    ex_a = g['A_W12'] - g['Pool_W12']
+    row = {
+        '周数': len(g),
+        '宽度%': round(g['Breadth'].mean(), 0),
+        '规则出场均益%': round(closed_part['Final_Return (%)'].mean(), 2) if len(closed_part) else np.nan,
+        '入选12周%': round(g['Pick_W12'].mean(), 2),
+        'A候选12周%': round(g['A_W12'].mean(), 2),
+        '股票池12周%': round(g['Pool_W12'].mean(), 2),
+        '入选−池': round(ex.mean(), 2),
+        'A候选−池': round(ex_a.mean(), 2),
+        '入选跑赢池的周%': round((ex.dropna() > 0).mean() * 100, 0) if ex.notna().any() else np.nan,
+        '牛股率%(入选)': round(g['Pick_Big30'].mean(), 1),
+        '牛股率%(A候选)': round(g['A_Big30'].mean(), 1),
+        '牛股率%(股票池)': round(g['Pool_Big30'].mean(), 1),
+    }
+    return row
+
+
+def benchmark_tables(weeks_log, closed):
+    if weeks_log.empty or 'Bench_Complete' not in weeks_log.columns:
+        return None, None
+    wl = weeks_log.copy()
+    for grp in ('Pick', 'A', 'Pool'):
+        for m in BENCH_METRICS:
+            col = f'{grp}_{m}'
+            wl[col] = pd.to_numeric(wl[col], errors='coerce') if col in wl.columns else np.nan
+    wl['Breadth'] = pd.to_numeric(wl.get('Breadth'), errors='coerce')
+    comp = wl[_truthy(wl['Bench_Complete'])].copy()
+    if comp.empty:
+        return None, None
+    comp['时期'] = _half_label(comp['Trade_Date'])
+    comp['宽度分组'] = pd.cut(comp['Breadth'], [-0.1, 30, 50, 70, 100.1], labels=['<30%', '30~50%', '50~70%', '≥70%'])
+
+    cl = closed.copy() if closed is not None else pd.DataFrame(columns=['Trade_Date', 'Final_Return (%)'])
+    cl['Trade_Date'] = cl['Trade_Date'].astype(str)
+    cl = cl[cl['Trade_Date'].isin(set(comp['Trade_Date']))]
+    cl['时期'] = _half_label(cl['Trade_Date']) if len(cl) else []
+    cl = cl.merge(comp[['Trade_Date', '宽度分组']], on='Trade_Date', how='left')
+
+    period_rows = []
+    for key, g in comp.groupby('时期', sort=True):
+        period_rows.append({'时期': key, **_bench_row(g, cl[cl['时期'] == key])})
+    period_rows.append({'时期': '全部', **_bench_row(comp, cl)})
+
+    breadth_rows = []
+    for key, g in comp.groupby('宽度分组', observed=True, sort=True):
+        breadth_rows.append({'宽度分组': str(key), **_bench_row(g, cl[cl['宽度分组'] == key])})
+    return pd.DataFrame(period_rows), pd.DataFrame(breadth_rows)
+
+
 def group_stats(closed, key):
     g = closed.groupby(key, observed=True)
     out = g.agg(
@@ -1025,6 +1183,10 @@ def group_stats(closed, key):
         止损占比=('Exit_Reason', lambda x: round(x.astype(str).str.contains('破-10%').mean() * 100, 1)),
         平均持有天数=('Hold_Days', lambda x: round(pd.to_numeric(x, errors='coerce').mean(), 1)),
     ).reset_index()
+    if 'Fwd_W12 (%)' in closed.columns:
+        fixed = closed.groupby(key, observed=True)['Fwd_W12 (%)'].apply(
+            lambda x: round(pd.to_numeric(x, errors='coerce').mean(), 2)).reset_index(name='固定持有12周均益')
+        out = out.merge(fixed, on=key, how='left')
     return out
 
 
@@ -1053,6 +1215,26 @@ if not is_picking_mode and (os.path.exists(TRADES_FILE) or os.path.exists(WEEKS_
             ).reset_index()
             st.markdown("#### 🗓️ 按年空周统计")
             show_df(by_year)
+
+        closed_for_bench = None
+        if not trades.empty and 'Exit_Reason' in trades.columns:
+            tmp = trades.copy()
+            tmp['Final_Return (%)'] = pd.to_numeric(tmp['Final_Return (%)'], errors='coerce')
+            tmp = tmp[~tmp['Exit_Reason'].astype(str).str.contains('剔除', na=False)]
+            closed_for_bench = tmp[tmp['Exit_Reason'].astype(str) != '持仓中']
+        period_tbl, breadth_tbl = benchmark_tables(weeks_log, closed_for_bench)
+        if period_tbl is not None:
+            st.markdown("#### 🧪 同周对照：分时期（只含已满12周的周，每周等权）")
+            st.caption(
+                "“12周%”=次日开盘买入、不设止损、持有60个交易日的平均收益；牛股率=60个交易日内最高涨幅≥30%的比例。"
+                "三组使用同一套开盘剔除规则。怎么读：入选≈A候选 → 评分排序没有价值；A候选≈股票池 → SKDJ信号本身没有超额，"
+                "赚亏主要来自行情；只有“A候选−池”在多数时期都为正，才说明信号真的有用。"
+            )
+            show_df(period_tbl)
+            if breadth_tbl is not None and not breadth_tbl.empty:
+                st.markdown("#### 🌡️ 同周对照：按市场宽度分组")
+                st.caption("宽度=过筛股票中周收盘站上20周线的比例，分组边界固定为30/50/70，不做优化。只用于观察行情依赖，不参与选股。")
+                show_df(breadth_tbl)
 
         if not trades.empty and 'Exit_Reason' in trades.columns:
             trades['Final_Return (%)'] = pd.to_numeric(trades['Final_Return (%)'], errors='coerce')
@@ -1100,15 +1282,24 @@ if not is_picking_mode and (os.path.exists(TRADES_FILE) or os.path.exists(WEEKS_
         if not trades.empty:
             st.markdown("#### 📋 交割流水")
             disp_cols = ['Trade_Date', 'Rank', 'Tier_Label', 'name', 'ts_code', 'Total_Score', 'SKDJ_K',
-                         'Close_Raw', 'Buy_Price', 'Gap_pct (%)', 'Exit_Date', 'Hold_Days', 'Exit_Reason', 'Final_Return (%)']
+                         'Close_Raw', 'Buy_Price', 'Gap_pct (%)', 'Exit_Date', 'Hold_Days', 'Exit_Reason', 'Final_Return (%)',
+                         'Fwd_W12 (%)', 'Fwd_MaxGain (%)', 'Fwd_MaxDD (%)']
             disp_cols = [c for c in disp_cols if c in trades.columns]
             show_df(trades[disp_cols].sort_values(['Trade_Date', 'Rank'], ascending=[False, True]))
             st.download_button(
                 label="📥 导出回测流水 (CSV)",
                 data=trades.to_csv(index=False).encode('utf-8-sig'),
-                file_name=f"skdj_v15_{CFG_SIG}_trades.csv",
+                file_name=f"skdj_v16_{CFG_SIG}_trades.csv",
                 mime="text/csv",
-                key="download_v15_trades",
+                key="download_v16_trades",
+            )
+        if not weeks_log.empty:
+            st.download_button(
+                label="📥 导出每周对照明细 (CSV)",
+                data=weeks_log.to_csv(index=False).encode('utf-8-sig'),
+                file_name=f"skdj_v16_{CFG_SIG}_weeks.csv",
+                mime="text/csv",
+                key="download_v16_weeks",
             )
     except Exception as report_error:
         st.warning(f"回测记录已保留，但报告暂时无法显示：{report_error}")
