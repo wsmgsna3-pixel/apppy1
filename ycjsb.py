@@ -1,7 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-周线 SKDJ 分级补位选股系统 (V16)
+周线 SKDJ 分级补位选股系统 (V17)
 ------------------------------------------------
+V17 新增（选股规则仍不变）：
+1. 【四路并发下载】行情同步默认 4 线程并发（侧边栏可调 1~8），遇到 Tushare
+   限流自动退避重试；失败的日期下次运行自动补下。
+2. 【一键导出】回测报告顶部一个按钮，把全部报告表格、交割流水、每周明细和
+   回测参数打包成 ZIP 下载。
+3. 【两个新对照组】事先固定定义、不做参数优化，只用于和股票池同周对照：
+   - 强势股前10%：过筛股票池中，截至上周的 12 周涨幅排名前 10%
+     （跳过最近一周，避免把短期反转混进来）；
+   - 强势板块：按申万二级行业分组（组内≥5只），用成分股 12 周涨幅均值排名，
+     取前 3 个板块 → “前3强板块全部成分” 与 “前3强板块各取最强2只”。
+4. 【候选组总览】每组给出 12 周超额、重叠修正后的 t 值、跑赢池的半年数、
+   牛股率差，一张表判断哪个方向值得继续。
+
 V16 新增（不改变任何选股规则，只增加“对照组”用于识别行情依赖与过拟合）：
 A. 【同周对照】每个回测周同时计算三组的固定持有表现（次日开盘买入，不设止损）：
    入选股票 / 当周全部 A 级候选 / 当周全部过筛股票池。
@@ -44,6 +57,11 @@ import tempfile
 import shutil
 import gc
 import traceback
+import threading
+import random
+import io
+import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 
 try:
@@ -53,7 +71,7 @@ except ImportError:
 
 warnings.filterwarnings("ignore")
 
-VERSION = "V16"
+VERSION = "V17"
 MARKET_CACHE_FILE = "skdj_market_data_master.pkl"
 MARKET_CACHE_DIR = "skdj_market_data_daily_cache"
 
@@ -61,13 +79,26 @@ SKDJ_N, SKDJ_M = 6, 3
 HOLD_WEEKS = 12
 FWD_HORIZONS = {"W2": 10, "W4": 20, "W8": 40, "W12": 60}
 BIG_WINNER_PCT = 30.0
+RS_LOOKBACK_WEEKS = 12
+RS_TOP_PCT = 10.0
+SECTOR_MIN_MEMBERS = 5
+SECTOR_TOP_K = 3
+SECTOR_STOCKS_EACH = 2
+
+BENCH_GROUPS = [
+    ("Pick", "入选5只"),
+    ("A", "A级候选"),
+    ("RS", "强势股前10%"),
+    ("SEC", "前3强板块全部成分"),
+    ("SECRS", "前3强板块各取最强2只"),
+]
 
 TIER_ORDER = {"A": 0, "B": 1, "C": 2}
 TIER_LABEL = {"A": "A 标准上穿25", "B": "B 低位金叉", "C": "C 趋势回踩金叉"}
 
-st.set_page_config(page_title="SKDJ V16 分级补位系统", layout="wide")
-st.title("🔬 周线 SKDJ 分级补位选股系统 (V16)")
-st.markdown("A 级为原始信号，A 级不足时由 B、C 级补位 · 同周对照组 · 分时期报告")
+st.set_page_config(page_title="SKDJ V17 对照回测系统", layout="wide")
+st.title("🔬 周线 SKDJ 分级补位选股系统 (V17)")
+st.markdown("SKDJ 信号 / 强势股 / 强势板块 与股票池同周对照 · 四路并发下载 · 一键导出")
 
 
 # ---------------------------
@@ -96,6 +127,9 @@ def verify_token_connection(token_str):
         return False, f"接口校验失败: {err_msg}"
 
 
+RATE_LIMIT_HINTS = ("每分钟", "频率", "最多访问", "too many", "Too Many", "rate limit")
+
+
 def safe_tushare_call(func, max_retries=3, sleep_time=0.8, **kwargs):
     for attempt in range(max_retries):
         try:
@@ -103,9 +137,25 @@ def safe_tushare_call(func, max_retries=3, sleep_time=0.8, **kwargs):
             if df is not None and not df.empty:
                 return df
             time.sleep(sleep_time)
-        except Exception:
-            time.sleep(sleep_time * (attempt + 1))
+        except Exception as e:
+            if any(h in str(e) for h in RATE_LIMIT_HINTS):
+                time.sleep(min(60.0, 8.0 * (attempt + 1)) + random.uniform(0, 2))  # 限流退避
+            else:
+                time.sleep(sleep_time * (attempt + 1))
     return pd.DataFrame()
+
+
+_thread_local = threading.local()
+
+
+def _thread_pro(token):
+    """每个下载线程各用一个 pro 实例。"""
+    pro = getattr(_thread_local, "pro", None)
+    if pro is None or getattr(_thread_local, "token", None) != token:
+        pro = ts.pro_api(token)
+        _thread_local.pro = pro
+        _thread_local.token = token
+    return pro
 
 
 # ---------------------------
@@ -259,6 +309,44 @@ def load_custom_tech_whitelist(token):
 
 
 # ---------------------------
+# 申万二级行业映射（仅用于“强势板块”对照组）
+# ---------------------------
+@st.cache_data(ttl=3600 * 24 * 7, show_spinner=False)
+def load_sw_l2_map(token):
+    """返回 {ts_code: (l2_code, l2_name)}。优先 index_member_all，失败时逐个二级行业调 index_member。
+    注意：使用当前行业归属回看历史，存在少量行业变更偏差。"""
+    token_c = clean_token_str(token)
+    if not token_c:
+        return {}
+    ts.set_token(token_c)
+    pro = ts.pro_api(token_c)
+    mapping = {}
+    l1 = safe_tushare_call(pro.index_classify, level='L1', src='SW2021')
+    if not l1.empty:
+        try:
+            probe = safe_tushare_call(pro.index_member_all, max_retries=1, l1_code=l1['index_code'].iloc[0], is_new='Y')
+            if not probe.empty and {'ts_code', 'l2_code', 'l2_name'}.issubset(probe.columns):
+                for code in l1['index_code']:
+                    df = probe if code == l1['index_code'].iloc[0] else safe_tushare_call(pro.index_member_all, l1_code=code, is_new='Y')
+                    if not df.empty and {'ts_code', 'l2_code', 'l2_name'}.issubset(df.columns):
+                        for r in df[['ts_code', 'l2_code', 'l2_name']].itertuples(index=False):
+                            mapping[r.ts_code] = (r.l2_code, r.l2_name)
+                    time.sleep(0.05)
+        except Exception:
+            pass
+    if len(mapping) < 1000:
+        l2 = safe_tushare_call(pro.index_classify, level='L2', src='SW2021')
+        if not l2.empty:
+            for r in l2[['index_code', 'industry_name']].itertuples(index=False):
+                m_df = safe_tushare_call(pro.index_member, max_retries=2, index_code=r.index_code, is_new='Y')
+                if not m_df.empty and 'con_code' in m_df.columns:
+                    for c_code in m_df['con_code']:
+                        mapping.setdefault(c_code, (r.index_code, r.industry_name))
+                time.sleep(0.05)
+    return mapping
+
+
+# ---------------------------
 # 行情增量下载与缓存（沿用原缓存目录，已下载的数据可直接复用）
 # ---------------------------
 def _market_partition_path(trade_date):
@@ -319,7 +407,28 @@ def _write_market_partition(payload, trade_date):
     _atomic_replace_bytes(writer, _market_partition_path(trade_date))
 
 
-def sync_market_data_incrementally(start_date, end_date, token):
+def _download_market_day(trade_date, token):
+    """在线程中运行：下载一天的日线/复权因子/市值并写入分区文件。不调用任何 streamlit 接口。"""
+    pro = _thread_pro(token)
+    df_d = safe_tushare_call(pro.daily, max_retries=5, trade_date=trade_date)
+    df_a = safe_tushare_call(pro.adj_factor, max_retries=5, trade_date=trade_date)
+    df_b = safe_tushare_call(pro.daily_basic, max_retries=5, trade_date=trade_date, fields='ts_code,trade_date,circ_mv')
+    ok = False
+    if not df_d.empty and not df_a.empty:
+        payload = {
+            "version": 1, "trade_date": trade_date,
+            "daily_count": len(df_d), "adj_count": len(df_a),
+            "daily": df_d, "adj": df_a,
+            "daily_basic": df_b if not df_b.empty else pd.DataFrame(),
+        }
+        if _valid_market_partition(payload, trade_date):
+            _write_market_partition(payload, trade_date)
+            ok = True
+    time.sleep(0.15)
+    return ok
+
+
+def sync_market_data_incrementally(start_date, end_date, token, n_workers=4):
     token_c = clean_token_str(token)
     ts.set_token(token_c)
     pro = ts.pro_api(token_c)
@@ -332,24 +441,23 @@ def sync_market_data_incrementally(start_date, end_date, token):
     missing_dates = [d for d in valid_dates if not _market_partition_exists(d)]
 
     if missing_dates:
-        my_bar = st.progress(0, text=f"📥 需要同步 {len(missing_dates)} 天行情...")
-        for i, d in enumerate(missing_dates):
-            df_d = safe_tushare_call(pro.daily, trade_date=d)
-            df_a = safe_tushare_call(pro.adj_factor, trade_date=d)
-            df_b = safe_tushare_call(pro.daily_basic, trade_date=d, fields='ts_code,trade_date,circ_mv')
-            if not df_d.empty and not df_a.empty:
-                payload = {
-                    "version": 1, "trade_date": d,
-                    "daily_count": len(df_d), "adj_count": len(df_a),
-                    "daily": df_d, "adj": df_a,
-                    "daily_basic": df_b if not df_b.empty else pd.DataFrame(),
-                }
-                if _valid_market_partition(payload, d):
-                    _write_market_partition(payload, d)
-            if (i + 1) % 5 == 0 or i == len(missing_dates) - 1:
-                my_bar.progress((i + 1) / len(missing_dates), text=f"📥 行情同步中: {i + 1}/{len(missing_dates)}")
-            time.sleep(0.25)
+        workers = int(max(1, min(8, n_workers)))
+        my_bar = st.progress(0, text=f"📥 需要同步 {len(missing_dates)} 天行情（{workers} 线程并发）...")
+        failed = []
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(_download_market_day, d, token_c): d for d in missing_dates}
+            for i, fut in enumerate(as_completed(futures), start=1):
+                d = futures[fut]
+                try:
+                    if not fut.result():
+                        failed.append(d)
+                except Exception:
+                    failed.append(d)
+                my_bar.progress(i / len(missing_dates), text=f"📥 行情同步中（{workers} 线程）: {i}/{len(missing_dates)}")
         my_bar.empty()
+        if failed:
+            st.warning(f"⚠️ {len(failed)} 天行情未下载成功（限流或当天数据尚未发布），下次运行会自动补下："
+                       f"{', '.join(sorted(failed)[:8])}{' ...' if len(failed) > 8 else ''}")
     return valid_dates
 
 
@@ -411,7 +519,7 @@ def _build_market_index(valid_dates, whitelist_keys, cache_stamp):
 
 def load_optimized_market_data(start_date, end_date, token, whitelist_keys):
     token_c = clean_token_str(token)
-    valid_dates = sync_market_data_incrementally(start_date, end_date, token_c)
+    valid_dates = sync_market_data_incrementally(start_date, end_date, token_c, DOWNLOAD_WORKERS)
     if not valid_dates:
         return {}, pd.DataFrame()
     valid_paths = [_market_partition_path(d) for d in valid_dates]
@@ -654,8 +762,45 @@ def summarize_fwd(items):
 # ---------------------------
 # 单日扫描（选股与回测共用）
 # ---------------------------
+def relative_strength(wa, wpos):
+    """截至上周的 12 周涨幅（%），跳过最近一周。"""
+    if wa is None or wpos - 1 - RS_LOOKBACK_WEEKS < 0:
+        return np.nan
+    c_end, c_start = wa['close'][wpos - 1], wa['close'][wpos - 1 - RS_LOOKBACK_WEEKS]
+    if not (np.isfinite(c_end) and np.isfinite(c_start) and c_start > 0):
+        return np.nan
+    return (c_end / c_start - 1.0) * 100.0
+
+
+def build_strength_groups(pool_items, sector_map):
+    """pool_items: [(ts_code, fwd, rs)]。返回 (RS组, SEC组, SECRS组, 前3板块名称)。"""
+    valid = [(c, f, r) for c, f, r in pool_items if np.isfinite(r)]
+    if not valid:
+        return [], [], [], ""
+    rs_vals = np.array([r for _, _, r in valid])
+    cut = np.percentile(rs_vals, 100.0 - RS_TOP_PCT)
+    rs_group = [f for _, f, r in valid if r >= cut]
+
+    sec_group, secrs_group, top_names = [], [], ""
+    if sector_map:
+        df = pd.DataFrame([(c, f, r, sector_map.get(c, (None, None))[0], sector_map.get(c, (None, None))[1])
+                           for c, f, r in valid], columns=['code', 'fwd', 'rs', 'l2', 'l2_name'])
+        df = df[df['l2'].notna()]
+        if not df.empty:
+            stats = df.groupby('l2').agg(n=('rs', 'size'), rs=('rs', 'mean'), name=('l2_name', 'first'))
+            stats = stats[stats['n'] >= SECTOR_MIN_MEMBERS].sort_values('rs', ascending=False)
+            top = stats.head(SECTOR_TOP_K)
+            if not top.empty:
+                in_top = df[df['l2'].isin(top.index)]
+                sec_group = in_top['fwd'].tolist()
+                secrs_group = (in_top.sort_values('rs', ascending=False)
+                               .groupby('l2', sort=False).head(SECTOR_STOCKS_EACH)['fwd'].tolist())
+                top_names = "、".join(f"{nm}({rs:.0f}%)" for nm, rs in zip(top['name'], top['rs']))
+    return rs_group, sec_group, secrs_group, top_names
+
+
 def scan_date(date, whitelist_keys, stock_qfq_dict, basic_indexed, name_map, weekly_cache, is_week_end, cfg,
-              with_benchmark=False, price_cache=None):
+              with_benchmark=False, price_cache=None, sector_map=None):
     funnel = {
         "股票池": len(whitelist_keys), "当日有行情": 0, "股价达标": 0, "市值达标": 0,
         "历史≥100天": 0, "非一字涨停": 0, "A级": 0, "B级": 0, "C级": 0, "市值缺失(未过滤)": 0,
@@ -670,7 +815,7 @@ def scan_date(date, whitelist_keys, stock_qfq_dict, basic_indexed, name_map, wee
             mv_map = {}
 
     cands = []
-    pool_fwd, a_fwd = [], []
+    pool_items, a_fwd = [], []
     breadth_up, breadth_total = 0, 0
     for ts_code in whitelist_keys:
         df_stock = stock_qfq_dict.get(ts_code)
@@ -715,7 +860,7 @@ def scan_date(date, whitelist_keys, stock_qfq_dict, basic_indexed, name_map, wee
 
         fwd = forward_metrics(ts_code, get_price_arrays(ts_code, df_stock, price_cache), pos) if with_benchmark else None
         if with_benchmark:
-            pool_fwd.append(fwd)
+            pool_items.append((ts_code, fwd, relative_strength(wa, wpos)))
 
         sig = evaluate_signal(wa, wpos)
         if not sig:
@@ -755,10 +900,15 @@ def scan_date(date, whitelist_keys, stock_qfq_dict, basic_indexed, name_map, wee
         picks['Trade_Date'] = date
 
     if with_benchmark:
+        rs_group, sec_group, secrs_group, top_names = build_strength_groups(pool_items, sector_map)
+        bench['Top_Sectors'] = top_names
         groups = {
             'Pick': picks['_fwd'].tolist() if not picks.empty else [],
             'A': a_fwd,
-            'Pool': pool_fwd,
+            'RS': rs_group,
+            'SEC': sec_group,
+            'SECRS': secrs_group,
+            'Pool': [f for _, f, _ in pool_items],
         }
         for g, items in groups.items():
             for k, v in summarize_fwd(items).items():
@@ -889,13 +1039,15 @@ with st.sidebar:
     except Exception:
         secret_token = ""
     TS_TOKEN_INPUT = st.text_input("🔑 Tushare Token", value=secret_token, type="password")
+    DOWNLOAD_WORKERS = int(st.number_input("行情下载并发线程数", value=4, min_value=1, max_value=8, step=1,
+                                           help="积分较低、频繁限流时调小"))
 
     tiers_enabled = ["A"] + (["B"] if USE_B else []) + (["C"] if USE_C else [])
     CFG = {"v": VERSION, "top_n": TOP_N, "tiers": tiers_enabled,
            "min_price": MIN_PRICE, "min_mv": MIN_MV, "max_mv": MAX_MV}
     CFG_SIG = hashlib.md5(json.dumps(CFG, sort_keys=True).encode("utf-8")).hexdigest()[:8]
-    TRADES_FILE = f"skdj_v16_{CFG_SIG}_trades.csv"
-    WEEKS_FILE = f"skdj_v16_{CFG_SIG}_weeks.csv"
+    TRADES_FILE = f"skdj_v17_{CFG_SIG}_trades.csv"
+    WEEKS_FILE = f"skdj_v17_{CFG_SIG}_weeks.csv"
 
     with st.expander("🧹 缓存与记录维护"):
         st.caption(f"当前参数组编号：{CFG_SIG}（改任何参数都会自动使用独立的回测记录）")
@@ -999,7 +1151,7 @@ def _truthy(series):
     return series.astype(str).str.strip().str.lower().isin(["true", "1", "1.0"])
 
 
-def run_backtest(pro, whitelist_keys, name_map):
+def run_backtest(pro, whitelist_keys, name_map, sector_map=None):
     trade_days, week_end_set = load_calendar(pro, backtest_date_end, BACKTEST_WEEKS * 7 + 60)
     if not trade_days:
         st.error("❌ 未获取到交易日历。")
@@ -1038,7 +1190,7 @@ def run_backtest(pro, whitelist_keys, name_map):
             continue
         picks, _, funnel, bench = scan_date(date, whitelist_keys, stock_qfq_dict, basic_indexed,
                                             name_map, weekly_cache, True, CFG,
-                                            with_benchmark=True, price_cache=price_cache)
+                                            with_benchmark=True, price_cache=price_cache, sector_map=sector_map)
         has_open = False
         if not picks.empty:
             future = [track_future_performance(r.ts_code, date, r.Signal_Close, stock_qfq_dict)
@@ -1083,7 +1235,15 @@ if st.button("🚀 开始选股" if is_picking_mode else "🚀 开始回测", ty
                 if is_picking_mode:
                     run_picking(pro_api, wl_keys, basic_name_map)
                 else:
-                    run_backtest(pro_api, wl_keys, basic_name_map)
+                    with st.spinner("正在加载申万二级行业映射（每周只下载一次）..."):
+                        sw_map = load_sw_l2_map(token_clean)
+                    covered = sum(1 for c in wl_keys if c in sw_map)
+                    if covered < len(wl_keys) * 0.5:
+                        st.warning(f"⚠️ 申万二级行业只覆盖 {covered}/{len(wl_keys)} 只，“强势板块”对照组结果不可靠"
+                                   "（可能是 Tushare 积分不足以调用行业成分接口）。")
+                    else:
+                        st.info(f"申万二级行业覆盖 {covered}/{len(wl_keys)} 只。")
+                    run_backtest(pro_api, wl_keys, basic_name_map, sw_map)
         except Exception as e:
             st.error(f"❌ 运行异常：{e}")
             with st.expander("错误详情"):
@@ -1121,56 +1281,101 @@ def _half_label(date_series):
     return s.str[:4] + np.where(pd.to_numeric(s.str[4:6], errors='coerce') <= 6, 'H1', 'H2')
 
 
-def _bench_row(g, closed_part):
-    ex = g['Pick_W12'] - g['Pool_W12']
-    ex_a = g['A_W12'] - g['Pool_W12']
-    row = {
-        '周数': len(g),
-        '宽度%': round(g['Breadth'].mean(), 0),
-        '规则出场均益%': round(closed_part['Final_Return (%)'].mean(), 2) if len(closed_part) else np.nan,
-        '入选12周%': round(g['Pick_W12'].mean(), 2),
-        'A候选12周%': round(g['A_W12'].mean(), 2),
-        '股票池12周%': round(g['Pool_W12'].mean(), 2),
-        '入选−池': round(ex.mean(), 2),
-        'A候选−池': round(ex_a.mean(), 2),
-        '入选跑赢池的周%': round((ex.dropna() > 0).mean() * 100, 0) if ex.notna().any() else np.nan,
-        '牛股率%(入选)': round(g['Pick_Big30'].mean(), 1),
-        '牛股率%(A候选)': round(g['A_Big30'].mean(), 1),
-        '牛股率%(股票池)': round(g['Pool_Big30'].mean(), 1),
-    }
-    return row
+def nw_tstat(series, lag=HOLD_WEEKS):
+    """Newey-West t 值：相邻周的 12 周持有期重叠，普通 t 值会高估显著性。"""
+    x = pd.to_numeric(series, errors='coerce').dropna().to_numpy(dtype=float)
+    n = len(x)
+    if n < 8:
+        return (float(np.mean(x)) if n else np.nan), np.nan, n
+    e = x - x.mean()
+    var = (e * e).sum() / n
+    for L in range(1, min(lag, n - 1) + 1):
+        var += 2.0 * (1.0 - L / (lag + 1.0)) * (e[L:] * e[:-L]).sum() / n
+    t = x.mean() / np.sqrt(var / n) if var > 0 else np.nan
+    return float(x.mean()), float(t), n
 
 
-def benchmark_tables(weeks_log, closed):
+def prepare_bench_weeks(weeks_log):
     if weeks_log.empty or 'Bench_Complete' not in weeks_log.columns:
-        return None, None
+        return pd.DataFrame()
     wl = weeks_log.copy()
-    for grp in ('Pick', 'A', 'Pool'):
+    for grp in [g for g, _ in BENCH_GROUPS] + ['Pool']:
         for m in BENCH_METRICS:
             col = f'{grp}_{m}'
             wl[col] = pd.to_numeric(wl[col], errors='coerce') if col in wl.columns else np.nan
-    wl['Breadth'] = pd.to_numeric(wl.get('Breadth'), errors='coerce')
-    comp = wl[_truthy(wl['Bench_Complete'])].copy()
+    wl['Breadth'] = pd.to_numeric(wl['Breadth'], errors='coerce') if 'Breadth' in wl.columns else np.nan
+    comp = wl[_truthy(wl['Bench_Complete'])].copy().sort_values('Trade_Date')
     if comp.empty:
-        return None, None
+        return comp
     comp['时期'] = _half_label(comp['Trade_Date'])
     comp['宽度分组'] = pd.cut(comp['Breadth'], [-0.1, 30, 50, 70, 100.1], labels=['<30%', '30~50%', '50~70%', '≥70%'])
+    return comp
 
-    cl = closed.copy() if closed is not None else pd.DataFrame(columns=['Trade_Date', 'Final_Return (%)'])
+
+def benchmark_report_tables(comp, closed):
+    tables = {}
+    if comp.empty:
+        return tables
+    active = [(g, label) for g, label in BENCH_GROUPS if comp[f'{g}_W12'].notna().any()]
+
+    # 1) 候选组总览
+    rows = []
+    for g, label in active:
+        ex = comp[f'{g}_W12'] - comp['Pool_W12']
+        big = comp[f'{g}_Big30'] - comp['Pool_Big30']
+        m, t, n = nw_tstat(ex)
+        bm, bt, _ = nw_tstat(big)
+        half = ex.groupby(comp['时期']).mean().dropna()
+        rows.append({
+            '候选组': label, '有效周数': n, '平均每周股数': round(comp[f'{g}_N'].mean(), 1),
+            '12周超额%': round(m, 2), 't值': round(t, 2) if pd.notna(t) else np.nan,
+            '跑赢池的半年': f"{int((half > 0).sum())}/{len(half)}",
+            '跑赢池的周%': round((ex.dropna() > 0).mean() * 100, 0) if ex.notna().any() else np.nan,
+            '牛股率差(百分点)': round(bm, 1), '牛股率差t值': round(bt, 2) if pd.notna(bt) else np.nan,
+        })
+    tables['候选组总览'] = pd.DataFrame(rows)
+
+    # 2) 分时期超额
+    cl = closed.copy() if closed is not None and len(closed) else pd.DataFrame(columns=['Trade_Date', 'Final_Return (%)'])
     cl['Trade_Date'] = cl['Trade_Date'].astype(str)
     cl = cl[cl['Trade_Date'].isin(set(comp['Trade_Date']))]
-    cl['时期'] = _half_label(cl['Trade_Date']) if len(cl) else []
+    cl['时期'] = _half_label(cl['Trade_Date']) if len(cl) else pd.Series(dtype=str)
     cl = cl.merge(comp[['Trade_Date', '宽度分组']], on='Trade_Date', how='left')
 
-    period_rows = []
-    for key, g in comp.groupby('时期', sort=True):
-        period_rows.append({'时期': key, **_bench_row(g, cl[cl['时期'] == key])})
-    period_rows.append({'时期': '全部', **_bench_row(comp, cl)})
+    def excess_rows(key_col, closed_key_col):
+        out = []
+        keys = list(comp.groupby(key_col, observed=True, sort=True).groups.keys()) + ['全部']
+        for key in keys:
+            g_df = comp if key == '全部' else comp[comp[key_col] == key]
+            c_df = cl if key == '全部' else cl[cl[closed_key_col] == key]
+            row = {key_col: str(key), '周数': len(g_df), '宽度%': round(g_df['Breadth'].mean(), 0),
+                   '股票池12周%': round(g_df['Pool_W12'].mean(), 2),
+                   '入选规则出场均益%': round(c_df['Final_Return (%)'].mean(), 2) if len(c_df) else np.nan}
+            for g, label in active:
+                row[f'{label}−池'] = round((g_df[f'{g}_W12'] - g_df['Pool_W12']).mean(), 2)
+            out.append(row)
+        return pd.DataFrame(out)
 
-    breadth_rows = []
-    for key, g in comp.groupby('宽度分组', observed=True, sort=True):
-        breadth_rows.append({'宽度分组': str(key), **_bench_row(g, cl[cl['宽度分组'] == key])})
-    return pd.DataFrame(period_rows), pd.DataFrame(breadth_rows)
+    tables['分时期_12周超额'] = excess_rows('时期', '时期')
+
+    big_rows = []
+    for key in list(comp.groupby('时期', sort=True).groups.keys()) + ['全部']:
+        g_df = comp if key == '全部' else comp[comp['时期'] == key]
+        row = {'时期': key, '股票池': round(g_df['Pool_Big30'].mean(), 1)}
+        for g, label in active:
+            row[label] = round(g_df[f'{g}_Big30'].mean(), 1)
+        big_rows.append(row)
+    tables['分时期_牛股率'] = pd.DataFrame(big_rows)
+
+    tables['按市场宽度_12周超额'] = excess_rows('宽度分组', '宽度分组')
+
+    if 'Top_Sectors' in comp.columns:
+        sec = comp[['Trade_Date', 'Breadth', 'Top_Sectors', 'Pool_W12', 'SEC_W12', 'SECRS_W12']].copy()
+        sec['板块−池'] = (sec['SEC_W12'] - sec['Pool_W12']).round(2)
+        tables['每周强势板块'] = sec.sort_values('Trade_Date', ascending=False).rename(columns={
+            'Trade_Date': '周末日期', 'Breadth': '宽度%', 'Top_Sectors': '前3强板块(12周涨幅)',
+            'Pool_W12': '股票池12周%', 'SEC_W12': '板块全部12周%', 'SECRS_W12': '板块最强2只12周%'})
+    return tables
 
 
 def group_stats(closed, key):
@@ -1190,13 +1395,27 @@ def group_stats(closed, key):
     return out
 
 
+def build_export_zip(tables, meta):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr('00_回测参数.json', json.dumps(meta, ensure_ascii=False, indent=2))
+        for i, (name, df) in enumerate(tables.items(), start=1):
+            if df is None or df.empty:
+                continue
+            zf.writestr(f'{i:02d}_{name}.csv', df.to_csv(index=False).encode('utf-8-sig'))
+    return buf.getvalue()
+
+
 if not is_picking_mode and (os.path.exists(TRADES_FILE) or os.path.exists(WEEKS_FILE)):
     st.markdown("---")
     st.header(f"📈 回测报告（参数组 {CFG_SIG}：每周{TOP_N}只，层级 {'+'.join(tiers_enabled)}）")
+    export_slot = st.container()
+    export_tables = {}
     try:
         weeks_log = _read_csv_safely(WEEKS_FILE)
         trades = _read_csv_safely(TRADES_FILE)
 
+        # ---- 空周统计
         if not weeks_log.empty:
             weeks_log['Picks'] = pd.to_numeric(weeks_log['Picks'], errors='coerce').fillna(0).astype(int)
             n_weeks = len(weeks_log)
@@ -1205,37 +1424,19 @@ if not is_picking_mode and (os.path.exists(TRADES_FILE) or os.path.exists(WEEKS_
             c1.metric("已扫描周数", n_weeks)
             c2.metric("空周数（0只）", n_empty)
             c3.metric("折合每年空周", f"{n_empty / n_weeks * 52:.1f}" if n_weeks else "-")
-
-            weeks_log['年份'] = weeks_log['Trade_Date'].astype(str).str[:4]
-            weeks_log['全A级'] = weeks_log['Pick_Tiers'].fillna("").astype(str).apply(lambda s: len(s) > 0 and set(s) == {"A"})
-            by_year = weeks_log.groupby('年份').agg(
+            wl_year = weeks_log.assign(
+                年份=weeks_log['Trade_Date'].astype(str).str[:4],
+                全A级=weeks_log['Pick_Tiers'].fillna("").astype(str).apply(lambda s: len(s) > 0 and set(s) == {"A"}),
+            )
+            by_year = wl_year.groupby('年份').agg(
                 扫描周数=('Picks', 'size'),
                 空周数=('Picks', lambda x: int((x == 0).sum())),
                 名额全为A级的周=('全A级', 'sum'),
             ).reset_index()
-            st.markdown("#### 🗓️ 按年空周统计")
-            show_df(by_year)
+            export_tables['按年空周统计'] = by_year
 
-        closed_for_bench = None
-        if not trades.empty and 'Exit_Reason' in trades.columns:
-            tmp = trades.copy()
-            tmp['Final_Return (%)'] = pd.to_numeric(tmp['Final_Return (%)'], errors='coerce')
-            tmp = tmp[~tmp['Exit_Reason'].astype(str).str.contains('剔除', na=False)]
-            closed_for_bench = tmp[tmp['Exit_Reason'].astype(str) != '持仓中']
-        period_tbl, breadth_tbl = benchmark_tables(weeks_log, closed_for_bench)
-        if period_tbl is not None:
-            st.markdown("#### 🧪 同周对照：分时期（只含已满12周的周，每周等权）")
-            st.caption(
-                "“12周%”=次日开盘买入、不设止损、持有60个交易日的平均收益；牛股率=60个交易日内最高涨幅≥30%的比例。"
-                "三组使用同一套开盘剔除规则。怎么读：入选≈A候选 → 评分排序没有价值；A候选≈股票池 → SKDJ信号本身没有超额，"
-                "赚亏主要来自行情；只有“A候选−池”在多数时期都为正，才说明信号真的有用。"
-            )
-            show_df(period_tbl)
-            if breadth_tbl is not None and not breadth_tbl.empty:
-                st.markdown("#### 🌡️ 同周对照：按市场宽度分组")
-                st.caption("宽度=过筛股票中周收盘站上20周线的比例，分组边界固定为30/50/70，不做优化。只用于观察行情依赖，不参与选股。")
-                show_df(breadth_tbl)
-
+        # ---- 交易数据准备
+        closed, executed, excluded = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
         if not trades.empty and 'Exit_Reason' in trades.columns:
             trades['Final_Return (%)'] = pd.to_numeric(trades['Final_Return (%)'], errors='coerce')
             if 'Tier' not in trades.columns:
@@ -1244,62 +1445,109 @@ if not is_picking_mode and (os.path.exists(TRADES_FILE) or os.path.exists(WEEKS_
             executed = trades[~trades.index.isin(excluded.index)].copy()
             closed = executed[executed['Exit_Reason'].astype(str) != '持仓中'].copy()
 
-            st.markdown("#### 💼 交易总览（已出场）")
+        # ---- 对照组
+        comp = prepare_bench_weeks(weeks_log)
+        bench_tables = benchmark_report_tables(comp, closed)
+        if bench_tables:
+            st.markdown("#### 🧪 候选组总览（与同周股票池对照，只含已满12周的周）")
+            st.caption(
+                "12周超额=该组次日开盘买入、不设止损持有60个交易日的平均收益减去同周股票池；每周等权。"
+                "t值已修正持有期重叠，绝对值≥2 才算显著。一个方向值得继续，至少要：超额为正、t值≥2、"
+                "多数半年跑赢池子（包括 2022~2024 年），牛股率差也不为负。"
+            )
+            show_df(bench_tables['候选组总览'])
+            st.markdown("#### 🗓️ 分时期：12周超额（相对股票池）")
+            show_df(bench_tables['分时期_12周超额'])
+            st.markdown("#### 🐂 分时期：牛股率%（60个交易日内最高涨幅≥30%的比例）")
+            show_df(bench_tables['分时期_牛股率'])
+            st.markdown("#### 🌡️ 按市场宽度：12周超额")
+            st.caption("宽度=过筛股票中周收盘站上20周线的比例，分组边界固定为30/50/70。")
+            show_df(bench_tables['按市场宽度_12周超额'])
+            if '每周强势板块' in bench_tables:
+                with st.expander("查看每周前3强板块"):
+                    show_df(bench_tables['每周强势板块'])
+            export_tables.update(bench_tables)
+
+        if '按年空周统计' in export_tables:
+            st.markdown("#### 🗓️ 按年空周统计（SKDJ 入选）")
+            show_df(export_tables['按年空周统计'])
+
+        # ---- SKDJ 入选交易（规则出场）
+        if not trades.empty and 'Exit_Reason' in trades.columns:
+            st.markdown("#### 💼 SKDJ 入选交易总览（规则出场，已出场）")
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("已出场笔数", len(closed))
+            summary = {'已出场笔数': len(closed), '开盘剔除': len(excluded), '持仓中': len(executed) - len(closed)}
             if len(closed):
-                c2.metric("胜率", f"{(closed['Final_Return (%)'] > 0).mean() * 100:.1f}%")
-                c3.metric("平均单笔收益", f"{closed['Final_Return (%)'].mean():.2f}%")
+                win = (closed['Final_Return (%)'] > 0).mean() * 100
+                avg = closed['Final_Return (%)'].mean()
+                c2.metric("胜率", f"{win:.1f}%")
+                c3.metric("平均单笔收益", f"{avg:.2f}%")
+                summary.update({'胜率%': round(win, 1), '平均单笔收益%': round(avg, 2)})
             c4.metric("开盘剔除 / 持仓中", f"{len(excluded)} / {len(executed) - len(closed)}")
+            export_tables['交易总览'] = pd.DataFrame([summary])
 
             if len(closed):
-                st.markdown("#### 🧱 分层级统计（判断补位层级是否拖后腿）")
                 tier_tbl = group_stats(closed, 'Tier')
                 tier_tbl['Tier'] = tier_tbl['Tier'].map(TIER_LABEL).fillna(tier_tbl['Tier'])
-                show_df(tier_tbl.rename(columns={'Tier': '层级'}))
-
-                st.markdown("#### 🏅 按排名统计")
-                show_df(group_stats(closed, 'Rank').rename(columns={'Rank': '排名'}))
-
-                st.markdown("#### 🚪 出场原因分布")
+                tier_tbl = tier_tbl.rename(columns={'Tier': '层级'})
+                rank_tbl = group_stats(closed, 'Rank').rename(columns={'Rank': '排名'})
                 reasons = closed['Exit_Reason'].astype(str).str.replace(r'\(.*\)', '', regex=True)
-                show_df(reasons.value_counts().rename_axis('出场原因').reset_index(name='笔数'))
+                reason_tbl = reasons.value_counts().rename_axis('出场原因').reset_index(name='笔数')
+                st.markdown("#### 🧱 分层级统计")
+                show_df(tier_tbl)
+                st.markdown("#### 🏅 按排名统计")
+                show_df(rank_tbl)
+                st.markdown("#### 🚪 出场原因分布")
+                show_df(reason_tbl)
+                export_tables.update({'分层级统计': tier_tbl, '按排名统计': rank_tbl, '出场原因分布': reason_tbl})
 
             st.markdown("#### 📅 W1~W12 全样本收益（已出场按出场收益计入）")
-            st.caption("V14.5 的周度表只统计仍在持有的股票，首周被截断的亏损单不再计入后面几周，胜率会被高估。本表修正了这一点；“样本数”下降只代表最近的信号还没走到那一周。")
             wtbl = weekly_full_sample_table(executed)
             if not wtbl.empty:
                 show_df(wtbl)
+                export_tables['W1-W12全样本收益'] = wtbl
 
+        # ---- 明细
         if not weeks_log.empty:
-            st.markdown("#### 🗂️ 每周扫描明细")
-            wl_disp = weeks_log.sort_values('Trade_Date', ascending=False)[
-                ['Trade_Date', 'A_Count', 'B_Count', 'C_Count', 'Picks', 'Pick_Tiers', 'Pick_Names']
-            ].rename(columns={'Trade_Date': '周末日期', 'A_Count': 'A级候选', 'B_Count': 'B级候选',
-                              'C_Count': 'C级候选', 'Picks': '入选数', 'Pick_Tiers': '入选层级', 'Pick_Names': '入选股票'})
-            show_df(wl_disp)
+            with st.expander("🗂️ 每周扫描明细"):
+                wl_disp = weeks_log.sort_values('Trade_Date', ascending=False)[
+                    ['Trade_Date', 'A_Count', 'B_Count', 'C_Count', 'Picks', 'Pick_Tiers', 'Pick_Names']
+                ].rename(columns={'Trade_Date': '周末日期', 'A_Count': 'A级候选', 'B_Count': 'B级候选',
+                                  'C_Count': 'C级候选', 'Picks': '入选数', 'Pick_Tiers': '入选层级', 'Pick_Names': '入选股票'})
+                show_df(wl_disp)
+            export_tables['每周明细_原始数据'] = weeks_log
 
         if not trades.empty:
-            st.markdown("#### 📋 交割流水")
-            disp_cols = ['Trade_Date', 'Rank', 'Tier_Label', 'name', 'ts_code', 'Total_Score', 'SKDJ_K',
-                         'Close_Raw', 'Buy_Price', 'Gap_pct (%)', 'Exit_Date', 'Hold_Days', 'Exit_Reason', 'Final_Return (%)',
-                         'Fwd_W12 (%)', 'Fwd_MaxGain (%)', 'Fwd_MaxDD (%)']
-            disp_cols = [c for c in disp_cols if c in trades.columns]
-            show_df(trades[disp_cols].sort_values(['Trade_Date', 'Rank'], ascending=[False, True]))
-            st.download_button(
-                label="📥 导出回测流水 (CSV)",
-                data=trades.to_csv(index=False).encode('utf-8-sig'),
-                file_name=f"skdj_v16_{CFG_SIG}_trades.csv",
-                mime="text/csv",
-                key="download_v16_trades",
-            )
-        if not weeks_log.empty:
-            st.download_button(
-                label="📥 导出每周对照明细 (CSV)",
-                data=weeks_log.to_csv(index=False).encode('utf-8-sig'),
-                file_name=f"skdj_v16_{CFG_SIG}_weeks.csv",
-                mime="text/csv",
-                key="download_v16_weeks",
-            )
+            with st.expander("📋 交割流水"):
+                disp_cols = ['Trade_Date', 'Rank', 'Tier_Label', 'name', 'ts_code', 'Total_Score', 'SKDJ_K',
+                             'Close_Raw', 'Buy_Price', 'Gap_pct (%)', 'Exit_Date', 'Hold_Days', 'Exit_Reason', 'Final_Return (%)',
+                             'Fwd_W12 (%)', 'Fwd_MaxGain (%)', 'Fwd_MaxDD (%)']
+                disp_cols = [c for c in disp_cols if c in trades.columns]
+                show_df(trades[disp_cols].sort_values(['Trade_Date', 'Rank'], ascending=[False, True]))
+            export_tables['交割流水_原始数据'] = trades
+
     except Exception as report_error:
-        st.warning(f"回测记录已保留，但报告暂时无法显示：{report_error}")
+        st.warning(f"回测记录已保留，但部分报告暂时无法显示：{report_error}")
+
+    if export_tables:
+        meta = {
+            '版本': VERSION, '参数组': CFG_SIG, '导出时间': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            '回测截止日期': backtest_date_end.strftime('%Y-%m-%d'), '回测周数设置': BACKTEST_WEEKS,
+            '每周选股数': TOP_N, '启用层级': tiers_enabled, '最低股价': MIN_PRICE,
+            '流通市值范围(亿)': [MIN_MV, MAX_MV],
+            '对照组定义': {
+                '强势股前10%': f'截至上周的{RS_LOOKBACK_WEEKS}周涨幅排名前{RS_TOP_PCT:.0f}%（跳过最近一周）',
+                '强势板块': f'申万二级、组内≥{SECTOR_MIN_MEMBERS}只、成分股{RS_LOOKBACK_WEEKS}周涨幅均值前{SECTOR_TOP_K}',
+                '板块内强势股': f'前{SECTOR_TOP_K}强板块各取{RS_LOOKBACK_WEEKS}周涨幅最高{SECTOR_STOCKS_EACH}只',
+                '固定持有': '次日开盘买入，不设止损，持有60个交易日；三组使用同一套开盘剔除规则',
+            },
+        }
+        export_slot.download_button(
+            label="📦 一键导出全部回测结果 (ZIP)",
+            data=build_export_zip(export_tables, meta),
+            file_name=f"skdj_{VERSION}_{CFG_SIG}_回测结果_{datetime.now().strftime('%Y%m%d_%H%M')}.zip",
+            mime="application/zip",
+            key="download_all_zip",
+            type="primary",
+        )
