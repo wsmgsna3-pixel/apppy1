@@ -1,7 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-周线 SKDJ 分级补位选股系统 (V22)
+周线 SKDJ 分级补位选股系统 (V23)
 ------------------------------------------------
+V23 新增（原有回测、板块跟踪全部不变）：
+1. 【止损止盈实战回测】新模式“🎯 止损止盈实战回测”。每周选 3 只，触发止损或止盈即卖出，
+   持有时间不固定（最长 60 个交易日）。同时比较：
+   - 选股：SKDJ 超跌上穿（A级前3） / 前3强板块各自最强 1 只 / 随机对照（同一股票池随机 15 只）
+   - 买入：次日直接买 / 等“MACD柱回升且站上5日线” / 等“日线SKDJ金叉”（最多等5个交易日）
+   - 止损：-8% / -10%（盘中触及即卖，跳空按开盘价）
+   - 止盈：涨超20%后回落到+10%卖 / 涨超10%后回撤一半利润卖
+2. 报告：选定止损止盈后的 9 组对比、比随机多赚多少及可靠程度、抓大牛股情况、
+   分段与逐年表现；全部 36 种组合明细；一键导出 ZIP。
+
 V22 新增（板块跟踪规则不变，已记录的跟踪数据继续有效）：
 1. 【板块内选股方法对比】回测中，在每周前3强申万二级板块里，按 7 种事先固定的方法
    各挑 2 只，与“前3强板块全部成分”（相当于在板块里随机挑）同周对照：
@@ -112,7 +122,7 @@ except ImportError:
 
 warnings.filterwarnings("ignore")
 
-VERSION = "V22"
+VERSION = "V23"
 LOGIC_VERSION = "V22"   # 选股/回测逻辑版本，决定参数组编号与记录文件名
 
 SKDJ_N, SKDJ_M = 6, 3
@@ -158,8 +168,8 @@ BENCH_GROUPS = [
 TIER_ORDER = {"A": 0, "B": 1, "C": 2}
 TIER_LABEL = {"A": "A 标准上穿25", "B": "B 低位金叉", "C": "C 趋势回踩金叉"}
 
-st.set_page_config(page_title="板块动量跟踪 · SKDJ 回测系统 V22", layout="wide")
-st.title("🔬 板块动量跟踪 · SKDJ 回测系统 (V22)")
+st.set_page_config(page_title="周线选股 · 实战规则回测 V23", layout="wide")
+st.title("🔬 周线选股 · 止损止盈实战回测 (V23)")
 st.markdown("板块动量前瞻跟踪 · 同周对照回测 · 四路并发下载 · 一键导出 · 缓存备份")
 
 
@@ -914,6 +924,7 @@ def build_cache_backup_zip():
             zf.write(_year_path(y), arcname=f"market_store/{y}.npz")
         for fn in sorted(os.listdir(".")):
             if re.fullmatch(r"skdj_v(1[5-9]|2[0-9])_[0-9a-f]{8}_(trades|weeks)\.csv", fn) or \
+                    re.fullmatch(r"skdj_rules_v2[0-9]_[0-9a-f]{8}_(trades|weeks)\.csv", fn) or \
                     re.fullmatch(r"skdj_track_(weeks|stocks|pool)\.csv", fn):
                 zf.write(fn, arcname=f"records/{fn}")
     return buf.getvalue()
@@ -950,7 +961,7 @@ def restore_cache_backup(file_bytes):
                     os.remove(tmp_path)
                     skipped.append(f"{year}(本地更全)")
                 continue
-            m = re.fullmatch(r"records/(skdj_v(?:1[5-9]|2[0-9])_[0-9a-f]{8}_(?:trades|weeks)\.csv|skdj_track_(?:weeks|stocks|pool)\.csv)", name)
+            m = re.fullmatch(r"records/(skdj_v(?:1[5-9]|2[0-9])_[0-9a-f]{8}_(?:trades|weeks)\.csv|skdj_rules_v2[0-9]_[0-9a-f]{8}_(?:trades|weeks)\.csv|skdj_track_(?:weeks|stocks|pool)\.csv)", name)
             if m and not os.path.exists(m.group(1)):
                 with open(m.group(1), "wb") as fh:
                     fh.write(zf.read(name))
@@ -1614,11 +1625,175 @@ def settle_week(date, stock_codes, top2_codes, pool_codes, market):
 
 
 # ---------------------------
+# 止损止盈实战回测（V23）：每周选3只，按止损/止盈触发即卖，持有时间不固定
+# ---------------------------
+RULES_VERSION = "V23"
+RULES_PICKS = 3
+RULES_RANDOM_N = 15
+RULES_MAX_HOLD = 60
+RULES_WAIT_DAYS = 5
+DAILY_SKDJ_N, DAILY_SKDJ_M = 9, 3
+RULES_SELECTIONS = [("SKDJ", "SKDJ超跌上穿"), ("STRONG", "强势板块最强股"), ("RANDOM", "随机对照")]
+RULES_ENTRIES = [("NEXT", "次日直接买"), ("MACD5", "等MACD柱回升且站上5日线"), ("KDJX", "等日线SKDJ金叉")]
+RULES_STOPS = [8, 10]
+RULES_TPS = [("A", "涨超20%后回落到+10%卖"), ("B", "涨超10%后回撤一半利润卖")]
+BIG_BULL_PCT = 50.0
+
+
+def daily_indicators(ts_code, s, cache):
+    """日线 MACD(12,26,9) 柱、5日均线、日线 SKDJ(9,3)。只用过去数据。"""
+    ind = cache.get(ts_code)
+    if ind is None:
+        close, high, low = pd.Series(s.close), pd.Series(s.high), pd.Series(s.low)
+        diff = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
+        dea = diff.ewm(span=9, adjust=False).mean()
+        lowv = low.rolling(DAILY_SKDJ_N).min()
+        highv = high.rolling(DAILY_SKDJ_N).max()
+        rng = (highv - lowv).replace(0, 0.001)
+        rsv = ((close - lowv) / rng * 100).ewm(span=DAILY_SKDJ_M, adjust=False).mean()
+        k = rsv.ewm(span=DAILY_SKDJ_M, adjust=False).mean()
+        d = k.rolling(DAILY_SKDJ_M).mean()
+        ind = {'bar': (diff - dea).to_numpy(dtype=float), 'ma5': close.rolling(5).mean().to_numpy(dtype=float),
+               'k': k.to_numpy(dtype=float), 'd': d.to_numpy(dtype=float)}
+        cache[ts_code] = ind
+    return ind
+
+
+def find_entry(ts_code, s, pos, mode, ind):
+    """返回买入信息。等待类：信号日及之后共5个交易日内，某天收盘满足条件 → 次日开盘买入。"""
+    n = len(s)
+    if mode == "NEXT":
+        cond = pos
+    else:
+        cond = None
+        for t in range(pos, pos + RULES_WAIT_DAYS):
+            if t >= n:
+                return {'status': '待定'}
+            if t < 1:
+                continue
+            if mode == "MACD5":
+                b0, b1, ma5 = ind['bar'][t - 1], ind['bar'][t], ind['ma5'][t]
+                ok = np.isfinite(b0) and np.isfinite(b1) and np.isfinite(ma5) and b1 > b0 and s.close[t] > ma5
+            else:
+                k0, d0, k1, d1 = ind['k'][t - 1], ind['d'][t - 1], ind['k'][t], ind['d'][t]
+                ok = np.isfinite([k0, d0, k1, d1]).all() and k0 <= d0 and k1 > d1
+            if ok:
+                cond = t
+                break
+        if cond is None:
+            return {'status': '未等到'}
+    b = cond + 1
+    if b >= n:
+        return {'status': '待定'}
+    reason, _ = entry_block_reason(ts_code, s.open[b], s.high[b], s.low[b], s.close[cond])
+    if reason:
+        return {'status': '开盘剔除'}
+    return {'status': '已买入', 'b': b, 'wait': cond - pos}
+
+
+def simulate_exit(s, b, stop_pct, tp_mode):
+    """
+    买入日 b 开盘价买入；T+1 起可卖。止损：盘中最低价触及止损价即卖（跳空低开按开盘价）。
+    止盈A：此前最高涨幅≥20%后，价格回落到+10%即卖；止盈B：此前最高涨幅≥10%后，回落到“最高涨幅的一半”即卖。
+    同一天同时触及时按止盈（下跌途中先碰到较高的止盈价）。60个交易日未触发按收盘价卖出。
+    """
+    n = len(s)
+    end = min(n, b + RULES_MAX_HOLD)
+    o, h, l, c = s.open[b:end], s.high[b:end], s.low[b:end], s.close[b:end]
+    m = len(o)
+    e = float(o[0])
+    prior_peak = np.r_[np.nan, np.maximum.accumulate(h)[:-1]]
+    stop_px = e * (1.0 - stop_pct / 100.0)
+    stop_hit = l <= stop_px
+    stop_hit[0] = False
+    with np.errstate(invalid='ignore'):
+        if tp_mode == "A":
+            tp_px = np.full(m, e * 1.10)
+            active = prior_peak >= e * 1.20
+        else:
+            gain = prior_peak / e - 1.0
+            tp_px = e * (1.0 + gain / 2.0)
+            active = gain >= 0.10
+        tp_hit = active & (l <= tp_px)
+    tp_hit[0] = False
+    j_stop = int(np.argmax(stop_hit)) if stop_hit.any() else None
+    j_tp = int(np.argmax(tp_hit)) if tp_hit.any() else None
+    max_gain = (float(np.nanmax(h)) / e - 1.0) * 100.0 if m >= RULES_MAX_HOLD else np.nan
+    if j_stop is None and j_tp is None:
+        if m >= RULES_MAX_HOLD:
+            return {'exit': '到期', 'ret': (float(c[m - 1]) / e - 1.0) * 100.0, 'days': m, 'max_gain': max_gain}
+        return {'exit': '持有中', 'ret': np.nan, 'days': m, 'max_gain': max_gain}
+    if j_tp is not None and (j_stop is None or j_tp <= j_stop):
+        px = min(float(o[j_tp]), float(tp_px[j_tp]))
+        return {'exit': '止盈', 'ret': (px / e - 1.0) * 100.0, 'days': j_tp + 1, 'max_gain': max_gain}
+    px = min(float(o[j_stop]), stop_px)
+    return {'exit': '止损', 'ret': (px / e - 1.0) * 100.0, 'days': j_stop + 1, 'max_gain': max_gain}
+
+
+def rules_scan(date, whitelist_keys, market, weekly_cache, sector_map, cfg):
+    """同一个股票池里给出三组候选：SKDJ A级前3、前3强板块各自最强1只、随机15只（按日期固定种子）。"""
+    date_int = int(date)
+    funnel = new_funnel(len(whitelist_keys))
+    pool, skdj = [], []
+    for ts_code, s, pos, close_raw, circ_mv in iter_pool(date_int, whitelist_keys, market, cfg, funnel):
+        wa, wpos = get_weekly_view(ts_code, date_int, s, pos, weekly_cache, True)
+        pool.append((ts_code, relative_strength(wa, wpos)))
+        sig = evaluate_signal(wa, wpos)
+        if sig and sig['tier'] == "A":
+            skdj.append((ts_code, sig['score']))
+    picks = {'SKDJ': [c for c, _ in sorted(skdj, key=lambda x: -x[1])[:RULES_PICKS]]}
+    top, in_top = rank_sectors([(c, r) for c, r in pool if np.isfinite(r)], sector_map)
+    picks['STRONG'] = ([] if top is None else
+                       in_top.sort_values('rs', ascending=False).groupby('l2', sort=False).head(1)['code'].tolist())
+    codes = [c for c, _ in pool]
+    rng = np.random.default_rng(date_int)
+    picks['RANDOM'] = [str(c) for c in rng.choice(codes, size=min(RULES_RANDOM_N, len(codes)), replace=False)] if codes else []
+    return picks, len(pool)
+
+
+def rules_trade_rows(date, picks, market, name_map, ind_cache):
+    rows, complete = [], True
+    date_int = int(date)
+    for sel, _ in RULES_SELECTIONS:
+        for rank, code in enumerate(picks.get(sel, []), start=1):
+            s = market.stocks.get(code)
+            pos = s.pos(date_int) if s is not None else -1
+            if pos < 0:
+                continue
+            row = {'Trade_Date': str(date), 'Selection': sel, 'Rank': rank, 'ts_code': code,
+                   'name': name_map.get(code, code), 'Signal_Close_Raw': round(float(s.close_raw[pos]), 2)}
+            ind = daily_indicators(code, s, ind_cache)
+            for ek, _ in RULES_ENTRIES:
+                ent = find_entry(code, s, pos, ek, ind)
+                row[f'{ek}_Status'] = ent['status']
+                if ent['status'] == '待定':
+                    complete = False
+                if ent['status'] != '已买入':
+                    continue
+                b = ent['b']
+                row[f'{ek}_BuyDate'] = str(int(s.dates[b]))
+                row[f'{ek}_Wait'] = ent['wait']
+                for stop in RULES_STOPS:
+                    for tk, _ in RULES_TPS:
+                        r = simulate_exit(s, b, stop, tk)
+                        key = f'{ek}_L{stop}_{tk}'
+                        row[f'{key}_Exit'] = r['exit']
+                        row[f'{key}_Ret'] = round(r['ret'], 3) if np.isfinite(r['ret']) else np.nan
+                        row[f'{key}_Days'] = r['days']
+                        if r['exit'] == '持有中':
+                            complete = False
+                        row[f'{ek}_MaxGain60'] = round(r['max_gain'], 2) if np.isfinite(r['max_gain']) else np.nan
+            rows.append(row)
+    return pd.DataFrame(rows), complete
+
+
+# ---------------------------
 # 侧边栏
 # ---------------------------
 with st.sidebar:
     st.header("⚙️ 设置")
-    MODE = st.radio("运行模式", ["🧭 板块动量跟踪", "📌 SKDJ今日选股", "📊 历史回测"], index=0)
+    MODE = st.radio("运行模式", ["🎯 止损止盈实战回测", "🧭 板块动量跟踪", "📌 SKDJ今日选股", "📊 历史回测"], index=0)
+    is_rules_mode = MODE.startswith("🎯")
     is_tracking_mode = MODE.startswith("🧭")
     is_picking_mode = MODE.startswith("📌")
     is_backtest_mode = MODE.startswith("📊")
@@ -1633,7 +1808,10 @@ with st.sidebar:
         backtest_date_end = st.date_input("选股日期（默认今天）", value=datetime.now().date())
         BACKTEST_WEEKS = 0
     else:
-        BACKTEST_WEEKS = int(st.number_input("回测周数（52≈1年）", value=52, min_value=4, max_value=520, step=4))
+        if is_rules_mode:
+            st.caption("每周选3只，触发止损或止盈即卖出，最长持有60个交易日。"
+                       "三种选股 × 三种买入时机 × 两种止损 × 两种止盈同时回测。")
+        BACKTEST_WEEKS = int(st.number_input("回测周数（52≈1年）", value=52, min_value=4, max_value=700, step=4))
         backtest_date_end = st.date_input("回测截止日期", value=datetime.now().date())
         st.caption("报告区间（只影响下方报告显示，不影响回测扫描）")
         REPORT_START = st.date_input("报告起始日期", value=datetime(2015, 1, 1).date())
@@ -1644,13 +1822,16 @@ with st.sidebar:
         TOP_N, USE_B, USE_C = 3, True, True
         MIN_PRICE, MIN_MV, MAX_MV = TRACK_CFG["min_price"], TRACK_CFG["min_mv"], TRACK_CFG["max_mv"]
     else:
-        TOP_N = int(st.number_input("每周选股数量", value=3, min_value=1, max_value=10, step=1))
+        if is_rules_mode:
+            TOP_N, USE_B, USE_C = RULES_PICKS, False, False
+        else:
+            TOP_N = int(st.number_input("每周选股数量", value=3, min_value=1, max_value=10, step=1))
 
-        st.markdown("---")
-        st.subheader("补位层级")
-        st.caption("A 级（周K上穿25）始终启用。A 级不足名额时，依次用 B、C 补位。")
-        USE_B = st.checkbox("B 低位金叉（K≤30 时 K 上穿 D）", value=True)
-        USE_C = st.checkbox("C 趋势回踩金叉（强势股回调后周线再金叉）", value=True)
+            st.markdown("---")
+            st.subheader("补位层级")
+            st.caption("A 级（周K上穿25）始终启用。A 级不足名额时，依次用 B、C 补位。")
+            USE_B = st.checkbox("B 低位金叉（K≤30 时 K 上穿 D）", value=True)
+            USE_C = st.checkbox("C 趋势回踩金叉（强势股回调后周线再金叉）", value=True)
 
         st.markdown("---")
         st.subheader("💰 股票池门槛")
@@ -1673,13 +1854,17 @@ with st.sidebar:
     CFG = {"v": LOGIC_VERSION, "top_n": TOP_N, "tiers": tiers_enabled,
            "min_price": MIN_PRICE, "min_mv": MIN_MV, "max_mv": MAX_MV}
     CFG_SIG = hashlib.md5(json.dumps(CFG, sort_keys=True).encode("utf-8")).hexdigest()[:8]
+    RULES_CFG = {"v": RULES_VERSION, "min_price": MIN_PRICE, "min_mv": MIN_MV, "max_mv": MAX_MV}
+    RULES_SIG = hashlib.md5(json.dumps(RULES_CFG, sort_keys=True).encode("utf-8")).hexdigest()[:8]
+    RULES_TRADES_FILE = f"skdj_rules_v23_{RULES_SIG}_trades.csv"
+    RULES_WEEKS_FILE = f"skdj_rules_v23_{RULES_SIG}_weeks.csv"
     TRADES_FILE = f"skdj_v22_{CFG_SIG}_trades.csv"
     WEEKS_FILE = f"skdj_v22_{CFG_SIG}_weeks.csv"
 
     with st.expander("🧹 缓存与记录维护"):
         st.caption(f"当前参数组编号：{CFG_SIG}（改任何参数都会自动使用独立的回测记录）")
         if st.button("清除【当前参数组】回测记录"):
-            for p in (TRADES_FILE, WEEKS_FILE):
+            for p in ((RULES_TRADES_FILE, RULES_WEEKS_FILE) if is_rules_mode else (TRADES_FILE, WEEKS_FILE)):
                 for suffix in ("", ".bak", ".lock"):
                     if os.path.exists(p + suffix):
                         os.remove(p + suffix)
@@ -1874,6 +2059,53 @@ def run_backtest(pro, whitelist_keys, name_map, sector_map=None):
     st.success("🎉 回测更新完毕，请查看下方报告。")
 
 
+def run_rules_backtest(pro, whitelist_keys, name_map, sector_map):
+    trade_days, week_end_set = load_calendar(pro, backtest_date_end, BACKTEST_WEEKS * 7 + 60)
+    if not trade_days:
+        st.error("❌ 未获取到交易日历。")
+        return
+    trade_day_set = set(trade_days)
+    week_ends = sorted(d for d in week_end_set if d in trade_day_set)
+    target_dates = week_ends[-BACKTEST_WEEKS:]
+    weeks_log = _read_csv_safely(RULES_WEEKS_FILE)
+    settled = set()
+    if not weeks_log.empty and 'Complete' in weeks_log.columns:
+        settled = set(weeks_log.loc[_truthy(weeks_log['Complete']), 'Trade_Date'].astype(str))
+    dates_to_run = [d for d in target_dates if d not in settled]
+    if not dates_to_run:
+        st.success("🎉 该区间已全部回测并结算完毕。")
+        return
+    st.info(f"本次扫描 {len(dates_to_run)} 周（含尚未全部卖出、需要重新结算的周）。")
+
+    today_str = datetime.now().strftime("%Y%m%d")
+    fetch_start = (datetime.strptime(min(dates_to_run), "%Y%m%d") - timedelta(days=300)).strftime("%Y%m%d")
+    fetch_end = min(today_str, (datetime.strptime(max(dates_to_run), "%Y%m%d") + timedelta(days=130)).strftime("%Y%m%d"))
+    market = load_optimized_market_data(fetch_start, fetch_end, token_clean, whitelist_keys)
+    if not market:
+        st.warning("⚠️ 未能加载到行情数据，请重试。")
+        return
+
+    cfg = {"min_price": MIN_PRICE, "min_mv": MIN_MV, "max_mv": MAX_MV}
+    weekly_cache, ind_cache = {}, {}
+    skipped = 0
+    bar = st.progress(0, text="实战回测中...")
+    for i, date in enumerate(dates_to_run):
+        if not market.has_date(date):
+            skipped += 1
+            continue
+        picks, pool_n = rules_scan(date, whitelist_keys, market, weekly_cache, sector_map, cfg)
+        rows, complete = rules_trade_rows(date, picks, market, name_map, ind_cache)
+        _replace_date_rows(RULES_TRADES_FILE, date, rows, ["Trade_Date", "Selection", "Rank"])
+        week_row = {'Trade_Date': date, 'Pool_N': pool_n, 'Complete': bool(complete),
+                    **{f'{sel}_N': len(picks.get(sel, [])) for sel, _ in RULES_SELECTIONS}}
+        _replace_date_rows(RULES_WEEKS_FILE, date, pd.DataFrame([week_row]), ["Trade_Date"])
+        bar.progress((i + 1) / len(dates_to_run), text=f"扫描 {date}：SKDJ {len(picks['SKDJ'])} 只 / 强势 {len(picks['STRONG'])} 只")
+    bar.empty()
+    if skipped:
+        st.warning(f"有 {skipped} 个周末交易日缺少行情数据被跳过，下次运行会自动补扫。")
+    st.success("🎉 实战回测更新完毕，请查看下方报告。")
+
+
 def _bj_now():
     return datetime.now(timezone(timedelta(hours=8)))
 
@@ -1991,7 +2223,7 @@ def run_tracking(pro, whitelist_keys, name_map, sector_map):
         st.session_state.pop('track_preview', None)
 
 
-if st.button({"🧭": "🚀 更新板块跟踪", "📌": "🚀 开始选股", "📊": "🚀 开始回测"}[MODE[:1]], type="primary"):
+if st.button({"🎯": "🚀 开始实战回测", "🧭": "🚀 更新板块跟踪", "📌": "🚀 开始选股", "📊": "🚀 开始回测"}[MODE[:1]], type="primary"):
     is_valid, msg = verify_token_connection(token_clean)
     if not is_valid:
         st.error(f"❌ Token 预检失败：{msg}")
@@ -2018,7 +2250,9 @@ if st.button({"🧭": "🚀 更新板块跟踪", "📌": "🚀 开始选股", "�
                                    "（可能是 Tushare 积分不足以调用行业成分接口）。")
                     else:
                         st.info(f"申万二级行业覆盖 {covered}/{len(wl_keys)} 只。")
-                    if is_tracking_mode:
+                    if is_rules_mode:
+                        run_rules_backtest(pro_api, wl_keys, basic_name_map, sw_map)
+                    elif is_tracking_mode:
                         run_tracking(pro_api, wl_keys, basic_name_map, sw_map)
                     else:
                         run_backtest(pro_api, wl_keys, basic_name_map, sw_map)
@@ -2500,3 +2734,161 @@ if is_tracking_mode:
             file_name=f"skdj_track_{_bj_now().strftime('%Y%m%d_%H%M')}.zip",
             mime="application/zip", key="download_track_zip", type="primary",
         )
+
+
+# ---------------------------
+# 止损止盈实战回测报告
+# ---------------------------
+def rules_combo_stats(trades, sel, ek, key, random_week_means=None, split=None):
+    g = trades[trades['Selection'] == sel]
+    st_col = f'{ek}_Status'
+    if g.empty or st_col not in g.columns:
+        return None
+    decided = g[g[st_col].isin(['已买入', '未等到', '开盘剔除'])]
+    bought = g[g[st_col] == '已买入']
+    ret_col, exit_col, day_col = f'{key}_Ret', f'{key}_Exit', f'{key}_Days'
+    if ret_col not in g.columns:
+        return None
+    closed = bought[bought[exit_col].isin(['止损', '止盈', '到期'])].copy()
+    closed[ret_col] = pd.to_numeric(closed[ret_col], errors='coerce')
+    r = closed[ret_col].dropna()
+    row = {'笔数': len(r), '放弃率%': round((1 - len(bought) / len(decided)) * 100, 1) if len(decided) else np.nan}
+    if len(r) == 0:
+        return row
+    wins, losses = r[r > 0], r[r <= 0]
+    row.update({
+        '胜率%': round((r > 0).mean() * 100, 1),
+        '平均每笔%': round(r.mean(), 2),
+        '中位%': round(r.median(), 2),
+        '盈亏比': round(wins.mean() / abs(losses.mean()), 2) if len(wins) and len(losses) and losses.mean() != 0 else np.nan,
+        '平均持有天': round(pd.to_numeric(closed[day_col], errors='coerce').mean(), 1),
+        '止损出场%': round((closed[exit_col] == '止损').mean() * 100, 1),
+        '止盈出场%': round((closed[exit_col] == '止盈').mean() * 100, 1),
+        '到期出场%': round((closed[exit_col] == '到期').mean() * 100, 1),
+    })
+    mg = pd.to_numeric(closed.get(f'{ek}_MaxGain60'), errors='coerce')
+    bull = closed[mg >= BIG_BULL_PCT]
+    row.update({
+        '曾涨≥50%占比%': round(len(bull) / len(closed) * 100, 1) if len(closed) else np.nan,
+        '这些牛股实际拿到%': round(pd.to_numeric(bull[ret_col], errors='coerce').mean(), 1) if len(bull) else np.nan,
+        '牛股被止损%': round((bull[exit_col] == '止损').mean() * 100, 0) if len(bull) else np.nan,
+    })
+    if random_week_means is not None and sel != 'RANDOM':
+        wk = closed.groupby('Trade_Date')[ret_col].mean()
+        diff = (wk - random_week_means.reindex(wk.index)).dropna()
+        m, t, n = nw_tstat(diff, lag=12) if len(diff) else (np.nan, np.nan, 0)
+        row['比随机多赚(每笔)%'] = round(m, 2) if pd.notna(m) else np.nan
+        row['可靠程度t值'] = round(t, 2) if pd.notna(t) else np.nan
+        if split is not None and len(diff):
+            idx = diff.index.astype(str)
+            row['分界前多赚%'] = round(diff[idx <= split].mean(), 2) if (idx <= split).any() else np.nan
+            row['分界后多赚%'] = round(diff[idx > split].mean(), 2) if (idx > split).any() else np.nan
+    return row
+
+
+def random_week_means(trades, ek, key):
+    g = trades[(trades['Selection'] == 'RANDOM') & (trades.get(f'{ek}_Status') == '已买入')]
+    if g.empty or f'{key}_Exit' not in g.columns:
+        return pd.Series(dtype=float)
+    g = g[g[f'{key}_Exit'].isin(['止损', '止盈', '到期'])]
+    return pd.to_numeric(g[f'{key}_Ret'], errors='coerce').groupby(g['Trade_Date']).mean()
+
+
+if is_rules_mode and os.path.exists(RULES_TRADES_FILE):
+    st.markdown("---")
+    st.header("📈 止损止盈实战回测报告")
+    rules_export_slot = st.container()
+    try:
+        r_trades = _read_csv_safely(RULES_TRADES_FILE)
+        rs_str, re_str = REPORT_START.strftime("%Y%m%d"), REPORT_END.strftime("%Y%m%d")
+        r_trades = r_trades[r_trades['Trade_Date'].astype(str).between(rs_str, re_str)].copy()
+        split = OOS_SPLIT.strftime("%Y%m%d")
+        if r_trades.empty:
+            st.info("所选报告区间内没有记录。")
+        else:
+            st.caption(f"报告区间：{r_trades['Trade_Date'].min()} ~ {r_trades['Trade_Date'].max()}，"
+                       f"共 {r_trades['Trade_Date'].nunique()} 周。未卖出的持仓不计入统计。")
+            c1, c2 = st.columns(2)
+            stop_sel = c1.selectbox("止损", RULES_STOPS, format_func=lambda x: f"-{x}%", key="rules_stop")
+            tp_sel = c2.selectbox("止盈", [k for k, _ in RULES_TPS], format_func=lambda k: dict(RULES_TPS)[k], key="rules_tp")
+            sel_name, ent_name = dict(RULES_SELECTIONS), dict(RULES_ENTRIES)
+
+            main_rows, full_rows = [], []
+            for stop in RULES_STOPS:
+                for tk, tname in RULES_TPS:
+                    for ek, ename in RULES_ENTRIES:
+                        key = f'{ek}_L{stop}_{tk}'
+                        rnd = random_week_means(r_trades, ek, key)
+                        for sel, sname in RULES_SELECTIONS:
+                            stats = rules_combo_stats(r_trades, sel, ek, key, rnd, split)
+                            if stats is None:
+                                continue
+                            row = {'选股': sname, '买入时机': ename, **stats}
+                            full_rows.append({'止损': f'-{stop}%', '止盈': tname, **row})
+                            if stop == stop_sel and tk == tp_sel:
+                                main_rows.append(row)
+            main_tbl = pd.DataFrame(main_rows)
+            full_tbl = pd.DataFrame(full_rows)
+
+            st.markdown(f"#### 🎯 9 组对比（止损 -{stop_sel}%，止盈：{dict(RULES_TPS)[tp_sel]}）")
+            st.caption(
+                "“比随机多赚”= 同一周、同样买入时机和止损止盈下，该选股方法平均每笔比随机挑的股票多赚多少；"
+                "t 值绝对值≥2 才算可靠。事先定好的判定标准：比随机多赚为正、t≥2，且分界前、后两段都为正。"
+                "放弃率=等不到买点或开盘涨停/跳空过大而放弃的比例。"
+            )
+            basic_cols = ['选股', '买入时机', '笔数', '放弃率%', '胜率%', '平均每笔%', '中位%', '盈亏比', '平均持有天',
+                          '比随机多赚(每笔)%', '可靠程度t值', '分界前多赚%', '分界后多赚%']
+            show_df(main_tbl[[c for c in basic_cols if c in main_tbl.columns]])
+
+            st.markdown("#### 🚪 出场方式与抓大牛股")
+            st.caption("曾涨≥50%：买入后60个交易日内最高涨幅达到50%。“实际拿到”是按止损止盈规则卖出时的收益。")
+            bull_cols = ['选股', '买入时机', '止损出场%', '止盈出场%', '到期出场%', '曾涨≥50%占比%', '这些牛股实际拿到%', '牛股被止损%']
+            show_df(main_tbl[[c for c in bull_cols if c in main_tbl.columns]])
+
+            st.markdown("#### 🗓️ 逐年平均每笔收益%")
+            ek_year = st.selectbox("买入时机（逐年表）", [k for k, _ in RULES_ENTRIES], format_func=lambda k: ent_name[k], key="rules_year_entry")
+            key = f'{ek_year}_L{stop_sel}_{tp_sel}'
+            yr_rows = []
+            for sel, sname in RULES_SELECTIONS:
+                g = r_trades[(r_trades['Selection'] == sel) & (r_trades[f'{ek_year}_Status'] == '已买入')]
+                g = g[g[f'{key}_Exit'].isin(['止损', '止盈', '到期'])] if f'{key}_Exit' in g.columns else g.iloc[0:0]
+                ret = pd.to_numeric(g[f'{key}_Ret'], errors='coerce') if len(g) else pd.Series(dtype=float)
+                by = ret.groupby(g['Trade_Date'].astype(str).str[:4]).agg(['mean', 'count']) if len(g) else pd.DataFrame()
+                for y, rr in by.iterrows():
+                    yr_rows.append({'年份': y, '选股': sname, '平均每笔%': round(rr['mean'], 2), '笔数': int(rr['count'])})
+            yr_tbl = pd.DataFrame(yr_rows)
+            if not yr_tbl.empty:
+                yr_pivot = yr_tbl.pivot_table(index='年份', columns='选股', values='平均每笔%').reset_index()
+                show_df(yr_pivot)
+            with st.expander("全部 36 种组合明细"):
+                show_df(full_tbl)
+            with st.expander("交易明细（当前止损止盈）"):
+                cols = ['Trade_Date', 'Selection', 'Rank', 'name', 'ts_code', 'Signal_Close_Raw']
+                for ek, _ in RULES_ENTRIES:
+                    cols += [f'{ek}_Status', f'{ek}_BuyDate', f'{ek}_L{stop_sel}_{tp_sel}_Exit',
+                             f'{ek}_L{stop_sel}_{tp_sel}_Ret', f'{ek}_L{stop_sel}_{tp_sel}_Days', f'{ek}_MaxGain60']
+                det = r_trades[[c for c in cols if c in r_trades.columns]].copy()
+                det['Selection'] = det['Selection'].map(sel_name)
+                show_df(det.sort_values(['Trade_Date', 'Selection', 'Rank'], ascending=[False, True, True]))
+
+            rules_meta = {
+                '版本': VERSION, '导出时间(北京)': _bj_now().strftime('%Y-%m-%d %H:%M'),
+                '报告区间': [rs_str, re_str], '样本外分界日期': split,
+                '股票池': {'最低股价': MIN_PRICE, '流通市值(亿)': [MIN_MV, MAX_MV]},
+                '规则': {
+                    '选股': 'SKDJ=周K上穿25的A级按原评分前3；强势=申万二级前3强板块各取12周涨幅最高1只；随机=同一股票池按日期固定种子随机15只',
+                    '买入': '次日开盘；或信号日起5个交易日内，收盘满足条件后次日开盘买入（MACD柱较前日回升且收盘站上5日线 / 日线SKDJ(9,3) K上穿D）；开盘涨停、主板高开>5%、双创高开>8%、低开>4%放弃',
+                    '止损': '盘中最低价触及即卖，跳空低开按开盘价；T+1',
+                    '止盈': 'A：此前最高涨幅≥20%后回落到+10%卖；B：此前最高涨幅≥10%后回落到最高涨幅的一半卖；同日同时触及按止盈',
+                    '最长持有': f'{RULES_MAX_HOLD}个交易日，到期按收盘价卖出',
+                },
+            }
+            rules_export_slot.download_button(
+                label="📦 一键导出实战回测结果 (ZIP)",
+                data=build_export_zip({'当前组合9组对比': main_tbl, '全部36种组合': full_tbl, '逐年表现': yr_tbl,
+                                       '交易明细_原始数据': r_trades}, rules_meta),
+                file_name=f"skdj_rules_{RULES_SIG}_{rs_str}-{re_str}_{_bj_now().strftime('%Y%m%d_%H%M')}.zip",
+                mime="application/zip", key="download_rules_zip", type="primary",
+            )
+    except Exception as rules_err:
+        st.warning(f"实战回测记录已保留，但报告暂时无法显示：{rules_err}")
