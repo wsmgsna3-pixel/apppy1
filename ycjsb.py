@@ -1,7 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-周线 SKDJ 分级补位选股系统 (V19)
+周线 SKDJ 分级补位选股系统 (V20)
 ------------------------------------------------
+V20 新增（选股规则不变）：
+1. 【短周期对照】每个对照组增加 1 周（5日）、2 周（10日）固定持有超额，
+   总览表同时给出 1/2/4/12 周超额和各自的 t 值，用于检验 3~15 天持有的效果。
+2. 【样本外分段】侧边栏可填“样本外分界日期”，总览表自动分成“分界前 / 分界后”两段，
+   同一份记录一次看清样本内外是否一致。
+3. 修正：入选组名称按“每周选股数量”显示（之前固定写成“入选5只”）。
+因新增指标，回测记录文件改名，需要重扫一次（行情缓存直接复用，不用重新下载）。
+
 V19 修复（选股与回测逻辑与 V18 完全一致，回测记录可继续沿用）：
 1. 【内存】行情改为按年压缩存储、只保留股票池内股票、逐年读取后直接转成 numpy 数组，
    不再把全市场多年日线拼成大 DataFrame。回测 5 年内存占用从 2GB 以上降到几百 MB，
@@ -88,12 +96,12 @@ except ImportError:
 
 warnings.filterwarnings("ignore")
 
-VERSION = "V19"
-LOGIC_VERSION = "V18"   # 选股/回测逻辑版本，决定参数组编号与记录文件名
+VERSION = "V20"
+LOGIC_VERSION = "V20"   # 选股/回测逻辑版本，决定参数组编号与记录文件名
 
 SKDJ_N, SKDJ_M = 6, 3
 HOLD_WEEKS = 12
-FWD_HORIZONS = {"W2": 10, "W4": 20, "W8": 40, "W12": 60}
+FWD_HORIZONS = {"W1": 5, "W2": 10, "W4": 20, "W8": 40, "W12": 60}
 BIG_WINNER_PCT = 30.0
 BIG_LOSER_PCT = -20.0
 RS_LOOKBACK_WEEKS = 12
@@ -113,8 +121,8 @@ BENCH_GROUPS = [
 TIER_ORDER = {"A": 0, "B": 1, "C": 2}
 TIER_LABEL = {"A": "A 标准上穿25", "B": "B 低位金叉", "C": "C 趋势回踩金叉"}
 
-st.set_page_config(page_title="SKDJ V19 对照回测系统", layout="wide")
-st.title("🔬 周线 SKDJ 分级补位选股系统 (V19)")
+st.set_page_config(page_title="SKDJ V20 对照回测系统", layout="wide")
+st.title("🔬 周线 SKDJ 分级补位选股系统 (V20)")
 st.markdown("SKDJ 信号 / 强势股 / 强势板块 与股票池同周对照 · 四路并发下载 · 一键导出")
 
 
@@ -867,7 +875,7 @@ def build_cache_backup_zip():
         for y in _store_years():
             zf.write(_year_path(y), arcname=f"market_store/{y}.npz")
         for fn in sorted(os.listdir(".")):
-            if re.fullmatch(r"skdj_v1[5-9]_[0-9a-f]{8}_(trades|weeks)\.csv", fn):
+            if re.fullmatch(r"skdj_v(1[5-9]|2[0-9])_[0-9a-f]{8}_(trades|weeks)\.csv", fn):
                 zf.write(fn, arcname=f"records/{fn}")
     return buf.getvalue()
 
@@ -902,7 +910,7 @@ def restore_cache_backup(file_bytes):
                     os.remove(tmp_path)
                     skipped.append(f"{year}(本地更全)")
                 continue
-            m = re.fullmatch(r"records/(skdj_v1[5-9]_[0-9a-f]{8}_(trades|weeks)\.csv)", name)
+            m = re.fullmatch(r"records/(skdj_v(?:1[5-9]|2[0-9])_[0-9a-f]{8}_(?:trades|weeks)\.csv)", name)
             if m and not os.path.exists(m.group(1)):
                 with open(m.group(1), "wb") as fh:
                     fh.write(zf.read(name))
@@ -1118,11 +1126,12 @@ def forward_metrics(ts_code, s, pos):
 def summarize_fwd(items):
     comp = [x for x in items if x and x.get('complete')]
     if not comp:
-        return {'N': 0, 'W4': np.nan, 'W12': np.nan, 'Med12': np.nan, 'MaxGain': np.nan,
+        return {'N': 0, 'W1': np.nan, 'W2': np.nan, 'W4': np.nan, 'W12': np.nan, 'Med12': np.nan, 'MaxGain': np.nan,
                 'MaxDD': np.nan, 'Big30': np.nan, 'Bear20': np.nan}
     df = pd.DataFrame(comp)
     return {
-        'N': len(df), 'W4': round(df['W4'].mean(), 3), 'W12': round(df['W12'].mean(), 3),
+        'N': len(df), 'W1': round(df['W1'].mean(), 3), 'W2': round(df['W2'].mean(), 3),
+        'W4': round(df['W4'].mean(), 3), 'W12': round(df['W12'].mean(), 3),
         'Med12': round(df['W12'].median(), 3),
         'MaxGain': round(df['MaxGain'].mean(), 3), 'MaxDD': round(df['MaxDD'].mean(), 3),
         'Big30': round((df['MaxGain'] >= BIG_WINNER_PCT).mean() * 100.0, 2),
@@ -1386,6 +1395,7 @@ with st.sidebar:
         st.caption("报告区间（只影响下方报告显示，不影响回测扫描）")
         REPORT_START = st.date_input("报告起始日期", value=datetime(2015, 1, 1).date())
         REPORT_END = st.date_input("报告截止日期", value=datetime.now().date())
+        OOS_SPLIT = st.date_input("样本外分界日期（总览表分两段显示）", value=datetime(2022, 8, 12).date())
 
     TOP_N = int(st.number_input("每周选股数量", value=3, min_value=1, max_value=10, step=1))
 
@@ -1416,8 +1426,8 @@ with st.sidebar:
     CFG = {"v": LOGIC_VERSION, "top_n": TOP_N, "tiers": tiers_enabled,
            "min_price": MIN_PRICE, "min_mv": MIN_MV, "max_mv": MAX_MV}
     CFG_SIG = hashlib.md5(json.dumps(CFG, sort_keys=True).encode("utf-8")).hexdigest()[:8]
-    TRADES_FILE = f"skdj_v18_{CFG_SIG}_trades.csv"
-    WEEKS_FILE = f"skdj_v18_{CFG_SIG}_weeks.csv"
+    TRADES_FILE = f"skdj_v20_{CFG_SIG}_trades.csv"
+    WEEKS_FILE = f"skdj_v20_{CFG_SIG}_weeks.csv"
 
     with st.expander("🧹 缓存与记录维护"):
         st.caption(f"当前参数组编号：{CFG_SIG}（改任何参数都会自动使用独立的回测记录）")
@@ -1674,7 +1684,7 @@ def weekly_full_sample_table(executed):
     return pd.DataFrame(rows)
 
 
-BENCH_METRICS = ('N', 'W4', 'W12', 'Med12', 'MaxGain', 'MaxDD', 'Big30', 'Bear20')
+BENCH_METRICS = ('N', 'W1', 'W2', 'W4', 'W12', 'Med12', 'MaxGain', 'MaxDD', 'Big30', 'Bear20')
 
 
 def _half_label(date_series):
@@ -1717,29 +1727,37 @@ def benchmark_report_tables(comp, closed):
     tables = {}
     if comp.empty:
         return tables
-    active = [(g, label) for g, label in BENCH_GROUPS if comp[f'{g}_W12'].notna().any()]
+    active = [(g, (f"入选{TOP_N}只" if g == "Pick" else label)) for g, label in BENCH_GROUPS
+              if comp[f'{g}_W12'].notna().any()]
 
-    # 1) 候选组总览
+    # 1) 候选组总览（全部 + 样本外分界前/后）
+    split = OOS_SPLIT.strftime("%Y%m%d")
+    segments = [("全部", comp),
+                (f"≤{split}", comp[comp['Trade_Date'].astype(str) <= split]),
+                (f">{split}", comp[comp['Trade_Date'].astype(str) > split])]
     rows = []
-    for g, label in active:
-        ex = comp[f'{g}_W12'] - comp['Pool_W12']
-        big = comp[f'{g}_Big30'] - comp['Pool_Big30']
-        bear = comp[f'{g}_Bear20'] - comp['Pool_Bear20']
-        med = comp[f'{g}_Med12'] - comp['Pool_Med12']
-        m, t, n = nw_tstat(ex)
-        bm, bt, _ = nw_tstat(big)
-        brm, brt, _ = nw_tstat(bear)
-        half = ex.groupby(comp['时期']).mean().dropna()
-        rows.append({
-            '候选组': label, '有效周数': n, '平均每周股数': round(comp[f'{g}_N'].mean(), 1),
-            '12周超额%': round(m, 2), 't值': round(t, 2) if pd.notna(t) else np.nan,
-            '跑赢池的半年': f"{int((half > 0).sum())}/{len(half)}",
-            '跑赢池的周%': round((ex.dropna() > 0).mean() * 100, 0) if ex.notna().any() else np.nan,
-            '12周中位数差%': round(med.mean(), 2) if med.notna().any() else np.nan,
-            '牛股率差(百分点)': round(bm, 1), '牛股率差t值': round(bt, 2) if pd.notna(bt) else np.nan,
-            '熊股率差(百分点)': round(brm, 1) if pd.notna(brm) else np.nan,
-            '熊股率差t值': round(brt, 2) if pd.notna(brt) else np.nan,
-        })
+    for seg_name, seg in segments:
+        if seg.empty:
+            continue
+        for g, label in active:
+            row = {'区间': seg_name, '候选组': label, '有效周数': int(seg[f'{g}_W12'].notna().sum()),
+                   '平均每周股数': round(seg[f'{g}_N'].mean(), 1)}
+            for h, lag in (("W1", 1), ("W2", 2), ("W4", 4), ("W12", 12)):
+                ex_h = seg[f'{g}_{h}'] - seg[f'Pool_{h}']
+                m_h, t_h, _ = nw_tstat(ex_h, lag=lag)
+                label_h = h.replace("W", "") + "周"
+                row[f'{label_h}超额%'] = round(m_h, 2) if pd.notna(m_h) else np.nan
+                row[f'{label_h}t值'] = round(t_h, 2) if pd.notna(t_h) else np.nan
+            ex = seg[f'{g}_W12'] - seg['Pool_W12']
+            half = ex.groupby(seg['时期']).mean().dropna()
+            bm, bt, _ = nw_tstat(seg[f'{g}_Big30'] - seg['Pool_Big30'])
+            brm, brt, _ = nw_tstat(seg[f'{g}_Bear20'] - seg['Pool_Bear20'])
+            row.update({
+                '12周跑赢池的半年': f"{int((half > 0).sum())}/{len(half)}",
+                '牛股率差(百分点)': round(bm, 1) if pd.notna(bm) else np.nan,
+                '熊股率差(百分点)': round(brm, 1) if pd.notna(brm) else np.nan,
+            })
+            rows.append(row)
     tables['候选组总览'] = pd.DataFrame(rows)
 
     # 2) 分时期超额
@@ -1764,6 +1782,15 @@ def benchmark_report_tables(comp, closed):
         return pd.DataFrame(out)
 
     tables['分时期_12周超额'] = excess_rows('时期', '时期')
+
+    w2_rows = []
+    for key in list(comp.groupby('时期', sort=True).groups.keys()) + ['全部']:
+        g_df = comp if key == '全部' else comp[comp['时期'] == key]
+        row = {'时期': key, '周数': len(g_df), '股票池2周%': round(g_df['Pool_W2'].mean(), 2)}
+        for g, label in active:
+            row[f'{label}−池'] = round((g_df[f'{g}_W2'] - g_df['Pool_W2']).mean(), 2)
+        w2_rows.append(row)
+    tables['分时期_2周超额'] = pd.DataFrame(w2_rows)
 
     big_rows = []
     for key in list(comp.groupby('时期', sort=True).groups.keys()) + ['全部']:
@@ -1877,10 +1904,12 @@ if not is_picking_mode and (os.path.exists(TRADES_FILE) or os.path.exists(WEEKS_
             st.markdown("#### 🧪 候选组总览（与同周股票池对照，只含已满12周的周）")
             st.caption(
                 "12周超额=该组次日开盘买入、不设止损持有60个交易日的平均收益减去同周股票池；每周等权。"
-                "t值已修正持有期重叠，绝对值≥2 才算显著。一个方向值得继续，至少要：超额为正、t值≥2、"
+                "每个持有期的 t 值都按各自的重叠长度修正，绝对值≥2 才算显著。一个方向值得继续，至少要：超额为正、t值≥2、"
                 "多数半年跑赢池子（包括 2022~2024 年），牛股率差也不为负。"
             )
             show_df(bench_tables['候选组总览'])
+            st.markdown("#### 🗓️ 分时期：2周超额（相对股票池）")
+            show_df(bench_tables['分时期_2周超额'])
             st.markdown("#### 🗓️ 分时期：12周超额（相对股票池）")
             show_df(bench_tables['分时期_12周超额'])
             st.markdown("#### 🐂 分时期：牛股率%（60个交易日内最高涨幅≥30%的比例）")
@@ -1963,6 +1992,7 @@ if not is_picking_mode and (os.path.exists(TRADES_FILE) or os.path.exists(WEEKS_
             '版本': VERSION, '参数组': CFG_SIG, '导出时间': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             '回测截止日期': backtest_date_end.strftime('%Y-%m-%d'), '回测周数设置': BACKTEST_WEEKS,
             '报告区间': [REPORT_START.strftime('%Y-%m-%d'), REPORT_END.strftime('%Y-%m-%d')],
+            '样本外分界日期': OOS_SPLIT.strftime('%Y-%m-%d'),
             '每周选股数': TOP_N, '启用层级': tiers_enabled, '最低股价': MIN_PRICE,
             '流通市值范围(亿)': [MIN_MV, MAX_MV],
             '对照组定义': {
