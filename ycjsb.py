@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""板块领涨惯性 M1.4 — 固定两套规则 / 月度与集中度 / 历史待验证和前向观察
+"""板块领涨惯性 M1.5 — 交易结果归因 / 买入前特征 / 两段历史对照
 
 依赖：pandas >= 2.0, numpy >= 1.24, streamlit >= 1.32, tushare >= 1.4。
 离线逻辑验算：python app.py --self-test
@@ -32,7 +32,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
-VERSION = "M1.4"
+VERSION = "M1.5"
 CORE = {"电子", "计算机", "通信", "国防军工"}
 TECH_WORDS = ("自动化", "机器人", "仪器仪表", "半导体", "光伏设备", "风电设备",
               "电池", "电网设备", "医疗器械", "电子", "金属新材料")
@@ -1482,7 +1482,288 @@ def validation_reports(events, selected, candidates, trades, cfg, mode):
     return out
 
 
-RULES = """板块领涨惯性 M1.4：固定规则验证
+# 仅用于事后归因的固定特征名单；不含次日开盘、后续最高价或任何收益标签。
+ATTR_FEATURES = (
+    ('ret1', '信号日涨幅%', 100.), ('pre3', '信号前3日涨幅%', 100.),
+    ('rs3', '3日相对板块超额(百分点)', 100.), ('rs5', '5日相对板块超额(百分点)', 100.),
+    ('efficiency', '5日上涨效率', 1.), ('amount_ratio', '成交额/此前20日均额', 1.),
+    ('turnover_rate', '换手率%', 1.), ('clv3', '3日平均收盘位置', 1.),
+    ('bias10', '距MA10%', 100.), ('volatility5', '5日波动率%', 100.),
+    ('sector_ret1', '板块当日涨幅%', 100.), ('breadth', '板块上涨家数比例%', 100.),
+    ('strength_score', '相对强度得分', 1.), ('efficiency_score', '上涨效率得分', 1.),
+    ('volume_score', '量价配合得分', 1.), ('position_score', '收盘位置得分', 1.),
+)
+ATTR_CONTRASTS = ('未达5%到期亏损', '达5%后到期亏损', '止损退出')
+ATTR_BASES = ('独立信号', '持仓回放')
+ATTR_NOTE = ('全部标签在交易结束后定义，仅作研究，不能用于当天选股。归因主要分析10%止盈。'
+    '独立信号允许重叠；持仓回放会跳过同股重复持仓；两者都不是账户收益。'
+    '止损后才出现的最高价不能认定为卖早了，止损单独列出。'
+    '两段历史用于寻找新特征后，都属于该新假设的探索样本，不能再称为独立验证。'
+    '固定16项特征同时观察；同向差异不代表统计显著、因果关系或可交易优势。'
+    '不会自动筛选最佳特征、门槛、权重或修改买卖规则。')
+
+
+def attribution_features(candidates):
+    """特征只取信号收盘时的候选表；当日分位参照完整合格、不过热池。"""
+    c = candidates.copy()
+    c['signal_date'] = pd.to_datetime(c['date'])
+    if c.duplicated(['signal_date', 'ts_code']).any():
+        raise DataError('归因候选表存在重复股票日')
+    eligible = c.base_reason.fillna('').eq('') & c.overheat.eq(False)
+    out = c[['signal_date', 'ts_code']].copy()
+    for key, _, _ in ATTR_FEATURES:
+        value = pd.to_numeric(c[key], errors='coerce') if key in c else pd.Series(np.nan, index=c.index)
+        value = value.where(np.isfinite(value))
+        out['signal_'+key] = value
+        g = value.where(eligible).groupby(c.signal_date)
+        count = g.transform('count')
+        # 池不足4只、同日没有横截面差异时不强行生成区分信息。
+        spread = g.transform('max')-g.transform('min')
+        out['pool_pct_'+key] = ((g.rank(method='average')-.5)/count*100).where(count.ge(4) & spread.gt(1e-12))
+    return out
+
+
+def classify_outcomes(records, hold_days=5):
+    f = records.copy()
+    label = pd.Series('未完成/无法分类', index=f.index, dtype=object)
+    good = ~f.data_issue.eq(True)
+    closed = f.status.eq('已平仓') & good & f.net_return.notna()
+    label.loc[f.status.eq('未买入') & good] = '未买入'
+    label.loc[f.status.eq('重复持仓跳过')] = '重复持仓跳过'
+    label.loc[closed] = '延期/其他退出'
+    # 延期交易与完整5日内的结果分开，避免把止损后的反弹叫作冲高回落。
+    timely = closed & pd.to_numeric(f.hold_days, errors='coerce').le(hold_days)
+    reason = f.reason.fillna('')
+    label.loc[timely & reason.str.contains('止盈')] = '顺利止盈'
+    label.loc[closed & reason.str.contains('止损')] = '止损退出'
+    expiry = timely & reason.eq('到期退出')
+    label.loc[expiry] = '到期路径不完整'
+    complete = expiry & f.horizon_complete.eq(True) & f.sellable_mfe5.notna()
+    complete &= pd.to_numeric(f.hold_days, errors='coerce').eq(5) & (hold_days == 5)
+    reached = f.sellable_mfe5.ge(.05-1e-12)
+    loss = f.net_return.lt(0)
+    label.loc[complete & ~reached & loss] = '未达5%到期亏损'
+    label.loc[complete & ~reached & ~loss] = '未达5%到期非亏损'
+    label.loc[complete & reached & loss] = '达5%后到期亏损'
+    label.loc[complete & reached & ~loss] = '达5%后到期非亏损'
+    label.loc[f.data_issue.eq(True)] = '数据问题'
+    return label
+
+
+def attribution_reports(events, candidates, trades, cfg):
+    if cfg.hold_days != 5 or candidates.empty:
+        return {}
+    signals = attribution_features(candidates)
+    ledgers = []
+    for basis, records in zip(ATTR_BASES, [events, trades]):
+        if records is None or records.empty:
+            continue
+        f = records[records.group.isin(VALIDATION_GROUPS) & records.take_profit.eq(.10)].copy()
+        if f.empty:
+            continue
+        f['signal_date'] = pd.to_datetime(f.signal_date)
+        if f.duplicated(['group', 'signal_date', 'ts_code']).any():
+            raise DataError('归因成交表存在重复信号')
+        for col, default in [('data_issue', False), ('horizon_complete', False), ('hold_days', np.nan),
+                             ('sellable_mfe5', np.nan), ('net_return', np.nan), ('reason', '')]:
+            if col not in f:
+                f[col] = default
+        f['outcome'] = classify_outcomes(f, cfg.hold_days)
+        f['basis'] = basis
+        f = f.merge(signals, on=['signal_date', 'ts_code'], how='left', validate='many_to_one', indicator=True)
+        if f._merge.ne('both').any():
+            raise DataError('归因记录缺少对应信号日特征，不能用未来日期补齐')
+        ledgers.append(f.drop(columns='_merge'))
+    if not ledgers:
+        return {}
+    ledger = pd.concat(ledgers, ignore_index=True)
+    summary, contrasts, buckets = [], [], []
+    for (basis, group), block in ledger.groupby(['basis', 'group'], sort=False):
+        base = dict(basis=basis, group=group)
+        known = block.status.eq('已平仓') & ~block.data_issue.eq(True) & block.net_return.notna()
+        closed_count = int(known.sum())
+        for outcome, b in block.groupby('outcome', sort=False):
+            valid = b[b.status.eq('已平仓') & ~b.data_issue.eq(True) & b.net_return.notna()]
+            summary.append({**base, 'outcome': outcome, '记录数': len(b), '占全部信号%': len(b)/len(block)*100,
+                '有效平仓数': len(valid), '净均益%': valid.net_return.mean()*100,
+                '净中位数%': valid.net_return.median()*100,
+                '对全部平仓均益贡献(百分点)': valid.net_return.sum()/closed_count*100 if closed_count and len(valid) else np.nan})
+        success = block[block.outcome.eq('顺利止盈')]
+        for contrast in ATTR_CONTRASTS:
+            other = block[block.outcome.eq(contrast)]
+            for feature, label, scale in ATTR_FEATURES:
+                a, b = success['signal_'+feature].dropna(), other['signal_'+feature].dropna()
+                pa, pb = success['pool_pct_'+feature].dropna(), other['pool_pct_'+feature].dropna()
+                contrasts.append({**base, 'contrast': contrast, 'feature': feature, '特征': label,
+                    '止盈有效数': len(a), '对照有效数': len(b),
+                    '止盈中位数': a.median()*scale, '对照中位数': b.median()*scale,
+                    '中位数差': (a.median()-b.median())*scale,
+                    '止盈池内分位有效数': len(pa), '对照池内分位有效数': len(pb),
+                    '止盈平均池内分位': pa.mean(), '对照平均池内分位': pb.mean(),
+                    '池内分位差': pa.mean()-pb.mean()})
+        # 固定三等分检视全部已选信号，避免仅对比输赢两端遗漏其他交易。
+        for feature, label, _ in ATTR_FEATURES:
+            pct = block['pool_pct_'+feature]
+            band = pd.cut(pct, [-np.inf, 100/3, 200/3, np.inf], labels=['低三分之一', '中三分之一', '高三分之一'])
+            for name in ['低三分之一', '中三分之一', '高三分之一']:
+                b = block[band.eq(name)]; valid = b[b.status.eq('已平仓') & ~b.data_issue.eq(True) & b.net_return.notna()]
+                full = b[b.horizon_complete.eq(True) & ~b.data_issue.eq(True) & b.entry_price.notna()]
+                buckets.append({**base, 'feature': feature, '特征': label, '分位段': name,
+                    '记录数': len(b), '分位缺失记录数': int(pct.isna().sum()), '有效平仓数': len(valid),
+                    '净均益%': valid.net_return.mean()*100,
+                    '止盈占已平仓%': valid.outcome.eq('顺利止盈').mean()*100 if len(valid) else np.nan,
+                    '完整路径数': len(full),
+                    '可卖日期曾达5%比例': full.sellable_mfe5.ge(.05-1e-12).mean()*100 if len(full) else np.nan,
+                    '可卖日期曾达10%比例': full.sellable_mfe5.ge(.10-1e-12).mean()*100 if len(full) else np.nan})
+    return {'attribution_ledger': ledger, 'attribution_summary': pd.DataFrame(summary),
+            'attribution_features': pd.DataFrame(contrasts), 'attribution_buckets': pd.DataFrame(buckets)}
+
+
+def load_attribution_archive(raw, name='审计.zip'):
+    """只读取受限ZIP内的表格，不解压文件、不运行其中代码、不调用行情接口。"""
+    if len(raw) > 100*1024*1024:
+        raise DataError('审计ZIP超过100MB，请使用单次回测的审计包')
+    needed = ['manifest.json', 'candidates.csv', 'selected.csv', 'trades.csv', 'independent_signal_paths.csv']
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as z:
+            names = z.namelist()
+            if any(names.count(k) != 1 for k in needed):
+                raise DataError('请上传M1.3或之后的完整回测审计ZIP，缺表或同名重复表不能归因')
+            if sum(i.file_size for i in z.infolist()) > 300*1024*1024 or any(z.getinfo(k).file_size > 100*1024*1024 for k in needed):
+                raise DataError('审计包解压后过大，拒绝读取')
+            manifest = json.loads(z.read('manifest.json'))
+            if manifest.get('version') not in ['M1.3', 'M1.4', 'M1.5']:
+                raise DataError('当前归因导入支持M1.3、M1.4、M1.5审计包')
+            frames = {}
+            for key in needed[1:]:
+                try:
+                    frames[key[:-4]] = pd.read_csv(z.open(key), dtype={'ts_code': str, 'sector': str}, float_precision='round_trip')
+                except pd.errors.EmptyDataError:
+                    frames[key[:-4]] = pd.DataFrame()
+    except (zipfile.BadZipFile, json.JSONDecodeError, UnicodeDecodeError, pd.errors.ParserError) as exc:
+        raise DataError('审计ZIP或表格损坏，无法读取') from exc
+    config = manifest.get('config', {})
+    if not isinstance(config, dict) or not {'start', 'end'}.issubset(config):
+        raise DataError('审计缺少有效配置和信号区间')
+    cfg = Config(**{k: v for k, v in config.items() if k in Config.__dataclass_fields__})
+    cfg.validate()
+    if cfg.hold_days != 5:
+        raise DataError('五日归因只适用于持有上限5日的报告')
+    c, selected, events, trades = [frames[k] for k in ['candidates', 'selected', 'independent_signal_paths', 'trades']]
+    if c.empty:
+        raise DataError('本报告没有候选特征，无法归因')
+    required = [
+        (c, ['date', 'ts_code', 'base_reason', 'exclude_reason', 'overheat', 'ret1', 'score', 'close']),
+        (selected, ['date', 'ts_code', 'group', 'rank', 'return_rank', 'gap_limit']),
+        (events, ['signal_date', 'ts_code', 'group', 'take_profit', 'status', 'net_return',
+                  'data_issue', 'horizon_complete', 'sellable_mfe5', 'entry_price', 'hold_days', 'reason']),
+        (trades, ['signal_date', 'ts_code', 'group', 'take_profit', 'status', 'net_return']),
+    ]
+    for frame, columns in required:
+        missing = sorted(set(columns)-set(frame.columns))
+        if missing:
+            raise DataError('审计缺少必要字段：'+', '.join(missing))
+    for key in ['base_reason', 'exclude_reason']:
+        c[key] = c[key].fillna('')
+    c['date'] = pd.to_datetime(c.date)
+    if not c.date.between(pd.Timestamp(cfg.start), pd.Timestamp(cfg.end)).all():
+        raise DataError('候选信号日期超出报告声明区间')
+    if selected.empty and events.empty:
+        raise DataError('本报告没有已选信号，无法进行结果归因')
+    keys = ['group', 'signal_date', 'ts_code', 'take_profit']
+    chosen = selected[selected.group.isin(VALIDATION_GROUPS)].copy()
+    chosen['signal_date'] = pd.to_datetime(chosen.date)
+    expected = chosen[['group', 'signal_date', 'ts_code']].merge(pd.DataFrame({'take_profit': [.05, .10]}), how='cross')
+    for records in [events, trades]:
+        records['signal_date'] = pd.to_datetime(records.signal_date)
+        e = records[records.group.isin(VALIDATION_GROUPS)]
+        if e.duplicated(keys).any() or set(map(tuple, e[keys].to_numpy())) != set(map(tuple, expected[keys].to_numpy())):
+            raise DataError('已选信号与独立回放/持仓记录不齐全或重复，不能将缺记录当作未成交')
+    # 检查当前固定规则能否重建导出选择；这里只复算选股，不声称重新撮合行情。
+    rebuilt = select_candidates(c, replace(cfg, validation_only=True))
+    cols = ['group', 'date', 'ts_code', 'rank', 'return_rank', 'gap_limit']
+    original = chosen.copy(); original['date'] = pd.to_datetime(original.date)
+    order = ['group', 'date', 'ts_code']
+    try:
+        pd.testing.assert_frame_equal(original[cols].sort_values(order).reset_index(drop=True),
+            rebuilt[cols].sort_values(order).reset_index(drop=True), check_dtype=False, atol=1e-10, rtol=1e-10)
+    except AssertionError as exc:
+        raise DataError('导出选股不能由当前固定规则重建，不能直接按同一规则比较') from exc
+    known_source = manifest.get('source_sha256') in {
+        'a4f8dbbaf706cbb034a2693a85bddc38fb93b56505b412aea1f95e778176e202',
+        'e861bf410d717fcdf32c14965ce9a800ff87b3dbc2800215983e0b4da43c114e'}
+    logic = manifest.get('validation_protocol', {}).get('trading_logic_sha256')
+    logic_match = known_source or logic == validation_protocol(cfg)['trading_logic_sha256']
+    meta = dict(name=Path(name).name, version=manifest['version'], start=cfg.start, end=cfg.end,
+        source_sha256=manifest.get('source_sha256'), zip_sha256=hashlib.sha256(raw).hexdigest(),
+        mode=manifest.get('mode', ''), params={k: getattr(cfg, k) for k in FROZEN_PARAMS},
+        selection_rebuilt=True, price_execution_replayed=False, declared_logic_recognized=logic_match,
+        origin='合成演示' if '演示' in manifest.get('mode', '') else '历史探索_新特征未验证')
+    return dict(meta=meta, tables=attribution_reports(events, c, trades, cfg))
+
+
+def attribution_consistency(a, b):
+    keys = ['basis', 'group', 'contrast', 'feature', '特征']
+    joined = a.merge(b, on=keys, how='outer', suffixes=('_区间1', '_区间2'), validate='one_to_one')
+    for axis, source in [('原值', '中位数差'), ('池内分位', '池内分位差')]:
+        x, y = joined[source+'_区间1'], joined[source+'_区间2']
+        count_cols = ['止盈有效数', '对照有效数'] if axis == '原值' else ['止盈池内分位有效数', '对照池内分位有效数']
+        enough = pd.Series(True, index=joined.index)
+        for col in count_cols:
+            enough &= joined[col+'_区间1'].ge(30) & joined[col+'_区间2'].ge(30)
+        direction = np.select([x.gt(1e-12) & y.gt(1e-12), x.lt(-1e-12) & y.lt(-1e-12)],
+                              ['止盈组两段都较高', '止盈组两段都较低'], default='方向不一致或无差异')
+        joined[axis+'方向检查'] = np.where(x.isna() | y.isna(), '数据不足',
+            np.where(enough, direction, '样本不足30_仅列数值'))
+    return joined
+
+
+def review_archives(files):
+    if not 1 <= len(files) <= 2:
+        raise DataError('请上传一份审计包，或两份不同区间的审计包')
+    reports = [load_attribution_archive(raw, name) for name, raw in files]
+    reports.sort(key=lambda r: (r['meta']['start'], r['meta']['end']))
+    tables = {}
+    for i, report in enumerate(reports, 1):
+        for key, frame in report['tables'].items():
+            f = frame.copy(); f.insert(0, 'source_period', f"区间{i} {report['meta']['start']}—{report['meta']['end']}")
+            tables.setdefault(key, []).append(f)
+    tables = {k: pd.concat(v, ignore_index=True) for k, v in tables.items()}
+    warnings = []; comparable = False
+    if len(reports) == 2:
+        a, b = [r['meta'] for r in reports]
+        if a['end'] >= b['start']:
+            warnings.append('信号区间重叠，不能当作两段独立样本；不生成方向一致性表。')
+        elif a['params'] != b['params']:
+            warnings.append('两份报告的股票池或交易参数不同；不生成方向一致性表。')
+        elif not a['declared_logic_recognized'] or not b['declared_logic_recognized']:
+            warnings.append('至少一份报告无法核对交易逻辑来源；仅分别展示。')
+        elif '演示' in a['origin'] or '演示' in b['origin']:
+            warnings.append('合成演示不能作为历史一致性证据；仅分别展示。')
+        else:
+            comparable = True
+            tables['attribution_consistency'] = attribution_consistency(
+                reports[0]['tables']['attribution_features'], reports[1]['tables']['attribution_features'])
+    meta = dict(version=VERSION, report_type='既有审计记录归因_未重新撮合', sources=[r['meta'] for r in reports],
+        comparable=comparable, warnings=warnings, feature_count=len(ATTR_FEATURES), rule_changes=False,
+        note=ATTR_NOTE, comparison_minimum_count=30,
+        minimum_count_is_not_significance_test=True, sorted_periods='区间1为更早信号区间；区间2为更晚区间')
+    stream = io.BytesIO()
+    with zipfile.ZipFile(stream, 'w', zipfile.ZIP_DEFLATED) as z:
+        for key, f in tables.items():
+            z.writestr(key+'.csv', f.to_csv(index=False).encode('utf-8-sig'))
+        z.writestr('manifest.json', json.dumps(meta, ensure_ascii=False, indent=2))
+        z.writestr('归因说明.txt', ATTR_NOTE)
+    return dict(meta=meta, tables=tables, archive=stream.getvalue())
+
+
+RULES = """板块领涨惯性 M1.5：结果归因与固定规则验证
+
+M1.5新增结果归因与两份旧审计ZIP对照，不改变选股排序、买价、止盈止损。
+只用信号日收盘已知的固定16项特征，未知和缺失不补为0。
+止损与冲高回落分开；五日最高价不能证明出现在止损之前。
+归因中新特征的两段历史均为探索，不自动筛选门槛，不回填当天选股。
+
 
 默认只运行原涨幅前三与前十低前涨幅两个方案。10%止盈为主要目标，5%止盈为敏感性对照。
 两套选股、交易规则全部继承M1.3；不新增门槛，不把主板/双创拼成事后最优规则。
@@ -1595,7 +1876,7 @@ T+1：买入当日不能止盈、不能止损，买入当日达到5%只作诊断
 
 def save_report(root, cfg, candidates, selected, trades, panel, calendar, data_hash, mode, events=None):
     root = Path(root)
-    folder = Path(tempfile.mkdtemp(prefix="M14_", dir=root))
+    folder = Path(tempfile.mkdtemp(prefix="M15_", dir=root))
     candidates = add_filter_ranks(candidates)
     tables = {"candidates": candidates, "selected": selected, "trades": trades,
               "sector_daily": panel[panel.date.between(pd.Timestamp(cfg.start), pd.Timestamp(cfg.end))].copy()}
@@ -1607,6 +1888,7 @@ def save_report(root, cfg, candidates, selected, trades, panel, calendar, data_h
     tables["filter_decisions"] = decisions
     tables["filter_execution_changes"], tables["filter_execution_summary"] = filter_execution_audit(trades, decisions)
     if events is not None:
+        tables.update(attribution_reports(events, candidates, trades, cfg))
         tables.update(validation_reports(events, selected, candidates, trades, cfg, mode))
         tables.update(top10_reports(events, candidates, cfg))
         tables["independent_signal_paths"] = events
@@ -1646,7 +1928,7 @@ def save_report(root, cfg, candidates, selected, trades, panel, calendar, data_h
                     data_start=ds(calendar[0]), data_end=ds(calendar[-1]), data_hash=data_hash,
                     source_sha256=source_hash, created_at=datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(),
                     verified_profitability=False, execution="保守日线近似", tables=list(tables),
-                    research_design="M1.4：固定原前三与低前涨幅；10%主要目标/5%敏感性；逐月贡献、逐月剔除和样本来源",
+                    research_design="M1.5：买入前特征与结果归因；固定原前三与低前涨幅；逐月贡献、逐月剔除",
                     experiment_count=len(experiments(cfg)),
                     tuning_performed=False, rs_definition="最近N个市场交易日每天收益严格高于同一板块；含信号日；不是累计跑赢",
                     independent_paths="允许重叠的独立信号5日观察；路径可能发生于止盈/止损之后，不是兑现利润")
@@ -1654,6 +1936,9 @@ def save_report(root, cfg, candidates, selected, trades, panel, calendar, data_h
         rank_preserved=True, filters_combined=False, threshold_tuned=False,
         same_opportunity_denominator="基准独立信号有效平仓数；未知不归零", available_event_targets=sorted(events.take_profit.unique().tolist()) if events is not None and not events.empty else [])
     manifest["validation_protocol"] = validation_protocol(cfg, mode)
+    manifest["attribution_protocol"] = dict(note=ATTR_NOTE, features=[k for k, _, _ in ATTR_FEATURES],
+        primary_target=.10, selection_rules_changed=False, automatic_feature_selection=False,
+        eligible_daily_pool_minimum=4, cross_period_minimum_count=30)
     manifest["top10_protocol"] = dict(enabled=cfg.research and not cfg.validation_only, observation_size=10, select_n=cfg.top_n,
         observation_is_portfolio=False, signal_day_excluded_from_pre3=True,
         models=[dict(experiment=k, group=g, sort=c, ascending=a) for k, g, c, a in TOP10_MODELS],
@@ -1760,6 +2045,7 @@ def run_demo(root, options=None):
 
 
 DISPLAY = {
+    "source_period": "来源区间", "basis": "归因口径", "outcome": "交易结果", "contrast": "对照结果",
     "month": "信号月份", "excluded_month": "剔除的信号月份", "sample_phase": "样本属性",
     "diagnostic_tail": "诊断类别",
     "return_rank": "原涨幅名次", "rank_band": "原涨幅排名段", "pre3": "信号前3日涨幅%",
@@ -1808,6 +2094,9 @@ PERCENT_COLUMNS.update({"pre3", "rs_accel", "signal_limit_ratio", "avg_pre3", "a
                         "slot_mean", "baseline_slot_mean", "paired_delta"})
 PERCENT_COLUMNS.update({"信号均值_ret1", "信号均值_ret5"})
 DISPLAY.update({f"rs_all_{n}": f"连续{n}日跑赢" for n in [1, 2, 3, 5]})
+DISPLAY.update({'signal_'+key: '信号日特征：'+label for key, label, _ in ATTR_FEATURES})
+DISPLAY.update({'pool_pct_'+key: '当日池内分位：'+label for key, label, _ in ATTR_FEATURES})
+PERCENT_COLUMNS.update({'signal_'+key for key, _, scale in ATTR_FEATURES if scale == 100.})
 
 
 def show_table(st, frame):
@@ -1957,6 +2246,95 @@ def show_top10(st, folder):
         show_table(st, ledger[ledger.take_profit.eq(tp)].sort_values(["signal_date", "return_rank"], ascending=[False, True]).head(200))
 
 
+def show_attribution(st, tables, prefix='attr'):
+    summary = tables.get('attribution_summary', pd.DataFrame())
+    st.subheader('交易结果归因：哪些股票没有形成上涨惯性')
+    if summary.empty:
+        st.info('本报告暂无归因表。持有上限需为5日；M1.3/M1.4旧ZIP可在“已有结果归因”直接导入。')
+        return
+    st.caption('仅分析10%止盈目标。结果标签在交易结束后确定；买入前特征仅来自信号日收盘，不参与修改选股。')
+    col1, col2 = st.columns(2)
+    bases = [x for x in ATTR_BASES if x in summary.basis.unique()]
+    basis = col1.selectbox('归因口径', bases, key=prefix+'_basis')
+    groups = [x for x in VALIDATION_GROUPS if x in summary.group.unique()]
+    group = col2.selectbox('归因方案', groups, index=groups.index(TOP10_MODELS[0][1]) if TOP10_MODELS[0][1] in groups else 0, key=prefix+'_group')
+    def subset(name):
+        f = tables.get(name, pd.DataFrame())
+        if not f.empty:
+            f = f[f.basis.eq(basis) & f.group.eq(group)]
+        return f
+    st.caption('独立信号用于研究选股，允许同股信号重叠；持仓回放跳过仍持有的同股。两种口径的数量不同，都不是账户收益。')
+    show_table(st, subset('attribution_summary'))
+    st.caption('占比的分母是全部信号，包含未买入和未完成；均益仅用有效平仓。各结果的均益贡献相加等于全部有效平仓均益。')
+    st.caption('止损单独列出，五日最高价可能在止损之后；“达5%后到期亏损”仅认定完整五日、正常到期且净亏损的交易。')
+    contrast = st.selectbox('止盈交易与哪类结果比较', list(ATTR_CONTRASTS), key=prefix+'_contrast')
+    consistency = subset('attribution_consistency')
+    if not consistency.empty:
+        st.write('两段历史的差异方向')
+        f = consistency[consistency.contrast.eq(contrast)]
+        columns = ['特征', '中位数差_区间1', '中位数差_区间2', '原值方向检查',
+                   '池内分位差_区间1', '池内分位差_区间2', '池内分位方向检查']
+        show_table(st, f.reindex(columns=columns))
+        st.caption('差值均为“止盈组减对照组”；区间1较早、区间2较晚。每组至少30条有效记录才显示方向描述，这不是显著性检验。')
+    else:
+        st.write('买入前的特征差异')
+    features = subset('attribution_features')
+    if not features.empty:
+        f = features[features.contrast.eq(contrast)]
+        if consistency.empty:
+            show_table(st, f.drop(columns=['basis', 'group', 'contrast', 'feature'], errors='ignore'))
+        else:
+            with st.expander('查看两个区间的样本数与原始中位数'):
+                show_table(st, f.drop(columns=['basis', 'group', 'contrast', 'feature'], errors='ignore'))
+    st.caption('池内分位按同日完整合格且不过热候选池计算；小于4只或无横截面差异时留空。板块涨幅/广度同日相同，不计算池内分位。原值差异可能受市场日期和主板/双创构成影响。')
+    st.caption('16项固定特征均展示，不按结果寻找最佳门槛。同向差异仍可能是偶然或板块构成影响，不能当作预测结论。')
+    feature = st.selectbox('查看固定三等分表现', [k for k, _, _ in ATTR_FEATURES],
+        format_func=lambda k: next(label for key, label, _ in ATTR_FEATURES if key == k), key=prefix+'_feature')
+    buckets = subset('attribution_buckets')
+    if not buckets.empty:
+        show_table(st, buckets[buckets.feature.eq(feature)].drop(columns=['basis', 'group', 'feature'], errors='ignore'))
+    st.caption('三等分界限固定在当日合格池的1/3和2/3，不是事后优化阈值；这里统计全部已选信号，包含输赢两端以外的交易。缺失记录不分档，最高价到达不等于兑现收益。')
+    with st.expander('逐笔核对结果与买入前特征'):
+        ledger = subset('attribution_ledger')
+        if not ledger.empty:
+            outcomes = sorted(ledger.outcome.unique())
+            selected = st.multiselect('查看结果类型', outcomes, default=[x for x in ATTR_CONTRASTS if x in outcomes], key=prefix+'_outcomes')
+            columns = ['source_period', 'signal_date', 'ts_code', 'name', 'outcome', 'net_return', 'reason',
+                       'hold_days', 'sellable_mfe5', 'signal_'+feature, 'pool_pct_'+feature]
+            show_table(st, ledger[ledger.outcome.isin(selected)].sort_values('signal_date', ascending=False).reindex(columns=columns).head(200))
+            st.caption('页面显示最近200条，完整记录在下载的归因审计中；signal_字段只取信号日，pool_pct_字段为该日合格池分位。')
+
+
+def show_archive_review(st):
+    st.write('读取已有回测结果，无需Token或重新下载行情')
+    st.caption('支持M1.3、M1.4、M1.5完整回测审计ZIP。建议同时上传M1.3的2026-09-18报告和M1.4的2025-09-19报告。')
+    uploads = st.file_uploader('上传一至两份回测审计ZIP', type=['zip'], accept_multiple_files=True, key='attribution_uploads')
+    if st.button('分析已有结果', type='primary'):
+        try:
+            with st.spinner('正在核对信号、分组与特征差异…'):
+                review = review_archives([(f.name, f.getvalue()) for f in uploads])
+            st.session_state['attribution_review'] = review
+        except Exception as exc:
+            st.error('本次归因未完成：'+str(exc))
+    review = st.session_state.get('attribution_review')
+    if review is None:
+        st.info('导入后可直接查看两个区间的结果分组、买入前特征差异和固定三等分表现。')
+        return
+    st.caption('以下为上一次已完成的归因；更换文件后请重新点击分析。')
+    meta = review['meta']
+    for i, source in enumerate(meta['sources'], 1):
+        st.write(f"区间{i}：{source['start']}—{source['end']} · {source['name']} · {source['origin']}")
+    for warning in meta['warnings']:
+        st.warning(warning)
+    st.info('两段历史现在用于寻找新特征，都属于新假设的探索样本。同向差异还需要未参与研究的数据验证。')
+    st.caption('已核对导出信号的完整性并重建选股；本次基于既有逐笔记录归因，没有重新撮合原始行情。')
+    show_attribution(st, review['tables'], prefix='import_attr')
+    st.download_button('下载归因审计', review['archive'], file_name='momentum_M1.5_attribution.zip', mime='application/zip')
+    with st.expander('归因口径与文件来源'):
+        st.write(ATTR_NOTE)
+        st.json(meta)
+
+
 def show_validation(st, folder, manifest):
     protocol = manifest.get("validation_protocol")
     st.subheader("固定两套规则，检查收益改善能否重复出现")
@@ -2016,7 +2394,9 @@ def display_frame(frame):
         if col in f:
             f[col] = pd.to_numeric(f[col], errors="coerce")*100
     f = f.rename(columns={**DISPLAY, **{f"close_return_d{n}": f"第{n}日收盘涨幅%(非策略收益)" for n in range(1, 6)}})
-    return f.round(3)
+    numeric = f.select_dtypes(include='number').columns
+    f[numeric] = f[numeric].round(3)
+    return f
 
 
 def report_table(folder, name):
@@ -2036,10 +2416,12 @@ def show_report(st, folder):
         st.warning("以下全部是合成数据演示，仅用于检查程序，不能用于选股或判断盈利。")
     st.caption(f"版本 {manifest['version']} · 信号截止 {manifest['latest_signal']} · 行情截止 {manifest['data_end']}")
     st.info("研究版：评分不是上涨概率。回测是等额单股审计，未施加账户总资金上限，不能当作账户收益。")
-    labels = ["固定验证", "最新候选", "回测结果", "排除与成交审计", "本次规则"]
+    labels = ["结果归因", "固定验证", "最新候选", "回测结果", "排除与成交审计", "本次规则"]
     if not manifest["config"].get("validation_only", False):
         labels += ["前十观察", "旧过滤验证", "完整对照"]
     tabs = dict(zip(labels, st.tabs(labels)))
+    with tabs["结果归因"]:
+        show_attribution(st, {k: report_table(folder, k) for k in ["attribution_ledger", "attribution_summary", "attribution_features", "attribution_buckets"]})
     with tabs["固定验证"]:
         show_validation(st, folder, manifest)
     if "前十观察" in tabs:
@@ -2127,7 +2509,11 @@ def main():
     import streamlit as st
     st.set_page_config(page_title="板块领涨惯性", page_icon="📈", layout="wide")
     st.title("板块领涨惯性")
-    st.caption("M1.4 · 固定两套规则 · 逐月对照 · 收益改善集中度")
+    st.caption("M1.5 · 交易结果归因 · 买入前特征 · 两段历史对照")
+    mode = st.radio("运行方式", ["每日选股", "区间回测", "离线演示", "已有结果归因"], horizontal=True, index=3)
+    if mode == "已有结果归因":
+        show_archive_review(st)
+        return
     with st.sidebar:
         st.header("数据与股票池")
         default_token = os.environ.get("TUSHARE_TOKEN", "")
@@ -2167,7 +2553,6 @@ def main():
             st.code("streamlit run app.py", language="bash")
             st.caption("依赖 pandas、numpy、streamlit、tushare。沿用原项目依赖即可。四路下载、逐日缓存；首次跨年运行需要下载较多数据。")
         cache_root = str(Path(os.environ.get("MOMENTUM_CACHE_DIR", "momentum_leader_cache")).resolve())
-    mode = st.radio("运行方式", ["每日选股", "区间回测", "离线演示"], horizontal=True, index=1)
     default_end = ready_day().date()
     if mode == "区间回测":
         preset = st.selectbox("验证区间", ["历史待验证：2024-09-20至2025-09-19", "已研究：2025-09-20至2026-09-18", "自定义区间"])
@@ -2227,6 +2612,123 @@ class StrategyTests(unittest.TestCase):
                              "pre_close": 100.0, "adj_factor": 1.0, "up_limit": 110.0,
                              "down_limit": 90.0, "vol": 10000.0, "amount": 10000.0,
                              "circ_mv": 1000000.0, "turnover_rate": 2.0}, index=self.calendar)
+
+    def test_outcome_classification_does_not_put_post_stop_peak_before_exit(self):
+        base = dict(status='已平仓', data_issue=False, net_return=-.03, hold_days=5,
+                    reason='到期退出', horizon_complete=True, sellable_mfe5=.06)
+        changes = [{}, {'sellable_mfe5': .04}, {'net_return': .02},
+                   {'net_return': .02, 'sellable_mfe5': .04},
+                   {'reason': '止损', 'sellable_mfe5': .20, 'hold_days': 2},
+                   {'reason': '止盈', 'net_return': .098, 'hold_days': 2, 'horizon_complete': False},
+                   {'horizon_complete': False}, {'data_issue': True},
+                   {'status': '未平仓', 'net_return': np.nan},
+                   {'reason': '到期延迟退出', 'hold_days': 7},
+                   {'status': '未买入', 'net_return': np.nan},
+                   {'status': '重复持仓跳过', 'net_return': np.nan}]
+        result = classify_outcomes(pd.DataFrame([{**base, **change} for change in changes]))
+        self.assertEqual(result.tolist(), ['达5%后到期亏损', '未达5%到期亏损', '达5%后到期非亏损',
+            '未达5%到期非亏损', '止损退出', '顺利止盈', '到期路径不完整', '数据问题',
+            '未完成/无法分类', '延期/其他退出', '未买入', '重复持仓跳过'])
+
+    def test_attribution_uses_signal_features_and_reconciles_all_records(self):
+        candidates = self.filter_candidates()
+        candidates['entry_price'] = -999  # 非白名单字段不能进入预测特征。
+        candidates['net_return'] = 999
+        records = []
+        for i, c in candidates.iterrows():
+            result = dict(status='已平仓', data_issue=False, net_return=-.02, hold_days=5,
+                reason='到期退出', horizon_complete=True, sellable_mfe5=.02, entry_price=20.)
+            if i < 2:
+                result.update(reason='止盈', net_return=.098)
+            if i == 2:
+                result.update(reason='止损', net_return=-.102, sellable_mfe5=.2)
+            if i == 7:
+                result.update(status='未平仓', net_return=np.nan, horizon_complete=False)
+            records.append(dict(**result, signal_date=c.date, ts_code=c.ts_code,
+                group=GROUP_BASE, take_profit=.10, ret1=777))
+        events = pd.DataFrame(records)
+        out = attribution_reports(events, candidates, events, Config())
+        ledger = out['attribution_ledger']
+        self.assertNotIn('signal_net_return', ledger)
+        self.assertNotIn('signal_entry_price', ledger)
+        np.testing.assert_allclose(ledger[ledger.basis.eq('独立信号')].signal_ret1, candidates.ret1)
+        summary = out['attribution_summary']
+        for basis, f in summary.groupby('basis'):
+            self.assertEqual(f['记录数'].sum(), len(events))
+            self.assertEqual(f['有效平仓数'].sum(), 7)
+            self.assertAlmostEqual(f['对全部平仓均益贡献(百分点)'].sum(), events.net_return.mean()*100)
+            self.assertTrue(f[f.outcome.eq('未完成/无法分类')]['净均益%'].isna().all())
+        # 修改后续收益只能改变结果类别，不能改变信号特征或当日分位。
+        changed = events.copy(); changed['net_return'] = .05
+        rebuilt = attribution_reports(changed, candidates, changed, Config())['attribution_ledger']
+        cols = [x for x in ledger if x.startswith(('signal_', 'pool_pct_'))]
+        pd.testing.assert_frame_equal(ledger[cols], rebuilt[cols])
+        # 只截断未来候选，不改变此前股票日的特征。
+        future = candidates.copy(); future['date'] = self.calendar[1]; future['ret1'] = 100
+        a = attribution_features(candidates)
+        b = attribution_features(pd.concat([candidates, future], ignore_index=True))
+        pd.testing.assert_frame_equal(a, b[b.signal_date.eq(self.calendar[0])])
+        constant = candidates.copy(); constant['sector_ret1'] = .03
+        self.assertTrue(attribution_features(constant).pool_pct_sector_ret1.isna().all())
+        self.assertEqual(attribution_reports(pd.DataFrame(), candidates, pd.DataFrame(), Config()), {})
+
+    def test_attribution_consistency_requires_both_counts_and_direction(self):
+        row = dict(basis='独立信号', group=GROUP_BASE, contrast='止损退出', feature='ret1', 特征='涨幅',
+            止盈有效数=40, 对照有效数=40, 中位数差=1., 止盈池内分位有效数=40, 对照池内分位有效数=40, 池内分位差=2.)
+        a = pd.DataFrame([row]); b = pd.DataFrame([{**row, '池内分位差': -2.}])
+        out = attribution_consistency(a, b).iloc[0]
+        self.assertEqual(out['原值方向检查'], '止盈组两段都较高')
+        self.assertEqual(out['池内分位方向检查'], '方向不一致或无差异')
+        b['对照有效数'] = 29
+        self.assertEqual(attribution_consistency(a, b).iloc[0]['原值方向检查'], '样本不足30_仅列数值')
+        b['中位数差'] = np.nan
+        self.assertEqual(attribution_consistency(a, b).iloc[0]['原值方向检查'], '数据不足')
+
+    def test_attribution_archive_roundtrip_rejects_missing_events_and_overlap(self):
+        with tempfile.TemporaryDirectory() as root:
+            store, basic, member, names, cal = demo_data(root)
+            cfg = replace(Config(), start=ds(cal[35]), end=ds(cal[50]), scope='全A沪深', min_mv=0, max_mv=10000)
+            panel = sector_panel(store, member, cal, cfg)
+            c = build_candidates(store, basic, member, names, panel, cal, cfg)
+            selected = select_candidates(c, cfg); events = []
+            trades = run_trades(store, selected, cal, cfg, event_records=events)
+            folder = save_report(root, cfg, c, selected, trades, panel, cal, 'test', '演示测试', pd.DataFrame(events))
+            raw = (Path(folder)/'回测审计.zip').read_bytes()
+            report = load_attribution_archive(raw)
+            self.assertTrue(report['meta']['selection_rebuilt'])
+            self.assertFalse(report['meta']['price_execution_replayed'])
+            self.assertIn('attribution_ledger', report['tables'])
+            review = review_archives([('first.zip', raw), ('second.zip', raw)])
+            self.assertFalse(review['meta']['comparable'])
+            self.assertIn('重叠', review['meta']['warnings'][0])
+            self.assertNotIn('attribution_consistency', review['tables'])
+            with zipfile.ZipFile(io.BytesIO(review['archive'])) as z:
+                self.assertIsNone(z.testzip())
+                self.assertIn('attribution_features.csv', z.namelist())
+            with zipfile.ZipFile(io.BytesIO(raw)) as z:
+                contents = {n: z.read(n) for n in z.namelist()}
+            def altered(changes):
+                buf = io.BytesIO()
+                with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
+                    for n, v in {**contents, **changes}.items():
+                        z.writestr(n, v)
+                return buf.getvalue()
+            incomplete = pd.DataFrame(events).iloc[1:].to_csv(index=False).encode()
+            with self.assertRaisesRegex(DataError, '不齐全'):
+                load_attribution_archive(altered({'independent_signal_paths.csv': incomplete}))
+            bad = c.copy(); bad.loc[bad.index[0], 'date'] = pd.Timestamp('2030-01-01')
+            with self.assertRaisesRegex(DataError, '日期超出'):
+                load_attribution_archive(altered({'candidates.csv': bad.to_csv(index=False).encode()}))
+            manifest = json.loads(contents['manifest.json']); manifest['config']['buy_fee'] = .001
+            other = altered({'manifest.json': json.dumps(manifest).encode()})
+            # 另一合法、不重叠区间用于检测参数不匹配。
+            other_report = load_attribution_archive(other)
+            self.assertNotEqual(other_report['meta']['params'], report['meta']['params'])
+            with self.assertRaises(DataError):
+                load_attribution_archive(b'not a zip')
+            with self.assertRaises(DataError):
+                review_archives([])
+            store.close()
 
     def test_fixed_protocol_dates_parameters_and_model_scope(self):
         cfg = Config()
