@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""板块领涨惯性 M1.1 — 分板块买价 / 权重 / 连续相对强度固定对照
+"""板块领涨惯性 M1.2 — 涨幅前三 + 四维独立过滤 / 误杀与等机会审计
 
 依赖：pandas >= 2.0, numpy >= 1.24, streamlit >= 1.32, tushare >= 1.4。
 离线逻辑验算：python app.py --self-test
@@ -31,7 +31,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
-VERSION = "M1.1"
+VERSION = "M1.2"
 CORE = {"电子", "计算机", "通信", "国防军工"}
 TECH_WORDS = ("自动化", "机器人", "仪器仪表", "半导体", "光伏设备", "风电设备",
               "电池", "电网设备", "医疗器械", "电子", "金属新材料")
@@ -59,6 +59,7 @@ class Config:
     max_gap: float = 0.03
     growth_gap: float = 0.06
     research: bool = True
+    legacy_research: bool = False
     hold_days: int = 5
     stop_loss: float = 0.10
     buy_fee: float = 0.0003
@@ -89,7 +90,7 @@ def board_name(code):
     return "创业板" if code.startswith("30") else "科创板" if code.startswith("68") else "主板"
 
 
-def experiments(cfg):
+def legacy_experiments(cfg):
     """预先固定的22组，不按回测表现搜索或自动选出最佳参数。"""
     designs = [
         ("B0", "等权基准", GROUP_MAIN, (25, 25, 25, 25), 0, "score", False),
@@ -109,6 +110,68 @@ def experiments(cfg):
             result.append(dict(experiment=key, family=family, group=label if policy == "统一上限" else "分板块_"+label,
                                gap_policy=policy, weights=weights, rs_days=days, sort=sort, hot=hot))
     return result
+
+
+FILTERS = (("F_RS", "相对强度", "strength_score"), ("F_EFF", "上涨效率", "efficiency_score"),
+           ("F_VOL", "量价配合", "volume_score"), ("F_POS", "收盘位置", "position_score"))
+
+
+def experiments(cfg):
+    specs = legacy_experiments(replace(cfg, research=cfg.legacy_research))
+    for spec in specs:
+        spec.update(filter_col="", filter_label="无", filter_cutoff=np.nan)
+    if cfg.research:
+        for key, label, col in FILTERS:
+            specs.append(dict(experiment=key, family="涨幅前三过滤", group="涨幅前三_过滤"+label,
+                              gap_policy="统一上限", weights=(25, 25, 25, 25), rs_days=0,
+                              sort="ret1", hot=False, filter_col=col, filter_label=label, filter_cutoff=25.0))
+    return specs
+
+
+def add_filter_ranks(candidates):
+    """只用当日基础合格且不过热的池；先固定分位，再过滤涨幅前三。"""
+    f = candidates.copy()
+    valid = f.base_reason.fillna("").eq("") & ~f.overheat.eq(True)
+    f["filter_pool_n"] = 0
+    g = f.loc[valid]
+    f.loc[valid, "filter_pool_n"] = g.groupby("date").ts_code.transform("size")
+    for col in SCORE_COLS:
+        f[col+"_filter_pct"] = np.nan
+        grouped = g.groupby("date")[col]
+        f.loc[valid, col+"_filter_pct"] = 100*(grouped.rank(method="average")-.5)/grouped.transform("count")
+    return f
+
+
+def apply_filter_rule(frame, spec):
+    f = frame.copy()
+    if not spec["filter_col"]:
+        f["filter_pass"], f["filter_reason"], f["filter_pct"] = True, "未启用过滤", np.nan
+        return f
+    f["filter_pct"] = f[spec["filter_col"]+"_filter_pct"]
+    small = f.filter_pool_n.lt(4)
+    f["filter_pass"] = small | f.filter_pct.ge(spec["filter_cutoff"])
+    f["filter_reason"] = np.select(
+        [small, f.filter_pct.isna(), f.filter_pass],
+        ["合格池不足4只，保留且标记不可评估", "过滤分位缺失，拒绝", "通过"],
+        default=spec["filter_label"]+"处于当日合格池末25%，拒绝")
+    return f
+
+
+def screening_decisions(candidates, cfg):
+    f = add_filter_ranks(candidates)
+    f = f[f.base_reason.fillna("").eq("") & ~f.overheat.eq(True)].copy()
+    f = f.sort_values(["date", "ret1", "ts_code"], ascending=[True, False, True])
+    f["rank"] = f.groupby("date").cumcount()+1
+    f = f[f["rank"].le(cfg.top_n)]
+    parts = []
+    for spec in experiments(cfg):
+        if not spec["filter_col"]:
+            continue
+        part = apply_filter_rule(f, spec)
+        for key in ["group", "experiment", "filter_col", "filter_label", "filter_cutoff"]:
+            part[key] = spec[key]
+        parts.append(part)
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
 
 
 def buy_gap(code, policy, cfg):
@@ -608,6 +671,7 @@ def score_candidates(candidates):
 
 
 def select_candidates(candidates, cfg):
+    candidates = add_filter_ranks(candidates)
     choices = []
     for spec in experiments(cfg):
         mask = candidates.base_reason.eq("") & candidates.overheat.eq(spec["hot"])
@@ -622,7 +686,9 @@ def select_candidates(candidates, cfg):
         f = f.sort_values(["date", spec["sort"], "ts_code"], ascending=[True, False, True])
         f["rank"] = f.groupby("date").cumcount()+1
         f = f[f["rank"].le(cfg.top_n)].copy()
-        for key in ["group", "experiment", "family", "gap_policy", "rs_days"]:
+        f = apply_filter_rule(f, spec)
+        f = f[f.filter_pass].copy()  # 排名后过滤，不补位、不把第4名提到前三。
+        for key in ["group", "experiment", "family", "gap_policy", "rs_days", "filter_col", "filter_label", "filter_cutoff"]:
             f[key] = spec[key]
         f["gap_limit"] = f.ts_code.map(lambda code: buy_gap(code, spec["gap_policy"], cfg))
         f["max_buy_reference"] = f.close*(1+f.gap_limit)
@@ -789,7 +855,7 @@ def run_trades(store, selected, calendar, cfg, progress=lambda s: None, event_re
                         cached_paths[cache_key] = simulate_trade(stock, calendar, row.date, tp,
                                                                replace(cfg, max_gap=row.gap_limit))
                     path = cached_paths[cache_key]
-                    if event_records is not None and tp == .05:
+                    if event_records is not None:
                         # 用全部候选信号的假设入场检查选股惯性，不受早先持仓阻塞影响。
                         event = {**base, **path}
                         event["event_mode"] = "独立信号观察_允许重叠_不是组合收益"
@@ -842,7 +908,7 @@ def summarize(trades, keys):
 def experiment_design(cfg):
     rows = []
     for spec in experiments(cfg):
-        row = {k: spec[k] for k in ["group", "experiment", "family", "gap_policy", "rs_days"]}
+        row = {k: spec[k] for k in ["group", "experiment", "family", "gap_policy", "rs_days", "filter_col", "filter_label", "filter_cutoff"]}
         row.update(dict(zip(["相对强度权重", "上涨效率权重", "量价配合权重", "收盘位置权重"], spec["weights"])))
         row.update({"主板买价上限%": cfg.max_gap*100,
                     "双创买价上限%": (cfg.growth_gap if spec["gap_policy"] == "分板块上限" else cfg.max_gap)*100})
@@ -868,6 +934,9 @@ def experiment_summary(trades, selected, calendar, cfg):
     base = grid[grid.experiment.eq("B0")][["gap_policy", "take_profit", "净均益%"]].rename(columns={"净均益%": "同买价等权净均益%"})
     grid = grid.merge(base, on=["gap_policy", "take_profit"], how="left")
     grid["相对等权均益差(百分点)"] = grid["净均益%"]-grid["同买价等权净均益%"]
+    simple = grid[grid.experiment.eq("RETURN")][["gap_policy", "take_profit", "净均益%"]].rename(columns={"净均益%": "同买价涨幅基准净均益%"})
+    grid = grid.merge(simple, on=["gap_policy", "take_profit"], how="left")
+    grid["相对涨幅均益差(百分点)"] = grid["净均益%"]-grid["同买价涨幅基准净均益%"]
     return grid
 
 
@@ -906,6 +975,8 @@ def path_summary(events):
     """不去重的独立信号5日路径，仅衡量入场后的惯性，不能解读为可实现利润。"""
     if events.empty:
         return pd.DataFrame()
+    # 两档止盈拥有相同固定观察路径，只取5%版本一次，防止把同一信号重复统计。
+    events = events[events.take_profit.eq(.05)]
     rows = []
     for group, f in events.groupby("group", sort=False):
         entered = f[f.entry_price.notna()]
@@ -924,7 +995,154 @@ def path_summary(events):
     return pd.DataFrame(rows)
 
 
-RULES = """板块领涨惯性 M1.1：研究规则与边界
+def filter_impact_summary(ledger, by=()):
+    """固定基准已平仓机会集合；被过滤票据贡献0，未完成结果仍是未知。"""
+    if ledger.empty:
+        return pd.DataFrame()
+    keys = ["group", "take_profit"]+list(by)
+    rows = []
+    for key, f in ledger.groupby(keys, sort=False, dropna=False):
+        issue = f.data_issue.eq(True)
+        closed = f[f.status.eq("已平仓") & ~issue & f.net_return.notna()]
+        kept, veto = closed[closed.filter_pass], closed[~closed.filter_pass]
+        n = len(closed)
+        avoided = -veto.loc[veto.net_return.lt(0), "net_return"].sum()
+        missed = veto.loc[veto.net_return.gt(0), "net_return"].sum()
+        row = dict(zip(keys, key))
+        row.update({"原始信号数": len(f), "规则保留数": int(f.filter_pass.sum()),
+                    "规则拒绝数": int((~f.filter_pass).sum()), "信号保留率%": f.filter_pass.mean()*100,
+                    "小候选池保留数": int((f.filter_pool_n.lt(4)&f.filter_pass).sum()),
+                    "未成交数": int(f.status.eq("未买入").sum()),
+                    "待买入或未平仓数": int(f.status.isin(["待下一交易日", "未平仓"]).sum()),
+                    "数据问题数": int(issue.sum()), "有效平仓机会数": n,
+                    "保留平仓数": len(kept), "拒绝平仓数": len(veto),
+                    "避免亏损笔数": int(veto.net_return.lt(0).sum()),
+                    "错过盈利笔数": int(veto.net_return.gt(0).sum()),
+                    "保留单笔均益%": kept.net_return.mean()*100, "拒绝单笔均益%": veto.net_return.mean()*100,
+                    "基准机会均益%": closed.net_return.mean()*100,
+                    "过滤后等机会均益%": kept.net_return.sum()/n*100 if n else np.nan,
+                    "等机会改善(百分点)": -veto.net_return.sum()/n*100 if n else np.nan,
+                    "避免亏损贡献(百分点)": avoided/n*100 if n else np.nan,
+                    "错过盈利贡献(百分点)": missed/n*100 if n else np.nan})
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def filter_audit(decisions, events):
+    if decisions.empty or events.empty:
+        return pd.DataFrame()
+    d = decisions.rename(columns={"date": "signal_date", "rank": "baseline_rank"}).copy()
+    d["signal_date"] = pd.to_datetime(d.signal_date)
+    base = events[events.group.eq(GROUP_BASE)].copy()
+    base["signal_date"] = pd.to_datetime(base.signal_date)
+    keys = ["signal_date", "ts_code"]
+    if base.duplicated(keys+["take_profit"]).any() or d.duplicated(keys+["group"]).any():
+        raise DataError("过滤审计存在重复信号，不能重复计入收益")
+    base = base[[col for col in base if col not in d.columns or col in keys]]
+    out = d.merge(base, on=keys, how="inner")
+    out["year"] = out.signal_date.dt.year
+    out["outcome_source"] = "涨幅基准独立信号_允许重叠_不是账户收益"
+    return out
+
+
+def selection_comparison(events, candidates):
+    if events.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    keys = ["signal_date", "ts_code", "take_profit"]
+    e = events.copy(); e["signal_date"] = pd.to_datetime(e.signal_date)
+    a = e[e.group.eq(GROUP_MAIN)].set_index(keys)
+    b = e[e.group.eq(GROUP_BASE)].set_index(keys)
+    common = a.index.intersection(b.index)
+    parts = []
+    for label, f in [("两种排序共同选中", b.loc[common]),
+                     ("仅涨幅排序选中", b.loc[b.index.difference(a.index)]),
+                     ("仅综合评分选中", a.loc[a.index.difference(b.index)])]:
+        f = f.reset_index().copy(); f["cohort"] = label; parts.append(f)
+    ledger = pd.concat([f for f in parts if not f.empty], ignore_index=True) if any(not f.empty for f in parts) else pd.DataFrame()
+    if ledger.empty:
+        return ledger, pd.DataFrame()
+    features = candidates.rename(columns={"date": "signal_date"}).copy()
+    features["signal_date"] = pd.to_datetime(features.signal_date)
+    feature_cols = ["ret1", "ret5"]+list(SCORE_COLS)
+    take = [col for col in feature_cols if col not in ledger]
+    ledger = ledger.merge(features[["signal_date", "ts_code"]+take], on=["signal_date", "ts_code"], how="left", validate="many_to_one")
+    summary = summarize(ledger, ["cohort", "take_profit"])
+    means = ledger.groupby(["cohort", "take_profit"], as_index=False)[feature_cols].mean()
+    means = means.rename(columns={col: "信号均值_"+col for col in feature_cols})
+    return ledger, summary.merge(means, on=["cohort", "take_profit"], how="left")
+
+
+def factor_bucket_summary(events, candidates):
+    if events.empty:
+        return pd.DataFrame()
+    base = events[events.group.eq(GROUP_BASE)].copy()
+    base["signal_date"] = pd.to_datetime(base.signal_date)
+    f = add_filter_ranks(candidates).rename(columns={"date": "signal_date"})
+    f["signal_date"] = pd.to_datetime(f.signal_date)
+    cols = ["signal_date", "ts_code", "filter_pool_n"]+[col+"_filter_pct" for col in SCORE_COLS]
+    base = base.merge(f[cols], on=["signal_date", "ts_code"], how="left", validate="many_to_one")
+    parts = []
+    for _, label, col in FILTERS:
+        block = base.copy(); pct = block[col+"_filter_pct"]
+        block["dimension"] = label
+        block["factor_bucket"] = np.select(
+            [block.filter_pool_n.lt(4)|pct.isna(), pct.lt(25), pct.lt(50), pct.lt(75)],
+            ["不可评估：池小或缺分位", "0—25分位", "25—50分位", "50—75分位"], default="75—100分位")
+        parts.append(block)
+    return summarize(pd.concat(parts, ignore_index=True), ["dimension", "factor_bucket", "take_profit"])
+
+
+def filter_execution_audit(trades, decisions):
+    if trades.empty or decisions.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    keys = ["signal_date", "ts_code", "take_profit"]
+    t = trades.copy(); t["signal_date"] = pd.to_datetime(t.signal_date)
+    base = t[t.group.eq(GROUP_BASE)].set_index(keys)
+    d = decisions.copy(); d["date"] = pd.to_datetime(d.date)
+    rows = []
+    for group, signals in d.groupby("group", sort=False):
+        decision = signals.set_index(["date", "ts_code"])
+        filtered = t[t.group.eq(group)].set_index(keys)
+        for key, old in base.iterrows():
+            keep = bool(decision.loc[key[:2], "filter_pass"])
+            new = filtered.loc[key] if key in filtered.index else None
+            if keep and new is None:
+                raise DataError("通过过滤的信号缺少成交审计记录")
+            old_fill = old.status in ["已平仓", "未平仓"]
+            new_fill = new is not None and new.status in ["已平仓", "未平仓"]
+            if not keep and old_fill:
+                label, source, side = "直接过滤基准成交", old, "基准成交结果（已被过滤）"
+            elif old_fill and new_fill:
+                label, source, side = "共同成交", new, "过滤组实际模拟"
+            elif new_fill:
+                label, source, side = "持仓路径变化新增", new, "过滤组实际模拟"
+            elif old_fill:
+                label, source, side = "持仓路径变化减少", old, "基准成交结果（过滤组未成交）"
+            else:
+                continue
+            rows.append({**source.to_dict(), **dict(zip(keys, key)), "group": group,
+                         "change_type": label, "reference_side": side, "baseline_status": old.status,
+                         "filtered_status": new.status if new is not None else "规则拒绝"})
+    ledger = pd.DataFrame(rows)
+    return (ledger, summarize(ledger, ["group", "change_type", "take_profit"])) if not ledger.empty else (ledger, pd.DataFrame())
+
+
+RULES = """板块领涨惯性 M1.2：研究规则与边界
+
+M1.2主研究：昨日涨幅排序先取前三，再分别检查四个维度的末25%分位；四个条件各自独立，不组合、不调权重。
+过滤分位在信号日基础合格且不过热的完整池内计算，按对应维度原始得分作中位秩百分位；不是只在前三内排名。
+分位<25拒绝，恰好25保留；并列平均排名。合格池少于4只时不作末25%判定，保留并列出不可评估数量。
+拒绝后不补位，保留原始涨幅名次。过滤只改变是否入选，不改变评分、买价、止盈止损或持有期。
+默认统一3%含滑点买价上限，默认7组：涨幅基准、综合评分、过热观察和四个独立过滤；M1.1完整对照可单独开启。
+最新候选默认显示涨幅基准。所有过滤都是待验证假设，不自动选用历史最优过滤，更不声称实盘盈利。
+误杀审计：以涨幅基准每个独立信号的假设成交为参照，允许同股重叠，分别记录5%与10%止盈；不是账户回报。
+等机会比较使用同一组基准有效平仓机会：被过滤机会按空仓0计，分母固定；未平仓/数据问题仍未知，不当作0。
+等机会改善=-被过滤机会收益之和/基准有效平仓机会数；避免亏损贡献减错过盈利贡献等于该改善。
+保留均益变高并不代表等机会收益改善；还需同时看拒绝组收益、信号覆盖、各年表现和实际持仓路径变化。
+共同/独有选股分析采用独立信号，不受之前持仓阻塞影响，其数量与去重后的实际模拟成交数可能不同。
+默认不自动加载旧报告做新策略实际回放；旧M1.1报告只有5%独立信号数据时，只能核对相应5%过滤机会审计。
+
+以下为继承的交易口径及可选M1.1对照：
 
 新增固定对照：统一买价上限（默认均为昨收+3%）与分板块上限（默认主板3%、创业板/科创板6%）。
 上限约束含滑点的买价，不是昨天涨幅；除权日使用当日除权参考昨收。创业板以30开头，科创板以68开头。
@@ -938,7 +1156,7 @@ RS条件叠加在原版股票池和方向门槛上；各组共用原始百分位
 独立信号路径把每条入选信号单独假设买入，允许同股重叠；仅完整5日窗口用于惯性占比，不是账户收益。
 路径窗口固定为买入起5个市场交易日，最高涨幅可能出现在实际止盈/止损之后；可卖最高涨幅不含买入当天。
 各实验报告信号覆盖、未完成样本、年度、名次和交易板块；高收益但极少样本不能自动胜出。
-默认每日候选仍展示原版等权统一上限，不自动采用历史最优实验。22组是预先固定的假设对照，不进行参数寻优。
+M1.1旧对照不自动采用历史最优实验。22组是预先固定的假设对照，不进行参数寻优。
 2025-09至2026-09样本已用于提出这些假设，应标记为探索样本；其他未参与调参区间/前向记录才用于验证。
 
 这是全新独立策略，未经过参数寻优，也未证明盈利。无自动下单功能。
@@ -981,16 +1199,27 @@ T+1：买入当日不能止盈、不能止损，买入当日达到5%只作诊断
 
 def save_report(root, cfg, candidates, selected, trades, panel, calendar, data_hash, mode, events=None):
     root = Path(root)
-    folder = Path(tempfile.mkdtemp(prefix="M11_", dir=root))
+    folder = Path(tempfile.mkdtemp(prefix="M12_", dir=root))
+    candidates = add_filter_ranks(candidates)
     tables = {"candidates": candidates, "selected": selected, "trades": trades,
               "sector_daily": panel[panel.date.between(pd.Timestamp(cfg.start), pd.Timestamp(cfg.end))].copy()}
     tables["summary"] = summarize(trades, ["group", "take_profit"])
     tables["experiment_design"] = experiment_design(cfg)
     tables["experiment_summary"] = experiment_summary(trades, selected, calendar, cfg)
     tables["gap_incremental_trades"], tables["gap_incremental_summary"] = gap_comparison(trades)
+    decisions = screening_decisions(candidates, cfg)
+    tables["filter_decisions"] = decisions
+    tables["filter_execution_changes"], tables["filter_execution_summary"] = filter_execution_audit(trades, decisions)
     if events is not None:
         tables["independent_signal_paths"] = events
         tables["path_summary"] = path_summary(events)
+        ledger = filter_audit(decisions, events)
+        tables["filter_signal_outcomes"] = ledger
+        tables["filter_impact"] = filter_impact_summary(ledger)
+        tables["filter_impact_by_year"] = filter_impact_summary(ledger, ["year"])
+        tables["filter_impact_by_rank"] = filter_impact_summary(ledger, ["baseline_rank"])
+        tables["selection_overlap_signals"], tables["selection_overlap_summary"] = selection_comparison(events, candidates)
+        tables["factor_buckets"] = factor_bucket_summary(events, candidates)
     if not trades.empty:
         tr = trades.copy()
         tr["year"] = pd.to_datetime(tr.signal_date).dt.year
@@ -1016,10 +1245,13 @@ def save_report(root, cfg, candidates, selected, trades, panel, calendar, data_h
                     data_start=ds(calendar[0]), data_end=ds(calendar[-1]), data_hash=data_hash,
                     source_sha256=source_hash, created_at=datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(),
                     verified_profitability=False, execution="保守日线近似", tables=list(tables),
-                    research_design="固定22组：两种买价×等权/四种40-20-20-20/四种连续RS/涨幅/过热",
+                    research_design="M1.2：涨幅前三、排名后单维末25%过滤、不补位；M1.1对照仅在开启时附加",
                     experiment_count=len(experiments(cfg)),
                     tuning_performed=False, rs_definition="最近N个市场交易日每天收益严格高于同一板块；含信号日；不是累计跑赢",
                     independent_paths="允许重叠的独立信号5日观察；路径可能发生于止盈/止损之后，不是兑现利润")
+    manifest["filter_protocol"] = dict(cutoff_percentile=25, minimum_pool=4, replacement=False,
+        rank_preserved=True, filters_combined=False, threshold_tuned=False,
+        same_opportunity_denominator="基准独立信号有效平仓数；未知不归零", available_event_targets=sorted(events.take_profit.unique().tolist()) if events is not None and not events.empty else [])
     (folder/"manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     (folder/"规则与口径.txt").write_text(RULES, encoding="utf-8")
     archive = folder/"回测审计.zip"
@@ -1118,6 +1350,11 @@ def run_demo(root):
 
 
 DISPLAY = {
+    "filter_label": "过滤维度", "filter_cutoff": "拒绝分位界限", "filter_pass": "是否保留",
+    "filter_reason": "过滤判定", "filter_pct": "当日池内分位", "filter_pool_n": "当日合格池数量",
+    "baseline_rank": "原始涨幅名次", "cohort": "选股交集", "dimension": "维度", "factor_bucket": "当日分位区间",
+    "change_type": "成交变化", "reference_side": "收益参照来源",
+    "信号均值_ret1": "入选时昨日涨幅均值%", "信号均值_ret5": "入选时5日涨幅均值%",
     "experiment": "实验编号", "family": "实验类型", "gap_policy": "买价规则", "rs_days": "连续跑赢日数",
     "board": "交易板块", "gap_limit": "含滑点买价溢价上限%", "base_score": "原版等权分",
     "rs1": "1日超额(百分点)", "rs2": "2日累计超额(百分点)", "ret2": "2日涨幅%",
@@ -1145,6 +1382,7 @@ PERCENT_COLUMNS = {"take_profit", "ret1", "ret3", "ret5", "rs3", "rs5", "lead_pr
     "runup5", "sector_ret1", "breadth", "bias10", "drawdown5", "volatility5", "net_return",
     "gross_return", "mark_return", "gap", "sellable_mfe5", "mae5", "mean_net", "min_net"}
 PERCENT_COLUMNS.update({"rs1", "rs2", "ret2", "gap_limit"})
+PERCENT_COLUMNS.update({"信号均值_ret1", "信号均值_ret5"})
 DISPLAY.update({f"rs_all_{n}": f"连续{n}日跑赢" for n in [1, 2, 3, 5]})
 
 
@@ -1160,9 +1398,9 @@ def show_research(st, folder):
     if grid.empty:
         st.info("此报告没有M1.1对照结果，请重新运行。")
         return
-    st.subheader("固定对照：买价上限、四维权重、连续跑赢天数")
+    st.subheader("全部实验结果")
     st.caption("这是探索性对照，不自动推荐历史收益最高的一组。净均益是独立交易均值，非账户收益；检查各年、样本量和信号覆盖。")
-    family = st.selectbox("查看实验类型", ["全部", "等权基准", "单维加权", "连续相对强度", "涨幅对照", "过热观察"], key="research_family")
+    family = st.selectbox("查看实验类型", ["全部", "涨幅前三过滤", "等权基准", "单维加权", "连续相对强度", "涨幅对照", "过热观察"], key="research_family")
     policy = st.radio("买入上限规则", ["两种都看", "统一上限", "分板块上限"], horizontal=True, key="research_policy")
     target = st.radio("止盈对照", ["5%", "10%"], horizontal=True, key="research_target")
     f = grid[grid.take_profit.eq(.05 if target == "5%" else .10)]
@@ -1171,7 +1409,7 @@ def show_research(st, folder):
     if policy != "两种都看":
         f = f[f.gap_policy.eq(policy)]
     cols = ["group", "gap_policy", "选股日数", "选股覆盖%", "合格候选股日数", "有效平仓数", "未平仓数",
-            "胜率%", "净均益%", "相对等权均益差(百分点)", "止盈占比%", "最差单笔%", "剔除最大5笔后净均益%"]
+            "胜率%", "净均益%", "相对涨幅均益差(百分点)", "相对等权均益差(百分点)", "止盈占比%", "最差单笔%", "剔除最大5笔后净均益%"]
     show_table(st, f.reindex(columns=cols))
     st.subheader("放宽后新增的交易表现")
     increment = report_table(folder, "gap_incremental_summary")
@@ -1188,6 +1426,61 @@ def show_research(st, folder):
     st.caption("每条信号独立假设入场，允许持仓重叠；可卖日期指买入后的第2—5个市场交易日。曾达目标不等于策略获利，可能先止损后反弹。此表不因上方5%/10%切换改变路径。")
     with st.expander("查看固定权重和买入上限"):
         show_table(st, report_table(folder, "experiment_design"))
+
+
+def show_screening(st, folder):
+    st.subheader("昨日涨幅前三：过滤是否真正改善结果")
+    st.caption("四个过滤独立运行：剔除当日合格池内对应维度末25%的原始前三候选；不补位，池不足4只不判定。默认不组合、不调权重。")
+    tp = .05 if st.radio("过滤验证止盈", ["5%", "10%"], horizontal=True, key="filter_target") == "5%" else .10
+    grid = report_table(folder, "experiment_summary")
+    if not grid.empty:
+        view = grid[grid.gap_policy.eq("统一上限") & grid.take_profit.eq(tp) &
+                    grid.family.isin(["涨幅对照", "等权基准", "涨幅前三过滤"])]
+        st.caption("实际模拟：同组同股不重复持仓。此表的交易集合可能因过滤后的持仓路径而改变。")
+        show_table(st, view.reindex(columns=["group", "选股日数", "选股覆盖%", "有效平仓数", "未平仓数",
+                                            "胜率%", "净均益%", "相对涨幅均益差(百分点)", "剔除最大5笔后净均益%", "最差单笔%"]))
+    impact = report_table(folder, "filter_impact")
+    if impact.empty:
+        st.info("本次没有可用过滤审计。请启用M1.2过滤验证并运行；无候选时不会用0收益伪装成有效结果。")
+        return
+    st.subheader("避免亏损与误杀盈利：相同机会集合")
+    st.info("以下把每条涨幅基准信号独立假设买入，允许重叠。分母固定为基准有效平仓机会数，被过滤机会按空仓0处理；未完成结果不归零。这不是账户收益。")
+    part = impact[impact.take_profit.eq(tp)]
+    show_table(st, part.reindex(columns=["group", "原始信号数", "规则拒绝数", "有效平仓机会数", "拒绝平仓数",
+        "避免亏损笔数", "错过盈利笔数", "保留单笔均益%", "拒绝单笔均益%", "基准机会均益%",
+        "过滤后等机会均益%", "等机会改善(百分点)"]))
+    st.caption("等机会改善为正，表示被过滤的这批机会合计亏损；为负，表示错过的盈利超过避免的亏损。仅看保留均益上升不够。")
+    with st.expander("分年度、原始名次及未完成机会"):
+        for name in ["filter_impact_by_year", "filter_impact_by_rank"]:
+            table = report_table(folder, name)
+            if not table.empty:
+                show_table(st, table[table.take_profit.eq(tp)])
+        show_table(st, part.reindex(columns=["group", "原始信号数", "信号保留率%", "小候选池保留数",
+            "未成交数", "待买入或未平仓数", "数据问题数", "避免亏损贡献(百分点)", "错过盈利贡献(百分点)"]))
+    st.subheader("综合评分与涨幅排序：共同选中与各自独有")
+    overlap = report_table(folder, "selection_overlap_summary")
+    if not overlap.empty:
+        show_table(st, overlap[overlap.take_profit.eq(tp)].reindex(columns=["cohort", "信号数", "有效平仓数",
+            "未平仓数", "胜率%", "净均益%", "信号均值_ret1", "信号均值_ret5", "最差单笔%"]))
+    st.caption("这也是独立信号审计，不受之前持仓阻塞影响，数量可能与实际成交表不同。完整特征与逐笔记录在下载中。")
+    with st.expander("四个维度的固定分位区间表现"):
+        buckets = report_table(folder, "factor_buckets")
+        if not buckets.empty:
+            show_table(st, buckets[buckets.take_profit.eq(tp)].reindex(columns=["dimension", "factor_bucket", "信号数",
+                "有效平仓数", "未平仓数", "胜率%", "净均益%", "最差单笔%"]))
+        st.caption("分位在当日完整合格池内计算；这里仅观察涨幅前三落入各区间后的表现，不据此自动寻找最佳门槛。")
+    with st.expander("过滤引起的持仓路径变化"):
+        changes = report_table(folder, "filter_execution_summary")
+        if not changes.empty:
+            show_table(st, changes[changes.take_profit.eq(tp)])
+        st.caption("直接过滤/路径减少显示基准中被放弃交易的结果；共同/新增显示过滤组结果。各行不能相加当作组合收益。")
+    with st.expander("最新信号的过滤判定"):
+        decisions = report_table(folder, "filter_decisions")
+        if not decisions.empty:
+            manifest = json.loads((Path(folder)/"manifest.json").read_text(encoding="utf-8"))
+            decisions = decisions[pd.to_datetime(decisions.date).eq(pd.Timestamp(manifest["latest_signal"]))]
+            show_table(st, decisions.reindex(columns=["date", "group", "rank", "ts_code", "name", "ret1",
+                "filter_pool_n", "filter_pct", "filter_pass", "filter_reason"]))
 
 
 def display_frame(frame):
@@ -1219,10 +1512,12 @@ def show_report(st, folder):
         st.warning("以下全部是合成数据演示，仅用于检查程序，不能用于选股或判断盈利。")
     st.caption(f"版本 {manifest['version']} · 信号截止 {manifest['latest_signal']} · 行情截止 {manifest['data_end']}")
     st.info("研究版：评分不是上涨概率。回测是等额单股审计，未施加账户总资金上限，不能当作账户收益。")
-    tabs = st.tabs(["对照验证", "最新候选", "回测结果", "排除与成交审计", "本次规则"])
+    tabs = st.tabs(["过滤验证", "完整对照", "最新候选", "回测结果", "排除与成交审计", "本次规则"])
     with tabs[0]:
-        show_research(st, folder)
+        show_screening(st, folder)
     with tabs[1]:
+        show_research(st, folder)
+    with tabs[2]:
         sectors = report_table(folder, "sector_daily")
         last_day = sectors.date.max() if not sectors.empty else None
         daily = sectors[sectors.date.eq(last_day)].sort_values("sector_rank").head(10) if last_day else pd.DataFrame()
@@ -1234,11 +1529,12 @@ def show_report(st, folder):
         designs = report_table(folder, "experiment_design")
         groups = designs.loc[~designs.experiment.eq("HOT"), "group"].tolist() if not designs.empty else [GROUP_MAIN]
         if st.session_state.get("daily_experiment") not in groups:
-            st.session_state["daily_experiment"] = GROUP_MAIN
-        chosen = st.selectbox("展示候选规则（实验尚未验证，默认保留原版）", groups, key="daily_experiment")
+            st.session_state["daily_experiment"] = GROUP_BASE if GROUP_BASE in groups else groups[0]
+        chosen = st.selectbox("展示候选规则（默认涨幅基准，过滤尚未验证）", groups, key="daily_experiment")
         if not picks.empty:
             picks = picks[picks.group.eq(chosen)]
         st.caption("已持仓不重复加仓；高开超过最高买价或开盘涨跌停则跳过，不补位。除权日请按除权参考价调整最高买价。")
+        st.caption("涨幅基准按昨日涨幅排序，综合分仅作审计；过滤组保留原始涨幅名次，空出的名额不补位。")
         cols = ["rank", "ts_code", "name", "board", "sector_name", "score", "gap_limit", "close", "max_buy_reference", "mv_yi",
                 "ret1", "ret5", "rs5", "runup5", "strength_score", "efficiency_score", "volume_score", "position_score", "heat_penalty"]
         if picks.empty:
@@ -1250,7 +1546,7 @@ def show_report(st, folder):
             if not pool.empty:
                 cols = ["ts_code", "name", "score", "ret5", "rs5", "runup5", "mv_yi", "exclude_reason"]
                 show_table(st, pool.sort_values("score", ascending=False)[cols])
-    with tabs[2]:
+    with tabs[3]:
         summary = report_table(folder, "summary")
         st.subheader("两档止盈与排序对照")
         st.caption("净收益含比例手续费、历史印花税和双边滑点。过热观察组不属于买入策略。未平仓与数据不完整记录不计入平仓均益，数量会列出。")
@@ -1264,7 +1560,7 @@ def show_report(st, folder):
             f = report_table(folder, "daily_cohorts")
             st.caption("仅汇总已平仓记录，未完成批次不是完整的一篮子收益；各交易有时间重叠。")
             show_table(st, f)
-    with tabs[3]:
+    with tabs[4]:
         st.subheader("为什么没入选、没买到或没卖出")
         show_table(st, report_table(folder, "exclusions"))
         show_table(st, report_table(folder, "execution_reasons"))
@@ -1285,7 +1581,7 @@ def show_report(st, folder):
                     "entry_price", "exit_date", "exit_price", "net_return", "hold_days", "reason", "ambiguous",
                     "deferred", "data_issue", "mark_date", "mark_return", "horizon_complete", "buy_day_hit5", "sellable_mfe5", "mae5"]
             show_table(st, sub.sort_values("signal_date", ascending=False).reindex(columns=cols).head(500))
-    with tabs[4]:
+    with tabs[5]:
         st.json(manifest["config"])
         st.text(RULES)
         st.caption(f"代码指纹：{manifest['source_sha256'][:16]} · 数据指纹：{manifest['data_hash'][:16]}")
@@ -1297,7 +1593,7 @@ def main():
     import streamlit as st
     st.set_page_config(page_title="板块领涨惯性", page_icon="📈", layout="wide")
     st.title("板块领涨惯性")
-    st.caption("M1.1 · 双创买价3%/6%对照 · 四维权重对照 · 连续1/2/3/5日跑赢板块")
+    st.caption("M1.2 · 昨日涨幅前三 · 四维独立过滤 · 误杀与相同机会审计")
     with st.sidebar:
         st.header("数据与股票池")
         default_token = os.environ.get("TUSHARE_TOKEN", "")
@@ -1313,13 +1609,16 @@ def main():
         max_mv = st.number_input("最高流通市值（亿元）", min_value=1.0, value=1000.0, step=100.0)
         with st.expander("交易设置"):
             max_gap = st.number_input("统一组/主板买价溢价上限（%）", min_value=0.0, max_value=20.0, value=3.0, step=0.5)/100
-            growth_gap = st.number_input("分板块组：创业板/科创板上限（%）", min_value=0.0, max_value=30.0, value=6.0, step=0.5)/100
+            growth_gap = st.number_input("可选旧对照：创业板/科创板上限（%）", min_value=0.0, max_value=30.0, value=6.0, step=0.5,
+                                         help="仅附加M1.1完整对照时使用，M1.2四个过滤统一沿用上方买价上限。")/100
             hold_days = st.selectbox("最多持有市场交易日（含买入日）", [2, 3, 4, 5], index=3)
             fee = st.number_input("单边综合手续费（万分之）", min_value=0.0, max_value=50.0, value=3.0, step=1.0)/10000
             slip = st.number_input("单边滑点（%）", min_value=0.0, max_value=2.0, value=0.1, step=0.05)/100
             st.caption("卖出另计历史印花税。止盈分别5%/10%，止损10%。默认最高买价含滑点；日线同日双触及按止损先发生。")
-        research = st.checkbox("运行固定对照验证（22组）", value=True,
-                               help="两种买价规则，各比较等权、四种单维40分、四种连续跑赢天数及两个对照。行情只下载一次。关闭后仅运行原版三组。")
+        research = st.checkbox("运行M1.2过滤验证（默认共7组）", value=True,
+                               help="涨幅基准、综合评分、过热观察，以及四个独立末25%过滤；先取前三再过滤，不补位。")
+        legacy_research = st.checkbox("附加M1.1完整对照", value=False,
+                                      help="仅需要复查买价、权重或连续RS旧实验时打开；与M1.2同时开启共26组，行情仍只下载一次。")
         with st.expander("运行说明"):
             st.code("streamlit run app.py", language="bash")
             st.caption("依赖 pandas、numpy、streamlit、tushare。沿用原项目依赖即可。四路下载、逐日缓存；首次跨年运行需要下载较多数据。")
@@ -1339,7 +1638,8 @@ def main():
         start = end = default_end
         st.warning("离线演示使用合成行情，检查界面和规则，不产生真实选股建议。")
     cfg = Config(start=ds(start), end=ds(end), scope=scope, min_price=min_price, min_mv=min_mv, max_mv=max_mv,
-                 max_gap=max_gap, growth_gap=growth_gap, research=research, hold_days=hold_days, buy_fee=fee, sell_fee=fee, slippage=slip)
+                 max_gap=max_gap, growth_gap=growth_gap, research=research, legacy_research=legacy_research,
+                 hold_days=hold_days, buy_fee=fee, sell_fee=fee, slippage=slip)
     if st.button("开始选股 / 回测" if mode != "离线演示" else "运行离线演示", type="primary"):
         try:
             cfg.validate()
@@ -1465,24 +1765,73 @@ class StrategyTests(unittest.TestCase):
             row.update({f"rs_all_{n}": True for n in [1, 2, 3, 5]})
             rows.append(row)
         c = pd.DataFrame(rows)
-        selected = select_candidates(c, replace(self.cfg, top_n=1))
+        selected = select_candidates(c, replace(self.cfg, top_n=1, legacy_research=True))
         self.assertEqual(selected[selected.group.eq(GROUP_MAIN)].iloc[0].ts_code, "300001.SZ")
         strong = selected[selected.group.eq("相对强度40")].iloc[0]
         self.assertEqual(strong.ts_code, "600001.SH")
         self.assertEqual(strong.strength_score, 90)
         self.assertEqual(strong.score, 60)
-        self.assertEqual(len(experiments(self.cfg)), 22)
+        self.assertEqual(len(experiments(self.cfg)), 7)
+        self.assertEqual(len(experiments(replace(self.cfg, legacy_research=True))), 26)
 
     def test_path_summary_excludes_incomplete_and_buy_day_only_hit(self):
         f = self.bars()
         f.loc[self.calendar[1], "high"] = 106
         result = simulate_trade(f, self.calendar, self.calendar[0], .05, self.cfg)
         partial = simulate_trade(f.iloc[:3], self.calendar[:3], self.calendar[0], .05, self.cfg)
-        report = path_summary(pd.DataFrame([{**result, "group": "test"}, {**partial, "group": "test"}]))
+        report = path_summary(pd.DataFrame([{**result, "group": "test", "take_profit": .05},
+                                           {**partial, "group": "test", "take_profit": .05},
+                                           {**result, "group": "test", "take_profit": .10}]))
         self.assertEqual(report.iloc[0]["完整5日观察数"], 1)
         self.assertEqual(report.iloc[0]["观察不完整或数据问题数"], 1)
         self.assertEqual(report.iloc[0]["可卖日期曾达5%比例"], 0)
         self.assertEqual(report.iloc[0]["仅买入当天达5%比例"], 100)
+
+    def filter_candidates(self, count=8):
+        rows = []
+        for i in range(count):
+            row = dict(date=self.calendar[0], ts_code=f"{600001+i}.SH", name=f"测试{i}", close=20,
+                       base_reason="", exclude_reason="", overheat=False, ret1=.08-i*.005,
+                       ret5=.1, rs5=.05, runup5=.15, sector="A", sector_name="测试板块",
+                       strength_score=i*10., efficiency_score=50., volume_score=50., position_score=50.,
+                       heat_penalty=0.)
+            row["score"] = np.mean([row[c] for c in SCORE_COLS]); rows.append(row)
+        return pd.DataFrame(rows)
+
+    def test_filter_after_ranking_never_backfills(self):
+        candidates = self.filter_candidates()
+        selected = select_candidates(candidates, self.cfg)
+        filtered = selected[selected.experiment.eq("F_RS")]
+        self.assertEqual(filtered.ts_code.tolist(), ["600003.SH"])
+        self.assertEqual(filtered["rank"].tolist(), [3])
+        decisions = screening_decisions(candidates, self.cfg)
+        d = decisions[decisions.experiment.eq("F_RS")]
+        self.assertEqual(d["rank"].tolist(), [1, 2, 3])
+        self.assertEqual(d.filter_pass.tolist(), [False, False, True])
+
+    def test_filter_small_pool_and_ties_are_not_arbitrary_vetoes(self):
+        for candidates in [self.filter_candidates(3), self.filter_candidates().assign(strength_score=10.)]:
+            selected = select_candidates(candidates, self.cfg)
+            self.assertEqual(len(selected[selected.experiment.eq("F_RS")]), 3)
+        f = self.filter_candidates()
+        before = screening_decisions(f, self.cfg)
+        future = f.copy(); future["date"] = self.calendar[1]; future["strength_score"] = 10000.
+        after = screening_decisions(pd.concat([f, future], ignore_index=True), self.cfg)
+        pd.testing.assert_frame_equal(before, after[after.date.eq(self.calendar[0])].reset_index(drop=True))
+
+    def test_filter_equal_opportunity_detects_false_average_improvement(self):
+        rows = [dict(group="filter", take_profit=.05, status="已平仓", data_issue=False, filter_pool_n=8,
+                     filter_pass=keep, net_return=r) for r, keep in [(.10, True), (.02, False), (-.05, True)]]
+        rows.append(dict(group="filter", take_profit=.05, status="未平仓", data_issue=False, filter_pool_n=8,
+                         filter_pass=False, net_return=np.nan))
+        result = filter_impact_summary(pd.DataFrame(rows)).iloc[0]
+        self.assertGreater(result["保留单笔均益%"], result["基准机会均益%"])
+        self.assertLess(result["过滤后等机会均益%"], result["基准机会均益%"])
+        self.assertAlmostEqual(result["等机会改善(百分点)"], -.02/3*100)
+        self.assertEqual(result["有效平仓机会数"], 3)
+        self.assertEqual(result["待买入或未平仓数"], 1)
+        self.assertEqual(result["错过盈利笔数"], 1)
+        self.assertAlmostEqual(result["避免亏损贡献(百分点)"]-result["错过盈利贡献(百分点)"], result["等机会改善(百分点)"])
 
     def test_dual_touch_is_stop_first(self):
         f = self.bars()
@@ -1621,6 +1970,8 @@ class StrategyTests(unittest.TestCase):
             short = build_candidates(store, basic, member, names, short_panel, short_cal, cfg)
             cols = ["date", "ts_code", "score", "exclude_reason", "rs1", "rs2"] + [f"rs_all_{n}" for n in [1, 2, 3, 5]]
             pd.testing.assert_frame_equal(c[cols].reset_index(drop=True), short[cols].reset_index(drop=True))
+            chosen_cols = ["date", "ts_code", "group", "rank", "filter_pass", "filter_pct"]
+            pd.testing.assert_frame_equal(selected[chosen_cols], select_candidates(short, cfg)[chosen_cols])
             events = []
             tr = run_trades(store, selected, cal, cfg, event_records=events)
             self.assertFalse(tr.empty)
@@ -1628,12 +1979,16 @@ class StrategyTests(unittest.TestCase):
                 f = f.sort_values("entry_date")
                 self.assertTrue((f.entry_date.iloc[1:].values > f.exit_date.iloc[:-1].values).all())
             ledger, increment = gap_comparison(tr)
-            self.assertFalse(ledger.empty)
-            self.assertEqual(len(events), len(selected))
+            self.assertTrue(ledger.empty)  # 默认不启用6%旧对照。
+            self.assertEqual(len(events), 2*len(selected))
             folder = save_report(root, cfg, c, selected, tr, panel, cal, "test", "演示测试", pd.DataFrame(events))
             grid = report_table(folder, "experiment_summary")
-            self.assertEqual(len(grid), 44)
+            self.assertEqual(len(grid), 14)
             self.assertTrue(grid.loc[grid.experiment.eq("B0"), "相对等权均益差(百分点)"].dropna().eq(0).all())
+            audit = report_table(folder, "filter_impact")
+            self.assertEqual(len(audit), 8)
+            self.assertTrue((audit["保留平仓数"]+audit["拒绝平仓数"]).eq(audit["有效平仓机会数"]).all())
+            np.testing.assert_allclose(audit["过滤后等机会均益%"]-audit["基准机会均益%"], audit["等机会改善(百分点)"], atol=1e-12)
             with zipfile.ZipFile(Path(folder)/"回测审计.zip") as z:
                 self.assertIsNone(z.testzip())
                 self.assertIn("trades.csv", z.namelist())
