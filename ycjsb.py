@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""板块领涨惯性 M1.6 — 单一效率过滤对照 / 等机会审计 / 持仓约束重放
+"""板块领涨惯性 M1.7 — 固定M1.6规则 / 首次留档 / 前向跟踪
 
 依赖：pandas >= 2.0, numpy >= 1.24, streamlit >= 1.32, tushare >= 1.4。
 离线逻辑验算：python app.py --self-test
@@ -32,7 +32,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
-VERSION = "M1.6"
+VERSION = "M1.7"
 CORE = {"电子", "计算机", "通信", "国防军工"}
 TECH_WORDS = ("自动化", "机器人", "仪器仪表", "半导体", "光伏设备", "风电设备",
               "电池", "电网设备", "医疗器械", "电子", "金属新材料")
@@ -1844,8 +1844,8 @@ def load_attribution_archive(raw, name='审计.zip'):
             if sum(i.file_size for i in z.infolist()) > 300*1024*1024 or any(z.getinfo(k).file_size > 100*1024*1024 for k in needed):
                 raise DataError('审计包解压后过大，拒绝读取')
             manifest = json.loads(z.read('manifest.json'))
-            if manifest.get('version') not in ['M1.3', 'M1.4', 'M1.5', 'M1.6']:
-                raise DataError('当前导入支持M1.3至M1.6的完整回测审计包，不支持二次归因包')
+            if manifest.get('version') not in ['M1.3', 'M1.4', 'M1.5', 'M1.6', 'M1.7']:
+                raise DataError('当前导入支持M1.3至M1.7的完整回测审计包，不支持二次归因包')
             frames = {}
             for key in needed[1:]:
                 try:
@@ -1976,7 +1976,18 @@ def review_archives(files):
     return dict(meta=meta, tables=tables, archive=stream.getvalue())
 
 
-RULES = """板块领涨惯性 M1.6：单一效率过滤对照
+RULES = """板块领涨惯性 M1.7：冻结M1.6规则并开始前向留档
+
+每日选股完成后自动保存首次候选、原名次、效率判定、参数、代码及数据校验值和本机时间。
+同日重复运行不覆盖首次留档；结果发生变化会提示。区间回测与旧ZIP导入不能补成前向记录。
+只有2026-09-22之后的信号、北京时间信号日18点至下一交易日9:30之前留档才进入时间合格样本。
+本机时间不是独立认证；导入备份保留原始时间并标记来源，不提升证据等级。
+后续只更新留档名单的价格结果，10%止盈为主检验，5%为敏感性对照，不根据结果调参。
+漏记交易日明确列出，不视为空仓。已留档但未选出股票的日期才是明确空仓。
+第一次合格留档之前的持仓不纳入，漏记日也不猜测选股；持仓约束只在已留档信号上连续重放。
+前向留档是人工运行时生成，并非后台定时任务；请下载完整留档备份以便恢复。
+
+继承的M1.6规则：
 
 默认三组：原涨幅前三、低前涨幅前三、低前涨幅剔除高效率。
 新组先完成低前涨幅前三选择，再排除效率分位严格大于200/3的股票，不补位且保留原始名次。
@@ -2108,7 +2119,7 @@ T+1：买入当日不能止盈、不能止损，买入当日达到5%只作诊断
 
 def save_report(root, cfg, candidates, selected, trades, panel, calendar, data_hash, mode, events=None):
     root = Path(root)
-    folder = Path(tempfile.mkdtemp(prefix="M16_", dir=root))
+    folder = Path(tempfile.mkdtemp(prefix="M17_", dir=root))
     candidates = add_filter_ranks(candidates)
     tables = {"candidates": candidates, "selected": selected, "trades": trades,
               "sector_daily": panel[panel.date.between(pd.Timestamp(cfg.start), pd.Timestamp(cfg.end))].copy()}
@@ -2217,10 +2228,421 @@ def run_online(token, root, cfg, scan=False, progress=lambda s: None):
         events = []
         trades = run_trades(store, selected, calendar, cfg, progress, event_records=events,
                             observations=top10_observation(candidates, cfg))
-        return save_report(root, cfg, candidates, selected, trades, panel, calendar,
-                           store.fingerprint(calendar[0], calendar[-1]), "正式数据_未验证盈利", pd.DataFrame(events))
+        data_hash = store.fingerprint(calendar[0], calendar[-1])
+        folder = save_report(root, cfg, candidates, selected, trades, panel, calendar,
+                           data_hash, "正式数据_未验证盈利", pd.DataFrame(events))
+        if scan:
+            progress('保存首次留档；同日重新运行不替换原记录')
+            archive_daily(root, client, cfg, candidates, selected, panel, calendar, data_hash, folder)
+        return folder
     finally:
         store.close()
+
+
+FORWARD_GROUPS = (GROUP_BASE, TOP10_MODELS[0][1], EFF_GROUP)
+FORWARD_NOTE = ('仅跟踪首次留档且本机时间符合收盘后、下一交易日开盘前窗口的信号；'
+    '本机时间与文件校验值不是第三方时间认证，也不证明盈利。漏记日不补成空仓。'
+    '后续读取原名单，仅更新价格路径；持仓从第一条有效留档开始，未纳入留档前或漏记日的交易。'
+    '同股持仓约束按全部有效留档连续重放，无账户总资金上限，所有均益均不是账户收益。')
+
+
+def forward_protocol():
+    """冻结策略与数据处理实现；界面修改不改变规则指纹。"""
+    funcs = [board_name, experiments, legacy_experiments, buy_gap, top10_candidates,
+        add_filter_ranks, apply_filter_rule, normalize_members, sector_panel, max_runup,
+        features, assign_sector, name_state, build_candidates, score_candidates,
+        efficiency_annotations, select_candidates, consecutive_rs, finite_positive,
+        stamp_tax, simulate_trade, run_trades, MarketStore, DataClient]
+    body = dict(protocol_id='M17_FORWARD_M16', frozen_on=EFF_FREEZE_DAY,
+        config={k: v for k, v in asdict(Config()).items() if k not in ['start', 'end']},
+        groups=list(FORWARD_GROUPS), targets=[.05, .10], primary_target=.10,
+        primary_comparison=[TOP10_MODELS[0][1], EFF_GROUP],
+        core=sorted(CORE), tech_words=list(TECH_WORDS), bar_columns=BAR_COLS, fields=FIELDS,
+        efficiency_cutoff=EFF_CUTOFF, top10_models=TOP10_MODELS,
+        logic_sha256=hashlib.sha256('\n'.join(inspect.getsource(f) for f in funcs).encode()).hexdigest(),
+        no_parameter_search=True, external_timestamp_verified=False)
+    body['fingerprint'] = hashlib.sha256(json.dumps(body, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    return body
+
+
+def forward_timing(signal_day, next_trade_day, created_at, data_end, mode):
+    signal, following = pd.Timestamp(signal_day).normalize(), pd.Timestamp(next_trade_day).normalize()
+    created = pd.Timestamp(created_at)
+    if created.tzinfo is None:
+        raise DataError('留档时间缺少时区')
+    created = created.tz_convert('Asia/Shanghai')
+    if following <= signal or following-signal > pd.Timedelta(days=31):
+        raise DataError('留档的下一交易日无效')
+    if pd.Timestamp(data_end).normalize() != signal:
+        return False, '行情截止与信号日不一致_仅留档'
+    if mode != '正式数据_未验证盈利':
+        return False, '非正式数据_仅留档'
+    if signal <= pd.Timestamp(EFF_FREEZE_DAY):
+        return False, '冻结边界或历史日期_仅留档'
+    start = signal.tz_localize('Asia/Shanghai')+pd.Timedelta(hours=18)
+    deadline = following.tz_localize('Asia/Shanghai')+pd.Timedelta(hours=9, minutes=30)
+    if created < start:
+        return False, '早于收盘数据就绪时间_仅留档'
+    if created >= deadline:
+        return False, '开盘后补记_不纳入前向统计'
+    return True, '本机时间符合事前窗口_未外部认证'
+
+
+def forward_csv(raw):
+    try:
+        f = pd.read_csv(io.BytesIO(raw), dtype={'ts_code': str, 'sector': str}, float_precision='round_trip')
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
+    for col in ['date', 'signal_date']:
+        if col in f:
+            f[col] = pd.to_datetime(f[col], errors='raise')
+    for col in ['base_reason', 'exclude_reason', 'filter_col', 'filter_label']:
+        if col in f:
+            f[col] = f[col].fillna('')
+    return f
+
+
+def forward_zip(files):
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as z:
+        for key, raw in files.items():
+            z.writestr(key, raw)
+    return out.getvalue()
+
+
+def forward_unzip(raw, limit_mb=30):
+    if len(raw) > limit_mb*1024*1024:
+        raise DataError('留档包过大')
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as z:
+            names = z.namelist()
+            if len(names) != len(set(names)) or sum(i.file_size for i in z.infolist()) > limit_mb*1024*1024:
+                raise DataError('留档包含重名文件或展开后过大')
+            return {name: z.read(name) for name in names}
+    except (zipfile.BadZipFile, RuntimeError) as exc:
+        raise DataError('无法读取留档ZIP') from exc
+
+
+def make_forward_snapshot(cfg, candidates, selected, panel, signal_day, next_trade_day,
+                          data_end, data_hash, mode, created_at=None):
+    cfg.validate()
+    protocol = forward_protocol()
+    params = {k: v for k, v in asdict(cfg).items() if k not in ['start', 'end']}
+    if params != protocol['config']:
+        raise DataError('前向留档仅接受固定M1.6三组规则；自定义参数不能混入')
+    day = pd.Timestamp(signal_day).normalize()
+    if ds(cfg.start) != ds(day) or ds(cfg.end) != ds(day):
+        raise DataError('只允许单日选股留档，区间回测不能补成前向记录')
+    created = created_at or datetime.now(ZoneInfo('Asia/Shanghai')).isoformat()
+    eligible, phase = forward_timing(day, next_trade_day, created, data_end, mode)
+    frames = dict(candidates=candidates, selected=selected,
+        efficiency_decisions=efficiency_decisions(candidates, selected),
+        sector_daily=panel[panel.date.eq(day)].copy())
+    files = {k+'.csv': f.to_csv(index=False).encode('utf-8-sig') for k, f in frames.items()}
+    meta = dict(version=VERSION, type='M17_DAILY_SNAPSHOT', signal_day=ds(day),
+        next_trade_day=ds(next_trade_day), created_at=str(created), data_end=ds(data_end),
+        data_hash=str(data_hash), mode=mode, protocol=protocol,
+        source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        timing_eligible=eligible, sample_phase=phase, config=asdict(cfg),
+        file_hashes={k: hashlib.sha256(v).hexdigest() for k, v in files.items()}, note=FORWARD_NOTE)
+    # 不含生成时间，便于识别同日完全相同的重复运行；首次时间始终保留。
+    content = {k: meta[k] for k in ['signal_day', 'next_trade_day', 'data_end', 'data_hash', 'mode', 'protocol', 'file_hashes']}
+    meta['content_sha256'] = hashlib.sha256(json.dumps(content, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    files['snapshot.json'] = json.dumps(meta, ensure_ascii=False, indent=2).encode()
+    return forward_zip(files)
+
+
+def load_forward_snapshot(raw):
+    files = forward_unzip(raw)
+    required = {'snapshot.json', 'candidates.csv', 'selected.csv', 'efficiency_decisions.csv', 'sector_daily.csv'}
+    if set(files) != required:
+        raise DataError('请使用M1.7每日留档包；历史回测或归因ZIP不能替代')
+    try:
+        meta = json.loads(files['snapshot.json'])
+        if meta.get('type') != 'M17_DAILY_SNAPSHOT':
+            raise DataError('留档类型无效')
+        protocol = forward_protocol()
+        # JSON中元组会成为列表，因此以序列化后结构核对，不能只相信自报指纹。
+        if meta['protocol'] != json.loads(json.dumps(protocol)):
+            raise DataError('留档的规则指纹与当前冻结规则不同，禁止混合')
+        hashes = {k: hashlib.sha256(v).hexdigest() for k, v in files.items() if k != 'snapshot.json'}
+        if hashes != meta['file_hashes']:
+            raise DataError('留档文件校验失败，原记录可能已改变')
+        content = {k: meta[k] for k in ['signal_day', 'next_trade_day', 'data_end', 'data_hash', 'mode', 'protocol', 'file_hashes']}
+        if hashlib.sha256(json.dumps(content, sort_keys=True, ensure_ascii=False).encode()).hexdigest() != meta['content_sha256']:
+            raise DataError('留档内容校验失败')
+        cfg = Config(**meta['config']); cfg.validate()
+        if {k: v for k, v in asdict(cfg).items() if k not in ['start', 'end']} != protocol['config']:
+            raise DataError('留档参数不符合固定规则')
+        day = pd.Timestamp(meta['signal_day'])
+        if ds(cfg.start) != ds(day) or ds(cfg.end) != ds(day):
+            raise DataError('留档必须是单日结果')
+        eligible, phase = forward_timing(day, meta['next_trade_day'], meta['created_at'], meta['data_end'], meta['mode'])
+        if meta['timing_eligible'] is not eligible or meta['sample_phase'] != phase:
+            raise DataError('留档时间分类不一致')
+        tables = {k[:-4]: forward_csv(v) for k, v in files.items() if k.endswith('.csv')}
+        c, s, panel = [tables[k] for k in ['candidates', 'selected', 'sector_daily']]
+        for f in [c, s, panel, tables['efficiency_decisions']]:
+            if not f.empty and ('date' not in f or not f.date.eq(day).all()):
+                raise DataError('留档混入其他日期的数据')
+        if c.empty or panel.empty or c.duplicated(['date', 'ts_code']).any():
+            raise DataError('留档候选或板块数据不完整')
+        # 只核对已保存的当日特征与名单，不读取后续行情重选。
+        rebuilt = select_candidates(c, cfg)
+        cols = ['group', 'date', 'ts_code', 'rank', 'return_rank', 'gap_limit', 'close', 'score', 'rs5', 'runup5']
+        order = ['group', 'date', 'ts_code']
+        pd.testing.assert_frame_equal(s[cols].sort_values(order).reset_index(drop=True),
+            rebuilt[cols].sort_values(order).reset_index(drop=True), check_dtype=False, atol=1e-10, rtol=1e-10)
+        rebuilt_d = efficiency_decisions(c, rebuilt)
+        original_d = tables['efficiency_decisions']
+        cols = ['date', 'ts_code', 'eff_pool_count', 'eff_pct', 'eff_keep', 'eff_reason']
+        pd.testing.assert_frame_equal(original_d[cols].sort_values('ts_code').reset_index(drop=True),
+            rebuilt_d[cols].sort_values('ts_code').reset_index(drop=True), check_dtype=False, atol=1e-10, rtol=1e-10)
+        return dict(meta=meta, tables=tables, raw=raw, sha256=hashlib.sha256(raw).hexdigest())
+    except (KeyError, TypeError, ValueError, AssertionError, pd.errors.ParserError) as exc:
+        raise DataError('留档字段或冻结名单校验失败：'+str(exc)[:180]) from exc
+
+
+class ForwardJournal:
+    """单日唯一、事务提交；无覆盖或删除接口。文件备份是可迁移的原始记录。"""
+    def __init__(self, root):
+        folder = Path(root)/'forward_M17'
+        folder.mkdir(parents=True, exist_ok=True)
+        self.db = sqlite3.connect(str(folder/'journal.sqlite3'), timeout=30)
+        self.db.execute('CREATE TABLE IF NOT EXISTS snapshots (day TEXT PRIMARY KEY, raw BLOB NOT NULL, sha256 TEXT NOT NULL, origin TEXT NOT NULL)')
+        self.db.commit()
+
+    def close(self):
+        self.db.close()
+
+    def records(self):
+        result = []
+        for day, raw, digest, origin in self.db.execute('SELECT day,raw,sha256,origin FROM snapshots ORDER BY day'):
+            if hashlib.sha256(raw).hexdigest() != digest:
+                raise DataError('本地留档内容校验失败：'+day)
+            item = load_forward_snapshot(raw)
+            if item['meta']['signal_day'] != day:
+                raise DataError('留档索引与内容日期不一致')
+            item['origin'] = origin
+            result.append(item)
+        return result
+
+    def add(self, raw):
+        item = load_forward_snapshot(raw)
+        with self.db:
+            self.db.execute('BEGIN IMMEDIATE')
+            day = item['meta']['signal_day']
+            old = self.db.execute('SELECT raw FROM snapshots WHERE day=?', (day,)).fetchone()
+            if old:
+                original = load_forward_snapshot(old[0])
+                same = original['meta']['content_sha256'] == item['meta']['content_sha256']
+                return ('重复运行：保留首次留档及首次时间' if same else
+                    '同日结果发生变化：首次留档保持不变，本次结果未替换原记录')
+            self.db.execute('INSERT INTO snapshots VALUES (?,?,?,?)', (day, raw, item['sha256'], '本机首次留档'))
+        return '已保存首次留档：'+item['meta']['sample_phase']
+
+    def export(self):
+        records = self.records()
+        files = {'snapshots/'+r['meta']['signal_day']+'.zip': r['raw'] for r in records}
+        meta = dict(version=VERSION, type='M17_FORWARD_JOURNAL', count=len(records),
+            snapshot_hashes={k: hashlib.sha256(v).hexdigest() for k, v in files.items()},
+            external_timestamp_verified=False, note=FORWARD_NOTE)
+        files['journal.json'] = json.dumps(meta, ensure_ascii=False, indent=2).encode()
+        return forward_zip(files)
+
+    def restore(self, raw):
+        files = forward_unzip(raw, 100)
+        try:
+            meta = json.loads(files.pop('journal.json'))
+            hashes = {k: hashlib.sha256(v).hexdigest() for k, v in files.items()}
+            if meta.get('type') != 'M17_FORWARD_JOURNAL' or meta.get('snapshot_hashes') != hashes or meta.get('count') != len(files):
+                raise DataError('留档备份目录或文件校验失败')
+            if len(files) > 3000:
+                raise DataError('留档备份过大，请分研究周期管理')
+            items = []; expanded_total = 0
+            for key, value in files.items():
+                try:
+                    with zipfile.ZipFile(io.BytesIO(value)) as nested:
+                        expanded_total += sum(i.file_size for i in nested.infolist())
+                except zipfile.BadZipFile as exc:
+                    raise DataError('备份中的每日留档ZIP损坏') from exc
+                if expanded_total > 300*1024*1024:
+                    raise DataError('嵌套留档全部展开后过大，拒绝导入')
+                item = load_forward_snapshot(value)
+                if key != 'snapshots/'+item['meta']['signal_day']+'.zip':
+                    raise DataError('备份文件名与留档日期不符')
+                items.append(item)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise DataError('请导入完整M1.7留档备份ZIP') from exc
+        added = 0
+        with self.db:
+            self.db.execute('BEGIN IMMEDIATE')
+            for item in items:
+                day = item['meta']['signal_day']
+                old = self.db.execute('SELECT sha256 FROM snapshots WHERE day=?', (day,)).fetchone()
+                if old and old[0] != item['sha256']:
+                    raise DataError('备份与已有首次留档冲突：'+day+'；整批未导入，原记录保留')
+                if not old:
+                    self.db.execute('INSERT INTO snapshots VALUES (?,?,?,?)', (day, item['raw'], item['sha256'], '从备份恢复_时间未外部认证'))
+                    added += 1
+        return added
+
+
+def forward_inventory(records):
+    rows = []
+    for item in records:
+        m, s = item['meta'], item['tables']['selected']
+        rows.append(dict(signal_date=m['signal_day'], created_at=m['created_at'],
+            next_trade_day=m['next_trade_day'], sample_phase=m['sample_phase'], timing_eligible=m['timing_eligible'],
+            origin=item.get('origin', '本机首次留档'),
+            baseline_count=int(s.group.eq(TOP10_MODELS[0][1]).sum()),
+            trial_count=int(s.group.eq(EFF_GROUP).sum()), snapshot_sha256=item['sha256']))
+    return pd.DataFrame(rows)
+
+
+def forward_coverage(records, calendar, as_of):
+    eligible = [r for r in records if r['meta']['timing_eligible']]
+    if not eligible:
+        return pd.DataFrame(columns=['signal_date', 'coverage', 'included'])
+    first = min(pd.Timestamp(r['meta']['signal_day']) for r in eligible)
+    lookup = {pd.Timestamp(r['meta']['signal_day']): r for r in records}
+    rows = []
+    for day in calendar[(calendar >= first) & (calendar <= pd.Timestamp(as_of))]:
+        r = lookup.get(pd.Timestamp(day))
+        ok = r is not None and r['meta']['timing_eligible']
+        rows.append(dict(signal_date=day, coverage='已事前留档' if ok else '漏记_不能视为空仓' if r is None else '仅补记_不纳入', included=ok))
+    return pd.DataFrame(rows)
+
+
+def forward_pairs(events, signal_days):
+    """包括已留档但无候选的日期；缺留档日完全不进入分母。"""
+    rows = []
+    for day in sorted(pd.to_datetime(signal_days).unique()):
+        for tp in [.05, .10]:
+            means = {}; counts = {}; unknowns = {}; cash = {}
+            for group in [TOP10_MODELS[0][1], EFF_GROUP]:
+                f = events[events.group.eq(group) & events.signal_date.eq(day) & events.take_profit.eq(tp)] if not events.empty else events
+                if len(f) > 3:
+                    raise DataError('前向固定名额审计发现超额信号')
+                if f.empty:
+                    means[group], counts[group], unknowns[group], cash[group] = 0., 0, 0, 3
+                    continue
+                issue = f.data_issue.eq(True)
+                closed = f.status.eq('已平仓') & ~issue & f.net_return.notna()
+                no_buy = f.status.eq('未买入') & ~issue
+                n = int((~(closed | no_buy)).sum())
+                means[group] = np.nan if n else f.loc[closed, 'net_return'].sum()/3
+                counts[group], unknowns[group], cash[group] = len(f), n, 3-len(f)+int(no_buy.sum())
+            base, trial = means[TOP10_MODELS[0][1]], means[EFF_GROUP]
+            rows.append(dict(signal_date=day, year=pd.Timestamp(day).year, group=EFF_GROUP, take_profit=tp,
+                selected_count=counts[EFF_GROUP], unknown_count=unknowns[EFF_GROUP], cash_slots=cash[EFF_GROUP],
+                baseline_selected_count=counts[TOP10_MODELS[0][1]], baseline_unknown_count=unknowns[TOP10_MODELS[0][1]],
+                slot_mean=trial, baseline_slot_mean=base, pair_complete=pd.notna(base) and pd.notna(trial),
+                paired_delta=trial-base, sample_phase='M17本机事前留档_时间未外部认证'))
+    return pd.DataFrame(rows)
+
+
+def evaluate_forward(records, store, calendar, as_of, progress=lambda s: None):
+    """消费首次留档名单。绝不从后续行情构造特征或重新排名。"""
+    calendar = pd.DatetimeIndex(calendar).sort_values().unique()
+    calendar = calendar[calendar <= pd.Timestamp(as_of)]
+    if not len(calendar):
+        raise DataError('当前没有可用于跟踪的收盘行情')
+    active = [r for r in records if r['meta']['timing_eligible'] and pd.Timestamp(r['meta']['signal_day']) <= calendar[-1]]
+    if not active:
+        raise DataError('暂无符合事前窗口的新留档，历史补记不能生成前向收益')
+    for r in active:
+        day, next_day = pd.Timestamp(r['meta']['signal_day']), pd.Timestamp(r['meta']['next_trade_day'])
+        if day not in calendar:
+            raise DataError('留档信号日不在交易日历中：'+ds(day))
+        later = calendar[calendar > day]
+        if len(later) and later[0] != next_day:
+            raise DataError('留档下一交易日与当前日历不符：'+ds(day))
+    selected = pd.concat([r['tables']['selected'] for r in active], ignore_index=True)
+    days = [r['meta']['signal_day'] for r in active]
+    cfg = Config(start=min(days), end=max(days))
+    events = []
+    trades = run_trades(store, selected, calendar, cfg, progress, event_records=events)
+    events = pd.DataFrame(events)
+    # 双目标必须覆盖每条已存名单；未完成路径不能消失或被当成0。
+    if len(events) != 2*len(selected):
+        raise DataError('留档名单与独立结果记录不齐全')
+    paired = forward_pairs(events, days)
+    coverage = forward_coverage(records, calendar, as_of)
+    grid = pd.MultiIndex.from_product([FORWARD_GROUPS, [.05, .10]], names=['group', 'take_profit']).to_frame(index=False)
+    summary = grid.merge(summarize(trades, ['group', 'take_profit']), how='left', on=['group', 'take_profit'])
+    for col in ['信号数', '成交数', '有效平仓数', '未平仓数', '数据问题数', '双触及笔数']:
+        summary[col] = pd.to_numeric(summary[col], errors='coerce').fillna(0).astype(int)
+    tables = dict(forward_inventory=forward_inventory(records), forward_coverage=coverage,
+        forward_selected=selected, forward_trades=trades, forward_events=events,
+        forward_summary=summary, forward_paired_days=paired)
+    for key, frame in concentration_tables(paired).items():
+        tables[key.replace('validation_', 'forward_pair_')] = frame
+    if not trades.empty:
+        monthly = trades.copy(); monthly['month'] = pd.to_datetime(monthly.signal_date).dt.strftime('%Y-%m')
+        tables['forward_actual_monthly'] = summarize(monthly, ['group', 'take_profit', 'month'])
+    meta = dict(version=VERSION, type='M17_FORWARD_RESULTS', as_of=ds(calendar[-1]),
+        created_at=datetime.now(ZoneInfo('Asia/Shanghai')).isoformat(), protocol=forward_protocol(),
+        eligible_days=len(active), excluded_snapshots=len(records)-len(active),
+        expected_days=len(coverage), missing_days=int((~coverage.included).sum()),
+        snapshot_hashes={r['meta']['signal_day']: r['sha256'] for r in active},
+        data_hash=store.fingerprint(calendar[0], calendar[-1]),
+        source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(), note=FORWARD_NOTE,
+        external_timestamp_verified=False, verified_profitability=False, selection_recomputed=False)
+    return dict(meta=meta, tables=tables)
+
+
+def update_forward(token, root, as_of=None, progress=lambda s: None):
+    journal = ForwardJournal(root)
+    try:
+        records = journal.records()
+    finally:
+        journal.close()
+    active = [r for r in records if r['meta']['timing_eligible']]
+    if not active:
+        raise DataError('暂无符合事前窗口的留档。请先在每日选股中生成新信号')
+    end = min(pd.Timestamp(as_of) if as_of is not None else ready_day(), ready_day())
+    start = min(pd.Timestamp(r['meta']['signal_day']) for r in active)
+    if end < start:
+        raise DataError('结果截止日早于首个有效留档日')
+    client = DataClient(token, Path(root), progress)
+    calendar = client.calendar(start, end)
+    progress('读取已有留档，更新后续行情；不重新排名选股')
+    store = client.download(calendar)
+    try:
+        result = evaluate_forward(records, store, calendar, end, progress)
+    finally:
+        store.close()
+    folder = Path(tempfile.mkdtemp(prefix='results_', dir=Path(root)/'forward_M17'))
+    files = {k+'.csv': f.to_csv(index=False).encode('utf-8-sig') for k, f in result['tables'].items()}
+    files['manifest.json'] = json.dumps(result['meta'], ensure_ascii=False, indent=2).encode()
+    archive = forward_zip(files)
+    for key, raw in files.items():
+        (folder/key).write_bytes(raw)
+    (folder/'前向结果.zip').write_bytes(archive)
+    return str(folder)
+
+
+def archive_daily(root, client, cfg, candidates, selected, panel, calendar, data_hash, folder):
+    """记录失败不抹掉选股报告，明确提示；不得静默声称已经留档。"""
+    note = {}
+    try:
+        future = client.calendar(calendar[-1], calendar[-1]+pd.Timedelta(days=31))
+        later = future[future > calendar[-1]]
+        if not len(later):
+            raise DataError('交易日历尚未提供下一交易日，不能判断事前窗口')
+        raw = make_forward_snapshot(cfg, candidates, selected, panel, calendar[-1], later[0],
+            calendar[-1], data_hash, '正式数据_未验证盈利')
+        journal = ForwardJournal(root)
+        try:
+            note['message'] = journal.add(raw)
+        finally:
+            journal.close()
+        note['saved_or_first_preserved'] = True
+    except Exception as exc:
+        note = dict(message='本次未能写入前向留档：'+str(exc), saved_or_first_preserved=False)
+    (Path(folder)/'forward_status.json').write_text(json.dumps(note, ensure_ascii=False, indent=2), encoding='utf-8')
+    return note
 
 
 def demo_data(root):
@@ -2485,7 +2907,7 @@ def show_efficiency(st, tables, prefix='eff'):
     st.subheader('低前涨幅选出前三后，剔除效率最高三分之一')
     summary = tables.get('efficiency_opportunity_summary', pd.DataFrame())
     if summary.empty:
-        st.info('暂无效率过滤对照。可启用M1.6重新计算，或导入M1.3至M1.6完整回测审计ZIP；没有原低前涨幅信号时不生成结果。')
+        st.info('暂无效率过滤对照。可启用M1.6规则重新计算，或导入M1.3至M1.7完整回测审计ZIP；没有原低前涨幅信号时不生成结果。')
         return
     st.caption('只增加这一条过滤，不补位，不重新排名。参照当日完整合格且不过热池；分位超过66.6667才拒绝，至少4个有限评分，并列用平均名次，分位不可评估时保留。')
     period = None
@@ -2634,7 +3056,7 @@ def show_archive_review(st):
         show_efficiency(st, review['tables'], prefix='import_eff')
     with tabs[1]:
         show_attribution(st, review['tables'], prefix='import_attr')
-    st.download_button('下载效率对照与归因审计', review['archive'], file_name='momentum_M1.6_efficiency.zip', mime='application/zip')
+    st.download_button('下载效率对照与归因审计', review['archive'], file_name=f'momentum_{VERSION}_efficiency.zip', mime='application/zip')
     with st.expander('归因口径与文件来源'):
         st.write(ATTR_NOTE)
         st.json(meta)
@@ -2717,6 +3139,13 @@ def report_table(folder, name):
 def show_report(st, folder):
     folder = Path(folder)
     manifest = json.loads((folder/"manifest.json").read_text(encoding="utf-8"))
+    if (folder/'forward_status.json').exists():
+        note = json.loads((folder/'forward_status.json').read_text(encoding='utf-8'))
+        if not note['saved_or_first_preserved'] or '发生变化' in note['message']:
+            st.warning(note['message'])
+        else:
+            st.info(note['message'])
+        st.caption('完整首次留档备份在“前向跟踪”页面下载；本页候选是本次计算结果。')
     if "演示" in manifest["mode"]:
         st.warning("以下全部是合成数据演示，仅用于检查程序，不能用于选股或判断盈利。")
     st.caption(f"版本 {manifest['version']} · 信号截止 {manifest['latest_signal']} · 行情截止 {manifest['data_end']}")
@@ -2812,24 +3241,142 @@ def show_report(st, folder):
         st.download_button("下载完整审计结果", f, file_name=f"momentum_{manifest['version']}_{manifest['latest_signal']}.zip", mime="application/zip")
 
 
+def token_input(st):
+    default = os.environ.get('TUSHARE_TOKEN', '')
+    if not default:
+        try:
+            default = str(st.secrets.get('TUSHARE_TOKEN', st.secrets.get('tushare_token', '')))
+        except Exception:
+            default = ''
+    return st.text_input('Tushare Token', value=default, type='password',
+        help='仅用于请求官方数据；不写入报告。沿用原接口权限与四路下载缓存。')
+
+
+def show_forward(st, root):
+    st.subheader('固定规则的后续跟踪')
+    st.write('每天收盘数据就绪后运行“每日选股”，程序自动保留第一次名单。之后在此更新这些名单的结果。')
+    st.caption('固定沿用M1.6三组：昨日涨幅前三、前十低前涨幅、低前涨幅剔除高效率。10%主检验，5%辅助检验。')
+    with st.sidebar:
+        token = token_input(st)
+        st.caption('结果更新沿用四路下载与既有行情缓存；不会重选历史候选。')
+    journal = ForwardJournal(root)
+    try:
+        with st.expander('恢复以前下载的完整留档备份'):
+            upload = st.file_uploader('选择M1.7留档备份ZIP', type=['zip'], key='forward_restore_file')
+            st.caption('仅接受完整留档备份，回测ZIP和前向结果ZIP不能恢复首次名单。同日记录冲突则整批停止。')
+            if st.button('导入留档备份'):
+                if upload is None:
+                    st.error('请先选择留档备份文件。')
+                else:
+                    try:
+                        n = journal.restore(upload.getvalue())
+                        st.success(f'已恢复{n}条留档；已有相同记录未重复导入。')
+                    except Exception as exc:
+                        st.error(str(exc))
+        records = journal.records()
+        inventory = forward_inventory(records)
+        eligible = [r for r in records if r['meta']['timing_eligible']]
+        a, b, c = st.columns(3)
+        a.metric('首次留档日数', len(records))
+        b.metric('符合事前时间窗口', len(eligible))
+        c.metric('历史/补记/其他留档', len(records)-len(eligible))
+        if records:
+            show_table(st, inventory.rename(columns={'created_at':'首次留档时间', 'next_trade_day':'计划买入日',
+                'origin':'记录来源', 'baseline_count':'低前涨幅只数', 'trial_count':'过滤后只数', 'timing_eligible':'时间窗口合格'})
+                .drop(columns=['snapshot_sha256']).tail(100))
+            st.download_button('下载完整留档备份', journal.export(), file_name='momentum_M1.7_forward_journal.zip', mime='application/zip')
+            with st.expander('查看首次留档候选与过滤原因'):
+                choices = [r['meta']['signal_day'] for r in records][::-1]
+                day = st.selectbox('查看留档日期', choices)
+                r = next(r for r in records if r['meta']['signal_day'] == day)
+                st.caption(r['meta']['sample_phase'])
+                show_table(st, r['tables']['selected'].reindex(columns=['group','rank','ts_code','name','close','max_buy_reference']))
+                show_table(st, r['tables']['efficiency_decisions'].reindex(columns=['ts_code','name','rank','eff_pct','eff_keep','eff_reason']))
+        else:
+            st.info('尚无留档。先在“每日选股”运行固定规则；即使没有选出股票，也应保留当天结果。')
+        st.caption('从首个合格留档日起检查连续性；更早日期不假装已验证。本机时间未经过第三方认证。请定期下载备份，尤其是使用临时云运行环境时。')
+        cutoff = st.date_input('跟踪结果截止日', value=ready_day().date(), max_value=ready_day().date())
+        if st.button('更新已留档信号的结果', type='primary', disabled=not eligible):
+            if not token.strip():
+                st.error('请填写Tushare Token。')
+            else:
+                status = st.empty()
+                try:
+                    with st.spinner('更新行情并回放已留档名单…'):
+                        folder = update_forward(token, root, cutoff, status.info)
+                    st.session_state['forward_result'] = folder
+                    status.success('结果已更新，首次名单未修改。')
+                except Exception as exc:
+                    st.error('跟踪未完成：'+str(exc).replace(token, '***'))
+        folder = st.session_state.get('forward_result')
+        if not folder:
+            previous = sorted((Path(root)/'forward_M17').glob('results_*/manifest.json'), key=lambda p: p.stat().st_mtime, reverse=True)
+            folder = str(previous[0].parent) if previous else None
+        if folder and (Path(folder)/'manifest.json').exists():
+            folder = Path(folder)
+            meta = json.loads((folder/'manifest.json').read_text(encoding='utf-8'))
+            if meta.get('protocol', {}).get('fingerprint') != forward_protocol()['fingerprint']:
+                st.error('旧结果来自不同规则，不能与当前留档合并。')
+                return
+            st.divider()
+            st.caption('以下为上次结果更新，行情截止 '+meta['as_of']+'；未平仓和数据问题不按零收益计入均值。')
+            current_hashes = {r['meta']['signal_day']: r['sha256'] for r in eligible
+                if r['meta']['signal_day'] <= meta['as_of']}
+            if current_hashes != meta['snapshot_hashes'] or any(r['meta']['signal_day'] > meta['as_of'] for r in eligible):
+                st.info('留档列表已有新增或变化，请更新结果；下表尚未包含全部当前留档。')
+            a, b, c = st.columns(3)
+            a.metric('本次覆盖交易日', meta['expected_days'])
+            b.metric('合格留档日', meta['eligible_days'])
+            c.metric('缺少事前留档日', meta['missing_days'])
+            if meta['missing_days']:
+                st.warning('留档不连续：下列结果只代表已记录信号，不能当作整个区间的完整执行结果。')
+            target = st.selectbox('前向止盈目标', [.10,.05], format_func=lambda x:'10%（主检验）' if x==.10 else '5%（辅助检验）')
+            def part(name):
+                f = report_table(folder, name)
+                return f[f.take_profit.eq(target)] if not f.empty and 'take_profit' in f else f
+            tabs = st.tabs(['单笔结果', '过滤增量', '连续性与明细'])
+            with tabs[0]:
+                st.caption('全部有效留档连续重放同股持仓限制；暂无账户总资金上限，均益不是账户收益。')
+                show_table(st, part('forward_summary'))
+                show_table(st, part('forward_actual_monthly'))
+            with tabs[1]:
+                st.caption('固定每天三个名额，以原低前涨幅为基准。被过滤和明确未买入按空仓0；任一已选结果未知，整对日期暂不计入。')
+                show_table(st, part('forward_pair_summary'))
+                show_table(st, part('forward_pair_concentration'))
+                show_table(st, part('forward_pair_monthly'))
+                with st.expander('逐月剔除敏感性检查'):
+                    show_table(st, part('forward_pair_leave_month_out'))
+            with tabs[2]:
+                show_table(st, part('forward_coverage'))
+                show_table(st, part('forward_trades').reindex(columns=['signal_date','group','rank','ts_code','name','status',
+                    'entry_date','exit_date','net_return','reason','data_issue']).tail(200))
+            st.download_button('下载前向验证结果', (folder/'前向结果.zip').read_bytes(),
+                file_name='momentum_M1.7_forward_results_'+meta['as_of']+'.zip', mime='application/zip')
+        with st.expander('固定规则及记录口径'):
+            st.write(FORWARD_NOTE)
+            st.json(forward_protocol())
+    except Exception as exc:
+        st.error('留档读取未完成：'+str(exc).replace(token, '***') if token else '留档读取未完成：'+str(exc))
+    finally:
+        journal.close()
+
+
 def main():
     import streamlit as st
     st.set_page_config(page_title="板块领涨惯性", page_icon="📈", layout="wide")
     st.title("板块领涨惯性")
-    st.caption("M1.6 · 单一效率过滤 · 等机会审计 · 持仓约束重放")
-    mode = st.radio("运行方式", ["每日选股", "区间回测", "离线演示", "已有结果归因"], horizontal=True, index=3)
+    st.caption("M1.7 · 固定M1.6规则 · 首次留档 · 后续验证")
+    mode = st.radio("运行方式", ["每日选股", "区间回测", "离线演示", "已有结果归因", "前向跟踪"], horizontal=True, index=4)
+    cache_root = str(Path(os.environ.get("MOMENTUM_CACHE_DIR", "momentum_leader_cache")).resolve())
+    if mode == '前向跟踪':
+        show_forward(st, cache_root)
+        return
     if mode == "已有结果归因":
         show_archive_review(st)
         return
     with st.sidebar:
         st.header("数据与股票池")
-        default_token = os.environ.get("TUSHARE_TOKEN", "")
-        if not default_token:
-            try:
-                default_token = str(st.secrets.get("TUSHARE_TOKEN", st.secrets.get("tushare_token", "")))
-            except Exception:
-                default_token = ""
-        token = st.text_input("Tushare Token", value=default_token, type="password", help="仅用于请求官方数据；不写入报告。需要日线、每日指标、复权因子、涨跌停价和历史行业成分接口权限。")
+        token = token_input(st)
         validation_only = st.checkbox("固定规则验证（推荐）", value=True,
             help="固定原涨幅前三与低前涨幅基准；默认另加M1.6单一效率过滤。关闭后可修改参数或附加旧实验。")
         efficiency_research = st.checkbox("启用M1.6效率过滤对照", value=True, help="先选低前涨幅前三，再剔除效率最高三分之一，不补位。")
@@ -2878,6 +3425,7 @@ def main():
         end = st.date_input("收盘信号日期", value=default_end, max_value=default_end)
         start = end
         st.caption("非交易日自动使用此前最近交易日。北京时间18点前默认使用上一自然日，再按交易日历定位。")
+        st.caption('固定规则运行后自动保存首次留档；信号日18:00至下一交易日09:30前记录才可能纳入前向跟踪，历史补跑单列。')
     else:
         start = end = default_end
         st.warning("离线演示使用合成行情，检查界面和规则，不产生真实选股建议。")
@@ -3658,9 +4206,194 @@ class StrategyTests(unittest.TestCase):
             store.close()
 
 
+class ForwardTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.calendar = pd.bdate_range('2026-09-23', periods=12)
+        fixture = StrategyTests(); fixture.setUp()
+        self.c = fixture.filter_candidates(9)
+        self.c['date'] = self.calendar[0]
+        self.c['pre3'] = np.arange(9)*.01
+        self.c['efficiency_score'] = [80., 0., 70., 10., 20., 30., 40., 50., 60.]
+        self.cfg = Config(start=ds(self.calendar[0]), end=ds(self.calendar[0]))
+
+    def snapshot(self, index=0, candidates=None, created=None, mode='正式数据_未验证盈利'):
+        day = self.calendar[index]
+        c = (candidates if candidates is not None else self.c).copy(); c['date'] = day
+        cfg = replace(self.cfg, start=ds(day), end=ds(day))
+        panel = pd.DataFrame([dict(date=day, sector='A', sector_rank=1, sector_name='测试板块')])
+        return make_forward_snapshot(cfg, c, select_candidates(c, cfg), panel, day, self.calendar[index+1],
+            day, 'test', mode, created or day.strftime('%Y-%m-%d')+'T19:00:00+08:00')
+
+    def store(self):
+        store = MarketStore(self.root/'bars.sqlite3'); self.addCleanup(store.close)
+        for d in self.calendar:
+            f = pd.DataFrame([dict(ts_code=code, trade_date=ds(d), open=20., high=20.2, low=19.8,
+                close=20., pre_close=20., adj_factor=1., up_limit=22., down_limit=18.,
+                vol=100000., amount=20000., circ_mv=2000000., turnover_rate=2.) for code in self.c.ts_code])
+            store.put(ds(d), f)
+        return store
+
+    def test_timing_boundaries_holiday_and_frozen_day(self):
+        def ok(created, signal='20260923', following='20260924', data='20260923', mode='正式数据_未验证盈利'):
+            return forward_timing(signal, following, created, data, mode)[0]
+        self.assertTrue(ok('2026-09-23T18:00:00+08:00'))
+        self.assertTrue(ok('2026-09-24T09:29:59+08:00'))
+        self.assertFalse(ok('2026-09-24T09:30:00+08:00'))
+        self.assertFalse(ok('2026-09-23T17:59:59+08:00'))
+        self.assertFalse(ok('2026-09-23T19:00:00+08:00', data='20260924'))
+        self.assertFalse(ok('2026-09-23T19:00:00+08:00', mode='演示合成数据'))
+        self.assertFalse(ok('2026-09-22T19:00:00+08:00', signal='20260922', following='20260923', data='20260922'))
+        self.assertTrue(ok('2026-10-05T19:00:00+08:00', following='20261009'))
+        with self.assertRaises(DataError):
+            ok('2026-09-23T19:00:00')
+
+    def test_first_snapshot_is_immutable_for_same_and_changed_run(self):
+        j = ForwardJournal(self.root); self.addCleanup(j.close)
+        raw = self.snapshot(); j.add(raw)
+        self.assertIn('重复运行', j.add(self.snapshot(created='2026-09-23T20:00:00+08:00')))
+        changed = self.c.copy(); changed.loc[0, 'pre3'] = 1.
+        self.assertIn('发生变化', j.add(self.snapshot(candidates=changed)))
+        self.assertEqual(j.records()[0]['raw'], raw)
+        self.assertEqual(len(j.records()), 1)
+
+    def test_backup_restore_keeps_exact_bytes_and_origin(self):
+        j = ForwardJournal(self.root/'a'); self.addCleanup(j.close)
+        j.add(self.snapshot()); j.add(self.snapshot(1))
+        raw = j.export()
+        k = ForwardJournal(self.root/'b'); self.addCleanup(k.close)
+        self.assertEqual(k.restore(raw), 2); self.assertEqual(k.restore(raw), 0)
+        self.assertEqual([x['raw'] for x in j.records()], [x['raw'] for x in k.records()])
+        self.assertTrue(all('备份恢复' in x['origin'] for x in k.records()))
+
+    def test_restore_conflict_rolls_back_entire_batch(self):
+        original = ForwardJournal(self.root/'a'); self.addCleanup(original.close)
+        original.add(self.snapshot(1))
+        incoming = ForwardJournal(self.root/'b'); self.addCleanup(incoming.close)
+        incoming.add(self.snapshot(0))
+        incoming.add(self.snapshot(1, created='2026-09-24T20:00:00+08:00'))
+        with self.assertRaises(DataError):
+            original.restore(incoming.export())
+        self.assertEqual([r['meta']['signal_day'] for r in original.records()], ['20260924'])
+
+    def test_corrupt_snapshot_and_changed_protocol_rejected(self):
+        files = forward_unzip(self.snapshot())
+        files['selected.csv'] += b'corrupt'
+        with self.assertRaises(DataError):
+            load_forward_snapshot(forward_zip(files))
+        files = forward_unzip(self.snapshot()); meta = json.loads(files['snapshot.json'])
+        meta['protocol']['config']['max_gap'] = .06
+        files['snapshot.json'] = json.dumps(meta).encode()
+        with self.assertRaises(DataError):
+            load_forward_snapshot(forward_zip(files))
+        cfg = replace(self.cfg, max_gap=.04)
+        with self.assertRaises(DataError):
+            make_forward_snapshot(cfg, self.c, select_candidates(self.c, cfg), pd.DataFrame({'date':[self.calendar[0]]}),
+                self.calendar[0], self.calendar[1], self.calendar[0], 'test', '正式数据_未验证盈利')
+
+    def test_no_selection_is_known_cash_missing_day_is_not(self):
+        empty = self.c.copy(); empty['base_reason'] = empty['exclude_reason'] = '全部不合格；'
+        r0 = load_forward_snapshot(self.snapshot(candidates=empty))
+        r2 = load_forward_snapshot(self.snapshot(2, candidates=empty))
+        records = [r0, r2]
+        result = evaluate_forward(records, self.store(), self.calendar[:3], self.calendar[2])
+        self.assertEqual(result['meta']['missing_days'], 1)
+        self.assertEqual(result['meta']['eligible_days'], 2)
+        self.assertTrue(result['tables']['forward_paired_days'].paired_delta.eq(0).all())
+        self.assertEqual(len(result['tables']['forward_paired_days']), 4)
+        self.assertTrue(result['tables']['forward_summary']['有效平仓数'].eq(0).all())
+        self.assertTrue(result['tables']['forward_summary']['净均益%'].isna().all())
+
+    def test_future_and_open_trades_remain_unknown(self):
+        records = [load_forward_snapshot(self.snapshot())]
+        store = self.store()
+        result = evaluate_forward(records, store, self.calendar[:1], self.calendar[0])
+        self.assertTrue(result['tables']['forward_events'].status.eq('待下一交易日').all())
+        self.assertTrue(result['tables']['forward_paired_days'].slot_mean.isna().all())
+        result = evaluate_forward(records, store, self.calendar[:3], self.calendar[2])
+        self.assertTrue(result['tables']['forward_events'].status.eq('未平仓').all())
+        self.assertFalse(result['tables']['forward_paired_days'].pair_complete.any())
+
+    def test_replay_uses_archived_choices_and_same_stock_blocking(self):
+        from unittest.mock import patch
+        records = [load_forward_snapshot(self.snapshot(i)) for i in [0,1]]
+        with patch(__name__+'.select_candidates', side_effect=AssertionError('不得从行情重新选股')):
+            # 协议构建读取函数源码，所以只验证执行选股函数没有被调用，结果阶段用原协议。
+            with patch(__name__+'.forward_protocol', return_value=records[0]['meta']['protocol']):
+                result = evaluate_forward(records, self.store(), self.calendar, self.calendar[-1])
+        self.assertTrue(result['tables']['forward_trades'].status.eq('重复持仓跳过').any())
+        self.assertEqual(len(result['tables']['forward_events']), 28)
+        self.assertEqual(result['meta']['missing_days'], 10)
+        self.assertFalse(result['meta']['selection_recomputed'])
+
+    def test_late_and_demo_records_are_excluded(self):
+        late = load_forward_snapshot(self.snapshot(created='2026-09-24T09:30:00+08:00'))
+        demo = load_forward_snapshot(self.snapshot(1, mode='演示合成数据'))
+        self.assertFalse(late['meta']['timing_eligible']); self.assertFalse(demo['meta']['timing_eligible'])
+        with self.assertRaises(DataError):
+            evaluate_forward([late,demo], self.store(), self.calendar, self.calendar[-1])
+
+    def test_calendar_change_is_not_silently_accepted(self):
+        r = load_forward_snapshot(self.snapshot())
+        changed = self.calendar.delete(1)
+        with self.assertRaises(DataError):
+            evaluate_forward([r], self.store(), changed, changed[-1])
+
+    def test_archive_daily_integration_and_failure_notice(self):
+        class CalendarClient:
+            def calendar(client, start, end):
+                return self.calendar
+        cfg = self.cfg; c = self.c; s = select_candidates(c,cfg)
+        panel = pd.DataFrame({'date':[self.calendar[0]]})
+        folder = self.root/'report'; folder.mkdir()
+        note = archive_daily(self.root, CalendarClient(), cfg,c,s,panel,self.calendar[:1],'test',folder)
+        self.assertTrue(note['saved_or_first_preserved'])
+        j = ForwardJournal(self.root); self.addCleanup(j.close)
+        self.assertEqual(len(j.records()),1)
+        class BadClient:
+            def calendar(client, start, end):
+                raise DataError('测试日历失败')
+        note = archive_daily(self.root, BadClient(), cfg,c,s,panel,self.calendar[:1],'test',folder)
+        self.assertFalse(note['saved_or_first_preserved'])
+        self.assertIn('日历失败', json.loads((folder/'forward_status.json').read_text())['message'])
+
+    def test_update_pipeline_keeps_original_bytes_and_writes_all_results(self):
+        from unittest.mock import patch
+        store = self.store(); path = store.path; store.close()
+        j = ForwardJournal(self.root); self.addCleanup(j.close)
+        raw = self.snapshot(); j.add(raw)
+        with patch.object(DataClient, '__init__', return_value=None), \
+             patch.object(DataClient, 'calendar', return_value=self.calendar), \
+             patch.object(DataClient, 'download', side_effect=lambda cal: MarketStore(path)), \
+             patch.object(DataClient, 'universe', side_effect=AssertionError('不能重新构造候选池')), \
+             patch(__name__+'.ready_day', return_value=self.calendar[-1]):
+            folder = Path(update_forward('dummy-not-written', self.root))
+        meta = json.loads((folder/'manifest.json').read_text())
+        self.assertEqual(meta['eligible_days'], 1)
+        self.assertEqual(meta['missing_days'], 11)
+        self.assertEqual(j.records()[0]['raw'], raw)
+        with zipfile.ZipFile(folder/'前向结果.zip') as z:
+            self.assertIsNone(z.testzip())
+            self.assertIn('forward_pair_concentration.csv', z.namelist())
+            self.assertNotIn(b'dummy-not-written', z.read('manifest.json'))
+
+    def test_pair_unknown_data_issue_and_known_no_buy(self):
+        day = self.calendar[0]
+        rows = [dict(signal_date=day, group=TOP10_MODELS[0][1], take_profit=.10,
+            status='未买入', net_return=np.nan, data_issue=True)]
+        f = forward_pairs(pd.DataFrame(rows), [day])
+        self.assertFalse(f.loc[f.take_profit.eq(.10), 'pair_complete'].item())
+        rows[0]['data_issue'] = False
+        f = forward_pairs(pd.DataFrame(rows), [day])
+        self.assertTrue(f.pair_complete.all())
+        self.assertTrue(f.paired_delta.eq(0).all())
+
+
 if __name__ == "__main__":
     if "--self-test" in sys.argv:
-        suite = unittest.defaultTestLoader.loadTestsFromTestCase(StrategyTests)
+        suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(cls) for cls in [StrategyTests, ForwardTests])
         result = unittest.TextTestRunner(verbosity=2).run(suite)
         sys.exit(0 if result.wasSuccessful() else 1)
     elif "--demo" in sys.argv:
