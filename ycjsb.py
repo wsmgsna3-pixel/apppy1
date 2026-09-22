@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""板块领涨惯性 M1.5 — 交易结果归因 / 买入前特征 / 两段历史对照
+"""板块领涨惯性 M1.6 — 单一效率过滤对照 / 等机会审计 / 持仓约束重放
 
 依赖：pandas >= 2.0, numpy >= 1.24, streamlit >= 1.32, tushare >= 1.4。
 离线逻辑验算：python app.py --self-test
@@ -32,7 +32,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
-VERSION = "M1.5"
+VERSION = "M1.6"
 CORE = {"电子", "计算机", "通信", "国防军工"}
 TECH_WORDS = ("自动化", "机器人", "仪器仪表", "半导体", "光伏设备", "风电设备",
               "电池", "电网设备", "医疗器械", "电子", "金属新材料")
@@ -53,6 +53,8 @@ FROZEN_PARAMS = dict(scope="科技行业", min_price=10.0, min_mv=50.0, max_mv=1
     top_n=3, heat_limit=.50, max_gap=.03, hold_days=5, stop_loss=.10,
     buy_fee=.0003, sell_fee=.0003, slippage=.001, min_sector_n=5)
 VALIDATION_GROUPS = (GROUP_BASE, TOP10_MODELS[0][1])
+EFF_EXPERIMENT, EFF_GROUP = 'T10_PRE3_EFF', '低前涨幅_剔除高效率'
+EFF_CUTOFF, EFF_FREEZE_DAY = 200/3, '20260922'
 
 
 @dataclass(frozen=True)
@@ -71,6 +73,7 @@ class Config:
     filter_research: bool = False
     legacy_research: bool = False
     validation_only: bool = True
+    efficiency_research: bool = True
     hold_days: int = 5
     stop_loss: float = 0.10
     buy_fee: float = 0.0003
@@ -136,14 +139,20 @@ def experiments(cfg):
             specs.append(dict(experiment=key, family="涨幅前三过滤", group="涨幅前三_过滤"+label,
                               gap_policy="统一上限", weights=(25, 25, 25, 25), rs_days=0,
                               sort="ret1", hot=False, filter_col=col, filter_label=label, filter_cutoff=25.0))
-    if cfg.research or cfg.validation_only:
+    if cfg.research or cfg.validation_only or cfg.efficiency_research:
         for key, label, col, ascending in TOP10_MODELS:
+            if not (cfg.research or cfg.validation_only) and key != 'T10_PRE3':
+                continue
             specs.append(dict(experiment=key, family="前十选三假设", group=label,
                               gap_policy="统一上限", weights=(25, 25, 25, 25), rs_days=0,
                               sort=col, ascending=ascending, top10=True, hot=False,
                               filter_col="", filter_label="无", filter_cutoff=np.nan))
+    if cfg.efficiency_research:
+        spec = next(s.copy() for s in specs if s['experiment'] == 'T10_PRE3')
+        spec.update(experiment=EFF_EXPERIMENT, group=EFF_GROUP, family='效率过滤对照', efficiency_guard=True)
+        specs.append(spec)
     if cfg.validation_only:
-        return [s for s in specs if s["experiment"] in ["RETURN", "T10_PRE3"] and s["gap_policy"] == "统一上限"]
+        return [s for s in specs if s["experiment"] in ["RETURN", "T10_PRE3", EFF_EXPERIMENT] and s["gap_policy"] == "统一上限"]
     return specs
 
 
@@ -731,8 +740,207 @@ def score_candidates(candidates):
     return f
 
 
+def efficiency_annotations(candidates):
+    c = candidates
+    valid = c.base_reason.fillna('').eq('') & c.overheat.eq(False)
+    values = pd.to_numeric(c.efficiency_score, errors='coerce')
+    values = values.where(valid & np.isfinite(values))
+    g = values.groupby(c.date)
+    n = g.transform('count')
+    spread = g.transform('max')-g.transform('min')
+    pct = (g.rank(method='average')-.5)/n*100
+    pct = pct.where(n.ge(4) & spread.gt(1e-12))
+    keep = pct.isna() | pct.le(EFF_CUTOFF)
+    reason = np.select([pct.isna(), keep], ['分位不可评估，保留', '未超过最高三分之一，保留'],
+                       default='效率分位处于最高三分之一，拒绝且不补位')
+    return pd.DataFrame(dict(eff_pool_count=n, eff_pct=pct, eff_keep=keep, eff_reason=reason), index=c.index)
+
+
+def efficiency_decisions(candidates, selected):
+    base = selected[selected.group.eq(TOP10_MODELS[0][1])].copy()
+    keys = ['date', 'ts_code']
+    annotations = candidates[keys].join(efficiency_annotations(candidates))
+    annotations['date'] = pd.to_datetime(annotations.date)
+    base['date'] = pd.to_datetime(base.date)
+    base = base.drop(columns=['eff_pool_count', 'eff_pct', 'eff_keep', 'eff_reason'], errors='ignore')
+    if base.duplicated(keys).any() or annotations.duplicated(keys).any():
+        raise DataError('效率过滤的股票日记录重复')
+    base = base.merge(annotations, on=keys, how='left', validate='one_to_one', indicator=True)
+    if base._merge.ne('both').any():
+        raise DataError('效率过滤缺少对应候选特征')
+    return base.drop(columns='_merge')
+
+
+def efficiency_sample_phase(values, mode=''):
+    d = pd.to_datetime(values)
+    if '演示' in mode:
+        return pd.Series('合成演示_不是验证', index=d.index)
+    return pd.Series(np.select([d.between(pd.Timestamp('20240920'), pd.Timestamp('20260918')),
+        d.gt(pd.Timestamp(EFF_FREEZE_DAY)), d.lt(pd.Timestamp('20240920'))],
+        ['M16已参与假设形成_探索', 'M16冻结后日期_须核实事前留存', '更早历史_须排除既往调参'],
+        default='M16冻结边界_不作独立验证'), index=d.index)
+
+
+def efficiency_protocol(cfg):
+    logic = '\n'.join(inspect.getsource(f) for f in [efficiency_annotations, efficiency_decisions,
+        select_candidates, simulate_trade, run_trades, replay_independent_paths])
+    return dict(protocol_id='M16_PRE3_DROP_HIGH_EFF', frozen_on=EFF_FREEZE_DAY,
+        base_group=TOP10_MODELS[0][1], trial_group=EFF_GROUP, primary_target=.10, sensitivity_target=.05,
+        threshold='eff_pct > 200/3', minimum_finite_pool=4, missing_percentile='保留', ties='平均名次',
+        no_replacement=True, rank_preserved=True, scope='当日基础合格且不过热的完整候选池',
+        params={k: getattr(cfg, k) for k in FROZEN_PARAMS},
+        logic_sha256=hashlib.sha256(logic.encode()).hexdigest(),
+        explored_signal_start='20240920', explored_signal_end='20260918',
+        interval_labels_are_not_out_of_sample_proof=True, automatic_best_model_selection=False,
+        note='先按原低前涨幅规则选最多3只，再过滤；原名次保留，不加仓其他股票。')
+
+
+REPLAY_BASE_COLUMNS = ['signal_date', 'ts_code', 'name', 'sector', 'sector_name', 'group',
+    'take_profit', 'rank', 'score', 'rs5', 'runup5', 'experiment', 'family', 'gap_policy',
+    'rs_days', 'board', 'gap_limit', 'return_rank']
+
+
+def replay_independent_paths(events):
+    """复用各信号原成交路径，按股票重放持仓阻塞；不重撮合价格，也不忽略原来被阻塞的信号。"""
+    if events.empty:
+        return events.copy()
+    f = events.copy()
+    for col in ['signal_date', 'entry_date', 'exit_date']:
+        f[col] = pd.to_datetime(f[col])
+    keys = ['group', 'ts_code', 'take_profit', 'signal_date']
+    if f.duplicated(keys).any():
+        raise DataError('持仓约束重放存在重复独立路径')
+    if not f.status.isin(['已平仓', '未平仓', '未买入', '待下一交易日']).all():
+        raise DataError('必须使用完整独立路径，不能拿已跳过的实际成交记录代替')
+    records = []
+    for _, block in f.groupby(['group', 'ts_code', 'take_profit'], sort=False):
+        busy_until = pd.Timestamp.min
+        for row in block.sort_values('signal_date').to_dict('records'):
+            entry = row['entry_date']
+            if row['status'] in ['已平仓', '未平仓'] and pd.isna(entry):
+                raise DataError('持仓路径缺少买入日期')
+            if row['status'] == '已平仓' and (pd.isna(row['exit_date']) or row['exit_date'] < entry):
+                raise DataError('已平仓路径的退出日期无效')
+            if pd.notna(entry) and entry <= busy_until:
+                result = {k: row[k] for k in REPLAY_BASE_COLUMNS if k in row}
+                result.update(status='重复持仓跳过', entry_date=entry, exit_date=pd.NaT,
+                    net_return=np.nan, reason='同组同止盈版本仍持有；退出当日不重复开仓')
+            else:
+                result = {k: v for k, v in row.items() if k != 'event_mode'}
+                if row['status'] in ['已平仓', '未平仓']:
+                    busy_until = row['exit_date'] if row['status'] == '已平仓' else pd.Timestamp.max
+            records.append(result)
+    return pd.DataFrame(records)
+
+
+def assert_replay_matches(original, replayed):
+    keys = ['group', 'ts_code', 'take_profit', 'signal_date']
+    cols = keys+['status', 'entry_date', 'exit_date', 'reason', 'net_return']
+    frames = []
+    for source in [original, replayed]:
+        f = source.reindex(columns=cols).copy()
+        for col in ['signal_date', 'entry_date', 'exit_date']:
+            f[col] = pd.to_datetime(f[col])
+        frames.append(f.sort_values(keys).reset_index(drop=True))
+    try:
+        pd.testing.assert_frame_equal(*frames, check_dtype=False, atol=1e-10, rtol=1e-10)
+    except AssertionError as exc:
+        raise DataError('独立路径不能复现报告中的原持仓记录，停止效率过滤对照') from exc
+
+
+def efficiency_execution_changes(base, trial, decisions):
+    keys = ['signal_date', 'ts_code', 'take_profit']
+    def entered(f):
+        return f[f.status.isin(['已平仓', '未平仓'])].copy()
+    a, b = entered(base), entered(trial)
+    before = {tuple(r[k] for k in keys): r for r in a.to_dict('records')}
+    after = {tuple(r[k] for k in keys): r for r in b.to_dict('records')}
+    keep = {(pd.Timestamp(r.date), r.ts_code): bool(r.eff_keep) for r in decisions.itertuples()}
+    rows = []
+    for key in sorted(set(before) | set(after)):
+        if key in before and key in after:
+            category, source, side = '共同成交', after[key], '过滤组'
+        elif key in after:
+            category, source, side = '持仓路径新增', after[key], '过滤组'
+        else:
+            category = '持仓路径减少' if keep[(pd.Timestamp(key[0]), key[1])] else '直接过滤'
+            source, side = before[key], '原低前涨幅'
+        rows.append({**source, 'change_type': category, 'reference_side': side})
+    return pd.DataFrame(rows)
+
+
+def efficiency_trial(candidates, selected, events, trades, cfg, mode=''):
+    if not cfg.efficiency_research or selected.empty or events.empty:
+        return {}
+    decisions = efficiency_decisions(candidates, selected)
+    if decisions.empty:
+        return {}
+    base_group = TOP10_MODELS[0][1]
+    e = events[events.group.eq(base_group)].copy()
+    if e.empty:
+        raise DataError('效率过滤缺少原低前涨幅组的独立路径')
+    for col in ['signal_date', 'entry_date', 'exit_date']:
+        e[col] = pd.to_datetime(e[col])
+    d = decisions.rename(columns={'date': 'signal_date'})
+    keys = ['signal_date', 'ts_code', 'take_profit']
+    expected = d[['signal_date', 'ts_code']].merge(pd.DataFrame({'take_profit': [.05, .10]}), how='cross')
+    if e.duplicated(keys).any() or set(map(tuple, e[keys].to_numpy())) != set(map(tuple, expected[keys].to_numpy())):
+        raise DataError('效率过滤独立路径不完整，不能把缺记录当空仓')
+    audit = e.merge(d[['signal_date', 'ts_code', 'eff_pool_count', 'eff_pct', 'eff_keep', 'eff_reason']],
+                    on=['signal_date', 'ts_code'], how='left', validate='many_to_one')
+    trial_events = audit[audit.eff_keep].copy()
+    trial_events['group'], trial_events['experiment'], trial_events['family'] = EFF_GROUP, EFF_EXPERIMENT, '效率过滤对照'
+    base_actual = replay_independent_paths(e)
+    original = trades[trades.group.eq(base_group)].copy()
+    assert_replay_matches(original, base_actual)
+    trial_actual = replay_independent_paths(trial_events)
+    if trades.group.eq(EFF_GROUP).any():
+        assert_replay_matches(trades[trades.group.eq(EFF_GROUP)], trial_actual)
+    actual = pd.concat([base_actual, trial_actual], ignore_index=True)
+    audit['closed_known'] = audit.status.eq('已平仓') & ~audit.data_issue.eq(True) & audit.net_return.notna()
+    summaries = []
+    for tp, block in audit.groupby('take_profit'):
+        known = block[block.closed_known]
+        retained = known[known.eff_keep]; rejected = known[~known.eff_keep]
+        n = len(known)
+        avoided = -rejected.net_return.clip(upper=0).sum()/n*100 if n else np.nan
+        missed = rejected.net_return.clip(lower=0).sum()/n*100 if n else np.nan
+        summaries.append(dict(group=EFF_GROUP, take_profit=tp, **{
+            '原始信号数': len(block), '过滤信号数': int((~block.eff_keep).sum()),
+            '分位缺失保留数': int(block.eff_pct.isna().sum()), '原始有效平仓机会数': n,
+            '未买入数': int((block.status.eq('未买入') & ~block.data_issue.eq(True)).sum()),
+            '未知或数据问题数': int((~block.closed_known & ~(block.status.eq('未买入') & ~block.data_issue.eq(True))).sum()),
+            '保留平仓数': len(retained), '过滤平仓数': len(rejected),
+            '避免亏损笔数': int(rejected.net_return.lt(0).sum()), '错过盈利笔数': int(rejected.net_return.gt(0).sum()),
+            '原始机会净均益%': known.net_return.mean()*100, '保留单笔净均益%': retained.net_return.mean()*100,
+            '过滤后等机会均益%': retained.net_return.sum()/n*100 if n else np.nan,
+            '等机会改善(百分点)': avoided-missed, '避免亏损贡献(百分点)': avoided,
+            '错过盈利贡献(百分点)': missed}))
+    temporary = pd.concat([e.assign(group=GROUP_BASE), trial_events], ignore_index=True)
+    paired, _ = paired_top10_days(temporary, top10_candidates(candidates, cfg), cfg, groups=[GROUP_BASE, EFF_GROUP])
+    paired['sample_phase'] = efficiency_sample_phase(paired.signal_date, mode)
+    actual_summary = summarize(actual, ['group', 'take_profit'])
+    grid = pd.MultiIndex.from_product([[base_group, EFF_GROUP], [.05, .10]], names=['group', 'take_profit']).to_frame(index=False)
+    actual_summary = grid.merge(actual_summary, how='left', on=['group', 'take_profit'])
+    for col in ['信号数', '成交数', '有效平仓数', '未平仓数', '数据问题数', '双触及笔数']:
+        actual_summary[col] = actual_summary[col].fillna(0).astype(int)
+    tables = {'efficiency_decisions': decisions, 'efficiency_opportunities': audit,
+        'efficiency_opportunity_summary': pd.DataFrame(summaries), 'efficiency_actual_trades': actual,
+        'efficiency_actual_summary': actual_summary,
+        'efficiency_paired_days': paired}
+    for key, value in concentration_tables(paired).items():
+        tables[key.replace('validation_', 'efficiency_')] = value
+    actual['month'] = pd.to_datetime(actual.signal_date).dt.strftime('%Y-%m')
+    tables['efficiency_actual_monthly'] = summarize(actual, ['group', 'take_profit', 'month'])
+    changes = efficiency_execution_changes(base_actual, trial_actual, decisions)
+    tables['efficiency_execution_changes'] = changes
+    tables['efficiency_execution_summary'] = summarize(changes, ['change_type', 'reference_side', 'take_profit']) if not changes.empty else pd.DataFrame()
+    return tables
+
+
 def select_candidates(candidates, cfg):
     candidates = add_filter_ranks(candidates)
+    efficiency = efficiency_annotations(candidates) if cfg.efficiency_research else None
     choices = []
     for spec in experiments(cfg):
         mask = candidates.base_reason.eq("") & candidates.overheat.eq(spec["hot"])
@@ -761,6 +969,9 @@ def select_candidates(candidates, cfg):
         f = f[f["rank"].le(cfg.top_n)].copy()
         f = apply_filter_rule(f, spec)
         f = f[f.filter_pass].copy()  # 排名后过滤，不补位、不把第4名提到前三。
+        if spec.get('efficiency_guard'):
+            f = f.join(efficiency)
+            f = f[f.eff_keep].copy()
         for key in ["group", "experiment", "family", "gap_policy", "rs_days", "filter_col", "filter_label", "filter_cutoff"]:
             f[key] = spec[key]
         # 空候选时，pandas 3的字符串map保留字符串dtype，显式转换保证后续价格计算有效。
@@ -990,7 +1201,8 @@ def experiment_design(cfg):
     for spec in experiments(cfg):
         row = {k: spec[k] for k in ["group", "experiment", "family", "gap_policy", "rs_days", "filter_col", "filter_label", "filter_cutoff"]}
         row.update(dict(zip(["相对强度权重", "上涨效率权重", "量价配合权重", "收盘位置权重"], spec["weights"])))
-        row.update({"候选范围": "基础合格且不过热的涨幅前十" if spec.get("top10") else "原基础池",
+        row.update({"排名后效率过滤": bool(spec.get("efficiency_guard")),
+                    "候选范围": "基础合格且不过热的涨幅前十" if spec.get("top10") else "原基础池",
                     "排序指标": spec["sort"], "排序方向": "由小到大" if spec.get("ascending") else "由大到小",
                     "综合评分参与排序": spec["sort"] == "score"})
         row.update({"主板买价上限%": cfg.max_gap*100,
@@ -1632,8 +1844,8 @@ def load_attribution_archive(raw, name='审计.zip'):
             if sum(i.file_size for i in z.infolist()) > 300*1024*1024 or any(z.getinfo(k).file_size > 100*1024*1024 for k in needed):
                 raise DataError('审计包解压后过大，拒绝读取')
             manifest = json.loads(z.read('manifest.json'))
-            if manifest.get('version') not in ['M1.3', 'M1.4', 'M1.5']:
-                raise DataError('当前归因导入支持M1.3、M1.4、M1.5审计包')
+            if manifest.get('version') not in ['M1.3', 'M1.4', 'M1.5', 'M1.6']:
+                raise DataError('当前导入支持M1.3至M1.6的完整回测审计包，不支持二次归因包')
             frames = {}
             for key in needed[1:]:
                 try:
@@ -1680,7 +1892,7 @@ def load_attribution_archive(raw, name='审计.zip'):
         if e.duplicated(keys).any() or set(map(tuple, e[keys].to_numpy())) != set(map(tuple, expected[keys].to_numpy())):
             raise DataError('已选信号与独立回放/持仓记录不齐全或重复，不能将缺记录当作未成交')
     # 检查当前固定规则能否重建导出选择；这里只复算选股，不声称重新撮合行情。
-    rebuilt = select_candidates(c, replace(cfg, validation_only=True))
+    rebuilt = select_candidates(c, replace(cfg, validation_only=True, efficiency_research=False))
     cols = ['group', 'date', 'ts_code', 'rank', 'return_rank', 'gap_limit']
     original = chosen.copy(); original['date'] = pd.to_datetime(original.date)
     order = ['group', 'date', 'ts_code']
@@ -1691,7 +1903,8 @@ def load_attribution_archive(raw, name='审计.zip'):
         raise DataError('导出选股不能由当前固定规则重建，不能直接按同一规则比较') from exc
     known_source = manifest.get('source_sha256') in {
         'a4f8dbbaf706cbb034a2693a85bddc38fb93b56505b412aea1f95e778176e202',
-        'e861bf410d717fcdf32c14965ce9a800ff87b3dbc2800215983e0b4da43c114e'}
+        'e861bf410d717fcdf32c14965ce9a800ff87b3dbc2800215983e0b4da43c114e',
+        '92ee79774bbe469777aaea7ed6a38dd3db9bec045e6ca145f1d7439832edbcc5'}
     logic = manifest.get('validation_protocol', {}).get('trading_logic_sha256')
     logic_match = known_source or logic == validation_protocol(cfg)['trading_logic_sha256']
     meta = dict(name=Path(name).name, version=manifest['version'], start=cfg.start, end=cfg.end,
@@ -1699,7 +1912,12 @@ def load_attribution_archive(raw, name='审计.zip'):
         mode=manifest.get('mode', ''), params={k: getattr(cfg, k) for k in FROZEN_PARAMS},
         selection_rebuilt=True, price_execution_replayed=False, declared_logic_recognized=logic_match,
         origin='合成演示' if '演示' in manifest.get('mode', '') else '历史探索_新特征未验证')
-    return dict(meta=meta, tables=attribution_reports(events, c, trades, cfg))
+    tables = attribution_reports(events, c, trades, cfg)
+    if logic_match:
+        tables.update(efficiency_trial(c, selected, events, trades, replace(cfg, efficiency_research=True), manifest.get('mode', '')))
+    meta['efficiency_replay_completed'] = 'efficiency_actual_trades' in tables
+    meta['efficiency_protocol'] = efficiency_protocol(cfg)
+    return dict(meta=meta, tables=tables)
 
 
 def attribution_consistency(a, b):
@@ -1744,8 +1962,9 @@ def review_archives(files):
             comparable = True
             tables['attribution_consistency'] = attribution_consistency(
                 reports[0]['tables']['attribution_features'], reports[1]['tables']['attribution_features'])
-    meta = dict(version=VERSION, report_type='既有审计记录归因_未重新撮合', sources=[r['meta'] for r in reports],
-        comparable=comparable, warnings=warnings, feature_count=len(ATTR_FEATURES), rule_changes=False,
+    meta = dict(version=VERSION, report_type='既有价格路径复用_新增过滤并重放持仓约束_未重撮合原始行情', sources=[r['meta'] for r in reports],
+        comparable=comparable, warnings=warnings, feature_count=len(ATTR_FEATURES), base_rules_changed=False,
+        new_trial=EFF_EXPERIMENT, efficiency_replay='复用原独立路径并重放同股持仓约束，不重撮合行情',
         note=ATTR_NOTE, comparison_minimum_count=30,
         minimum_count_is_not_significance_test=True, sorted_periods='区间1为更早信号区间；区间2为更晚区间')
     stream = io.BytesIO()
@@ -1757,7 +1976,20 @@ def review_archives(files):
     return dict(meta=meta, tables=tables, archive=stream.getvalue())
 
 
-RULES = """板块领涨惯性 M1.5：结果归因与固定规则验证
+RULES = """板块领涨惯性 M1.6：单一效率过滤对照
+
+默认三组：原涨幅前三、低前涨幅前三、低前涨幅剔除高效率。
+新组先完成低前涨幅前三选择，再排除效率分位严格大于200/3的股票，不补位且保留原始名次。
+分位参照当天完整基础合格且不过热池；平均名次处理并列，至少4个有限值，分位缺失保留。
+只增加此一个条件，交易价格、止盈、止损、持有期与原规则相同。
+10%止盈为主要目标，5%为敏感性对照。2024-09-20至2026-09-18均参与了新假设形成。
+新规则冻结于2026-09-22；冻结后日期标签仍不证明信号事前留存。
+旧ZIP导入复用独立信号的完整价格路径，先复现原组持仓记录，再重放过滤组持仓约束。
+新增持仓路径可能包含原来被重复持仓挡住的信号；不能只删除原成交表中的被过滤交易。
+无信号、未买入、未知结果分开；等机会均益保留原有效平仓机会分母，过滤记空仓0。
+逐月和极端日剔除仅作集中度诊断，不是可提前执行的条件。
+
+以下保留M1.5及更早审计口径：
 
 M1.5新增结果归因与两份旧审计ZIP对照，不改变选股排序、买价、止盈止损。
 只用信号日收盘已知的固定16项特征，未知和缺失不补为0。
@@ -1876,7 +2108,7 @@ T+1：买入当日不能止盈、不能止损，买入当日达到5%只作诊断
 
 def save_report(root, cfg, candidates, selected, trades, panel, calendar, data_hash, mode, events=None):
     root = Path(root)
-    folder = Path(tempfile.mkdtemp(prefix="M15_", dir=root))
+    folder = Path(tempfile.mkdtemp(prefix="M16_", dir=root))
     candidates = add_filter_ranks(candidates)
     tables = {"candidates": candidates, "selected": selected, "trades": trades,
               "sector_daily": panel[panel.date.between(pd.Timestamp(cfg.start), pd.Timestamp(cfg.end))].copy()}
@@ -1888,6 +2120,7 @@ def save_report(root, cfg, candidates, selected, trades, panel, calendar, data_h
     tables["filter_decisions"] = decisions
     tables["filter_execution_changes"], tables["filter_execution_summary"] = filter_execution_audit(trades, decisions)
     if events is not None:
+        tables.update(efficiency_trial(candidates, selected, events, trades, cfg, mode))
         tables.update(attribution_reports(events, candidates, trades, cfg))
         tables.update(validation_reports(events, selected, candidates, trades, cfg, mode))
         tables.update(top10_reports(events, candidates, cfg))
@@ -1928,7 +2161,7 @@ def save_report(root, cfg, candidates, selected, trades, panel, calendar, data_h
                     data_start=ds(calendar[0]), data_end=ds(calendar[-1]), data_hash=data_hash,
                     source_sha256=source_hash, created_at=datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(),
                     verified_profitability=False, execution="保守日线近似", tables=list(tables),
-                    research_design="M1.5：买入前特征与结果归因；固定原前三与低前涨幅；逐月贡献、逐月剔除",
+                    research_design="M1.6：低前涨幅选后剔除效率最高三分之一；等机会与持仓约束重放；逐月贡献",
                     experiment_count=len(experiments(cfg)),
                     tuning_performed=False, rs_definition="最近N个市场交易日每天收益严格高于同一板块；含信号日；不是累计跑赢",
                     independent_paths="允许重叠的独立信号5日观察；路径可能发生于止盈/止损之后，不是兑现利润")
@@ -1936,6 +2169,7 @@ def save_report(root, cfg, candidates, selected, trades, panel, calendar, data_h
         rank_preserved=True, filters_combined=False, threshold_tuned=False,
         same_opportunity_denominator="基准独立信号有效平仓数；未知不归零", available_event_targets=sorted(events.take_profit.unique().tolist()) if events is not None and not events.empty else [])
     manifest["validation_protocol"] = validation_protocol(cfg, mode)
+    manifest["efficiency_protocol"] = efficiency_protocol(cfg)
     manifest["attribution_protocol"] = dict(note=ATTR_NOTE, features=[k for k, _, _ in ATTR_FEATURES],
         primary_target=.10, selection_rules_changed=False, automatic_feature_selection=False,
         eligible_daily_pool_minimum=4, cross_period_minimum_count=30)
@@ -2048,6 +2282,7 @@ DISPLAY = {
     "source_period": "来源区间", "basis": "归因口径", "outcome": "交易结果", "contrast": "对照结果",
     "month": "信号月份", "excluded_month": "剔除的信号月份", "sample_phase": "样本属性",
     "diagnostic_tail": "诊断类别",
+    "eff_pct": "效率池内分位", "eff_pool_count": "效率有效候选数", "eff_keep": "是否保留", "eff_reason": "效率过滤判定",
     "return_rank": "原涨幅名次", "rank_band": "原涨幅排名段", "pre3": "信号前3日涨幅%",
     "rs_accel": "当日相对强度提升(百分点)", "pre3_band": "信号前3日涨幅区间",
     "signal_gain_band": "信号日涨幅区间", "signal_limit_up": "信号日收盘涨停",
@@ -2113,7 +2348,7 @@ def show_research(st, folder):
         return
     st.subheader("全部实验结果")
     st.caption("这是探索性对照，不自动推荐历史收益最高的一组。净均益是独立交易均值，非账户收益；检查各年、样本量和信号覆盖。")
-    family = st.selectbox("查看实验类型", ["全部", "前十选三假设", "涨幅前三过滤", "等权基准", "单维加权", "连续相对强度", "涨幅对照", "过热观察"], key="research_family")
+    family = st.selectbox("查看实验类型", ["全部", "效率过滤对照", "前十选三假设", "涨幅前三过滤", "等权基准", "单维加权", "连续相对强度", "涨幅对照", "过热观察"], key="research_family")
     policy = st.radio("买入上限规则", ["两种都看", "统一上限", "分板块上限"], horizontal=True, key="research_policy")
     target = st.radio("止盈对照", ["5%", "10%"], horizontal=True, key="research_target")
     f = grid[grid.take_profit.eq(.05 if target == "5%" else .10)]
@@ -2246,6 +2481,69 @@ def show_top10(st, folder):
         show_table(st, ledger[ledger.take_profit.eq(tp)].sort_values(["signal_date", "return_rank"], ascending=[False, True]).head(200))
 
 
+def show_efficiency(st, tables, prefix='eff'):
+    st.subheader('低前涨幅选出前三后，剔除效率最高三分之一')
+    summary = tables.get('efficiency_opportunity_summary', pd.DataFrame())
+    if summary.empty:
+        st.info('暂无效率过滤对照。可启用M1.6重新计算，或导入M1.3至M1.6完整回测审计ZIP；没有原低前涨幅信号时不生成结果。')
+        return
+    st.caption('只增加这一条过滤，不补位，不重新排名。参照当日完整合格且不过热池；分位超过66.6667才拒绝，至少4个有限评分，并列用平均名次，分位不可评估时保留。')
+    period = None
+    if 'source_period' in summary:
+        period = st.selectbox('效率对照区间', ['全部区间']+summary.source_period.unique().tolist(), key=prefix+'_period')
+    tp = st.selectbox('效率对照止盈目标', [.10, .05], format_func=lambda x: '10% · 主要目标' if x == .10 else '5% · 敏感性对照', key=prefix+'_target')
+    def part(name):
+        f = tables.get(name, pd.DataFrame())
+        if not f.empty:
+            if 'take_profit' in f:
+                f = f[f.take_profit.eq(tp)]
+            if period and period != '全部区间' and 'source_period' in f:
+                f = f[f.source_period.eq(period)]
+        return f
+    st.info('2024-09-20至2026-09-18两段数据已参与新规则形成，均为探索样本。新规则于2026-09-22固定，不能把本页改善当作独立验证通过。')
+    st.write('完整持仓回放：是否真正改善原方案')
+    show_table(st, part('efficiency_actual_summary').reindex(columns=['source_period', 'group', 'take_profit',
+        '信号数', '有效平仓数', '未平仓数', '数据问题数', '胜率%', '净均益%', '净中位数%',
+        '剔除最大5笔后净均益%', '最差单笔%']))
+    st.caption('每组分别重放同股持仓占用；退出当日不重复开仓。过滤后原来被持仓挡住的信号可能变为成交，所以新组不是简单删除原成交记录。仍未施加账户总资金限制。')
+    st.write('避免亏损与错过盈利：固定原机会分母')
+    cols = ['source_period', '原始信号数', '过滤信号数', '分位缺失保留数', '原始有效平仓机会数',
+        '避免亏损笔数', '错过盈利笔数', '原始机会净均益%', '保留单笔净均益%', '过滤后等机会均益%',
+        '等机会改善(百分点)', '避免亏损贡献(百分点)', '错过盈利贡献(百分点)', '未知或数据问题数']
+    show_table(st, part('efficiency_opportunity_summary').reindex(columns=cols))
+    st.caption('独立信号允许重叠。等机会分母固定为原方案有效平仓机会数，被过滤记空仓0，未知不归零；改善=避免亏损贡献−错过盈利贡献。保留单笔均益上升本身不足以证明过滤有效。')
+    st.write('同日固定名额比较与集中度')
+    show_table(st, part('efficiency_summary'))
+    show_table(st, part('efficiency_concentration'))
+    st.caption('此处基准专指原低前涨幅。每天最多三个固定名额，任一原结果未知则整日剔除，两组都用同一日期集合；不同批次会重叠，不能复利或年化。')
+    with st.expander('逐月贡献与逐一剔除月份'):
+        show_table(st, part('efficiency_monthly'))
+        show_table(st, part('efficiency_leave_month_out'))
+        st.caption('逐月和极端日剔除是事后敏感性检查，不是可执行的交易条件。')
+    with st.expander('哪些交易因持仓路径发生变化'):
+        show_table(st, part('efficiency_execution_summary'))
+        st.caption('直接过滤/路径减少展示原组交易；共同成交/路径新增展示过滤组交易。不同来源不能混加成组合收益。')
+        f = part('efficiency_execution_changes')
+        if not f.empty:
+            show_table(st, f.reindex(columns=['source_period', 'signal_date', 'ts_code', 'name',
+                'change_type', 'reference_side', 'status', 'entry_date', 'exit_date', 'net_return', 'reason']).tail(150))
+    with st.expander('过滤判定明细（最近100条，完整记录见下载）'):
+        d = part('efficiency_decisions')
+        if not d.empty:
+            show_table(st, d.sort_values('date', ascending=False).reindex(columns=['source_period', 'date',
+                'ts_code', 'name', 'rank', 'return_rank', 'efficiency_score', 'eff_pool_count',
+                'eff_pct', 'eff_keep', 'eff_reason']).head(100))
+    with st.expander('逐月成交表现与样本属性'):
+        show_table(st, part('efficiency_actual_monthly'))
+        show_table(st, part('efficiency_by_sample'))
+
+
+EFFICIENCY_TABLES = ['efficiency_decisions', 'efficiency_opportunities', 'efficiency_opportunity_summary',
+    'efficiency_actual_trades', 'efficiency_actual_summary', 'efficiency_paired_days', 'efficiency_summary',
+    'efficiency_monthly', 'efficiency_leave_month_out', 'efficiency_concentration', 'efficiency_by_sample',
+    'efficiency_extreme_days', 'efficiency_actual_monthly', 'efficiency_execution_changes', 'efficiency_execution_summary']
+
+
 def show_attribution(st, tables, prefix='attr'):
     summary = tables.get('attribution_summary', pd.DataFrame())
     st.subheader('交易结果归因：哪些股票没有形成上涨惯性')
@@ -2306,8 +2604,8 @@ def show_attribution(st, tables, prefix='attr'):
 
 
 def show_archive_review(st):
-    st.write('读取已有回测结果，无需Token或重新下载行情')
-    st.caption('支持M1.3、M1.4、M1.5完整回测审计ZIP。建议同时上传M1.3的2026-09-18报告和M1.4的2025-09-19报告。')
+    st.write('复用已有独立信号路径，重放效率过滤后的持仓约束')
+    st.caption('上传M1.3的2026-09-18和M1.4的2025-09-19完整回测审计ZIP。无需Token或下载行情；M1.5二次归因ZIP不包含完整两档路径，不能代替原回测包。')
     uploads = st.file_uploader('上传一至两份回测审计ZIP', type=['zip'], accept_multiple_files=True, key='attribution_uploads')
     if st.button('分析已有结果', type='primary'):
         try:
@@ -2327,9 +2625,16 @@ def show_archive_review(st):
     for warning in meta['warnings']:
         st.warning(warning)
     st.info('两段历史现在用于寻找新特征，都属于新假设的探索样本。同向差异还需要未参与研究的数据验证。')
-    st.caption('已核对导出信号的完整性并重建选股；本次基于既有逐笔记录归因，没有重新撮合原始行情。')
-    show_attribution(st, review['tables'], prefix='import_attr')
-    st.download_button('下载归因审计', review['archive'], file_name='momentum_M1.5_attribution.zip', mime='application/zip')
+    if all(s.get('efficiency_replay_completed', False) for s in meta['sources']):
+        st.caption('已用独立路径复现原组持仓记录，并对新过滤组重放持仓约束。原始成交价格路径复用报告记录，没有重新撮合原始行情。')
+    else:
+        st.warning('至少一份报告尚未完成效率回放或无法核对逻辑来源，仅显示已完成区间。更换版本或文件后请重新点击分析。')
+    tabs = st.tabs(['效率过滤对照', '原规则归因'])
+    with tabs[0]:
+        show_efficiency(st, review['tables'], prefix='import_eff')
+    with tabs[1]:
+        show_attribution(st, review['tables'], prefix='import_attr')
+    st.download_button('下载效率对照与归因审计', review['archive'], file_name='momentum_M1.6_efficiency.zip', mime='application/zip')
     with st.expander('归因口径与文件来源'):
         st.write(ATTR_NOTE)
         st.json(meta)
@@ -2416,10 +2721,12 @@ def show_report(st, folder):
         st.warning("以下全部是合成数据演示，仅用于检查程序，不能用于选股或判断盈利。")
     st.caption(f"版本 {manifest['version']} · 信号截止 {manifest['latest_signal']} · 行情截止 {manifest['data_end']}")
     st.info("研究版：评分不是上涨概率。回测是等额单股审计，未施加账户总资金上限，不能当作账户收益。")
-    labels = ["结果归因", "固定验证", "最新候选", "回测结果", "排除与成交审计", "本次规则"]
+    labels = ["效率过滤", "结果归因", "固定验证", "最新候选", "回测结果", "排除与成交审计", "本次规则"]
     if not manifest["config"].get("validation_only", False):
         labels += ["前十观察", "旧过滤验证", "完整对照"]
     tabs = dict(zip(labels, st.tabs(labels)))
+    with tabs["效率过滤"]:
+        show_efficiency(st, {k: report_table(folder, k) for k in EFFICIENCY_TABLES})
     with tabs["结果归因"]:
         show_attribution(st, {k: report_table(folder, k) for k in ["attribution_ledger", "attribution_summary", "attribution_features", "attribution_buckets"]})
     with tabs["固定验证"]:
@@ -2450,7 +2757,7 @@ def show_report(st, folder):
         st.caption("已持仓不重复加仓；高开超过最高买价或开盘涨跌停则跳过，不补位。除权日请按除权参考价调整最高买价。")
         st.caption("涨幅基准按昨日涨幅排序，综合分仅作审计；过滤组保留原始涨幅名次，空出的名额不补位。")
         cols = ["rank", "return_rank", "pre3", "rs_accel", "ts_code", "name", "board", "sector_name", "score", "gap_limit", "close", "max_buy_reference", "mv_yi",
-                "ret1", "ret5", "rs5", "runup5", "strength_score", "efficiency_score", "volume_score", "position_score", "heat_penalty"]
+                "ret1", "ret5", "rs5", "runup5", "strength_score", "efficiency_score", "volume_score", "position_score", "heat_penalty", "eff_pct", "eff_keep", "eff_reason"]
         if picks.empty:
             st.info("这一天没有合格候选。下方可查看排除原因；不会改选第二板块凑数。")
         else:
@@ -2509,7 +2816,7 @@ def main():
     import streamlit as st
     st.set_page_config(page_title="板块领涨惯性", page_icon="📈", layout="wide")
     st.title("板块领涨惯性")
-    st.caption("M1.5 · 交易结果归因 · 买入前特征 · 两段历史对照")
+    st.caption("M1.6 · 单一效率过滤 · 等机会审计 · 持仓约束重放")
     mode = st.radio("运行方式", ["每日选股", "区间回测", "离线演示", "已有结果归因"], horizontal=True, index=3)
     if mode == "已有结果归因":
         show_archive_review(st)
@@ -2524,7 +2831,8 @@ def main():
                 default_token = ""
         token = st.text_input("Tushare Token", value=default_token, type="password", help="仅用于请求官方数据；不写入报告。需要日线、每日指标、复权因子、涨跌停价和历史行业成分接口权限。")
         validation_only = st.checkbox("固定规则验证（推荐）", value=True,
-            help="固定原涨幅前三与低前涨幅两组；沿用M1.3参数。关闭后才可修改参数或附加旧实验。")
+            help="固定原涨幅前三与低前涨幅基准；默认另加M1.6单一效率过滤。关闭后可修改参数或附加旧实验。")
+        efficiency_research = st.checkbox("启用M1.6效率过滤对照", value=True, help="先选低前涨幅前三，再剔除效率最高三分之一，不补位。")
         if validation_only:
             scope, min_price, min_mv, max_mv = "科技行业", 10.0, 50.0, 1000.0
             max_gap, growth_gap, hold_days, fee, slip = .03, .06, 5, .0003, .001
@@ -2555,16 +2863,16 @@ def main():
         cache_root = str(Path(os.environ.get("MOMENTUM_CACHE_DIR", "momentum_leader_cache")).resolve())
     default_end = ready_day().date()
     if mode == "区间回测":
-        preset = st.selectbox("验证区间", ["历史待验证：2024-09-20至2025-09-19", "已研究：2025-09-20至2026-09-18", "自定义区间"])
-        if preset.startswith("历史"):
+        preset = st.selectbox("验证区间", ["探索区间1：2024-09-20至2025-09-19", "探索区间2：2025-09-20至2026-09-18", "自定义区间"])
+        if preset.startswith("探索区间1"):
             start, end = pd.Timestamp("2024-09-20").date(), pd.Timestamp("2025-09-19").date()
-        elif preset.startswith("已研究"):
+        elif preset.startswith("探索区间2"):
             start, end = pd.Timestamp(EXPLORED_START).date(), pd.Timestamp(EXPLORED_END).date()
         else:
             a, b = st.columns(2)
             start = a.date_input("信号开始日期", value=(pd.Timestamp(default_end)-pd.Timedelta(days=365)).date(), max_value=default_end)
             end = b.date_input("信号结束日期", value=default_end, max_value=default_end)
-        st.caption(f"信号日期 {start} 至 {end}。区间仅作为待验证标签；请确保历史区间未用于本策略调参。")
+        st.caption(f"信号日期 {start} 至 {end}。两段预设区间都已参与M1.6假设形成；其他日期仍须核实未参与调参或事前留存。")
         st.caption("必要时读取结束日后最多45个自然日观察退出；月份按信号日归属，未平仓仍单列。")
     elif mode == "每日选股":
         end = st.date_input("收盘信号日期", value=default_end, max_value=default_end)
@@ -2574,7 +2882,7 @@ def main():
         start = end = default_end
         st.warning("离线演示使用合成行情，检查界面和规则，不产生真实选股建议。")
     cfg = Config(start=ds(start), end=ds(end), scope=scope, min_price=min_price, min_mv=min_mv, max_mv=max_mv,
-                 max_gap=max_gap, growth_gap=growth_gap, research=research, filter_research=filter_research, legacy_research=legacy_research, validation_only=validation_only,
+                 max_gap=max_gap, growth_gap=growth_gap, research=research, filter_research=filter_research, legacy_research=legacy_research, validation_only=validation_only, efficiency_research=efficiency_research,
                  hold_days=hold_days, buy_fee=fee, sell_fee=fee, slippage=slip)
     if st.button("开始选股 / 回测" if mode != "离线演示" else "运行离线演示", type="primary"):
         try:
@@ -2605,13 +2913,133 @@ def main():
 class StrategyTests(unittest.TestCase):
     def setUp(self):
         self.calendar = pd.bdate_range("2024-01-02", periods=10)
-        self.cfg = Config(buy_fee=0, sell_fee=0, slippage=0, research=False, filter_research=True, validation_only=False)
+        self.cfg = Config(buy_fee=0, sell_fee=0, slippage=0, research=False, filter_research=True, validation_only=False, efficiency_research=False)
 
     def bars(self):
         return pd.DataFrame({"open": 100.0, "high": 102.0, "low": 98.0, "close": 100.0,
                              "pre_close": 100.0, "adj_factor": 1.0, "up_limit": 110.0,
                              "down_limit": 90.0, "vol": 10000.0, "amount": 10000.0,
                              "circ_mv": 1000000.0, "turnover_rate": 2.0}, index=self.calendar)
+
+    def test_efficiency_guard_is_after_top3_no_replacement_and_preserves_baselines(self):
+        c = self.filter_candidates(9)
+        c['pre3'] = np.arange(9)*.01
+        c['efficiency_score'] = [80., 0., 70., 10., 20., 30., 40., 50., 60.]
+        cfg = Config()
+        old = select_candidates(c, replace(cfg, efficiency_research=False))
+        new = select_candidates(c, cfg)
+        self.assertEqual([s['experiment'] for s in experiments(cfg)], ['RETURN', 'T10_PRE3', EFF_EXPERIMENT])
+        pd.testing.assert_frame_equal(old.reset_index(drop=True), new[new.group.isin(VALIDATION_GROUPS)][old.columns].reset_index(drop=True))
+        guard = new[new.group.eq(EFF_GROUP)]
+        self.assertEqual(guard.ts_code.tolist(), ['600002.SH'])
+        self.assertEqual(guard['rank'].tolist(), [2])
+        self.assertEqual(guard.return_rank.tolist(), [2])
+        self.assertEqual(guard.eff_keep.tolist(), [True])
+        d = efficiency_decisions(c, new)
+        self.assertEqual(d.eff_keep.tolist(), [False, True, False])
+        # 拒绝决定不依赖下一交易日或未来收益。
+        future = c.copy(); future['date'] = self.calendar[1]; future['efficiency_score'] = 999.
+        joined = pd.concat([c, future], ignore_index=True)
+        pd.testing.assert_frame_equal(efficiency_annotations(c), efficiency_annotations(joined).iloc[:len(c)])
+        small = c.iloc[:3]
+        self.assertTrue(efficiency_annotations(small).eff_keep.all())
+        flat = c.assign(efficiency_score=50.)
+        self.assertTrue(efficiency_annotations(flat).eff_pct.isna().all())
+        self.assertEqual(len(select_candidates(flat, cfg).query('group == @EFF_GROUP')), 3)
+        missing = c.copy(); missing.loc[0, 'efficiency_score'] = np.nan
+        self.assertTrue(efficiency_annotations(missing).iloc[0].eff_keep)
+        ties = c.assign(efficiency_score=[1., 2., 3., 4., 5., 6., 6., 8., 9.])
+        a = efficiency_annotations(ties)
+        self.assertAlmostEqual(a.iloc[5].eff_pct, EFF_CUTOFF)
+        self.assertTrue(a.iloc[5].eff_keep)
+        self.assertFalse(a.iloc[7].eff_keep)
+
+    def test_efficiency_replay_restores_blocked_signals_and_keeps_exit_day_blocked(self):
+        dates = pd.date_range('2024-01-01', periods=10)
+        rows = []
+        for i, exit_i in [(0, 4), (1, 3), (2, 7), (3, 5)]:
+            rows.append(dict(group=TOP10_MODELS[0][1], ts_code='600001.SH', take_profit=.10,
+                signal_date=dates[i], entry_date=dates[i+1], exit_date=dates[exit_i], status='已平仓',
+                reason='到期退出', net_return=-.03, entry_price=20., data_issue=False))
+        events = pd.DataFrame(rows)
+        original = replay_independent_paths(events)
+        self.assertEqual(original.status.tolist(), ['已平仓', '重复持仓跳过', '重复持仓跳过', '重复持仓跳过'])
+        retained = events.iloc[1:].copy(); retained['group'] = EFF_GROUP
+        updated = replay_independent_paths(retained)
+        self.assertEqual(updated.status.tolist(), ['已平仓', '重复持仓跳过', '已平仓'])
+        self.assertEqual(updated.net_return.dropna().tolist(), [-.03, -.03])
+        unfinished = events.copy(); unfinished.loc[0, ['status', 'exit_date', 'net_return']] = ['未平仓', pd.NaT, np.nan]
+        self.assertTrue(replay_independent_paths(unfinished).status.iloc[1:].eq('重复持仓跳过').all())
+        delayed = events.copy(); delayed.loc[0, 'exit_date'] = dates[9]
+        self.assertTrue(replay_independent_paths(delayed).status.iloc[1:].eq('重复持仓跳过').all())
+        bad = events.copy(); bad.loc[0, 'status'] = '重复持仓跳过'
+        with self.assertRaises(DataError):
+            replay_independent_paths(bad)
+
+    def test_efficiency_empty_trial_keeps_unknown_as_unknown(self):
+        c = self.filter_candidates(6)
+        c['pre3'] = np.arange(6)*.01
+        c['efficiency_score'] = [100., 0., 0., 0., 0., 0.]
+        cfg = replace(Config(), top_n=1)
+        selected = select_candidates(c, cfg)
+        self.assertTrue(selected[selected.group.eq(EFF_GROUP)].empty)
+        signal = selected[selected.group.eq(TOP10_MODELS[0][1])].iloc[0]
+        e = pd.DataFrame([dict(signal_date=signal.date, ts_code=signal.ts_code, group=signal.group,
+            take_profit=tp, status='未平仓', entry_date=self.calendar[1], exit_date=pd.NaT,
+            net_return=np.nan, data_issue=False, reason='观察截止时尚未满足退出条件',
+            entry_price=20., hold_days=1, ambiguous=False) for tp in [.05, .10]])
+        original = replay_independent_paths(e)
+        out = efficiency_trial(c, selected, e, original, cfg)
+        self.assertTrue(out['efficiency_opportunity_summary']['过滤后等机会均益%'].isna().all())
+        self.assertTrue(out['efficiency_paired_days'].paired_delta.isna().all())
+        self.assertTrue(out['efficiency_paired_days'].slot_mean.eq(0).all())
+        self.assertTrue(out['efficiency_paired_days'].baseline_slot_mean.isna().all())
+        self.assertEqual(out['efficiency_actual_trades'].group.unique().tolist(), [TOP10_MODELS[0][1]])
+
+    def test_efficiency_online_replay_audit_and_archive_have_identical_results(self):
+        with tempfile.TemporaryDirectory() as root:
+            store, basic, member, names, cal = demo_data(root)
+            cfg = replace(Config(), start=ds(cal[35]), end=ds(cal[60]))
+            panel = sector_panel(store, member, cal, cfg)
+            c = build_candidates(store, basic, member, names, panel, cal, cfg)
+            selected = select_candidates(c, cfg); events = []
+            trades = run_trades(store, selected, cal, cfg, event_records=events)
+            e = pd.DataFrame(events)
+            out = efficiency_trial(c, selected, e, trades, cfg, '演示测试')
+            self.assertFalse(out['efficiency_decisions'].empty)
+            self.assertTrue((~out['efficiency_decisions'].eff_keep).any())
+            actual = out['efficiency_actual_trades']
+            for group in [TOP10_MODELS[0][1], EFF_GROUP]:
+                assert_replay_matches(trades[trades.group.eq(group)], actual[actual.group.eq(group)])
+            for r in out['efficiency_opportunity_summary'].to_dict('records'):
+                self.assertAlmostEqual(r['等机会改善(百分点)'], r['避免亏损贡献(百分点)']-r['错过盈利贡献(百分点)'])
+                self.assertAlmostEqual(r['等机会改善(百分点)'], r['过滤后等机会均益%']-r['原始机会净均益%'])
+            for r in out['efficiency_summary'].to_dict('records'):
+                monthly = out['efficiency_monthly']; monthly = monthly[monthly.take_profit.eq(r['take_profit'])]
+                self.assertAlmostEqual(r['配对改善(百分点)'], monthly['对全期改善贡献(百分点)'].sum())
+            for tp, block in actual.groupby('take_profit'):
+                changes = out['efficiency_execution_changes']
+                changes = changes[changes.take_profit.eq(tp)]
+                n_original = changes.change_type.isin(['共同成交', '直接过滤', '持仓路径减少']).sum()
+                n_new = changes.change_type.isin(['共同成交', '持仓路径新增']).sum()
+                self.assertEqual(n_original, block[block.group.eq(TOP10_MODELS[0][1])].status.isin(['已平仓', '未平仓']).sum())
+                self.assertEqual(n_new, block[block.group.eq(EFF_GROUP)].status.isin(['已平仓', '未平仓']).sum())
+            damaged = e.drop(e[e.group.eq(TOP10_MODELS[0][1])].index[0])
+            with self.assertRaisesRegex(DataError, '独立路径不完整'):
+                efficiency_trial(c, selected, damaged, trades, cfg)
+            bad = trades.copy()
+            idx = bad[bad.group.eq(TOP10_MODELS[0][1]) & bad.status.eq('已平仓')].index[0]
+            bad.loc[idx, 'net_return'] += .01
+            with self.assertRaisesRegex(DataError, '不能复现'):
+                efficiency_trial(c, selected, e, bad, cfg)
+            folder = save_report(root, cfg, c, selected, trades, panel, cal, 'test', '演示测试', e)
+            imported = load_attribution_archive((Path(folder)/'回测审计.zip').read_bytes())
+            self.assertTrue(imported['meta']['efficiency_replay_completed'])
+            pd.testing.assert_frame_equal(out['efficiency_actual_summary'], imported['tables']['efficiency_actual_summary'], check_dtype=False)
+            pd.testing.assert_frame_equal(out['efficiency_opportunity_summary'], imported['tables']['efficiency_opportunity_summary'], check_dtype=False)
+            self.assertEqual(len(report_table(folder, 'experiment_summary')), 6)
+            self.assertTrue(out['efficiency_by_sample'].sample_phase.eq('合成演示_不是验证').all())
+            store.close()
 
     def test_outcome_classification_does_not_put_post_stop_peak_before_exit(self):
         base = dict(status='已平仓', data_issue=False, net_return=-.03, hold_days=5,
@@ -2731,7 +3159,7 @@ class StrategyTests(unittest.TestCase):
             store.close()
 
     def test_fixed_protocol_dates_parameters_and_model_scope(self):
-        cfg = Config()
+        cfg = Config(efficiency_research=False)
         self.assertEqual([s["experiment"] for s in experiments(cfg)], ["RETURN", "T10_PRE3"])
         self.assertTrue(top10_observation(self.filter_candidates(), cfg).empty)
         a = validation_protocol(cfg); b = validation_protocol(replace(cfg, start="20200101", end="20210101"))
@@ -2778,7 +3206,7 @@ class StrategyTests(unittest.TestCase):
     def test_frozen_run_preserves_m13_models_and_requires_all_events(self):
         with tempfile.TemporaryDirectory() as root:
             store, basic, member, names, cal = demo_data(root)
-            cfg = Config(start=ds(cal[35]), end=ds(cal[60]))
+            cfg = Config(start=ds(cal[35]), end=ds(cal[60]), efficiency_research=False)
             panel = sector_panel(store, member, cal, cfg)
             c = build_candidates(store, basic, member, names, panel, cal, cfg)
             selected = select_candidates(c, cfg)
