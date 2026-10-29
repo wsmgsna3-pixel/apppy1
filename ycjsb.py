@@ -35,7 +35,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
-VERSION = "T1.0"
+VERSION = "T1.0.1"
 CORE_SECTORS = ["电子", "计算机", "通信", "国防军工"]
 # 申万一级行业名在 Tushare index_classify 里就是上面这几个中文名。
 BAR_COLS = ["ts_code", "trade_date", "open", "high", "low", "close", "pre_close",
@@ -837,12 +837,31 @@ def main_ui():
             st.error(f"运行失败：{type(exc).__name__}：{exc}")
 
 
+def _in_streamlit_runtime() -> bool:
+    """判断是不是正在被 Streamlit 运行（而不是 python app.py 直接运行）。"""
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        return get_script_run_ctx() is not None
+    except Exception:
+        pass
+    try:
+        import streamlit as st
+        return bool(st.runtime.exists())
+    except Exception:
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
     if args.self_test:
         print(self_test())
+        return 0
+    if _in_streamlit_runtime():
+        # Streamlit 下必须调 main_ui() 才会渲染界面；
+        # 之前版本这里只 print 了一句话，所以页面是空白的。
+        main_ui()
         return 0
     print("Streamlit 界面请用：streamlit run app.py；自测请用：python app.py --self-test")
     return 0
