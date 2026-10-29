@@ -35,7 +35,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
-VERSION = "T1.0.1"
+VERSION = "T1.0.2"
 CORE_SECTORS = ["电子", "计算机", "通信", "国防军工"]
 # 申万一级行业名在 Tushare index_classify 里就是上面这几个中文名。
 BAR_COLS = ["ts_code", "trade_date", "open", "high", "low", "close", "pre_close",
@@ -807,7 +807,9 @@ def main_ui():
                 client.download(cal_full, store, basic, member, names)
                 panel = sector_panel(store.all_bars(cal_full[0], cal_full[-1]), cal_full, cfg)
                 cand = build_candidates(store, panel, cal_full, cfg, progress=st.write)
-                store.close()
+                # 注意：数据库不能在这里关。回测撮合还要用 store.stock() 逐只读行情，
+                # 提前关了就会报 Cannot operate on a closed database。
+                # 关闭放在下面所有用到 store 的分支都跑完之后。
             else:
                 st.warning("没有 token，正在用合成演示数据跑流程，结果不是实盘信号。")
                 bars = demo_bars()
@@ -833,7 +835,16 @@ def main_ui():
                     st.dataframe(horizons.groupby("strategy")[["h1", "h2", "h3", "h5"]].mean())
                 st.subheader("逐笔（节选）")
                 st.dataframe(trades.head(200))
+            # 所有用到数据库的分支都结束了，才关库。DemoStore 没有 close 方法，直接跳过。
+            if hasattr(store, "close"):
+                store.close()
         except Exception as exc:
+            # 出错时也尽量关库，避免下一次运行还拿着旧连接。
+            try:
+                if "store" in locals() and hasattr(store, "close"):
+                    store.close()
+            except Exception:
+                pass
             st.error(f"运行失败：{type(exc).__name__}：{exc}")
 
 
