@@ -1,3 +1,8 @@
 [server]
 websocketPingInterval = 10
 disconnectedSessionTTL = 600
+[server]
+# 应用自己会写 data/market.sqlite 和 data/forward_log.csv，
+# 不要因为这些文件变化就自动重跑脚本，否则页面一打开就反复跑。
+fileWatcherType = "none"
+runOnSave = false
